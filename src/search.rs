@@ -4,8 +4,13 @@ use tantivy::directory::MmapDirectory;
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STRING, STORED,
 };
-use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer, Token, TokenStream, Tokenizer};
+use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy};
+
+use lindera::dictionary::load_dictionary;
+use lindera::mode::Mode;
+use lindera::segmenter::Segmenter;
+use lindera_tantivy::tokenizer::LinderaTokenizer;
 
 use crate::catalog::Catalog;
 use crate::translit::variants;
@@ -68,78 +73,12 @@ pub fn schema_with_tokenizers() -> (Schema, SearchFields) {
     )
 }
 
-/// A Tantivy 0.26 [`Tokenizer`] backed by Lindera's morphological analyser.
-///
-/// `lindera-tantivy` 4.0.0 is built against `tantivy` 0.25 / the 0.6
-/// `tantivy-tokenizer-api`, whose `Tokenizer` trait is a *different* trait
-/// than the 0.7 one that `tantivy` 0.26 expects. Registering its
-/// `LinderaTokenizer` with tantivy 0.26's `TokenizerManager` therefore fails
-/// to type-check. This wrapper talks to `lindera` directly and implements
-/// tantivy 0.26's own `Tokenizer`/`TokenStream` traits, reproducing the small
-/// surface of `lindera-tantivy`'s `LinderaTokenizer` (segment text, byte
-/// offsets, position) against the matching API.
-#[derive(Clone)]
-struct LinderaTokenizer {
-    inner: lindera::tokenizer::Tokenizer,
-}
-
-impl LinderaTokenizer {
-    fn new() -> Result<Self> {
-        use lindera::dictionary::load_dictionary;
-        use lindera::mode::Mode;
-        use lindera::segmenter::Segmenter;
-
-        let dict = load_dictionary("embedded://ipadic").context("loading embedded ipadic")?;
-        let segmenter = Segmenter::new(Mode::Normal, dict, None);
-        Ok(LinderaTokenizer {
-            inner: lindera::tokenizer::Tokenizer::new(segmenter),
-        })
-    }
-}
-
-impl Tokenizer for LinderaTokenizer {
-    type TokenStream<'a> = LinderaTokenStream<'a>;
-
-    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
-        // Tokenisation failures yield an empty stream rather than panicking;
-        // the field simply contributes no tokens for that document.
-        let tokens = self.inner.tokenize(text).unwrap_or_default();
-        LinderaTokenStream {
-            tokens,
-            token: Token::default(),
-            index: 0,
-        }
-    }
-}
-
-struct LinderaTokenStream<'a> {
-    tokens: Vec<lindera::token::Token<'a>>,
-    token: Token,
-    index: usize,
-}
-
-impl<'a> TokenStream for LinderaTokenStream<'a> {
-    fn advance(&mut self) -> bool {
-        if self.index >= self.tokens.len() {
-            return false;
-        }
-        let t = &self.tokens[self.index];
-        self.token.text = t.surface.to_string();
-        self.token.offset_from = t.byte_start;
-        self.token.offset_to = t.byte_end;
-        self.token.position = t.position;
-        self.token.position_length = t.position_length;
-        self.index += 1;
-        true
-    }
-
-    fn token(&self) -> &Token {
-        &self.token
-    }
-
-    fn token_mut(&mut self) -> &mut Token {
-        &mut self.token
-    }
+/// Build an embedded-IPADIC `LinderaTokenizer` (the maintained
+/// `lindera-tantivy` crate's tokenizer) for registration with Tantivy.
+fn build_lindera_tokenizer() -> Result<LinderaTokenizer> {
+    let dict = load_dictionary("embedded://ipadic").context("loading embedded ipadic")?;
+    let segmenter = Segmenter::new(Mode::Normal, dict, None);
+    Ok(LinderaTokenizer::from_segmenter(segmenter))
 }
 
 /// Register the `lindera` (embedded IPADIC) and `lowercase` tokenizers on the
@@ -147,7 +86,7 @@ impl<'a> TokenStream for LinderaTokenStream<'a> {
 /// call this — Tantivy does not persist tokenizer registrations to disk, and a
 /// tokenizer named in the schema must be resolvable at query time too.
 fn register_tokenizers(index: &Index) -> Result<()> {
-    let lindera = LinderaTokenizer::new()?;
+    let lindera = build_lindera_tokenizer()?;
     let lowercase = TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(LowerCaser)
         .build();
