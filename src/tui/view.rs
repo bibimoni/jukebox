@@ -36,7 +36,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // Search pane: input line + ranked results (scrolls with the cursor).
     let mut lines: Vec<ListItem> = vec![ListItem::new(format!("/ {}", app.search_input))];
-    for (_i, (score, tidx)) in app.results.iter().enumerate() {
+    for (score, tidx) in app.results.iter() {
         let t = &app.catalog.tracks[*tidx];
         let pct = (score * 100.0).clamp(0.0, 100.0);
         // Prefix shows queue state: `▶` playing, `+` enqueued, ` ` neither.
@@ -88,7 +88,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // what space/enter will do in the focused pane.
     let hint = match app.focus {
         Pane::Search => "search: /filter  space/enter=enqueue+play  ↑↓=move  Tab=next pane  q=quit",
-        Pane::Artists => "artists: space=enqueue all  ↑↓=move  /=search  Tab=next pane  q=quit",
+        Pane::Artists => "artists: enter=browse songs  space=enqueue all  ↑↓=move  /=search  Tab=next pane  q=quit",
         Pane::Queue => "queue: enter=play  x/r=remove  s=shuffle  c=clear  n/p=next/prev  q=quit",
     };
     let qcount = app.queue().items().len();

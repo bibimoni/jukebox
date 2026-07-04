@@ -140,6 +140,45 @@ fn all_dead_queue_does_not_loop_forever() {
 
 // --- auto-next + space-in-search tests ---
 
+#[test]
+fn enter_on_artist_browses_their_songs_without_enqueueing() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("catalog.json");
+    // Two artists, Ado with two tracks so we can verify browse lists both
+    // and sorts by title, and that nothing is enqueued.
+    let json = serde_json::json!({
+        "version":1,"built_at":"x","source_root":"/tmp/lossless",
+        "tracks":[
+          {"id":"a1","artists":["Ado"],"primary_artist":"Ado","title":"Zebra",
+           "bit_depth":24,"sample_rate_hz":48000,"source_path":"lossless/a/01.flac","symlinked_into_artists":["Ado"]},
+          {"id":"a2","artists":["Ado"],"primary_artist":"Ado","title":"Alpha",
+           "bit_depth":24,"sample_rate_hz":48000,"source_path":"lossless/a/02.flac","symlinked_into_artists":["Ado"]},
+          {"id":"b1","artists":["Aimer"],"primary_artist":"Aimer","title":"Brave",
+           "bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/b/01.flac","symlinked_into_artists":["Aimer"]},
+        ]
+    }).to_string();
+    std::fs::write(&p, json).unwrap();
+    let cat = Catalog::load(&p).unwrap();
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None);
+
+    // Cursor on Ado (sorted: Ado, Aimer -> Ado is index 0).
+    app.artist_cursor = 0;
+    app.browse_artist();
+
+    // Results are exactly Ado's two tracks, nothing from Aimer, queue empty.
+    assert_eq!(app.results.len(), 2, "browse should list Ado's tracks only");
+    let ids: Vec<String> = app.results.iter()
+        .map(|(_, i)| app.catalog.tracks[*i].id.clone()).collect();
+    assert!(ids.contains(&"a1".into()) && ids.contains(&"a2".into()));
+    assert!(!ids.contains(&"b1".into()));
+    assert_eq!(app.queue().len(), 0, "browse must not enqueue anything");
+    assert!(matches!(app.focus, jukebox::tui::Pane::Search));
+
+    // Sorted by title: Alpha (a2) before Zebra (a1).
+    assert_eq!(app.results[0].1, 1, "Alpha (index 1) should sort first");
+    assert_eq!(app.results[1].1, 0, "Zebra (index 0) should sort second");
+}
+
 /// A stub player whose `track_ended()` returns true after `end_after` loads,
 /// simulating a track that finishes on its own. Lets us test auto-advance
 /// without a real mpv.

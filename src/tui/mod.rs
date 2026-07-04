@@ -61,6 +61,32 @@ impl App {
     pub fn artists(&self) -> &Vec<String> { &self.artists }
     pub fn queue(&self) -> &queue::Queue { &self.queue }
 
+    /// Populate the Search results with a specific artist's tracks (sorted by
+    /// title), without enqueueing any of them. Lets the user browse an
+    /// artist's songs and pick one with `space`/`enter` instead of dumping
+    /// the whole artist into the queue. Switches focus to the Search pane.
+    /// Pressing `/` or typing replaces this browse view with a normal search.
+    pub fn browse_artist(&mut self) {
+        if let Some(a) = self.artists.get(self.artist_cursor).cloned() {
+            if let Some(tracks) = self.artist_index.get(&a).cloned() {
+                self.results = tracks
+                    .into_iter()
+                    .map(|i| (1.0, i))
+                    .collect();
+                // Sort by title for a stable, scannable browse order.
+                self.results.sort_by(|(_, a), (_, b)| {
+                    self.catalog.tracks[*a]
+                        .title
+                        .to_lowercase()
+                        .cmp(&self.catalog.tracks[*b].title.to_lowercase())
+                });
+                self.result_cursor = 0;
+                self.focus = Pane::Search;
+                self.search_input.clear();
+            }
+        }
+    }
+
     pub fn enqueue_artist(&mut self, artist: &str) {
         if let Some(tracks) = self.artist_index.get(artist) {
             let was_empty = self.now_playing.is_none() && self.queue.is_empty();
@@ -226,6 +252,7 @@ impl App {
             // the search and reset the cursor to result #0, so the next enter
             // would enqueue the wrong (first) result.
             Char(' ') if matches!(self.focus, Pane::Search) => self.enqueue_current_result(),
+            Enter if matches!(self.focus, Pane::Artists) => self.browse_artist(),
             Char('/') => { self.focus = Pane::Search; self.search_input.clear(); }
             Char(c) if matches!(self.focus, Pane::Search) => { self.search_input.push(c); self.run_search(); }
             Backspace if matches!(self.focus, Pane::Search) => { self.search_input.pop(); self.run_search(); }
