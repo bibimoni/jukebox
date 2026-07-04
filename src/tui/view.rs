@@ -119,7 +119,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let line1 = format!(
         " {now} Tab=pane  /=search  ↑↓=move  q=quit  ←→=±5s  space=play-pause  n/p=next/prev  s=shuf  S=reshuf+play   {qcount} queued"
     );
-    let line2 = " Artists: enter=browse · space=enq all | Search: space/enter=enq+play | Queue: enter=play · x/r=remove · c=clear";
+    let line2 = " Artists: enter=browse · a=enq all | Search: enter=enq+play | Queue: enter=play · x/r=remove · c=clear";
     f.render_widget(
         Paragraph::new(format!("{}\n{}", line1, line2))
             .style(Style::default().fg(Color::DarkGray)),

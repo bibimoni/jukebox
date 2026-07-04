@@ -1496,6 +1496,7 @@ dependencies = [
  "coreaudio-sys",
  "crossterm",
  "dirs",
+ "libc",
  "lindera",
  "lindera-tantivy",
  "ratatui",

@@ -242,19 +242,18 @@ impl App {
             Char('q') => { self.should_quit = true; self.player.stop().ok(); }
             Down => self.cursor_down(),
             Up => self.cursor_up(),
-            Char(' ') if matches!(self.focus, Pane::Artists) => {
+            // space = play/pause in EVERY pane. The footer advertises it
+            // globally, so it must actually work globally — previously it only
+            // fired in the Queue pane, so pressing space in Artists/Search
+            // looked like pause was broken.
+            Char(' ') => { let _ = self.player.play_pause(); }
+            // `a` enqueues all of the focused artist's tracks (was on space;
+            // moved so space can be the global pause).
+            Char('a') if matches!(self.focus, Pane::Artists) => {
                 if let Some(a) = self.artists.get(self.artist_cursor).cloned() {
                     self.enqueue_artist(&a);
                 }
             }
-            // In Search, space enqueues the highlighted result (multi-select)
-            // rather than inserting a space — inserting a space would re-run
-            // the search and reset the cursor to result #0, so the next enter
-            // would enqueue the wrong (first) result.
-            Char(' ') if matches!(self.focus, Pane::Search) => self.enqueue_current_result(),
-            // In Queue, space toggles play/pause (the only pane where space
-            // is otherwise free — it enqueues in the other two).
-            Char(' ') if matches!(self.focus, Pane::Queue) => { let _ = self.player.play_pause(); }
             Enter if matches!(self.focus, Pane::Artists) => self.browse_artist(),
             Char('/') => { self.focus = Pane::Search; self.search_input.clear(); }
             Char(c) if matches!(self.focus, Pane::Search) => { self.search_input.push(c); self.run_search(); }

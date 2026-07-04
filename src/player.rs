@@ -41,23 +41,78 @@ impl Player for StubPlayer {
 }
 
 // ---------- afplay fallback (per-track, no seek) ----------
-pub struct AfplayPlayer { child: Option<RefCell<Child>> }
+#[derive(Default)]
+pub struct AfplayPlayer { child: Option<RefCell<Child>>, paused: bool }
 impl AfplayPlayer {
-    pub fn new() -> Self { Self { child: None } }
-}
-impl Player for AfplayPlayer {
-    fn load(&mut self, path: &Path) -> Result<()> {
-        self.child = Some(RefCell::new(Command::new("afplay").arg(path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?));
-        Ok(())
-    }
-    fn play_pause(&mut self) -> Result<()> { Ok(()) } // afplay has no IPC
-    fn seek(&mut self, _secs: f64) -> Result<()> { Ok(()) }
-    fn stop(&mut self) -> Result<()> {
+    pub fn new() -> Self { Self::default() }
+
+    /// Kill + reap the current child (if any). Dropping a `Child` on Unix
+    /// does NOT kill the process — it only orphans it, leaving afplay playing
+    /// forever. Every load/stop must explicitly kill+reap, or rapid loads
+    /// stack overlapping afplay processes (the "weird songs" bug).
+    fn kill_current(&mut self) {
         if let Some(c) = self.child.take() {
             let mut child = c.into_inner();
             let _ = child.kill();
             let _ = child.wait();   // reap to avoid a zombie
         }
+        self.paused = false;
+    }
+
+    /// Send a Unix signal to the afplay process. Used for SIGSTOP/SIGCONT
+    /// pause/resume (afplay has no IPC). The pid is the direct child.
+    #[cfg(unix)]
+    fn signal_child(&self, sig: i32) {
+        if let Some(c) = self.child.as_ref() {
+            let pid = c.borrow().id() as i32;
+            if pid > 0 {
+                unsafe { libc::kill(pid, sig); }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn signal_child(&self, _sig: i32) {}
+
+}
+impl Player for AfplayPlayer {
+    fn load(&mut self, path: &Path) -> Result<()> {
+        // Kill the previous afplay BEFORE spawning the next. Without this,
+        // replacing `self.child` drops the old `Child` handle but leaves the
+        // afplay process running — overlapping playback on rapid enters.
+        self.kill_current();
+        let child = Command::new("afplay")
+            .arg(path)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .spawn()?;
+        self.child = Some(RefCell::new(child));
+        self.paused = false;
+        Ok(())
+    }
+    fn play_pause(&mut self) -> Result<()> {
+        // afplay has no IPC, so we pause it at the kernel level: SIGSTOP
+        // freezes the process (audio stops immediately), SIGCONT resumes.
+        // The track keeps its position because afplay's internal buffer
+        // state is preserved across stop/cont.
+        #[cfg(unix)]
+        {
+            if self.child.is_some() {
+                if self.paused {
+                    self.signal_child(libc::SIGCONT);
+                    self.paused = false;
+                } else {
+                    self.signal_child(libc::SIGSTOP);
+                    self.paused = true;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        { let _ = self; }
+        Ok(())
+    }
+    fn seek(&mut self, _secs: f64) -> Result<()> { Ok(()) }
+    fn stop(&mut self) -> Result<()> {
+        self.kill_current();
         Ok(())
     }
     fn position(&self) -> Option<f64> { None }
@@ -74,10 +129,19 @@ impl Player for AfplayPlayer {
         if let Some(c) = self.child.as_ref() {
             if c.borrow_mut().try_wait().ok().flatten().is_some() {
                 if let Some(c) = self.child.take() { let _ = c.into_inner().wait(); }
+                self.paused = false;
                 return true;
             }
         }
         false
+    }
+}
+impl Drop for AfplayPlayer {
+    fn drop(&mut self) {
+        // Last-resort cleanup: if the App is dropped without an explicit
+        // stop() (e.g. a panic mid-loop), kill afplay so it can't outlive
+        // the TUI and keep playing "weird songs" after we exit.
+        self.kill_current();
     }
 }
 
@@ -99,17 +163,16 @@ pub struct MpvPlayer {
 impl MpvPlayer {
     pub fn spawn(socket: &Path) -> Result<Self> {
         let _ = std::fs::remove_file(socket);
-        // --audio-resample=no: mpv outputs the file's native sample rate
-        // instead of resampling to 48k. Without this, mpv opens the audio
-        // device at its own preferred rate and CoreAudio snaps the device
-        // back to 48k — undoing our CoreAudio format switch within a beat
-        // (visible in LosslessSwitcher / Audio MIDI Setup as the rate
-        // flicking to the right value then reverting). With it, mpv requests
-        // the file's rate, the device is already at that rate, and the
-        // switch sticks.
+        // mpv's ao_coreaudio sets the device's HW format to the source file's
+        // sample rate when it opens audio, so mpv naturally plays at the
+        // file's rate (no resampling to 48k) — this is what keeps our
+        // CoreAudio pre-switch from reverting. (We previously passed
+        // --audio-resample=no, but that option does not exist in mpv and made
+        // spawn fail fatally, silently forcing the afplay fallback — which in
+        // turn broke pause and stacked orphaned afplay processes on rapid
+        // loads.)
         let mut child = Command::new("mpv")
-            .args(["--no-video", "--no-terminal", "--idle", "--gapless-audio=yes",
-                   "--audio-resample=no"])
+            .args(["--no-video", "--no-terminal", "--idle", "--gapless-audio=yes"])
             .arg(format!("--input-ipc-server={}", socket.display()))
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
             .spawn()?;
