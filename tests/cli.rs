@@ -1,7 +1,4 @@
-use jukebox::cli::Cli;
-use jukebox::config::Config;
 use jukebox::prompt::prompt_source_dir_with;
-use std::io::Write;
 use tempfile::tempdir;
 
 #[test]
