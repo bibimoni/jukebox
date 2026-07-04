@@ -30,3 +30,18 @@ coreaudio-sys = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# `cargo-binstall` support: `cargo binstall jukebox` downloads the prebuilt
+# binary from the GitHub Release for the current version instead of compiling
+# from source (which is slow because lindera-tantivy embeds the ~40MB IPADIC
+# dictionary at build time). The archive layout produced by
+# .github/workflows/release.yml is: jukebox + scripts/ + README + LICENSE at
+# the archive root, so pkg-path = "jukebox" (the binary is at the root, not
+# under a bin/ subdir).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/jukebox-{ target }{ archive-suffix }"
+bin-dir = "."
+pkg-fmt = "tgz"
+# Each Release asset is named jukebox-<target>.tar.gz (matches release.yml's
+# `artifact:` matrix value: jukebox-aarch64-apple-darwin, etc.).
+

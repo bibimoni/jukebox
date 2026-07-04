@@ -7,14 +7,44 @@ search and mpv playback.
 The originals in `lossless/` are never mutated — `standardize.sh` only writes
 symlinks, `catalog.json`, and a Tantivy index into `filtered_lossless/`.
 
-## Setup
+## Install
+
+```bash
+cargo binstall jukebox          # downloads the prebuilt binary (no compile)
+jukebox                         # first run prompts for your lossless source dir
+jukebox sync                    # build symlinks + catalog + search index
+jukebox play                    # launch the TUI
+```
+
+`cargo binstall` downloads the prebuilt binary from the
+[releases page](https://github.com/bibimoni/jukebox/releases) — recommended,
+since building from source embeds the ~40MB IPADIC dictionary (slow, RAM-heavy).
+
+<details><summary>Alternative install methods</summary>
+
+```bash
+# From source (slower; embeds the IPADIC dictionary at build time):
+cargo install jukebox
+
+# Or grab a binary archive directly from a release:
+tar xzf jukebox-<target>.tar.gz      # e.g. jukebox-aarch64-apple-darwin.tar.gz
+./jukebox
+```
+
+Or build from a checkout:
 
 ```bash
 cargo build --release
-./target/release/jukebox          # first run prompts for your lossless source dir
-./target/release/jukebox sync      # build symlinks + catalog + search index
-./target/release/jukebox play      # launch the TUI
+./target/release/jukebox
 ```
+
+</details>
+
+### Runtime prerequisites
+
+- `metaflac`, `ffprobe`, `jq`, `yq` — for `jukebox sync`
+- `mpv` — for playback (falls back to `afplay` on macOS if unavailable)
+
 
 `jukebox sync` walks every `.flac` under the configured source dir, reads tags
 via `metaflac` and quality via `ffprobe`, keeps the best copy per song (highest
