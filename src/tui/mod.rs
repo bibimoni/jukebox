@@ -23,6 +23,9 @@ pub struct App {
     /// Track ids whose source file is missing or a broken symlink. Marked dead
     /// at play time and skipped; shown as `[dead]` in the queue pane.
     pub dead: HashSet<String>,
+    /// The id of the track most recently loaded into the player (for the
+    /// Now Playing panel). `None` until the first track plays.
+    pub now_playing: Option<String>,
 }
 
 impl App {
@@ -42,6 +45,7 @@ impl App {
             should_quit: false,
             searcher,
             dead: HashSet::new(),
+            now_playing: None,
         }
     }
 
@@ -119,6 +123,7 @@ impl App {
                 continue;
             }
             let _ = self.player.load(&path);
+            self.now_playing = Some(id);
             return;
         }
     }
