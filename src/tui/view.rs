@@ -6,10 +6,16 @@ use ratatui::Frame;
 use crate::tui::{App, Pane};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    // Main 3-pane area + a 1-line footer for keybinding hints + queue state.
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(f.area());
+
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(25), Constraint::Percentage(50), Constraint::Percentage(25)])
-        .split(f.area());
+        .split(outer[0]);
 
     // Artists — rendered with a ListState so the view scrolls to follow the
     // cursor (without this the highlight disappears once it passes the bottom
@@ -32,7 +38,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let mut lines: Vec<ListItem> = vec![ListItem::new(format!("/ {}", app.search_input))];
     for (_i, (score, tidx)) in app.results.iter().enumerate() {
         let t = &app.catalog.tracks[*tidx];
-        let label = format!("{:>3.0}%  {} — {}", (score * 100.0).clamp(0.0, 100.0), t.title, t.primary_artist);
+        let pct = (score * 100.0).clamp(0.0, 100.0);
+        // Prefix shows queue state: `▶` playing, `+` enqueued, ` ` neither.
+        let prefix = if app.now_playing.as_deref() == Some(&t.id) {
+            "▶"
+        } else if app.enqueued.contains(&t.id) {
+            "+"
+        } else {
+            " "
+        };
+        let label = format!("{:>3.0}% {} {} — {}", pct, prefix, t.title, t.primary_artist);
         lines.push(ListItem::new(label));
     }
     let mut rstate = list_state(app.result_cursor, app.results.len());
@@ -68,6 +83,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .block(border("Queue", matches!(app.focus, Pane::Queue)))
         .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
     f.render_stateful_widget(qlist, chunks[2], &mut qstate);
+
+    // Footer: keybinding hints + queue count. Context-aware so the user knows
+    // what space/enter will do in the focused pane.
+    let hint = match app.focus {
+        Pane::Search => "search: /filter  space/enter=enqueue+play  ↑↓=move  Tab=next pane  q=quit",
+        Pane::Artists => "artists: space=enqueue all  ↑↓=move  /=search  Tab=next pane  q=quit",
+        Pane::Queue => "queue: enter=play  x/r=remove  s=shuffle  c=clear  n/p=next/prev  q=quit",
+    };
+    let qcount = app.queue().items().len();
+    let footer = format!(" {}  |  {} queued", hint, qcount);
+    f.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        outer[1],
+    );
 }
 
 /// Build a `ListState` with `selected` set to `cursor`, clamped to the list

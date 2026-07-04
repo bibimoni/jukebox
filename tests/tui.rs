@@ -222,12 +222,13 @@ fn space_in_search_enqueues_highlighted_result_not_first() {
     let player: Box<dyn Player> = Box::new(jukebox::player::StubPlayer::default());
     let mut app = App::new(cat, player, Some(s));
 
-    // Search for something that matches both tracks; both have distinct titles
-    // so search a broad term. "Brave" matches t2 only; use empty-ish by searching
-    // a token present in t2. We'll search "Brave" → t2 only, then arrow down
-    // is a no-op (only 1 result). Instead search a term matching both: none.
-    // Use the catalog's two titles: search "e" → both "Freedom" and "Brave"
-    // contain no "e"... Freedom has no 'e'. Use a guaranteed-both query.
+    // Create the source files so play_current_queue (auto-play on first enqueue)
+    // can load them instead of marking them dead.
+    std::fs::create_dir_all("/tmp/lossless/a").unwrap();
+    std::fs::create_dir_all("/tmp/lossless/b").unwrap();
+    std::fs::write("/tmp/lossless/a/01.flac", b"x").unwrap();
+    std::fs::write("/tmp/lossless/b/01.flac", b"x").unwrap();
+
     app.search_input = "a".into();           // matches both (Ado, Aimer, Freedom, Brave)
     app.run_search();
     assert!(app.results.len() >= 2, "expected >=2 results, got {}", app.results.len());
@@ -244,4 +245,5 @@ fn space_in_search_enqueues_highlighted_result_not_first() {
     app.enqueue_current_result();
     assert_eq!(app.queue().items().first().cloned(), Some(highlighted_id),
         "space must enqueue the highlighted result, not the first");
+    let _ = std::fs::remove_dir_all("/tmp/lossless");
 }

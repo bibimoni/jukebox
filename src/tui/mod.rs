@@ -30,6 +30,9 @@ pub struct App {
     /// depth to match each track before playback (CoreAudio, in-process).
     /// No-op on non-macOS. Set from config in main.rs.
     pub switch_sample_rate: bool,
+    /// Track ids enqueued this session — used to mark Search results that are
+    /// already in the queue with a `+` so space/enter gives visible feedback.
+    pub enqueued: HashSet<String>,
 }
 
 impl App {
@@ -51,6 +54,7 @@ impl App {
             dead: HashSet::new(),
             now_playing: None,
             switch_sample_rate: true,
+            enqueued: HashSet::new(),
         }
     }
 
@@ -59,8 +63,14 @@ impl App {
 
     pub fn enqueue_artist(&mut self, artist: &str) {
         if let Some(tracks) = self.artist_index.get(artist) {
+            let was_empty = self.now_playing.is_none() && self.queue.is_empty();
             for &i in tracks {
-                self.queue.enqueue(self.catalog.tracks[i].id.clone());
+                let id = self.catalog.tracks[i].id.clone();
+                self.queue.enqueue(id.clone());
+                self.enqueued.insert(id);
+            }
+            if was_empty {
+                self.play_current_queue();
             }
         }
     }
@@ -79,10 +89,19 @@ impl App {
         }
     }
 
-    /// Enqueue the track under the result cursor (no-op if no results).
+    /// Enqueue the track under the result cursor. If nothing is playing yet,
+    /// start playback immediately so the user gets audio feedback (otherwise
+    /// space feels like a no-op — the track goes into the queue but the user
+    /// sees no change). Marks the track `+` in the Search pane.
     pub fn enqueue_current_result(&mut self) {
         if let Some(&(_, idx)) = self.results.get(self.result_cursor) {
-            self.queue.enqueue(self.catalog.tracks[idx].id.clone());
+            let id = self.catalog.tracks[idx].id.clone();
+            let was_empty = self.now_playing.is_none() && self.queue.is_empty();
+            self.queue.enqueue(id.clone());
+            self.enqueued.insert(id);
+            if was_empty {
+                self.play_current_queue();
+            }
         }
     }
 
