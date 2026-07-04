@@ -52,7 +52,6 @@ impl App {
 
     /// Run the terminal event loop. Returns when the user quits.
     pub fn run(&mut self) -> anyhow::Result<()> {
-        use crossterm::event::{self, Event, KeyEventKind};
         use crossterm::execute;
         use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
         use ratatui::backend::CrosstermBackend;
@@ -64,6 +63,21 @@ impl App {
         let backend = CrosstermBackend::new(stdout);
         let mut term = Terminal::new(backend)?;
 
+        let result = self.run_loop(&mut term);
+
+        // Unconditional cleanup — runs on Ok AND Err so the terminal is never
+        // left in raw mode + alt screen if the loop errors.
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        result
+    }
+
+    fn run_loop(
+        &mut self,
+        term: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    ) -> anyhow::Result<()> {
+        use crossterm::event::{self, Event, KeyEventKind};
+
         while !self.should_quit {
             term.draw(|f| view::draw(f, self))?;
             if event::poll(std::time::Duration::from_millis(200))? {
@@ -74,9 +88,6 @@ impl App {
                 }
             }
         }
-
-        terminal::disable_raw_mode()?;
-        execute!(std::io::stdout(), LeaveAlternateScreen)?;
         Ok(())
     }
 
