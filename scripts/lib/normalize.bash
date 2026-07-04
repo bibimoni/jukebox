@@ -71,3 +71,32 @@ normalized_title() {
 canonical_artists_sorted() {
   split_artists "$1" | tr '[:upper:]' '[:lower:]' | sort -u | paste -sd '|' -
 }
+
+# Build the dedup key: canonicalArtistsSorted | normalizedTitle.
+dedup_key() {
+  local artists="$1" title="$2"
+  printf '%s|%s' "$(canonical_artists_sorted "$artists")" "$(normalized_title "$title")"
+}
+
+# Read candidate lines on stdin (TSV):
+#   bit_depth \t sample_rate \t isrc \t tidal_id \t n_tags \t path
+# Print the winning line per spec §1.4 tiebreaker:
+#   bit_depth desc, sample_rate desc, has_isrc desc, has_tidal desc,
+#   n_tags desc, path-length asc.
+pick_winner() {
+  awk -F'\t' '
+    function score(c,    isrc, tidal, plen) {
+      isrc  = (c[3] != "" ? 1 : 0);
+      tidal = (c[4] != "" ? 1 : 0);
+      plen  = length(c[6]);
+      return sprintf("%05d|%010d|%d|%d|%05d|%09d",
+                     c[1]+0, c[2]+0, isrc, tidal, c[5]+0, 1000000000 - plen);
+    }
+    {
+      n = split($0, c, "\t");
+      s = score(c);
+      if (s > best) { best = s; bestline = $0; }
+    }
+    END { print bestline }
+  '
+}
