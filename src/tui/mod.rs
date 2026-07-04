@@ -252,6 +252,9 @@ impl App {
             // the search and reset the cursor to result #0, so the next enter
             // would enqueue the wrong (first) result.
             Char(' ') if matches!(self.focus, Pane::Search) => self.enqueue_current_result(),
+            // In Queue, space toggles play/pause (the only pane where space
+            // is otherwise free — it enqueues in the other two).
+            Char(' ') if matches!(self.focus, Pane::Queue) => { let _ = self.player.play_pause(); }
             Enter if matches!(self.focus, Pane::Artists) => self.browse_artist(),
             Char('/') => { self.focus = Pane::Search; self.search_input.clear(); }
             Char(c) if matches!(self.focus, Pane::Search) => { self.search_input.push(c); self.run_search(); }

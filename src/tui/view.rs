@@ -1,15 +1,15 @@
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::tui::{App, Pane};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    // Main 3-pane area + a 1-line footer for keybinding hints + queue state.
+    // Main 3-pane area + a 2-line footer with all keybindings + queue count.
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([Constraint::Min(3), Constraint::Length(2)])
         .split(f.area());
 
     let chunks = Layout::default()
@@ -56,11 +56,37 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
     f.render_stateful_widget(slist, center[0], &mut rstate);
 
-    // Now Playing panel.
+    // Now Playing panel: track text on top, a 1-line progress gauge below.
+    // The gauge updates every loop tick (~200ms, smoother than the requested
+    // 0.5s) from the player's position()/duration() — for mpv these come from
+    // observed `time-pos`/`duration` properties; afplay (fallback) reports None.
     let np = now_playing_text(app);
+    let np_area = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(center[1]);
     f.render_widget(
         Paragraph::new(np).wrap(Wrap { trim: true }).block(border("Now Playing", false)),
-        center[1],
+        np_area[0],
+    );
+    let pos = app.player.position();
+    let dur = app.player.duration();
+    let pct = match (pos, dur) {
+        (Some(p), Some(d)) if d > 0.0 => ((p / d) * 100.0).clamp(0.0, 100.0) as u16,
+        _ => 0,
+    };
+    let label = match (pos, dur) {
+        (Some(p), Some(d)) => format!("{} / {}", fmt_time(p), fmt_time(d)),
+        (Some(p), None) => fmt_time(p),
+        _ => String::new(),
+    };
+    f.render_widget(
+        Gauge::default()
+            .block(Block::default().borders(Borders::NONE))
+            .gauge_style(Style::default().fg(Color::Cyan))
+            .percent(pct)
+            .label(label),
+        np_area[1],
     );
 
     // Queue pane: items with ▶ on the current; [dead] marks missing sources.
@@ -84,17 +110,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
     f.render_stateful_widget(qlist, chunks[2], &mut qstate);
 
-    // Footer: keybinding hints + queue count. Context-aware so the user knows
-    // what space/enter will do in the focused pane.
-    let hint = match app.focus {
-        Pane::Search => "search: /filter  space/enter=enqueue+play  ↑↓=move  Tab=next pane  q=quit",
-        Pane::Artists => "artists: enter=browse songs  space=enqueue all  ↑↓=move  /=search  Tab=next pane  q=quit",
-        Pane::Queue => "queue: enter=play  x/r=remove  s=shuffle  c=clear  n/p=next/prev  q=quit",
-    };
+    // Footer: all keybindings across two lines + queue count, so nothing is
+    // hidden behind a per-pane context switch. Line 1 = global navigation +
+    // playback; line 2 = per-pane actions (which space/enter/x do depends on
+    // the focused pane, so they're grouped by pane).
     let qcount = app.queue().items().len();
-    let footer = format!(" {}  |  {} queued", hint, qcount);
+    let now = app.now_playing.as_deref().map(|_| "▶").unwrap_or("■");
+    let line1 = format!(
+        " {now} Tab=pane  /=search  ↑↓=move  q=quit  ←→=±5s  space=play-pause  n/p=next/prev  s=shuf  S=reshuf+play   {qcount} queued"
+    );
+    let line2 = " Artists: enter=browse · space=enq all | Search: space/enter=enq+play | Queue: enter=play · x/r=remove · c=clear";
     f.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(format!("{}\n{}", line1, line2))
+            .style(Style::default().fg(Color::DarkGray)),
         outer[1],
     );
 }
@@ -126,18 +154,22 @@ fn now_playing_text(app: &App) -> String {
     let quality = t.quality_label();
     // When sample-rate switching is on, the output device is switched to match
     // the track's format, so the quality line doubles as the device output rate.
+    // Position/duration is rendered by the progress gauge below this panel, not
+    // here, to avoid duplication.
     let quality_label = if app.switch_sample_rate { "Output" } else { "Quality" };
-    let pos = app.player.position();
-    let dur = app.player.duration();
-    let time = match (pos, dur) {
-        (Some(p), Some(d)) if d > 0.0 => format!("  {:.0}s / {:.0}s", p, d),
-        (Some(p), _) => format!("  {:.0}s", p),
-        _ => String::new(),
-    };
     format!(
-        "{} — {}\nAlbum: {}\n{}: {}{}",
-        t.title, t.primary_artist, album, quality_label, quality, time
+        "{} — {}\nAlbum: {}\n{}: {}",
+        t.title, t.primary_artist, album, quality_label, quality
     )
+}
+
+/// Format seconds as `M:SS` (or `H:MM:SS` past an hour) for the gauge label.
+fn fmt_time(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    let h = s / 3600;
+    let m = (s % 3600) / 60;
+    let sec = s % 60;
+    if h > 0 { format!("{}:{:02}:{:02}", h, m, sec) } else { format!("{}:{:02}", m, sec) }
 }
 
 fn border<'a>(title: &'a str, focused: bool) -> Block<'a> {
