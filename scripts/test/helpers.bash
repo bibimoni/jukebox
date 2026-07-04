@@ -19,3 +19,8 @@ mkflac() {
     for kv in "$@"; do metaflac --remove-tag "${kv%%=*}" "$path" 2>/dev/null; metaflac --set-tag "$kv" "$path" 2>/dev/null; done
   fi
 }
+
+# Skip a test when metaflac is not installed (integration tests need real flacs).
+skip_if_no_metaflac() {
+  command -v metaflac >/dev/null || skip "metaflac not installed"
+}

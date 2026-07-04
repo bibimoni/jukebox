@@ -59,6 +59,3 @@ load helpers.bash
   rm -rf "$d"
 }
 
-skip_if_no_metaflac() {
-  command -v metaflac >/dev/null || skip "metaflac not installed"
-}
