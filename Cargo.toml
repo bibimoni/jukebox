@@ -13,7 +13,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tantivy = "0.26"
 lindera = { version = "4.0", features = ["embed-ipadic"] }
-lindera-tantivy = { version = "4.0", features = ["embed-ipadic"] }
 wana_kana = "5.0"
 unicode-normalization = "0.1"
 
