@@ -60,6 +60,24 @@ print(os.path.relpath(sys.argv[1], start=sys.argv[2]))
 PY
 }
 
+# Byte-safe truncation that respects UTF-8 char boundaries.
+# macOS filenames are capped at 255 bytes; a track listing dozens of
+# artists in its ARTIST tag produces a canon far exceeding that.
+truncate_bytes() { # <string> <max_bytes>
+  python3 - "$1" "$2" <<'PY'
+import sys
+s, n = sys.argv[1], int(sys.argv[2])
+b = s.encode('utf-8')
+if len(b) <= n:
+    print(s); sys.exit()
+while n > 0:
+    try:
+        print(b[:n].decode('utf-8')); break
+    except UnicodeDecodeError:
+        n -= 1
+PY
+}
+
 # --- probe every flac ---
 shopt -s nullglob
 TMP="$(mktemp -d)"
@@ -175,7 +193,16 @@ emit_winner() { # <dedup_key> <winner-line>
   [[ ${#arts[@]} -eq 0 ]] && arts=("[unknown artist]")
 
   local khz; khz="$(khz_label "$sr")"
-  local fname; fname="$(sanitize_filename "$canon - $title [${bd}bit-${khz}].flac")"
+  # Cap the canon so the full "canon - title [bd-bit khz].flac" stays under
+  # the 255-byte filename limit. 180 bytes leaves headroom for title + bracket + ext.
+  local canon_trunc; canon_trunc="$(truncate_bytes "$canon" 180)"
+  local fname; fname="$(sanitize_filename "$canon_trunc - $title [${bd}bit-${khz}].flac")"
+  # Final safety net: if a long title still pushes the stem over the limit,
+  # truncate the stem (keep the .flac extension).
+  if [[ "${#fname}" -gt 250 ]]; then
+    local stem="${fname%.flac}"
+    fname="$(truncate_bytes "$stem" 245).flac"
+  fi
 
   local symlinked='[]'
   local artist dir relpath linkpath

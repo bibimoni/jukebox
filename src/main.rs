@@ -22,7 +22,23 @@ fn main() -> anyhow::Result<()> {
             let mut app = tui::App::new(cat, player, searcher);
             app.run()?;
         }
-        Cmd::Sync => { eprintln!("(sync not implemented yet)"); }
+        Cmd::Sync => {
+            let cfg = cli::ensure_config()?;
+            let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/standardize.sh");
+            // Fall back to a sibling-of-binary location if running installed.
+            let script = if script.exists() { script } else {
+                std::env::current_exe()?.parent().unwrap().join("scripts/standardize.sh")
+            };
+            let status = std::process::Command::new(&script)
+                .args(["--source", &cfg.source_dir.display().to_string(),
+                       "--out", &cfg.filtered_dir.display().to_string()])
+                .status()?;
+            if !status.success() { anyhow::bail!("standardize.sh failed"); }
+            let cat = catalog::Catalog::load(&cfg.filtered_dir.join("catalog.json"))?;
+            search::build_index(&cat, &cfg.filtered_dir.join("search-index"))?;
+            println!("synced: {} tracks", cat.tracks.len());
+        }
         Cmd::Index => {
             let cfg = cli::ensure_config()?;
             let cat = jukebox::catalog::Catalog::load(
