@@ -6,3 +6,4 @@ pub mod prompt;
 pub mod search;
 pub mod translit;
 pub mod tui;
+pub mod audio;

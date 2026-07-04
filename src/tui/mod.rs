@@ -26,6 +26,10 @@ pub struct App {
     /// The id of the track most recently loaded into the player (for the
     /// Now Playing panel). `None` until the first track plays.
     pub now_playing: Option<String>,
+    /// When true, switch the macOS default output device's sample rate + bit
+    /// depth to match each track before playback (CoreAudio, in-process).
+    /// No-op on non-macOS. Set from config in main.rs.
+    pub switch_sample_rate: bool,
 }
 
 impl App {
@@ -46,6 +50,7 @@ impl App {
             searcher,
             dead: HashSet::new(),
             now_playing: None,
+            switch_sample_rate: true,
         }
     }
 
@@ -121,6 +126,14 @@ impl App {
                     return;
                 }
                 continue;
+            }
+            // Switch the macOS output device to the track's sample rate + bit
+            // depth before loading. Best-effort: a failure to switch (e.g. the
+            // device doesn't support the format) should not block playback.
+            if self.switch_sample_rate {
+                if let Err(e) = crate::audio::set_output_format(t.sample_rate_hz, t.bit_depth) {
+                    eprintln!("sample-rate switch failed (continuing): {e}");
+                }
             }
             let _ = self.player.load(&path);
             self.now_playing = Some(id);

@@ -17,7 +17,14 @@ pub struct Config {
     pub filtered_dir: PathBuf,
     pub player: PlayerKind,
     pub mpv_socket: PathBuf,
+    /// Switch the macOS default output device's sample rate + bit depth to
+    /// match each track before playback (CoreAudio, in-process; no external
+    /// app required). No-op on non-macOS. Defaults to true.
+    #[serde(default = "default_true")]
+    pub switch_sample_rate: bool,
 }
+
+fn default_true() -> bool { true }
 
 /// Resolve the config file path.
 /// Honors `$XDG_CONFIG_HOME`, else falls back to `~/.config` (via `dirs`).
@@ -43,6 +50,7 @@ impl Config {
             filtered_dir,
             player: PlayerKind::Mpv,
             mpv_socket: PathBuf::from("/tmp/jukebox-mpv.sock"),
+            switch_sample_rate: true,
         }
     }
 
@@ -113,6 +121,7 @@ fn serde_yaml_compat(text: &str) -> Result<Config> {
     let mut filtered_dir = PathBuf::new();
     let mut player = PlayerKind::Mpv;
     let mut mpv_socket = PathBuf::from("/tmp/jukebox-mpv.sock");
+    let mut switch_sample_rate = true;
     for line in text.lines() {
         let line = line.split('#').next().unwrap().trim();
         if line.is_empty() { continue; }
@@ -125,10 +134,11 @@ fn serde_yaml_compat(text: &str) -> Result<Config> {
             "filtered_dir" => filtered_dir = PathBuf::from(v),
             "player" => player = if v == "afplay" { PlayerKind::Afplay } else { PlayerKind::Mpv },
             "mpv_socket" => mpv_socket = PathBuf::from(v),
+            "switch_sample_rate" => switch_sample_rate = matches!(v, "true" | "yes" | "1"),
             _ => {}
         }
     }
-    Ok(Config { version, source_dir, filtered_dir, player, mpv_socket })
+    Ok(Config { version, source_dir, filtered_dir, player, mpv_socket, switch_sample_rate })
 }
 
 fn format_yaml(c: &Config) -> Result<String> {
@@ -139,11 +149,13 @@ fn format_yaml(c: &Config) -> Result<String> {
          source_dir: \"{s}\"\n\
          filtered_dir: \"{f}\"\n\
          player: {p}\n\
-         mpv_socket: \"{m}\"\n",
+         mpv_socket: \"{m}\"\n\
+         switch_sample_rate: {ssr}\n",
         v = c.version,
         s = c.source_dir.display(),
         f = c.filtered_dir.display(),
         p = player,
         m = c.mpv_socket.display(),
+        ssr = c.switch_sample_rate,
     ))
 }

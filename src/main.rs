@@ -30,6 +30,7 @@ fn main() -> anyhow::Result<()> {
             };
             let player = player::launch(cfg.player, &cfg.mpv_socket);
             let mut app = tui::App::new(cat, player, searcher);
+            app.switch_sample_rate = cfg.switch_sample_rate;
             app.run()?;
         }
         Cmd::Sync => {

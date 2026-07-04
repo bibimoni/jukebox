@@ -95,6 +95,9 @@ fn now_playing_text(app: &App) -> String {
     };
     let album = t.album.clone().unwrap_or_else(|| "—".to_string());
     let quality = t.quality_label();
+    // When sample-rate switching is on, the output device is switched to match
+    // the track's format, so the quality line doubles as the device output rate.
+    let quality_label = if app.switch_sample_rate { "Output" } else { "Quality" };
     let pos = app.player.position();
     let dur = app.player.duration();
     let time = match (pos, dur) {
@@ -103,8 +106,8 @@ fn now_playing_text(app: &App) -> String {
         _ => String::new(),
     };
     format!(
-        "{} — {}\nAlbum: {}\nQuality: {}{}",
-        t.title, t.primary_artist, album, quality, time
+        "{} — {}\nAlbum: {}\n{}: {}{}",
+        t.title, t.primary_artist, album, quality_label, quality, time
     )
 }
 
