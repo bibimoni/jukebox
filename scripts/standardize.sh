@@ -21,7 +21,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/jukebox/config.yml"
+# Resolve the config path the same way the Rust side (config::config_path)
+# does: honor $XDG_CONFIG_HOME; otherwise on macOS use
+# ~/Library/Application Support/jukebox/config.yml (matching dirs::config_dir),
+# else ~/.config/jukebox/config.yml. bash 3.2 compatible.
+config_path() {
+  if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+    printf '%s' "$XDG_CONFIG_HOME/jukebox/config.yml"
+  elif [[ "$(uname)" == "Darwin" ]]; then
+    printf '%s' "$HOME/Library/Application Support/jukebox/config.yml"
+  else
+    printf '%s' "$HOME/.config/jukebox/config.yml"
+  fi
+}
+CONFIG="$(config_path)"
 read_cfg() { # <key> <default>
   if [[ -f "$CONFIG" ]] && command -v yq >/dev/null; then
     yq ".$1" "$CONFIG" 2>/dev/null

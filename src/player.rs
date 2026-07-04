@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::cell::RefCell;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -74,7 +74,7 @@ pub struct MpvPlayer {
 impl MpvPlayer {
     pub fn spawn(socket: &Path) -> Result<Self> {
         let _ = std::fs::remove_file(socket);
-        let child = Command::new("mpv")
+        let mut child = Command::new("mpv")
             .args(["--no-video", "--no-terminal", "--idle", "--gapless-audio=yes"])
             .arg(format!("--input-ipc-server={}", socket.display()))
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
@@ -85,7 +85,17 @@ impl MpvPlayer {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let conn = std::os::unix::net::UnixStream::connect(socket).ok();
-        Ok(MpvPlayer { child: RefCell::new(child), sock: socket.to_path_buf(), conn })
+        match conn {
+            Some(conn) => Ok(MpvPlayer { child: RefCell::new(child), sock: socket.to_path_buf(), conn: Some(conn) }),
+            None => {
+                // mpv IPC socket never appeared (or connect failed). Per spec
+                // (mpv socket unavailable → afplay fallback), kill the child
+                // and surface an error so `launch` falls back to AfplayPlayer.
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(anyhow!("mpv ipc socket unavailable at {}", socket.display()))
+            }
+        }
     }
 
     fn send(&mut self, cmd: &[serde_json::Value]) -> Result<()> {

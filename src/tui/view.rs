@@ -33,15 +33,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let list = List::new(lines).block(border("Search", matches!(app.focus, Pane::Search)));
     f.render_widget(list, chunks[1]);
 
-    // Queue pane: items with ▶ on the current
+    // Queue pane: items with ▶ on the current; [dead] marks missing sources
     let cur = app.queue.current_index();
     let qitems: Vec<ListItem> = app.queue().items().iter().enumerate()
         .map(|(i, id)| {
             let prefix = if Some(i) == cur { "▶ " } else { "  " };
+            let dead_marker = if app.dead.contains(id) { " [dead]" } else { "" };
             let track = app.catalog.tracks.iter().find(|t| &t.id == id);
             let label = match track {
-                Some(t) => format!("{prefix}{} — {}", t.title, t.primary_artist),
-                None => format!("{prefix}{id}"),
+                Some(t) => format!("{prefix}{} — {}{dead_marker}", t.title, t.primary_artist),
+                None => format!("{prefix}{id}{dead_marker}"),
             };
             ListItem::new(label)
         }).collect();

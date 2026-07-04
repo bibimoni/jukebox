@@ -17,7 +17,17 @@ fn main() -> anyhow::Result<()> {
         Cmd::Play => {
             let cfg = cli::ensure_config()?;
             let cat = catalog::Catalog::load(&cfg.filtered_dir.join("catalog.json"))?;
-            let searcher = search::Searcher::open(&cfg.filtered_dir.join("search-index")).ok();
+            let index_path = cfg.filtered_dir.join("search-index");
+            let searcher = match search::Searcher::open(&index_path) {
+                Ok(s) => Some(s),
+                Err(_) => {
+                    eprintln!(
+                        "search index not found at {}; run `jukebox sync` to build it",
+                        index_path.display()
+                    );
+                    None
+                }
+            };
             let player = player::launch(cfg.player, &cfg.mpv_socket);
             let mut app = tui::App::new(cat, player, searcher);
             app.run()?;

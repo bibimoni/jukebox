@@ -3,7 +3,7 @@ pub mod view;
 
 use crate::catalog::Catalog;
 use crate::player::Player;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 pub enum Pane { Artists, Search, Queue }
 
@@ -20,6 +20,9 @@ pub struct App {
     pub result_cursor: usize,
     pub should_quit: bool,
     pub searcher: Option<crate::search::Searcher>,
+    /// Track ids whose source file is missing or a broken symlink. Marked dead
+    /// at play time and skipped; shown as `[dead]` in the queue pane.
+    pub dead: HashSet<String>,
 }
 
 impl App {
@@ -38,6 +41,7 @@ impl App {
             search_input: String::new(), results: Vec::new(), result_cursor: 0,
             should_quit: false,
             searcher,
+            dead: HashSet::new(),
         }
     }
 
@@ -74,12 +78,48 @@ impl App {
     }
 
     /// Load the current queue item into the player and start playback.
+    ///
+    /// Per spec §Error Handling ("TUI marks the track dead, skips to next,
+    /// logs"), a track whose source file is missing or a broken symlink is
+    /// marked dead and skipped. We iterate through the queue at most
+    /// `queue.len()` times so an entirely-dead queue can't recurse forever.
     pub fn play_current_queue(&mut self) {
-        if let Some(id) = self.queue.current().cloned() {
-            if let Some(t) = self.catalog.tracks.iter().find(|t| t.id == id) {
-                let path = t.resolve_source(&self.catalog.source_root);
-                let _ = self.player.load(&path);
+        let n = self.queue.len();
+        if n == 0 { return; }
+        let start = self.queue.current_index();
+        for _ in 0..n {
+            let id = match self.queue.current().cloned() {
+                Some(id) => id,
+                None => return,
+            };
+            // Already known dead? Skip to next.
+            if self.dead.contains(&id) {
+                self.queue.next();
+                continue;
             }
+            let t = match self.catalog.tracks.iter().find(|t| t.id == id) {
+                Some(t) => t,
+                None => { self.queue.next(); continue; }
+            };
+            let path = t.resolve_source(&self.catalog.source_root);
+            // std::fs::metadata follows symlinks: a broken symlink or missing
+            // file yields Err, which we treat as a dead track.
+            if std::fs::metadata(&path).is_err() {
+                eprintln!(
+                    "dead track {} (source missing: {}); skipping",
+                    id, path.display()
+                );
+                self.dead.insert(id.clone());
+                self.queue.next();
+                // If we've looped back to the start, the whole queue is dead.
+                if self.queue.current_index() == start {
+                    eprintln!("all queued tracks are dead; nothing to play");
+                    return;
+                }
+                continue;
+            }
+            let _ = self.player.load(&path);
+            return;
         }
     }
 
