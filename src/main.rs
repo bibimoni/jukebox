@@ -31,7 +31,15 @@ fn main() -> anyhow::Result<()> {
             let player = player::launch(cfg.player, &cfg.mpv_socket);
             let mut app = tui::App::new(cat, player, searcher);
             app.switch_sample_rate = cfg.switch_sample_rate;
+            // Restore the last-focused pane from the state DB (if any), so the
+            // TUI reopens where you left it. Best-effort: a read failure just
+            // leaves the default (Artists) focus.
+            if let Ok(Some(pane)) = jukebox::state::load_focus() {
+                app.focus = jukebox::tui::Pane::from_db_key(&pane);
+            }
             app.run()?;
+            // Persist the final focused pane so the next launch restores it.
+            let _ = jukebox::state::save_focus(&app.focus.db_key());
         }
         Cmd::Sync => {
             let cfg = cli::ensure_config()?;

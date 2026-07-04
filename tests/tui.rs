@@ -138,9 +138,7 @@ fn all_dead_queue_does_not_loop_forever() {
     assert!(app.dead.contains("d2"));
 }
 
-// --- auto-next + space-in-search tests ---
-
-#[test]
+// --- auto-next + space-in-search tests ---#[test]
 fn enter_on_artist_browses_their_songs_without_enqueueing() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("catalog.json");

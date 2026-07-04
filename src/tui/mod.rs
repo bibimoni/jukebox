@@ -8,6 +8,27 @@ use std::collections::{BTreeMap, HashSet};
 #[derive(Clone, Copy)]
 pub enum Pane { Artists, Search, Queue }
 
+impl Pane {
+    /// Stable storage key for this pane, written to the state DB. Keep these
+    /// in sync with `state::ARTISTS` etc.
+    pub fn db_key(&self) -> &'static str {
+        match self {
+            Pane::Artists => crate::state::ARTISTS,
+            Pane::Search => crate::state::SEARCH,
+            Pane::Queue => crate::state::QUEUE,
+        }
+    }
+    /// Parse a stored DB key back into a Pane. Unknown values fall back to
+    /// Artists so a corrupted/garbage row can't crash startup.
+    pub fn from_db_key(s: &str) -> Self {
+        match s {
+            "search" => Pane::Search,
+            "queue" => Pane::Queue,
+            _ => Pane::Artists,
+        }
+    }
+}
+
 pub struct App {
     pub catalog: Catalog,
     pub player: Box<dyn Player>,
@@ -312,6 +333,13 @@ impl App {
             Char('p') => { self.queue.prev(); self.play_current_queue(); self.sync_queue_cursor(); }
             Left => { let _ = self.player.seek(-5.0); }
             Right => { let _ = self.player.seek(5.0); }
+            // R clears the saved UI state (focused pane) so the next launch
+            // restores defaults instead of the last-focused pane.
+            Char('R') => {
+                if let Err(e) = crate::state::clear() {
+                    eprintln!("failed to clear state: {e}");
+                }
+            }
             _ => {}
         }
     }

@@ -1,9 +1,10 @@
+pub mod audio;
 pub mod catalog;
 pub mod cli;
 pub mod config;
 pub mod player;
 pub mod prompt;
 pub mod search;
+pub mod state;
 pub mod translit;
 pub mod tui;
-pub mod audio;
