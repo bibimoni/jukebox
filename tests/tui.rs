@@ -250,6 +250,39 @@ fn auto_next_advances_queue_on_track_end() {
 }
 
 #[test]
+fn consume_current_drops_finished_track_and_advances_to_next() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("catalog.json");
+    std::fs::write(&p, mini_catalog_json()).unwrap();
+    let cat = Catalog::load(&p).unwrap();
+    let player: Box<dyn Player> = Box::new(jukebox::player::StubPlayer::default());
+    let mut app = App::new(cat, player, None);
+
+    // Create real source files so play_current_queue can load them.
+    std::fs::create_dir_all("/tmp/lossless/a").unwrap();
+    std::fs::create_dir_all("/tmp/lossless/b").unwrap();
+    std::fs::write("/tmp/lossless/a/01.flac", b"x").unwrap();
+    std::fs::write("/tmp/lossless/b/01.flac", b"x").unwrap();
+
+    app.queue.enqueue("t1".into());
+    app.queue.enqueue("t2".into());
+    app.play_current_queue();
+    assert_eq!(app.queue.current().cloned(), Some("t1".to_string()));
+    assert_eq!(app.queue.len(), 2);
+
+    // peek_next reports t2 before consume.
+    assert_eq!(app.queue.peek_next().cloned(), Some("t2".to_string()));
+
+    // Consume the finished track (simulate track-end).
+    app.queue.consume_current();
+    // t1 removed, t2 is now current, queue length is 1.
+    assert_eq!(app.queue.len(), 1);
+    assert_eq!(app.queue.current().cloned(), Some("t2".to_string()));
+
+    let _ = std::fs::remove_dir_all("/tmp/lossless");
+}
+
+#[test]
 fn space_in_search_enqueues_highlighted_result_not_first() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("catalog.json");

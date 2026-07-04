@@ -43,9 +43,46 @@ impl Queue {
         if self.order.is_empty() { return; }
         self.order_cursor = (self.order_cursor + 1) % self.order.len();
     }
+    /// Move the cursor so that `id` becomes the current track. Used by mouse
+    /// click-to-play in the Queue pane. No-op if the id isn't queued.
+    pub fn jump_to(&mut self, id: &str) {
+        if let Some(pos) = self.items.iter().position(|x| x == id) {
+            if let Some(cursor) = self.order.iter().position(|&o| o == pos) {
+                self.order_cursor = cursor;
+            }
+        }
+    }
     pub fn prev(&mut self) {
         if self.order.is_empty() { return; }
         self.order_cursor = (self.order_cursor + self.order.len() - 1) % self.order.len();
+    }
+
+    /// The track that will play after the current one (wraps). `None` if the
+    /// queue has fewer than 2 items.
+    pub fn peek_next(&self) -> Option<&String> {
+        if self.order.len() < 2 { return None; }
+        let next_cursor = (self.order_cursor + 1) % self.order.len();
+        let &oidx = self.order.get(next_cursor)?;
+        self.items.get(oidx)
+    }
+
+    /// Remove the currently-playing track from the queue and leave the cursor
+    /// pointing at what was the next track (now shifted into the current
+    /// slot). Preserves shuffle order. Used by consume mode: a track is
+    /// dropped from the queue once it has finished playing.
+    pub fn consume_current(&mut self) {
+        if self.order.is_empty() { return; }
+        let cur_oidx = self.order[self.order_cursor];
+        self.items.remove(cur_oidx);
+        self.order.remove(self.order_cursor);
+        for o in self.order.iter_mut() {
+            if *o > cur_oidx { *o -= 1; }
+        }
+        // If the cursor landed past the (now shorter) order, wrap to 0 — also
+        // covers the empty case (len 0, cursor >= 0 always true).
+        if self.order_cursor >= self.order.len() {
+            self.order_cursor = 0;
+        }
     }
     pub fn remove(&mut self, id: &str) {
         if let Some(pos) = self.items.iter().position(|x| x == id) {

@@ -5,6 +5,7 @@ use crate::catalog::Catalog;
 use crate::player::Player;
 use std::collections::{BTreeMap, HashSet};
 
+#[derive(Clone, Copy)]
 pub enum Pane { Artists, Search, Queue }
 
 pub struct App {
@@ -33,6 +34,13 @@ pub struct App {
     /// Track ids enqueued this session — used to mark Search results that are
     /// already in the queue with a `+` so space/enter gives visible feedback.
     pub enqueued: HashSet<String>,
+    /// Consume mode: when on (default), a track is removed from the queue
+    /// once it finishes playing, so the queue drains as you listen. Toggle
+    /// with `C`.
+    pub consume: bool,
+    /// Last mouse click (timestamp + position) for double-click detection —
+    /// a double-click in Search/Artists/Queue enqueues/plays the clicked row.
+    pub last_click: Option<(std::time::Instant, u16, u16)>,
 }
 
 impl App {
@@ -55,6 +63,8 @@ impl App {
             now_playing: None,
             switch_sample_rate: true,
             enqueued: HashSet::new(),
+            consume: true,
+            last_click: None,
         }
     }
 
@@ -202,7 +212,8 @@ impl App {
         let result = self.run_loop(&mut term);
 
         // Unconditional cleanup — runs on Ok AND Err so the terminal is never
-        // left in raw mode + alt screen if the loop errors.
+        // left in raw mode + alt screen + mouse capture if the loop errors.
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
         let _ = terminal::disable_raw_mode();
         let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
         result
@@ -213,20 +224,30 @@ impl App {
         term: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     ) -> anyhow::Result<()> {
         use crossterm::event::{self, Event, KeyEventKind};
+        // Enable mouse capture so click-to-focus + wheel scrolling work. Disabled
+        // unconditionally on exit (in `run`) so the terminal is never left in a
+        // captured state on panic/error.
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
 
         while !self.should_quit {
             term.draw(|f| view::draw(f, self))?;
             // Auto-advance: when the current track ends naturally (mpv end-file
-            // eof, or afplay child exit), advance the queue and play the next.
+            // eof, or afplay child exit), drop the finished track if consume is
+            // on (so the queue drains as you listen), then play the next.
             if self.player.track_ended() && !self.queue.is_empty() {
-                self.queue.next();
+                if self.consume {
+                    self.queue.consume_current();
+                } else {
+                    self.queue.next();
+                }
                 self.play_current_queue();
             }
             if event::poll(std::time::Duration::from_millis(200))? {
                 let ev = event::read()?;
-                if let Event::Key(k) = ev {
-                    if k.kind != KeyEventKind::Press { continue; }
-                    self.handle_key(k.code);
+                match ev {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => self.handle_key(k.code),
+                    Event::Mouse(m) => self.handle_mouse(m),
+                    _ => {}
                 }
             }
         }
@@ -238,6 +259,10 @@ impl App {
         match code {
             Tab => self.focus = match self.focus {
                 Pane::Artists => Pane::Search, Pane::Search => Pane::Queue, Pane::Queue => Pane::Artists,
+            },
+            // Shift+Tab (crossterm delivers it as BackTab) moves focus backward.
+            BackTab => self.focus = match self.focus {
+                Pane::Artists => Pane::Queue, Pane::Search => Pane::Artists, Pane::Queue => Pane::Search,
             },
             Char('q') => { self.should_quit = true; self.player.stop().ok(); }
             Down => self.cursor_down(),
@@ -269,12 +294,96 @@ impl App {
                 if let Some(id) = self.queue.current().cloned() { self.queue.remove(&id); }
             }
             Char('c') if matches!(self.focus, Pane::Queue) => { self.queue.clear(); }
+            // `C` toggles consume mode (drop finished tracks from the queue).
+            Char('C') => { self.consume = !self.consume; }
             Char('n') => { self.queue.next(); self.play_current_queue(); }
             Char('p') => { self.queue.prev(); self.play_current_queue(); }
             Left => { let _ = self.player.seek(-5.0); }
             Right => { let _ = self.player.seek(5.0); }
             _ => {}
         }
+    }
+
+    /// Map a mouse event to a pane focus + cursor move. Click in a pane focuses
+    /// it and selects the clicked row; double-click (two clicks on the same row
+    /// within 400ms) enqueues/plays it. The wheel scrolls the focused pane.
+    fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseEventKind, MouseButton};
+        // Pane layout must match view::draw: outer[0] split into 3 horizontal
+        // columns — Artists (25%) | Search+NowPlaying (50%) | Queue (25%).
+        // We re-derive which column the click landed in from the terminal width.
+        // The view splits outer[0] horizontally, so a click's column decides
+        // the pane; a click's row (minus the 1-line top border) decides the item.
+        match m.kind {
+            MouseEventKind::ScrollDown => { for _ in 0..3 { self.cursor_down(); } }
+            MouseEventKind::ScrollUp => { for _ in 0..3 { self.cursor_up(); } }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
+                self.click_pane(m.column, m.row);
+            }
+            _ => {}
+        }
+    }
+
+    /// Focus the pane under (col, row) and set its cursor to the clicked row.
+    /// Double-click on the same row within 400ms enqueues/plays it.
+    fn click_pane(&mut self, col: u16, row: u16) {
+        // Determine pane from column. Layout: [25% | 50% | 25%] of terminal width.
+        let w = term_width();
+        let a_end = w / 4;
+        let q_start = w * 3 / 4;
+        let clicked_pane = if (col as usize) < a_end {
+            Some(Pane::Artists)
+        } else if (col as usize) >= q_start {
+            Some(Pane::Queue)
+        } else {
+            Some(Pane::Search) // center column; sub-split into Search/NowPlaying by row handled below
+        };
+        // Row within a pane = row - pane_top - 1 (top border). The three columns
+        // share the same vertical span (outer[0]), so pane_top is 0.
+        let item_row = row.saturating_sub(1) as usize;
+
+        let pane = match clicked_pane { Some(p) => p, None => return };
+        // Center column upper 70% is Search; lower 30% is Now Playing. A click
+        // below the search area just focuses Search without selecting past end.
+        if matches!(pane, Pane::Search) || matches!(pane, Pane::Artists) || matches!(pane, Pane::Queue) {
+            self.focus = pane;
+        }
+        match pane {
+            Pane::Artists => {
+                if item_row < self.artists.len() { self.artist_cursor = item_row; }
+                if self.is_double_click(col, row) { self.browse_artist(); }
+            }
+            Pane::Search => {
+                if item_row > 0 && item_row - 1 < self.results.len() {
+                    self.result_cursor = item_row - 1; // row 0 is the "/ query" input line
+                    if self.is_double_click(col, row) { self.enqueue_current_result(); }
+                }
+            }
+            Pane::Queue => {
+                // Click selects the queue item at that row; double-click plays it.
+                let items = self.queue().items();
+                if item_row < items.len() {
+                    // Jump the queue cursor to the clicked item by id.
+                    let id = items[item_row].clone();
+                    if self.is_double_click(col, row) {
+                        self.queue.jump_to(&id);
+                        self.play_current_queue();
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_double_click(&mut self, col: u16, row: u16) -> bool {
+        let now = std::time::Instant::now();
+        if let Some((t, c, r)) = self.last_click {
+            if now.duration_since(t).as_millis() < 400 && c == col && r == row {
+                self.last_click = None;
+                return true;
+            }
+        }
+        self.last_click = Some((now, col, row));
+        false
     }
 
     fn cursor_down(&mut self) {
@@ -291,4 +400,11 @@ impl App {
             Pane::Queue => { self.queue.prev(); }
         }
     }
+}
+
+/// Terminal width in columns, used by mouse hit-testing to map a click column
+/// to one of the three layout panes. Falls back to 80 if the size can't be
+/// read (shouldn't happen inside the alt screen, but don't crash on it).
+fn term_width() -> usize {
+    crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
 }
