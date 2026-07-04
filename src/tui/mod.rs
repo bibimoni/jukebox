@@ -171,6 +171,12 @@ impl App {
 
         while !self.should_quit {
             term.draw(|f| view::draw(f, self))?;
+            // Auto-advance: when the current track ends naturally (mpv end-file
+            // eof, or afplay child exit), advance the queue and play the next.
+            if self.player.track_ended() && !self.queue.is_empty() {
+                self.queue.next();
+                self.play_current_queue();
+            }
             if event::poll(std::time::Duration::from_millis(200))? {
                 let ev = event::read()?;
                 if let Event::Key(k) = ev {
@@ -196,6 +202,11 @@ impl App {
                     self.enqueue_artist(&a);
                 }
             }
+            // In Search, space enqueues the highlighted result (multi-select)
+            // rather than inserting a space — inserting a space would re-run
+            // the search and reset the cursor to result #0, so the next enter
+            // would enqueue the wrong (first) result.
+            Char(' ') if matches!(self.focus, Pane::Search) => self.enqueue_current_result(),
             Char('/') => { self.focus = Pane::Search; self.search_input.clear(); }
             Char(c) if matches!(self.focus, Pane::Search) => { self.search_input.push(c); self.run_search(); }
             Backspace if matches!(self.focus, Pane::Search) => { self.search_input.pop(); self.run_search(); }
@@ -203,6 +214,9 @@ impl App {
             Enter if matches!(self.focus, Pane::Queue) => { self.play_current_queue(); }
             Char('s') => { self.queue.shuffle(42); }
             Char('S') => { self.queue.shuffle(42); self.queue.next(); self.play_current_queue(); }
+            Char('x') if matches!(self.focus, Pane::Queue) => {
+                if let Some(id) = self.queue.current().cloned() { self.queue.remove(&id); }
+            }
             Char('r') if matches!(self.focus, Pane::Queue) => {
                 if let Some(id) = self.queue.current().cloned() { self.queue.remove(&id); }
             }

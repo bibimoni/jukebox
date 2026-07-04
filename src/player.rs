@@ -13,6 +13,10 @@ pub trait Player {
     fn position(&self) -> Option<f64>;
     fn duration(&self) -> Option<f64>;
     fn is_playing(&self) -> bool;
+    /// True when the current track has finished playing on its own (mpv
+    /// end-file with reason "eof", or afplay child exited). The TUI polls
+    /// this each loop tick to auto-advance the queue. Default: no detection.
+    fn track_ended(&mut self) -> bool { false }
 }
 
 // ---------- Stub (tests / dry-run) ----------
@@ -63,6 +67,18 @@ impl Player for AfplayPlayer {
         // to allow this read probe through the trait's `&self` signature.
         self.child.as_ref().map(|c| c.borrow_mut().try_wait().ok().flatten().is_none()).unwrap_or(false)
     }
+    fn track_ended(&mut self) -> bool {
+        // afplay exits when the track finishes. If the child is present and
+        // has exited on its own, reap it and report ended. `stop()` takes the
+        // child out (None), so a manual stop won't fire this.
+        if let Some(c) = self.child.as_ref() {
+            if c.borrow_mut().try_wait().ok().flatten().is_some() {
+                if let Some(c) = self.child.take() { let _ = c.into_inner().wait(); }
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // ---------- mpv over Unix socket ----------
@@ -86,7 +102,12 @@ impl MpvPlayer {
         }
         let conn = std::os::unix::net::UnixStream::connect(socket).ok();
         match conn {
-            Some(conn) => Ok(MpvPlayer { child: RefCell::new(child), sock: socket.to_path_buf(), conn: Some(conn) }),
+            Some(conn) => {
+                // Non-blocking so the TUI can poll for end-file events without
+                // stalling the event loop.
+                let _ = conn.set_nonblocking(true);
+                Ok(MpvPlayer { child: RefCell::new(child), sock: socket.to_path_buf(), conn: Some(conn) })
+            }
             None => {
                 // mpv IPC socket never appeared (or connect failed). Per spec
                 // (mpv socket unavailable → afplay fallback), kill the child
@@ -107,9 +128,28 @@ impl MpvPlayer {
         }
         Ok(())
     }
+
+    /// Drain any buffered IPC data mpv has sent (event notifications + command
+    /// responses) without blocking. Used to clear stale events when loading a
+    /// new track so the replaced track's `end-file` doesn't fire auto-next.
+    fn drain_socket(&mut self) {
+        use std::io::Read;
+        if let Some(c) = self.conn.as_mut() {
+            let mut buf = [0u8; 4096];
+            loop {
+                match c.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => { /* keep draining */ }
+                }
+            }
+        }
+    }
 }
 impl Player for MpvPlayer {
     fn load(&mut self, path: &Path) -> Result<()> {
+        // Drain any pending events for the track we're replacing so its
+        // end-file doesn't trigger an auto-advance right after this load.
+        self.drain_socket();
         self.send(&["loadfile".into(), path.to_string_lossy().into()])?;
         Ok(())
     }
@@ -132,6 +172,31 @@ impl Player for MpvPlayer {
     fn position(&self) -> Option<f64> { None }   // polled in TUI via get_property (future)
     fn duration(&self) -> Option<f64> { None }
     fn is_playing(&self) -> bool { self.child.borrow_mut().try_wait().ok().flatten().is_none() }
+    fn track_ended(&mut self) -> bool {
+        use std::io::Read;
+        let Some(c) = self.conn.as_mut() else { return false };
+        let mut buf = [0u8; 8192];
+        loop {
+            match c.read(&mut buf) {
+                Ok(0) => return false,        // socket closed (mpv quit)
+                Ok(n) => {
+                    let txt = String::from_utf8_lossy(&buf[..n]);
+                    // mpv fires end-file with reason "eof" when a track
+                    // finishes naturally. "redirect" (replaced by loadfile)
+                    // and "stop"/"quit" are ignored so manual skips don't
+                    // double-advance the queue.
+                    if txt.contains("\"event\":\"end-file\"")
+                        && txt.contains("\"reason\":\"eof\"")
+                    {
+                        return true;
+                    }
+                    // keep draining other buffered events/responses
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+                Err(_) => return false,
+            }
+        }
+    }
 }
 impl Drop for MpvPlayer {
     fn drop(&mut self) {

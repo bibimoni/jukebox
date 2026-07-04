@@ -137,3 +137,111 @@ fn all_dead_queue_does_not_loop_forever() {
     assert!(app.dead.contains("d1"));
     assert!(app.dead.contains("d2"));
 }
+
+// --- auto-next + space-in-search tests ---
+
+/// A stub player whose `track_ended()` returns true after `end_after` loads,
+/// simulating a track that finishes on its own. Lets us test auto-advance
+/// without a real mpv.
+use jukebox::player::Player;
+use std::path::{Path, PathBuf};
+
+#[derive(Default)]
+struct EndAfterN {
+    loads: u32,
+    end_after: u32,        // fire track_ended once after this many loads
+    ended_fired: bool,
+    loaded: Option<PathBuf>,
+}
+impl Player for EndAfterN {
+    fn load(&mut self, path: &Path) -> anyhow::Result<()> {
+        self.loads += 1;
+        self.ended_fired = false;
+        self.loaded = Some(path.to_path_buf());
+        Ok(())
+    }
+    fn play_pause(&mut self) -> anyhow::Result<()> { Ok(()) }
+    fn seek(&mut self, _: f64) -> anyhow::Result<()> { Ok(()) }
+    fn stop(&mut self) -> anyhow::Result<()> { Ok(()) }
+    fn position(&self) -> Option<f64> { None }
+    fn duration(&self) -> Option<f64> { None }
+    fn is_playing(&self) -> bool { self.loaded.is_some() }
+    fn track_ended(&mut self) -> bool {
+        if !self.ended_fired && self.loads >= self.end_after {
+            self.ended_fired = true;
+            return true;
+        }
+        false
+    }
+}
+
+#[test]
+fn auto_next_advances_queue_on_track_end() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("catalog.json");
+    std::fs::write(&p, mini_catalog_json()).unwrap();
+    let cat = Catalog::load(&p).unwrap();
+    // Player signals end after the first load.
+    let player: Box<dyn Player> = Box::new(EndAfterN { end_after: 1, ..Default::default() });
+    let mut app = App::new(cat, player, None);
+
+    // Need real source files for play_current_queue to load them.
+    std::fs::create_dir_all("/tmp/lossless/a").unwrap();
+    std::fs::create_dir_all("/tmp/lossless/b").unwrap();
+    std::fs::write("/tmp/lossless/a/01.flac", b"x").unwrap();
+    std::fs::write("/tmp/lossless/b/01.flac", b"x").unwrap();
+
+    app.queue.enqueue("t1".into());
+    app.queue.enqueue("t2".into());
+    app.play_current_queue();
+    assert_eq!(app.queue.current().cloned(), Some("t1".to_string()));
+
+    // Simulate the TUI loop detecting end-of-track: advance + play next.
+    let ended = app.player.track_ended();
+    assert!(ended, "track should report ended after first load");
+    if ended {
+        app.queue.next();
+        app.play_current_queue();
+    }
+    assert_eq!(app.queue.current().cloned(), Some("t2".to_string()));
+    assert_eq!(app.now_playing.as_deref(), Some("t2"));
+
+    // cleanup
+    let _ = std::fs::remove_dir_all("/tmp/lossless");
+}
+
+#[test]
+fn space_in_search_enqueues_highlighted_result_not_first() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("catalog.json");
+    std::fs::write(&p, mini_catalog_json()).unwrap();
+    let cat = Catalog::load(&p).unwrap();
+    let idx = d.path().join("search-index");
+    jukebox::search::build_index(&cat, &idx).unwrap();
+    let s = Searcher::open(&idx).unwrap();
+    let player: Box<dyn Player> = Box::new(jukebox::player::StubPlayer::default());
+    let mut app = App::new(cat, player, Some(s));
+
+    // Search for something that matches both tracks; both have distinct titles
+    // so search a broad term. "Brave" matches t2 only; use empty-ish by searching
+    // a token present in t2. We'll search "Brave" → t2 only, then arrow down
+    // is a no-op (only 1 result). Instead search a term matching both: none.
+    // Use the catalog's two titles: search "e" → both "Freedom" and "Brave"
+    // contain no "e"... Freedom has no 'e'. Use a guaranteed-both query.
+    app.search_input = "a".into();           // matches both (Ado, Aimer, Freedom, Brave)
+    app.run_search();
+    assert!(app.results.len() >= 2, "expected >=2 results, got {}", app.results.len());
+
+    // Arrow down to the second result.
+    app.result_cursor = 1;
+    let highlighted_id = {
+        let (_, tidx) = app.results[1];
+        app.catalog.tracks[tidx].id.clone()
+    };
+
+    // Space should enqueue the HIGHLIGHTED result, not result #0.
+    // (enqueue_current_result is what space now calls.)
+    app.enqueue_current_result();
+    assert_eq!(app.queue().items().first().cloned(), Some(highlighted_id),
+        "space must enqueue the highlighted result, not the first");
+}
