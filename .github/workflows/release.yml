@@ -20,11 +20,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS — native runners per arch
+          # macOS aarch64 — native on an M-series runner.
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: jukebox-aarch64-apple-darwin
-          - os: macos-13
+          # macOS x86_64 — cross-compiled on an M-series runner (macos-14).
+          # The macos-13 Intel runners are being deprecated by GitHub and have
+          # long provisioning queues; cross-compiling from arm with the
+          # x86_64-apple-darwin target produces a correct x86_64 binary and
+          # starts immediately instead of waiting on Intel capacity.
+          - os: macos-14
             target: x86_64-apple-darwin
             artifact: jukebox-x86_64-apple-darwin
           # Linux
@@ -32,7 +37,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: jukebox-x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -46,7 +51,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
 
       - name: Cache cargo registry + build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -68,7 +73,7 @@ jobs:
           tar czf ../${{ matrix.artifact }}.tar.gz .
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.tar.gz
@@ -80,10 +85,10 @@ jobs:
     runs-on: ubuntu-22.04
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: assets
           merge-multiple: true
@@ -98,17 +103,27 @@ jobs:
             echo
             echo "Each archive contains the \`jukebox\` binary for its platform plus \`scripts/standardize.sh\` (the indexer invoked by \`jukebox sync\`)."
             echo
+            echo "### Install"
+            echo
+            echo "**Recommended** — download the prebuilt binary without compiling:"
+            echo
+            echo "\`\`\`bash"
+            echo "cargo binstall jukebox"
+            echo "jukebox          # first run prompts for your lossless source dir"
+            echo "jukebox sync     # build symlinks + catalog + search index"
+            echo "jukebox play     # launch the TUI"
+            echo "\`\`\`"
+            echo
+            echo "Or grab a binary archive directly from this release:"
+            echo
+            echo "\`\`\`bash"
+            echo "tar xzf jukebox-<target>.tar.gz   # e.g. jukebox-aarch64-apple-darwin.tar.gz"
+            echo "./jukebox"
+            echo "\`\`\`"
+            echo
             echo "### Runtime prerequisites"
             echo "- \`metaflac\`, \`ffprobe\`, \`jq\`, \`yq\` (for \`jukebox sync\`)"
             echo "- \`mpv\` (for playback; falls back to \`afplay\` on macOS if unavailable)"
-            echo
-            echo "### Install"
-            echo "\`\`\`bash"
-            echo "tar xzf jukebox-<target>.tar.gz"
-            echo "./jukebox          # first run prompts for your lossless source dir"
-            echo "./jukebox sync     # build symlinks + catalog + search index"
-            echo "./jukebox play     # launch the TUI"
-            echo "\`\`\`"
           } > notes.md
           echo "path=notes.md" >> "$GITHUB_OUTPUT"
 
