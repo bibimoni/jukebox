@@ -1,0 +1,220 @@
+use anyhow::{Context, Result};
+use std::path::Path;
+use tantivy::directory::MmapDirectory;
+use tantivy::collector::TopDocs;
+use tantivy::query::QueryParser;
+use tantivy::schema::{
+    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STRING, STORED,
+};
+use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
+use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
+
+use lindera::dictionary::load_dictionary;
+use lindera::mode::Mode;
+use lindera::segmenter::Segmenter;
+use lindera_tantivy::tokenizer::LinderaTokenizer;
+
+use crate::catalog::Catalog;
+use crate::translit::variants;
+
+/// Directory name used for the on-disk Tantivy index under the catalog root.
+pub const INDEX_DIR_NAME: &str = "search-index";
+
+/// Field handles for the search schema. Built once and reused for indexing and querying.
+#[derive(Clone)]
+pub struct SearchFields {
+    pub id: Field,
+    pub artists: Field,
+    pub title: Field,
+    pub title_variants: Field,
+    pub artist_variants: Field,
+    pub album: Field,
+    pub quality: Field,
+}
+
+/// Build the schema used by both `build_index` and `Searcher::open`.
+///
+/// Text fields that hold Japanese text (`artists`, `title`, `album`) use the
+/// `lindera` tokenizer (Lindera IPADIC morphological analysis). Cross-script
+/// romaji/kana variant fields (`title_variants`, `artist_variants`) use a plain
+/// `lowercase` tokenizer, since the variants are already pre-romanised by
+/// [`crate::translit::variants`] and only need case-folding for matching.
+/// `id` is stored (retrieved on hit) but not tokenised; `quality` is indexed
+/// verbatim for exact filtering.
+pub fn schema_with_tokenizers() -> (Schema, SearchFields) {
+    let lindera_opts = TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer("lindera")
+            .set_index_option(IndexRecordOption::Basic),
+    );
+    let lower_opts = TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer("lowercase")
+            .set_index_option(IndexRecordOption::Basic),
+    );
+
+    let mut b = Schema::builder();
+    let id = b.add_text_field("id", STORED);
+    let artists = b.add_text_field("artists", lindera_opts.clone());
+    let title = b.add_text_field("title", lindera_opts.clone());
+    let title_variants = b.add_text_field("title_variants", lower_opts.clone());
+    let artist_variants = b.add_text_field("artist_variants", lower_opts);
+    let album = b.add_text_field("album", lindera_opts);
+    let quality = b.add_text_field("quality", STRING);
+    (
+        b.build(),
+        SearchFields {
+            id,
+            artists,
+            title,
+            title_variants,
+            artist_variants,
+            album,
+            quality,
+        },
+    )
+}
+
+/// Build an embedded-IPADIC `LinderaTokenizer` (the maintained
+/// `lindera-tantivy` crate's tokenizer) for registration with Tantivy.
+fn build_lindera_tokenizer() -> Result<LinderaTokenizer> {
+    let dict = load_dictionary("embedded://ipadic").context("loading embedded ipadic")?;
+    let segmenter = Segmenter::new(Mode::Normal, dict, None);
+    Ok(LinderaTokenizer::from_segmenter(segmenter))
+}
+
+/// Register the `lindera` (embedded IPADIC) and `lowercase` tokenizers on the
+/// index's tokenizer manager. Both `build_index` and `Searcher::open` must
+/// call this — Tantivy does not persist tokenizer registrations to disk, and a
+/// tokenizer named in the schema must be resolvable at query time too.
+fn register_tokenizers(index: &Index) -> Result<()> {
+    let lindera = build_lindera_tokenizer()?;
+    let lowercase = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(LowerCaser)
+        .build();
+
+    let mgr = index.tokenizers();
+    mgr.register("lindera", lindera);
+    mgr.register("lowercase", lowercase);
+    Ok(())
+}
+
+/// Build (or rebuild) the Tantivy full-text index for `catalog` at `index_dir`.
+///
+/// The directory is created if missing. Any existing documents are cleared via
+/// `delete_all_documents` + commit before the current catalog is re-indexed, so
+/// calling this on an existing index refreshes it in place.
+pub fn build_index(catalog: &Catalog, index_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(index_dir)?;
+
+    let (schema, fields) = schema_with_tokenizers();
+    let directory = MmapDirectory::open(index_dir)?;
+    let index = Index::open_or_create(directory, schema)?;
+    register_tokenizers(&index)?;
+
+    let mut writer: IndexWriter = index.writer(50_000_000)?;
+    writer.delete_all_documents()?;
+    for t in &catalog.tracks {
+        let title_variants_str = variants(&t.title).join(" ");
+        let artist_variants_str = t
+            .artists
+            .iter()
+            .flat_map(|a| variants(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let quality = format!("{}bit-{}Hz", t.bit_depth, t.sample_rate_hz);
+        writer.add_document(doc!(
+            fields.id => t.id.as_str(),
+            fields.artists => t.artists.join(" "),
+            fields.title => t.title.as_str(),
+            fields.title_variants => title_variants_str.as_str(),
+            fields.artist_variants => artist_variants_str.as_str(),
+            fields.album => t.album.clone().unwrap_or_default().as_str(),
+            fields.quality => quality.as_str(),
+        ))?;
+    }
+    writer.commit()?;
+    Ok(())
+}
+
+/// Handle for searching an existing on-disk index.
+///
+/// Re-registers the Lindera/lowercase tokenizers on open so the schema's
+/// named tokenizers resolve at query time (Tantivy does not persist
+/// tokenizer registrations to disk).
+pub struct Searcher {
+    reader: IndexReader,
+    fields: SearchFields,
+    index: Index,
+}
+
+/// A single search hit: the catalog track id and the BM25 score Tantivy
+/// assigned to the match. `score` is a normalised relevance score (higher is
+/// better); callers may render it as a percentage.
+pub struct Hit {
+    pub track_id: String,
+    pub score: f32,
+}
+
+impl Searcher {
+    pub fn open(index_dir: &Path) -> Result<Searcher> {
+        let (_schema, fields) = schema_with_tokenizers();
+        let directory = MmapDirectory::open(index_dir)?;
+        // Read-side handle: use `open` (not `open_or_create`) so a missing index
+        // errors instead of silently yielding an empty searcher — lets the TUI
+        // detect a missing index and prompt to run `jukebox index`.
+        let index = Index::open(directory)?;
+        register_tokenizers(&index)?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+        Ok(Searcher { reader, fields, index })
+    }
+
+    /// Run a BM25 query against the index and return up to `limit` hits, best
+    /// score first.
+    ///
+    /// The query parser searches across `title`, `title_variants`, `artists`,
+    /// `artist_variants`, and `album`, with `title` boosted ×2 and
+    /// `title_variants` boosted ×1.5 so direct title matches outrank
+    /// cross-script romaji/kana matches. Fuzzy matching (edit distance 2) is
+    /// enabled on `title`, `title_variants`, and `artist_variants` so that
+    /// typos (e.g. `Freedon`→`Freedom`) and the romaji-doubling mismatch from
+    /// `translit::normalize_romaji` (`burubaado` indexed as `burubado`) are
+    /// tolerated. The `id` field is `STORED`, so it is read back from the
+    /// matched document to populate [`Hit::track_id`].
+    pub fn search(&self, q: &str, limit: usize) -> Result<Vec<Hit>> {
+        let mut qp = QueryParser::for_index(&self.index, vec![
+            self.fields.title,
+            self.fields.title_variants,
+            self.fields.artists,
+            self.fields.artist_variants,
+            self.fields.album,
+        ]);
+        // BM25 boosts: title x2, title_variants x1.5, others x1.
+        qp.set_field_boost(self.fields.title, 2.0);
+        qp.set_field_boost(self.fields.title_variants, 1.5);
+        // Fuzzy (edit distance 2) on the romaji/ascii variant fields and the
+        // title itself. distance=2 covers both single-character typos and the
+        // 2-edit romaji-doubling mismatch flagged by the Task 8 reviewer.
+        qp.set_field_fuzzy(self.fields.title_variants, true, 2, true);
+        qp.set_field_fuzzy(self.fields.artist_variants, true, 2, true);
+        qp.set_field_fuzzy(self.fields.title, true, 2, true);
+
+        let query = qp.parse_query(q)?;
+        let searcher = self.reader.searcher();
+        let top = searcher.search(&query, &TopDocs::with_limit(limit))?;
+        let mut hits = Vec::with_capacity(top.len());
+        for (score, doc_addr) in top {
+            let doc: TantivyDocument = searcher.doc(doc_addr)?;
+            if let Some(id) = doc.get_first(self.fields.id).and_then(|v| v.as_str()) {
+                hits.push(Hit {
+                    track_id: id.to_string(),
+                    score,
+                });
+            }
+        }
+        Ok(hits)
+    }
+}
