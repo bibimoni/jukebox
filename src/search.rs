@@ -139,9 +139,9 @@ pub fn build_index(catalog: &Catalog, index_dir: &Path) -> Result<()> {
 
 /// Handle for searching an existing on-disk index.
 ///
-/// `search()` is implemented in Task 10; Task 9 only opens the index and
-/// re-registers the Lindera/lowercase tokenizers so the schema's named
-/// tokenizers resolve at query time.
+/// Re-registers the Lindera/lowercase tokenizers on open so the schema's
+/// named tokenizers resolve at query time (Tantivy does not persist
+/// tokenizer registrations to disk).
 pub struct Searcher {
     reader: IndexReader,
     fields: SearchFields,
