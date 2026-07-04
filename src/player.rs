@@ -48,7 +48,14 @@ impl Player for AfplayPlayer {
     }
     fn play_pause(&mut self) -> Result<()> { Ok(()) } // afplay has no IPC
     fn seek(&mut self, _secs: f64) -> Result<()> { Ok(()) }
-    fn stop(&mut self) -> Result<()> { if let Some(c) = self.child.take() { let _ = c.into_inner().kill(); } Ok(()) }
+    fn stop(&mut self) -> Result<()> {
+        if let Some(c) = self.child.take() {
+            let mut child = c.into_inner();
+            let _ = child.kill();
+            let _ = child.wait();   // reap to avoid a zombie
+        }
+        Ok(())
+    }
     fn position(&self) -> Option<f64> { None }
     fn duration(&self) -> Option<f64> { None }
     fn is_playing(&self) -> bool {
@@ -97,8 +104,8 @@ impl Player for MpvPlayer {
         Ok(())
     }
     fn play_pause(&mut self) -> Result<()> {
-        // toggle via property read; simplest: set pause based on is_playing probe
-        self.send(&["set".into(), "pause".into(), "toggle".into()])?;
+        // mpv's `set` expects a boolean for the `pause` property; `cycle` toggles it.
+        self.send(&["cycle".into(), "pause".into()])?;
         Ok(())
     }
     fn seek(&mut self, secs: f64) -> Result<()> {
@@ -107,7 +114,9 @@ impl Player for MpvPlayer {
     }
     fn stop(&mut self) -> Result<()> {
         let _ = self.send(&["quit".into()]);
-        let _ = self.child.borrow_mut().kill();
+        let mut child = self.child.borrow_mut();
+        let _ = child.kill();
+        let _ = child.wait();   // reap to avoid a zombie
         Ok(())
     }
     fn position(&self) -> Option<f64> { None }   // polled in TUI via get_property (future)
@@ -115,7 +124,12 @@ impl Player for MpvPlayer {
     fn is_playing(&self) -> bool { self.child.borrow_mut().try_wait().ok().flatten().is_none() }
 }
 impl Drop for MpvPlayer {
-    fn drop(&mut self) { let _ = self.child.borrow_mut().kill(); let _ = std::fs::remove_file(&self.sock); }
+    fn drop(&mut self) {
+        let mut child = self.child.borrow_mut();
+        let _ = child.kill();
+        let _ = child.wait();   // reap to avoid a zombie
+        let _ = std::fs::remove_file(&self.sock);
+    }
 }
 
 pub fn launch(kind: PlayerKind, socket: &Path) -> Box<dyn Player> {

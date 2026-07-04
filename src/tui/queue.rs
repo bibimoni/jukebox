@@ -2,7 +2,6 @@
 #[derive(Default, Clone)]
 pub struct Queue {
     items: Vec<String>,
-    cursor: usize,
     order: Vec<usize>,   // permutation; identity until shuffled
     order_cursor: usize,
 }
