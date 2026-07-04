@@ -185,6 +185,17 @@ mod inner {
     }
 
     fn set_physical_format(stream: AudioStreamID, format: AudioStreamBasicDescription) -> Result<()> {
+        // Fast path: if the device is already at the target format, do nothing.
+        // Consecutive tracks at the same rate (e.g. a 96k album) skip the
+        // switch — and the settle delay — entirely, so there's no gap between
+        // tracks of the same format.
+        if current_physical_format(stream)
+            .map(|cur| same_format(&cur, &format))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
         let addr = AudioObjectPropertyAddress {
             mSelector: kAudioStreamPropertyPhysicalFormat,
             mScope: kAudioObjectPropertyScopeOutput,
@@ -204,7 +215,67 @@ mod inner {
         if status != 0 {
             return Err(anyhow!("AudioObjectSetPropertyData(physical format) -> {}", status));
         }
+        // Wait for the device to actually apply the new format before
+        // returning. SetPropertyData returns once the property is written, but
+        // the DAC takes a few ms to re-clock to the new rate; loading the
+        // track into the player before that lands the first audio frames
+        // mid-transition, which is the stutter. Poll the current physical
+        // format back until it matches the target (or ~250ms, then give up —
+        // best-effort, never block playback indefinitely), plus one short
+        // settle beat so the stream is ready when mpv pushes the first samples.
+        verify_format_landed(stream, &format);
+        std::thread::sleep(std::time::Duration::from_millis(60));
         Ok(())
+    }
+
+    /// Read the stream's current physical format. Returns `None` if CoreAudio
+    /// refuses the read (e.g. the device was unplugged mid-switch).
+    fn current_physical_format(stream: AudioStreamID) -> Option<AudioStreamBasicDescription> {
+        let addr = AudioObjectPropertyAddress {
+            mSelector: kAudioStreamPropertyPhysicalFormat,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut asbd: AudioStreamBasicDescription = unsafe { mem::zeroed() };
+        let mut size = mem::size_of::<AudioStreamBasicDescription>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                stream,
+                &addr,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut asbd as *mut _ as *mut c_void,
+            )
+        };
+        if status == 0 { Some(asbd) } else { None }
+    }
+
+    /// True if `a` and `b` describe the same effective playback format — same
+    /// sample rate + bit depth. (Other ASBD fields like channel count matter
+    /// less for the rate-switch purpose; we match on the two fields we drive.)
+    fn same_format(a: &AudioStreamBasicDescription, b: &AudioStreamBasicDescription) -> bool {
+        (a.mSampleRate as u32) == (b.mSampleRate as u32)
+            && a.mBitsPerChannel == b.mBitsPerChannel
+    }
+
+    /// Poll the device's current physical format until it matches `target`, or
+    /// ~250ms elapses. The format change is asynchronous at the device level —
+    /// this is the "did it actually take?" check that closes the gap between
+    /// "property written" and "DAC running at the new rate".
+    fn verify_format_landed(stream: AudioStreamID, target: &AudioStreamBasicDescription) {
+        for _ in 0..25 {
+            if current_physical_format(stream)
+                .map(|cur| same_format(&cur, target))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Timed out waiting for the format to land — return anyway; the
+        // settle sleep in the caller gives the device one last beat. We never
+        // block playback indefinitely over a stubborn device.
     }
 
     /// Pure format matcher: pick the supported `AudioStreamBasicDescription`
