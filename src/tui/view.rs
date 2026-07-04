@@ -63,7 +63,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let right = quality_tag(t.bit_depth, t.sample_rate_hz);
         lines.push(ListItem::new(pad_between(&left, &right, pane_w)));
     }
-    let mut rstate = list_state(app.result_cursor, app.results.len());
+    // The list widget holds ["/ query" line, result0, result1, ...] — the query
+    // line is row 0, so results start at row 1. `result_cursor` indexes into
+    // `results` (0-based on results), so the highlighted row must be
+    // `result_cursor + 1` to line up with what `enqueue_current_result`
+    // enqueues. Without this offset the highlight is one row above the cursor:
+    // arrowing down to the first visible result highlights results[1] (the
+    // second song), and enter on the highlighted row enqueues the wrong track.
+    let mut rstate = ListState::default();
+    if app.results.is_empty() {
+        rstate.select(None);
+    } else {
+        rstate.select(Some((app.result_cursor + 1).min(app.results.len())));
+    }
     let slist = List::new(lines)
         .block(border("Search", matches!(app.focus, Pane::Search)))
         .highlight_style(selection_style());
