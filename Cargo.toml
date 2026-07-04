@@ -8,6 +8,13 @@ repository = "https://github.com/bibimoni/jukebox"
 keywords = ["music", "flac", "tui", "search", "tantivy"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
+# Explicit binary so cargo-binstall can resolve the bin name without crates.io
+# metadata (we distribute via GitHub Releases, not crates.io). Without this,
+# `cargo binstall jukebox` fails with "no binaries specified nor inferred".
+[[bin]]
+name = "jukebox"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
@@ -36,11 +43,12 @@ libc = "0.2"
 # from source (which is slow because lindera-tantivy embeds the ~40MB IPADIC
 # dictionary at build time). The archive layout produced by
 # .github/workflows/release.yml is: jukebox + scripts/ + README + LICENSE at
-# the archive root, so pkg-path = "jukebox" (the binary is at the root, not
-# under a bin/ subdir).
+# the archive root. The binary inside the archive is named `jukebox` (with the
+# platform binary-ext, e.g. `.exe` on Windows, empty on Unix), so bin-dir uses
+# the default `{ bin }{ binary-ext }` template resolved at the archive root.
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/jukebox-{ target }{ archive-suffix }"
-bin-dir = "."
+bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 # Each Release asset is named jukebox-<target>.tar.gz (matches release.yml's
 # `artifact:` matrix value: jukebox-aarch64-apple-darwin, etc.).
