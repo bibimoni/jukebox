@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use tantivy::directory::MmapDirectory;
+use tantivy::collector::TopDocs;
+use tantivy::query::QueryParser;
 use tantivy::schema::{
-    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STRING, STORED,
+    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STRING, STORED,
 };
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
-use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy};
+use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 
 use lindera::dictionary::load_dictionary;
 use lindera::mode::Mode;
@@ -141,17 +143,22 @@ pub fn build_index(catalog: &Catalog, index_dir: &Path) -> Result<()> {
 /// re-registers the Lindera/lowercase tokenizers so the schema's named
 /// tokenizers resolve at query time.
 pub struct Searcher {
-    #[allow(dead_code)]
     reader: IndexReader,
-    #[allow(dead_code)]
     fields: SearchFields,
-    #[allow(dead_code)]
     index: Index,
+}
+
+/// A single search hit: the catalog track id and the BM25 score Tantivy
+/// assigned to the match. `score` is a normalised relevance score (higher is
+/// better); callers may render it as a percentage.
+pub struct Hit {
+    pub track_id: String,
+    pub score: f32,
 }
 
 impl Searcher {
     pub fn open(index_dir: &Path) -> Result<Searcher> {
-        let (schema, fields) = schema_with_tokenizers();
+        let (_schema, fields) = schema_with_tokenizers();
         let directory = MmapDirectory::open(index_dir)?;
         // Read-side handle: use `open` (not `open_or_create`) so a missing index
         // errors instead of silently yielding an empty searcher — lets the TUI
@@ -163,5 +170,51 @@ impl Searcher {
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
         Ok(Searcher { reader, fields, index })
+    }
+
+    /// Run a BM25 query against the index and return up to `limit` hits, best
+    /// score first.
+    ///
+    /// The query parser searches across `title`, `title_variants`, `artists`,
+    /// `artist_variants`, and `album`, with `title` boosted ×2 and
+    /// `title_variants` boosted ×1.5 so direct title matches outrank
+    /// cross-script romaji/kana matches. Fuzzy matching (edit distance 2) is
+    /// enabled on `title`, `title_variants`, and `artist_variants` so that
+    /// typos (e.g. `Freedon`→`Freedom`) and the romaji-doubling mismatch from
+    /// `translit::normalize_romaji` (`burubaado` indexed as `burubado`) are
+    /// tolerated. The `id` field is `STORED`, so it is read back from the
+    /// matched document to populate [`Hit::track_id`].
+    pub fn search(&self, q: &str, limit: usize) -> Result<Vec<Hit>> {
+        let mut qp = QueryParser::for_index(&self.index, vec![
+            self.fields.title,
+            self.fields.title_variants,
+            self.fields.artists,
+            self.fields.artist_variants,
+            self.fields.album,
+        ]);
+        // BM25 boosts: title x2, title_variants x1.5, others x1.
+        qp.set_field_boost(self.fields.title, 2.0);
+        qp.set_field_boost(self.fields.title_variants, 1.5);
+        // Fuzzy (edit distance 2) on the romaji/ascii variant fields and the
+        // title itself. distance=2 covers both single-character typos and the
+        // 2-edit romaji-doubling mismatch flagged by the Task 8 reviewer.
+        qp.set_field_fuzzy(self.fields.title_variants, true, 2, true);
+        qp.set_field_fuzzy(self.fields.artist_variants, true, 2, true);
+        qp.set_field_fuzzy(self.fields.title, true, 2, true);
+
+        let query = qp.parse_query(q)?;
+        let searcher = self.reader.searcher();
+        let top = searcher.search(&query, &TopDocs::with_limit(limit))?;
+        let mut hits = Vec::with_capacity(top.len());
+        for (score, doc_addr) in top {
+            let doc: TantivyDocument = searcher.doc(doc_addr)?;
+            if let Some(id) = doc.get_first(self.fields.id).and_then(|v| v.as_str()) {
+                hits.push(Hit {
+                    track_id: id.to_string(),
+                    score,
+                });
+            }
+        }
+        Ok(hits)
     }
 }
