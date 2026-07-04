@@ -53,3 +53,16 @@ teardown() { rm -rf "$ROOT"; }
   [ "$status" -eq 0 ]
   [ -L "$OUT/Ado/Ado - Freedom [16bit-44.1kHz].flac" ]
 }
+
+@test "non-flac/corrupt .flac file is skipped without aborting" {
+  # one valid flac + one bogus .flac-named file (plain bytes, not a flac)
+  mkflac "$SRC" "good.flac" "ARTIST=Ado" "TITLE=Freedom"
+  printf 'not a flac' > "$SRC/bad.flac"
+  run "$PROJECT_ROOT/scripts/standardize.sh" --source "$SRC" --out "$OUT"
+  [ "$status" -eq 0 ]
+  # valid track was indexed
+  [ -L "$OUT/Ado/Ado - Freedom [16bit-44.1kHz].flac" ]
+  # bogus file was skipped + logged, not indexed
+  grep -q 'SKIP	ffprobe-empty	'"$SRC"'/bad.flac' "$OUT/_build.log"
+  [ "$(jq '.tracks | length' "$OUT/catalog.json")" = "1" ]
+}

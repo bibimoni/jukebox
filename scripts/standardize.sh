@@ -87,9 +87,19 @@ probe() { # <flac-path>
   [[ -z "$title" ]]   && title="$(basename "$flac" .flac)"
 
   # quality
+  # If ffprobe yields nothing usable (corrupt/non-flac file, or ffprobe
+  # missing), `read` hits EOF and returns 1 — or, on a malformed file, ffprobe
+  # may emit garbage like `0,N/A`. Per spec §Error Handling ("ffprobe failure:
+  # skip track, log, continue") we log the file and skip it rather than
+  # indexing it with bogus defaults. Validate that sr/bd are positive integers.
   local sr bd
-  read sr bd < <(ffprobe -v error -show_entries stream=sample_rate,bits_per_raw_sample \
-    -of csv=p=0 "$flac" 2>/dev/null | head -1 | awk -F',' '{print $1, ($2==""?"16":$2)}')
+  if ! read sr bd < <(ffprobe -v error -show_entries stream=sample_rate,bits_per_raw_sample \
+        -of csv=p=0 "$flac" 2>/dev/null | head -1 | awk -F',' '{print $1, ($2==""?"16":$2)}') \
+     || [[ -z "$sr" ]] || ! [[ "$sr" =~ ^[0-9]+$ ]] || [[ "$sr" -le 0 ]] \
+     || ! [[ "$bd" =~ ^[0-9]+$ ]] || [[ "$bd" -le 0 ]]; then
+    printf 'SKIP\tffprobe-empty\t%s\n' "$flac" >&3
+    return 1
+  fi
   sr="${sr:-44100}"; bd="${bd:-16}"
 
   local ntags
@@ -100,7 +110,7 @@ probe() { # <flac-path>
 }
 
 while IFS= read -r -d '' flac; do
-  probe "$flac" >> "$RECORDS"
+  probe "$flac" >> "$RECORDS" || true   # probe returns 1 on skip (already logged)
 done < <(find "$SOURCE" -type f -iname '*.flac' -print0)
 
 # Sort records by dedup_key (field 1) so all candidates of a song are adjacent.
