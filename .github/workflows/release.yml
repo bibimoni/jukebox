@@ -1,0 +1,122 @@
+name: release
+
+# Build release binaries and publish a GitHub Release on version tags (v*.*.*).
+# Each archive bundles the Rust `jukebox` binary plus `scripts/standardize.sh`
+# (the bash indexer invoked by `jukebox sync`).
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:   # allow manual runs from the Actions tab
+
+permissions:
+  contents: write      # to create the release + upload assets
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS — native runners per arch
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: jukebox-aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: jukebox-x86_64-apple-darwin
+          # Linux
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: jukebox-x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux audio deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: cargo-${{ matrix.target }}-
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        run: |
+          mkdir -p staging/scripts
+          cp target/${{ matrix.target }}/release/jukebox staging/
+          cp -R scripts/standardize.sh scripts/lib staging/scripts/
+          cp README.md LICENSE Cargo.toml staging/
+          cd staging
+          tar czf ../${{ matrix.artifact }}.tar.gz .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+          retention-days: 7
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          {
+            echo "## jukebox ${GITHUB_REF_NAME}"
+            echo
+            echo "Filtered-lossless jukebox: bash indexer + Rust TUI with multilingual search and mpv playback."
+            echo
+            echo "Each archive contains the \`jukebox\` binary for its platform plus \`scripts/standardize.sh\` (the indexer invoked by \`jukebox sync\`)."
+            echo
+            echo "### Runtime prerequisites"
+            echo "- \`metaflac\`, \`ffprobe\`, \`jq\`, \`yq\` (for \`jukebox sync\`)"
+            echo "- \`mpv\` (for playback; falls back to \`afplay\` on macOS if unavailable)"
+            echo
+            echo "### Install"
+            echo "\`\`\`bash"
+            echo "tar xzf jukebox-<target>.tar.gz"
+            echo "./jukebox          # first run prompts for your lossless source dir"
+            echo "./jukebox sync     # build symlinks + catalog + search index"
+            echo "./jukebox play     # launch the TUI"
+            echo "\`\`\`"
+          } > notes.md
+          echo "path=notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*.tar.gz
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

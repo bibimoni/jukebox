@@ -2,6 +2,11 @@
 name = "jukebox"
 version = "0.1.0"
 edition = "2021"
+description = "Filtered-lossless jukebox: bash indexer + Rust TUI with multilingual search and mpv playback"
+license = "MIT"
+repository = "https://github.com/bibimoni/jukebox"
+keywords = ["music", "flac", "tui", "search", "tantivy"]
+categories = ["command-line-utilities", "multimedia::audio"]
 
 [dependencies]
 anyhow = "1.0"
