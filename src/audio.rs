@@ -45,7 +45,7 @@ mod inner {
         let addr = AudioObjectPropertyAddress {
             mSelector: kAudioHardwarePropertyDefaultOutputDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMaster,
+            mElement: kAudioObjectPropertyElementMain,
         };
         let status = unsafe {
             AudioObjectGetPropertyData(
@@ -70,22 +70,18 @@ mod inner {
         let addr = AudioObjectPropertyAddress {
             mSelector: kAudioDevicePropertyStreams,
             mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMaster,
+            mElement: kAudioObjectPropertyElementMain,
         };
-        // Two-phase: ask for size, then read.
+        // Use AudioObjectGetPropertyDataSize for the size pass — some virtual
+        // devices (eqMac loopbacks) return `!wh?` (kAudioHardwareUnknownPropertyError)
+        // when AudioObjectGetPropertyData is called with a null out-buffer for the
+        // size, even though the property is readable. The dedicated size API works.
         let mut size: u32 = 0;
         let status = unsafe {
-            AudioObjectGetPropertyData(
-                device,
-                &addr,
-                0,
-                ptr::null(),
-                &mut size,
-                ptr::null_mut(),
-            )
+            AudioObjectGetPropertyDataSize(device, &addr, 0, ptr::null(), &mut size)
         };
         if status != 0 {
-            return Err(anyhow!("AudioObjectGetPropertyData(streams size) -> {}", status));
+            return Err(anyhow!("AudioObjectGetPropertyDataSize(streams) -> {}", status));
         }
         let count = (size / mem::size_of::<AudioStreamID>() as u32) as usize;
         if count == 0 {
@@ -112,19 +108,23 @@ mod inner {
     }
 
     /// Return the available physical formats for a stream, as flat
-    /// `AudioStreamBasicDescription`s (stripping the range envelope).
+    /// `AudioStreamBasicDescription`s (stripping the range envelope). Falls
+    /// back to virtual formats if physical formats aren't exposed (some
+    /// virtual/loopback devices only expose virtual).
     fn available_physical_formats(stream: AudioStreamID) -> Result<Vec<AudioStreamBasicDescription>> {
         let addr = AudioObjectPropertyAddress {
             mSelector: kAudioStreamPropertyAvailablePhysicalFormats,
             mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMaster,
+            mElement: kAudioObjectPropertyElementMain,
         };
         let mut size: u32 = 0;
         let status = unsafe {
-            AudioObjectGetPropertyData(stream, &addr, 0, ptr::null(), &mut size, ptr::null_mut())
+            AudioObjectGetPropertyDataSize(stream, &addr, 0, ptr::null(), &mut size)
         };
-        if status != 0 {
-            return Err(anyhow!("AudioObjectGetPropertyData(formats size) -> {}", status));
+        // Fallback to virtual formats if the device reports no physical formats
+        // (common for virtual/loopback devices like eqMac or BlackHole).
+        if status != 0 || size == 0 {
+            return available_virtual_formats(stream);
         }
         let count = (size / mem::size_of::<AudioStreamRangedDescription>() as u32) as usize;
         if count == 0 {
@@ -147,11 +147,48 @@ mod inner {
         Ok(ranged.into_iter().map(|r| r.mFormat).collect())
     }
 
+    /// Fallback: virtual formats when a device exposes no physical formats.
+    /// Setting the virtual format still drives the underlying DAC at that rate
+    /// (the virtual device re-clocks to its physical output).
+    fn available_virtual_formats(stream: AudioStreamID) -> Result<Vec<AudioStreamBasicDescription>> {
+        let addr = AudioObjectPropertyAddress {
+            mSelector: kAudioStreamPropertyAvailableVirtualFormats,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut size: u32 = 0;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(stream, &addr, 0, ptr::null(), &mut size)
+        };
+        if status != 0 {
+            return Err(anyhow!("AudioObjectGetPropertyDataSize(virtual formats) -> {}", status));
+        }
+        let count = (size / mem::size_of::<AudioStreamRangedDescription>() as u32) as usize;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut ranged: Vec<AudioStreamRangedDescription> = vec![unsafe { mem::zeroed() }; count];
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                stream,
+                &addr,
+                0,
+                ptr::null(),
+                &mut size,
+                ranged.as_mut_ptr() as *mut c_void,
+            )
+        };
+        if status != 0 {
+            return Err(anyhow!("AudioObjectGetPropertyData(virtual formats) -> {}", status));
+        }
+        Ok(ranged.into_iter().map(|r| r.mFormat).collect())
+    }
+
     fn set_physical_format(stream: AudioStreamID, format: AudioStreamBasicDescription) -> Result<()> {
         let addr = AudioObjectPropertyAddress {
             mSelector: kAudioStreamPropertyPhysicalFormat,
             mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMaster,
+            mElement: kAudioObjectPropertyElementMain,
         };
         let size = mem::size_of::<AudioStreamBasicDescription>() as u32;
         let status = unsafe {
