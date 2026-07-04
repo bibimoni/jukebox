@@ -34,10 +34,6 @@ pub struct App {
     /// Track ids enqueued this session — used to mark Search results that are
     /// already in the queue with a `+` so space/enter gives visible feedback.
     pub enqueued: HashSet<String>,
-    /// Consume mode: when on (default), a track is removed from the queue
-    /// once it finishes playing, so the queue drains as you listen. Toggle
-    /// with `C`.
-    pub consume: bool,
     /// Last mouse click (timestamp + position) for double-click detection —
     /// a double-click in Search/Artists/Queue enqueues/plays the clicked row.
     pub last_click: Option<(std::time::Instant, u16, u16)>,
@@ -68,7 +64,6 @@ impl App {
             now_playing: None,
             switch_sample_rate: true,
             enqueued: HashSet::new(),
-            consume: true,
             last_click: None,
             queue_cursor: 0,
         }
@@ -241,11 +236,11 @@ impl App {
             // eof, or afplay child exit), drop the finished track if consume is
             // on (so the queue drains as you listen), then play the next.
             if self.player.track_ended() && !self.queue.is_empty() {
-                if self.consume {
-                    self.queue.consume_current();
-                } else {
-                    self.queue.next();
-                }
+                // Consume: a finished track is removed from the queue on
+                // natural end (mpv end-file eof / afplay exit), so the queue
+                // drains as you listen. This is unconditional — there's no
+                // toggle, finished tracks always leave the queue.
+                self.queue.consume_current();
                 self.play_current_queue();
                 self.sync_queue_cursor();
             }
@@ -313,8 +308,6 @@ impl App {
                 self.sync_queue_cursor();
             }
             Char('c') if matches!(self.focus, Pane::Queue) => { self.queue.clear(); self.queue_cursor = 0; }
-            // `C` toggles consume mode (drop finished tracks from the queue).
-            Char('C') => { self.consume = !self.consume; }
             Char('n') => { self.queue.next(); self.play_current_queue(); self.sync_queue_cursor(); }
             Char('p') => { self.queue.prev(); self.play_current_queue(); self.sync_queue_cursor(); }
             Left => { let _ = self.player.seek(-5.0); }

@@ -139,9 +139,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // so nothing is hidden behind a per-pane context switch.
     let qcount = app.queue().items().len();
     let now = app.now_playing.as_deref().map(|_| "▶").unwrap_or("■");
-    let consume = if app.consume { "consume:on" } else { "consume:off" };
     let line1 = format!(
-        " {now} Tab/⇧Tab=pane  /=search  ↑↓=move  q=quit  ←→=±5s  space=play-pause  n/p=next/prev  s=shuf  S=reshuf+play  C=consume  {qcount} queued · {consume}"
+        " {now} Tab/⇧Tab=pane  /=search  ↑↓=move  q=quit  ←→=±5s  space=play-pause  n/p=next/prev  s=shuf  S=reshuf+play  {qcount} queued"
     );
     let line2 = " Artists: enter=browse · a=enq all | Search: enter=enq+play | Queue: enter=play · x/r=remove · c=clear   (mouse: click=focus+select · dbl-click=play · wheel=scroll)";
     f.render_widget(
