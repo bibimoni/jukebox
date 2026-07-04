@@ -283,6 +283,47 @@ fn consume_current_drops_finished_track_and_advances_to_next() {
 }
 
 #[test]
+fn queue_arrow_moves_visual_cursor_not_playback_order() {
+    // Under shuffle, ↑/↓ must move the VISUAL highlight one row at a time,
+    // not jump through playback order (queue.next/prev). Build a 3-track queue
+    // and verify the cursor walks 0→1→2→1→0 regardless of the shuffle permutation.
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("catalog.json");
+    let json = serde_json::json!({
+        "version":1,"built_at":"x","source_root":"/tmp/lossless",
+        "tracks":[
+          {"id":"q1","artists":["X"],"primary_artist":"X","title":"One",
+           "bit_depth":16,"sample_rate_hz":44100,"source_path":"a/1.flac","symlinked_into_artists":["X"]},
+          {"id":"q2","artists":["X"],"primary_artist":"X","title":"Two",
+           "bit_depth":16,"sample_rate_hz":44100,"source_path":"a/2.flac","symlinked_into_artists":["X"]},
+          {"id":"q3","artists":["X"],"primary_artist":"X","title":"Three",
+           "bit_depth":16,"sample_rate_hz":44100,"source_path":"a/3.flac","symlinked_into_artists":["X"]},
+        ]
+    }).to_string();
+    std::fs::write(&p, json).unwrap();
+    let cat = Catalog::load(&p).unwrap();
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None);
+    app.queue.enqueue("q1".into());
+    app.queue.enqueue("q2".into());
+    app.queue.enqueue("q3".into());
+    app.queue.shuffle(42);
+    app.focus = jukebox::tui::Pane::Queue;
+
+    app.cursor_down();
+    assert_eq!(app.queue_cursor, 1, "down should move visual cursor to row 1");
+    app.cursor_down();
+    assert_eq!(app.queue_cursor, 2, "down again to row 2");
+    app.cursor_down();
+    assert_eq!(app.queue_cursor, 2, "down at the end stays clamped");
+    app.cursor_up();
+    assert_eq!(app.queue_cursor, 1, "up back to row 1");
+    app.cursor_up();
+    assert_eq!(app.queue_cursor, 0, "up back to row 0");
+    app.cursor_up();
+    assert_eq!(app.queue_cursor, 0, "up at the start stays clamped");
+}
+
+#[test]
 fn space_in_search_enqueues_highlighted_result_not_first() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("catalog.json");

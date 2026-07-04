@@ -125,9 +125,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             };
             ListItem::new(label)
         }).collect();
-    // The queue's "cursor" is the current play position; scroll to follow it.
-    let qcursor = cur.unwrap_or(0);
-    let mut qstate = list_state(qcursor, app.queue().items().len());
+    // The highlight follows the VISUAL cursor (queue_cursor), which ↑/↓ move
+    // one row at a time even under shuffle. The ▶ prefix above still marks the
+    // currently-playing track, so the two are visually distinct: ▶ = playing,
+    // the bar = what your arrow keys selected (what enter will play).
+    let mut qstate = list_state(app.queue_cursor, app.queue().items().len());
     let qlist = List::new(qitems)
         .block(border("Queue", matches!(app.focus, Pane::Queue)))
         .highlight_style(selection_style());

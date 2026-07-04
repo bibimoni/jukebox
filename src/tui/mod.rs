@@ -41,6 +41,11 @@ pub struct App {
     /// Last mouse click (timestamp + position) for double-click detection —
     /// a double-click in Search/Artists/Queue enqueues/plays the clicked row.
     pub last_click: Option<(std::time::Instant, u16, u16)>,
+    /// Visual cursor row in the Queue pane. Decoupled from the queue's playback
+    /// cursor (which jumps around under shuffle) so ↑/↓ move the highlight to the
+    /// adjacent visible row instead of the next-in-playback-order. Enter or
+    /// double-click on the highlighted row jumps playback there via jump_to.
+    pub queue_cursor: usize,
 }
 
 impl App {
@@ -65,6 +70,7 @@ impl App {
             enqueued: HashSet::new(),
             consume: true,
             last_click: None,
+            queue_cursor: 0,
         }
     }
 
@@ -241,6 +247,7 @@ impl App {
                     self.queue.next();
                 }
                 self.play_current_queue();
+                self.sync_queue_cursor();
             }
             if event::poll(std::time::Duration::from_millis(200))? {
                 let ev = event::read()?;
@@ -284,20 +291,32 @@ impl App {
             Char(c) if matches!(self.focus, Pane::Search) => { self.search_input.push(c); self.run_search(); }
             Backspace if matches!(self.focus, Pane::Search) => { self.search_input.pop(); self.run_search(); }
             Enter if matches!(self.focus, Pane::Search) => self.enqueue_current_result(),
-            Enter if matches!(self.focus, Pane::Queue) => { self.play_current_queue(); }
-            Char('s') => { self.queue.shuffle(42); }
-            Char('S') => { self.queue.shuffle(42); self.queue.next(); self.play_current_queue(); }
+            Enter if matches!(self.focus, Pane::Queue) => {
+                // Play the highlighted row (queue_cursor), not the playback
+                // cursor — so enter on a visually-selected track under shuffle
+                // plays that exact track.
+                if let Some(id) = self.queue().items().get(self.queue_cursor).cloned() {
+                    self.queue.jump_to(&id);
+                    self.play_current_queue();
+                } else {
+                    self.play_current_queue();
+                }
+            }
+            Char('s') => { self.queue.shuffle(42); self.sync_queue_cursor(); }
+            Char('S') => { self.queue.shuffle(42); self.queue.next(); self.play_current_queue(); self.sync_queue_cursor(); }
             Char('x') if matches!(self.focus, Pane::Queue) => {
                 if let Some(id) = self.queue.current().cloned() { self.queue.remove(&id); }
+                self.sync_queue_cursor();
             }
             Char('r') if matches!(self.focus, Pane::Queue) => {
                 if let Some(id) = self.queue.current().cloned() { self.queue.remove(&id); }
+                self.sync_queue_cursor();
             }
-            Char('c') if matches!(self.focus, Pane::Queue) => { self.queue.clear(); }
+            Char('c') if matches!(self.focus, Pane::Queue) => { self.queue.clear(); self.queue_cursor = 0; }
             // `C` toggles consume mode (drop finished tracks from the queue).
             Char('C') => { self.consume = !self.consume; }
-            Char('n') => { self.queue.next(); self.play_current_queue(); }
-            Char('p') => { self.queue.prev(); self.play_current_queue(); }
+            Char('n') => { self.queue.next(); self.play_current_queue(); self.sync_queue_cursor(); }
+            Char('p') => { self.queue.prev(); self.play_current_queue(); self.sync_queue_cursor(); }
             Left => { let _ = self.player.seek(-5.0); }
             Right => { let _ = self.player.seek(5.0); }
             _ => {}
@@ -360,12 +379,13 @@ impl App {
                 }
             }
             Pane::Queue => {
-                // Click selects the queue item at that row; double-click plays it.
-                let items = self.queue().items();
-                if item_row < items.len() {
-                    // Jump the queue cursor to the clicked item by id.
-                    let id = items[item_row].clone();
+                // Single click moves the VISUAL highlight to the clicked row;
+                // double-click jumps playback there and plays.
+                let items_len = self.queue().items().len();
+                if item_row < items_len {
+                    self.queue_cursor = item_row;
                     if self.is_double_click(col, row) {
+                        let id = self.queue().items()[item_row].clone();
                         self.queue.jump_to(&id);
                         self.play_current_queue();
                     }
@@ -386,18 +406,41 @@ impl App {
         false
     }
 
-    fn cursor_down(&mut self) {
+    /// Point the Queue pane's visual cursor at the currently-playing track and
+    /// clamp it to the queue length. Called after operations that change what's
+    /// playing (shuffle, next/prev, remove, consume-on-end) so the highlight
+    /// follows playback — but ↑/↓ move it off again freely afterward.
+    fn sync_queue_cursor(&mut self) {
+        let items = self.queue().items();
+        if items.is_empty() { self.queue_cursor = 0; return; }
+        match self.queue.current() {
+            Some(id) => {
+                self.queue_cursor = items.iter().position(|x| x == id).unwrap_or(0);
+            }
+            None => { self.queue_cursor = self.queue_cursor.min(items.len() - 1); }
+        }
+    }
+
+    pub fn cursor_down(&mut self) {
         match self.focus {
             Pane::Artists => { if self.artist_cursor + 1 < self.artists.len() { self.artist_cursor += 1; } }
             Pane::Search => { if self.result_cursor + 1 < self.results.len() { self.result_cursor += 1; } }
-            Pane::Queue => { self.queue.next(); }
+            // Move the VISUAL highlight one row down — not queue.next(), which
+            // jumps to the next-in-playback-order (and skips around under shuffle).
+            Pane::Queue => {
+                if self.queue_cursor + 1 < self.queue().items().len() { self.queue_cursor += 1; }
+            }
         }
     }
-    fn cursor_up(&mut self) {
+    pub fn cursor_up(&mut self) {
         match self.focus {
             Pane::Artists => { if self.artist_cursor > 0 { self.artist_cursor -= 1; } }
             Pane::Search => { if self.result_cursor > 0 { self.result_cursor -= 1; } }
-            Pane::Queue => { self.queue.prev(); }
+            // Move the VISUAL highlight one row up — not queue.prev(), which
+            // jumps to the previous-in-playback-order under shuffle.
+            Pane::Queue => {
+                if self.queue_cursor > 0 { self.queue_cursor -= 1; }
+            }
         }
     }
 }
