@@ -197,12 +197,13 @@ emit_winner() { # <dedup_key> <winner-line>
   # the 255-byte filename limit. 180 bytes leaves headroom for title + bracket + ext.
   local canon_trunc; canon_trunc="$(truncate_bytes "$canon" 180)"
   local fname; fname="$(sanitize_filename "$canon_trunc - $title [${bd}bit-${khz}].flac")"
-  # Final safety net: if a long title still pushes the stem over the limit,
-  # truncate the stem (keep the .flac extension).
-  if [[ "${#fname}" -gt 250 ]]; then
-    local stem="${fname%.flac}"
-    fname="$(truncate_bytes "$stem" 245).flac"
-  fi
+  # Final safety net: a long title can still push the name over the 255-byte
+  # macOS limit. `${#fname}` counts *characters*, not bytes, so for CJK names
+  # (byte-heavy, char-light) it never trips — always clamp by byte length here.
+  # `truncate_bytes` is a no-op under the limit. 240-byte stem + `.flac` (5) =
+  # 245, leaving headroom for the ` (2)` collision suffix added below.
+  local stem="${fname%.flac}"
+  fname="$(truncate_bytes "$stem" 240).flac"
 
   local symlinked='[]'
   local artist dir relpath linkpath

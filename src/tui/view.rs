@@ -24,7 +24,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let mut lines: Vec<ListItem> = vec![ListItem::new(format!("/ {}", app.search_input))];
     for (i, (score, tidx)) in app.results.iter().enumerate() {
         let t = &app.catalog.tracks[*tidx];
-        let label = format!("{:>3.0}%  {} — {}", score * 100.0, t.title, t.primary_artist);
+        let label = format!("{:>3.0}%  {} — {}", (score * 100.0).clamp(0.0, 100.0), t.title, t.primary_artist);
         let style = if i == app.result_cursor {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
         } else { Style::default() };

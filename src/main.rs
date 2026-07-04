@@ -60,7 +60,9 @@ fn main() -> anyhow::Result<()> {
                 if let Some(t) = cat.tracks.iter().find(|t| t.id == hit.track_id) {
                     println!(
                         "{:>3.0}%  {} — {} [{}]",
-                        hit.score * 100.0,
+                        // BM25 is unbounded; cap the displayed relevance at 100%
+                        // so a strong match reads as 100% rather than e.g. 200%.
+                        (hit.score * 100.0).clamp(0.0, 100.0),
                         t.title,
                         t.primary_artist,
                         t.quality_label()
