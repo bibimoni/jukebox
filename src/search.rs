@@ -153,7 +153,10 @@ impl Searcher {
     pub fn open(index_dir: &Path) -> Result<Searcher> {
         let (schema, fields) = schema_with_tokenizers();
         let directory = MmapDirectory::open(index_dir)?;
-        let index = Index::open_or_create(directory, schema)?;
+        // Read-side handle: use `open` (not `open_or_create`) so a missing index
+        // errors instead of silently yielding an empty searcher — lets the TUI
+        // detect a missing index and prompt to run `jukebox index`.
+        let index = Index::open(directory)?;
         register_tokenizers(&index)?;
         let reader = index
             .reader_builder()
