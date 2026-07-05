@@ -180,7 +180,7 @@ fn fmt_time(secs: f64) -> String {
 
 /// `96000 -> "96"`, `44100 -> "44.1"`.
 fn khz(sample_rate_hz: u32) -> String {
-    if sample_rate_hz % 1000 == 0 {
+    if sample_rate_hz.is_multiple_of(1000) {
         format!("{}", sample_rate_hz / 1000)
     } else {
         format!("{:.1}", sample_rate_hz as f64 / 1000.0)

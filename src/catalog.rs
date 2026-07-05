@@ -55,7 +55,7 @@ impl Track {
     /// Format the audio quality as `{bitDepth}bit-{sampleRateKHz}kHz`,
     /// e.g. `24bit-48kHz` or `16bit-44.1kHz`.
     pub fn quality_label(&self) -> String {
-        let khz = if self.sample_rate_hz % 1000 == 0 {
+        let khz = if self.sample_rate_hz.is_multiple_of(1000) {
             format!("{}kHz", self.sample_rate_hz / 1000)
         } else {
             format!("{:.1}kHz", self.sample_rate_hz as f64 / 1000.0)
