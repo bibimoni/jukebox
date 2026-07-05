@@ -7,6 +7,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use jukebox::catalog::Catalog;
 use jukebox::player::StubPlayer;
+use jukebox::search::Searcher;
 use jukebox::tui::app::{App, Overlay, View};
 use jukebox::tui::input::handle_key;
 use jukebox::tui::queue::{RepeatMode, ShuffleMode};
@@ -129,4 +130,61 @@ fn slash_opens_search_overlay_and_esc_closes_it() {
     assert!(matches!(app.overlay, Some(Overlay::Search { .. })));
     handle_key(&mut app, key_code(KeyCode::Esc));
     assert!(app.overlay.is_none());
+}
+
+/// Build a small catalog (2 artists) backed by a real Tantivy index so a query
+/// actually matches. Returns the tempdir (keep it alive for the test's duration).
+fn cat_with_index() -> (tempfile::TempDir, Catalog) {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("catalog.json");
+    let json = serde_json::json!({
+        "version":1,"built_at":"x","source_root":"/tmp/lossless",
+        "tracks":[
+          {"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"Freedom",
+           "bit_depth":24,"sample_rate_hz":48000,"source_path":"lossless/a/01.flac","symlinked_into_artists":["Ado"]},
+          {"id":"t2","artists":["Aimer"],"primary_artist":"Aimer","title":"Brave",
+           "bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/b/01.flac","symlinked_into_artists":["Aimer"]},
+        ]
+    }).to_string();
+    std::fs::write(&p, json).unwrap();
+    let cat = Catalog::load(&p).unwrap();
+    let idx = d.path().join("search-index");
+    jukebox::search::build_index(&cat, &idx).unwrap();
+    (d, cat)
+}
+
+#[test]
+fn search_overlay_populates_results() {
+    let (_d, cat) = cat_with_index();
+    let searcher = Searcher::open(&_d.path().join("search-index")).unwrap();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), Some(searcher));
+
+    // Open the search overlay (same as `/`).
+    handle_key(&mut app, key('/'));
+    // Type a query that matches t1 ("Freedom"). Each keystroke re-runs the
+    // search and updates the overlay's `results`.
+    handle_key(&mut app, key('F'));
+    handle_key(&mut app, key('r'));
+    handle_key(&mut app, key('e'));
+    handle_key(&mut app, key('e'));
+    handle_key(&mut app, key('d'));
+    handle_key(&mut app, key('o'));
+    handle_key(&mut app, key('m'));
+
+    let results = match &app.overlay {
+        Some(Overlay::Search { results, .. }) => results.clone(),
+        _ => panic!("expected Search overlay to still be open"),
+    };
+    assert!(!results.is_empty(), "search overlay results must be non-empty after a matching query");
+    assert!(results.iter().any(|id| id == "t1"),
+        "results must contain the matched track id t1: {:?}", results);
+}
+
+#[test]
+fn four_key_opens_search_overlay() {
+    let (_d, cat) = cat_with_index();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    assert!(app.overlay.is_none());
+    handle_key(&mut app, key('4'));
+    assert!(matches!(app.overlay, Some(Overlay::Search { .. })));
 }

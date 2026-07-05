@@ -417,6 +417,51 @@ impl App {
         self.should_quit = true;
         self.player.stop().ok();
     }
+
+    /// Run a catalog search for `q` against `self.searcher` and return the
+    /// track ids (in BM25 order, up to 50) that resolve to extant tracks in
+    /// `self.catalog.tracks`. Returns an empty `Vec` if no index is present.
+    ///
+    /// This is the single source of truth for the search overlay's `results`
+    /// field: every mutation of the overlay's `input` should be followed by a
+    /// call to [`App::update_search_results`] (which calls this internally).
+    pub fn run_search(&self, q: &str) -> Vec<String> {
+        let Some(searcher) = self.searcher.as_ref() else {
+            return Vec::new();
+        };
+        let hits = match searcher.search(q, 50) {
+            Ok(h) => h,
+            Err(_) => return Vec::new(),
+        };
+        // Keep only ids that exist in the catalog (the index may lag behind a
+        // re-scan). A linear scan per hit is fine for ~50 results.
+        hits.into_iter()
+            .map(|h| h.track_id)
+            .filter(|id| self.catalog.tracks.iter().any(|t| t.id == *id))
+            .collect()
+    }
+
+    /// If the active overlay is `Search`, re-run the search against its current
+    /// `input` and replace `results` with the fresh id list, clamping `cursor`
+    /// to the new result count. No-op for non-search overlays.
+    pub fn update_search_results(&mut self) {
+        let Some(overlay) = self.overlay.take() else {
+            return;
+        };
+        let overlay = match overlay {
+            Overlay::Search { input, results: _, mut cursor } => {
+                let ids = self.run_search(&input);
+                let results = ids;
+                if cursor >= results.len() {
+                    cursor = results.len().saturating_sub(1);
+                }
+                Overlay::Search { input, results, cursor }
+
+            }
+            other => other,
+        };
+        self.overlay = Some(overlay);
+    }
 }
 
 // Transport methods take `(&dyn ContextResolver, &Catalog)`. `App` passes

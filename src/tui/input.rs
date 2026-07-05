@@ -75,6 +75,15 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('1'), m) if m == KeyModifiers::NONE => switch_view(app, View::Artists),
         (KeyCode::Char('2'), m) if m == KeyModifiers::NONE => switch_view(app, View::Playlists),
         (KeyCode::Char('3'), m) if m == KeyModifiers::NONE => switch_view(app, View::Queue),
+        // `4` opens the Search overlay (spec §Keymap maps `4` → Search; the
+        // `View` enum has no Search variant, so this is the consistent path).
+        (KeyCode::Char('4'), m) if m == KeyModifiers::NONE => {
+            app.overlay = Some(Overlay::Search {
+                input: String::new(),
+                results: Vec::new(),
+                cursor: 0,
+            });
+        }
 
         // Tab / Shift+Tab cycle view forward / backward.
         (KeyCode::Tab, m) if m.contains(KeyModifiers::SHIFT) => cycle_view(app, false),
@@ -132,15 +141,24 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
     }
 
     match app.overlay.take() {
-        Some(Overlay::Search { mut input, results, mut cursor }) => {
+        Some(Overlay::Search { mut input, mut results, mut cursor }) => {
+            // Track whether the query changed so we only re-search on mutation.
+            let mut changed = false;
             match key.code {
-                KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE => input.push(c),
-                KeyCode::Backspace => { input.pop(); }
+                KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE => {
+                    input.push(c);
+                    changed = true;
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    changed = true;
+                }
                 KeyCode::Enter => {
                     // Play the result under the search cursor in context.
                     if let Some(id) = results.get(cursor).cloned() {
-                        app.play_in_context_ids(results.clone(), &id);
-                        // play_in_context_ids moved `results`; we're done.
+                        let ids = std::mem::take(&mut results);
+                        app.play_in_context_ids(ids, &id);
+                        // play_in_context_ids consumed `results`; nothing to restore.
                         return;
                     }
                 }
@@ -153,6 +171,9 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 _ => {}
             }
             app.overlay = Some(Overlay::Search { input, results, cursor });
+            if changed {
+                app.update_search_results();
+            }
         }
         Some(Overlay::Command { mut input }) => {
             match key.code {

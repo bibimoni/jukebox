@@ -208,14 +208,17 @@ pub fn run(app: &mut App, captured: Option<CapturedFormat>) -> Result<()> {
     // Flush the queued enter-alt-screen + mouse-capture commands.
     stdout.flush().context("flushing terminal setup")?;
 
+    // Guard must live from the moment raw + alt-screen are both enabled, so any
+    // `?`-return below (Terminal::new, clear, first draw) still restores the
+    // terminal via the guard's Drop. Constructed BEFORE `Terminal::new`.
+    let _guard = TerminalGuard;
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("building ratatui terminal")?;
     terminal.clear()?;
 
     // Force an initial draw so the screen isn't blank for the first poll tick.
     terminal.draw(|f| view::layout::draw(f, app))?;
-
-    let _guard = TerminalGuard;
 
     while !app.should_quit {
         // Drain the SIGCONT redraw flag.
