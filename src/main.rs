@@ -15,31 +15,12 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Play => {
-            let cfg = cli::ensure_config()?;
-            let cat = catalog::Catalog::load(&cfg.filtered_dir.join("catalog.json"))?;
-            let index_path = cfg.filtered_dir.join("search-index");
-            let searcher = match search::Searcher::open(&index_path) {
-                Ok(s) => Some(s),
-                Err(_) => {
-                    eprintln!(
-                        "search index not found at {}; run `jukebox sync` to build it",
-                        index_path.display()
-                    );
-                    None
-                }
-            };
-            let player = player::launch(cfg.player, &cfg.mpv_socket);
-            let mut app = tui::App::new(cat, player, searcher);
-            app.switch_sample_rate = cfg.switch_sample_rate;
-            // Restore the last-focused pane from the state DB (if any), so the
-            // TUI reopens where you left it. Best-effort: a read failure just
-            // leaves the default (Artists) focus.
-            if let Ok(Some(pane)) = jukebox::state::load_focus() {
-                app.focus = jukebox::tui::Pane::from_db_key(&pane);
-            }
-            app.run()?;
-            // Persist the final focused pane so the next launch restores it.
-            let _ = jukebox::state::save_focus(&app.focus.db_key());
+            // TODO(tui-revamp): the old `tui::App`/`tui::Pane` were removed when
+            // `src/tui/mod.rs` was scaffolded into the new module tree. The new
+            // `tui::app::App` is implemented in Task 5 and re-wired here then.
+            // Until then, `jukebox play` cannot launch the TUI.
+            let _cfg = cli::ensure_config()?;
+            anyhow::bail!("TUI revamp in progress (Task 1): `jukebox play` is temporarily unavailable");
         }
         Cmd::Sync => {
             let cfg = cli::ensure_config()?;
