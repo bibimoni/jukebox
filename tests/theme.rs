@@ -1,5 +1,4 @@
 use jukebox::tui::view::theme::{disp_width, pad_between, quality_color, no_color};
-use ratatui::style::Color;
 
 #[test]
 fn disp_width_counts_cjk_as_two() {
