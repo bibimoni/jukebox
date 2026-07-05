@@ -444,6 +444,18 @@ impl App {
     /// If the active overlay is `Search`, re-run the search against its current
     /// `input` and replace `results` with the fresh id list, clamping `cursor`
     /// to the new result count. No-op for non-search overlays.
+    /// The current browse view as a stable string key, for state persistence.
+    /// Keep these strings stable — `state::load_layout` parses them back into a
+    /// [`View`] on the next launch, so renaming one would orphan previously-
+    /// saved state.
+    pub fn focus_key(&self) -> &'static str {
+        match self.view {
+            View::Artists => "artists",
+            View::Playlists => "playlists",
+            View::Queue => "queue",
+        }
+    }
+
     pub fn update_search_results(&mut self) {
         let Some(overlay) = self.overlay.take() else {
             return;
