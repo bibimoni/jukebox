@@ -1,101 +1,268 @@
-/// A play queue with deterministic (seeded) Fisher–Yates shuffle.
-#[derive(Default, Clone)]
-pub struct Queue {
-    items: Vec<String>,
-    order: Vec<usize>,   // permutation; identity until shuffled
-    order_cursor: usize,
+//! The transport engine: drives playback over a [`Context`].
+//!
+//! [`Transport`] owns the play order (a permutation over the context's track
+//! ids), a cursor into that order, a history stack (for `prev`), a manual
+//! "play next" queue, and the current shuffle/repeat modes. It knows nothing
+//! about the audio backend — it just answers "what should play now / next /
+//! previously" given a [`ContextResolver`] and a [`Catalog`] (the latter for
+//! artist-aware smart shuffle).
+
+use crate::catalog::Catalog;
+use crate::tui::context::{Context, ContextResolver};
+
+/// How the play order is derived from the context's track list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShuffleMode {
+    Off,
+    Smart,
+    Random,
 }
 
-impl Queue {
-    pub fn new() -> Self { Self::default() }
+/// Whether/how playback loops when the context ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RepeatMode {
+    Off,
+    All,
+    One,
+}
 
-    pub fn enqueue(&mut self, id: String) {
-        let idx = self.items.len();
-        self.items.push(id);
-        self.order.push(idx);
+pub struct Transport {
+    pub context: Context,
+    pub order: Vec<usize>, // permutation over context.track_ids
+    pub cursor: usize,     // index into `order`
+    pub history: Vec<(String, Context)>, // (track_id, context_at_play_time)
+    pub manual_queue: Vec<String>,
+    pub shuffle: ShuffleMode,
+    pub repeat: RepeatMode,
+    // seeded RNG state so shuffle is deterministic across runs/tests
+    rng_state: u64,
+}
+
+impl Transport {
+    pub fn new(context: Context) -> Self {
+        let n = context.track_ids_placeholder_len();
+        Transport {
+            context,
+            order: (0..n).collect(),
+            cursor: 0,
+            history: Vec::new(),
+            manual_queue: Vec::new(),
+            shuffle: ShuffleMode::Off,
+            repeat: RepeatMode::Off,
+            rng_state: 0x9E3779B97F4A7C15,
+        }
     }
 
-    pub fn items(&self) -> &Vec<String> { &self.items }
-    pub fn len(&self) -> usize { self.items.len() }
-    pub fn is_empty(&self) -> bool { self.items.is_empty() }
+    fn ids(&self, r: &dyn ContextResolver) -> Vec<String> {
+        self.context.track_ids(r)
+    }
 
-    /// Fisher–Yates with a linear congruential RNG seeded by `seed`.
-    pub fn shuffle(&mut self, seed: u64) {
-        let n = self.items.len();
-        self.order = (0..n).collect();
-        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    pub fn current(&self, r: &dyn ContextResolver, _cat: &Catalog) -> Option<String> {
+        let ids = self.ids(r);
+        let &oidx = self.order.get(self.cursor)?;
+        ids.get(oidx).cloned()
+    }
+
+    pub fn peek_next(&self, r: &dyn ContextResolver, _cat: &Catalog) -> Option<String> {
+        let ids = self.ids(r);
+        if self.repeat == RepeatMode::One {
+            return self.current(r, _cat);
+        }
+        let next_cursor = self.cursor + 1;
+        if next_cursor < self.order.len() {
+            ids.get(self.order[next_cursor]).cloned()
+        } else if !self.manual_queue.is_empty() {
+            self.manual_queue.first().cloned()
+        } else if self.repeat == RepeatMode::All && !self.order.is_empty() {
+            ids.get(self.order[0]).cloned()
+        } else {
+            None
+        }
+    }
+
+    /// Jump to `track_id` within the current context. No-op if not present.
+    pub fn play_at(&mut self, r: &dyn ContextResolver, _cat: &Catalog, track_id: &str) {
+        let ids = self.ids(r);
+        if let Some(pos) = ids.iter().position(|x| x == track_id) {
+            if let Some(c) = self.order.iter().position(|&o| o == pos) {
+                self.cursor = c;
+            }
+        }
+    }
+
+    pub fn next(&mut self, r: &dyn ContextResolver, cat: &Catalog) -> Option<String> {
+        if self.repeat == RepeatMode::One {
+            return self.current(r, cat);
+        }
+        // push current to history before advancing
+        if let Some(cur) = self.current(r, cat) {
+            self.history.push((cur, self.context.clone()));
+        }
+        let next_cursor = self.cursor + 1;
+        if next_cursor < self.order.len() {
+            self.cursor = next_cursor;
+            self.current(r, cat)
+        } else if !self.manual_queue.is_empty() {
+            // Context exhausted and a manual "play next" track is queued: pop
+            // and return it without mutating `self.context` (the controller's
+            // approved simplification — keeps the original context intact).
+            let id = self.manual_queue.remove(0);
+            // We didn't actually advance within the context, so undo the
+            // history push we just made for the now-finished track.
+            self.history.pop();
+            Some(id)
+        } else if self.repeat == RepeatMode::All && !self.order.is_empty() {
+            self.cursor = 0;
+            self.current(r, cat)
+        } else {
+            // Nothing to advance to: undo the history push (we never moved).
+            self.history.pop();
+            None
+        }
+    }
+
+    pub fn prev(&mut self, r: &dyn ContextResolver, _cat: &Catalog) -> Option<String> {
+        if let Some((id, ctx)) = self.history.pop() {
+            self.context = ctx;
+            // re-derive order/cursor for the restored context
+            let ids = self.ids(r);
+            if let Some(pos) = ids.iter().position(|x| x == &id) {
+                self.order = (0..ids.len()).collect();
+                self.cursor = pos;
+            }
+            Some(id)
+        } else {
+            // no history → replay current (same id) from the start
+            self.current(r, _cat)
+        }
+    }
+
+    pub fn set_repeat(&mut self, mode: RepeatMode) {
+        self.repeat = mode;
+    }
+
+    pub fn set_shuffle(&mut self, mode: ShuffleMode, r: &dyn ContextResolver, cat: &Catalog) {
+        self.shuffle = mode;
+        let n = self.ids(r).len();
+        let current_id = self.current(r, cat);
+        self.order = match mode {
+            ShuffleMode::Off => (0..n).collect(),
+            ShuffleMode::Random => self.fisher_yates(n),
+            ShuffleMode::Smart => self.smart_shuffle(r, cat),
+        };
+        // Keep the currently-playing track at cursor position 0 so a shuffle
+        // change doesn't yank the user away mid-playback.
+        if let Some(id) = current_id {
+            let ids = self.ids(r);
+            if let Some(pos) = ids.iter().position(|x| x == &id) {
+                if let Some(c) = self.order.iter().position(|&o| o == pos) {
+                    self.order.swap(0, c);
+                }
+            }
+            self.cursor = 0;
+        }
+    }
+
+    pub fn reshuffle(&mut self, r: &dyn ContextResolver, cat: &Catalog) {
+        // rotate the seed so a re-shuffle yields a different permutation
+        self.rng_state = self.rng_state.wrapping_add(0x632BE59BD9B4C0A1);
+        let m = self.shuffle;
+        self.set_shuffle(m, r, cat);
+    }
+
+    pub fn enqueue(&mut self, track_id: String) {
+        self.manual_queue.push(track_id);
+    }
+
+    pub fn remove_from_queue(&mut self, track_id: &str) {
+        self.manual_queue.retain(|x| x != track_id);
+    }
+
+    pub fn clear_queue(&mut self) {
+        self.manual_queue.clear();
+    }
+
+    pub fn switch_context(
+        &mut self,
+        context: Context,
+        start_at: Option<&str>,
+        r: &dyn ContextResolver,
+        cat: &Catalog,
+    ) {
+        self.context = context;
+        let n = self.ids(r).len();
+        self.order = match self.shuffle {
+            ShuffleMode::Off => (0..n).collect(),
+            ShuffleMode::Random => self.fisher_yates(n),
+            ShuffleMode::Smart => self.smart_shuffle(r, cat),
+        };
+        self.cursor = 0;
+        if let Some(id) = start_at {
+            self.play_at(r, cat, id);
+        }
+    }
+
+    fn next_rand(&mut self) -> u64 {
+        // xorshift64*
+        let mut x = self.rng_state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng_state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    fn fisher_yates(&mut self, n: usize) -> Vec<usize> {
+        let mut v: Vec<usize> = (0..n).collect();
         for i in (1..n).rev() {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let j = (state >> 33) as usize % (i + 1);
-            self.order.swap(i, j);
+            let j = (self.next_rand() as usize) % (i + 1);
+            v.swap(i, j);
         }
-        self.order_cursor = 0;
+        v
     }
 
-    /// Index into items for the current position.
-    pub fn current(&self) -> Option<&String> {
-        let &oidx = self.order.get(self.order_cursor)?;
-        self.items.get(oidx)
-    }
-    pub fn current_index(&self) -> Option<usize> { self.order.get(self.order_cursor).copied() }
-
-    pub fn next(&mut self) {
-        if self.order.is_empty() { return; }
-        self.order_cursor = (self.order_cursor + 1) % self.order.len();
-    }
-    /// Move the cursor so that `id` becomes the current track. Used by mouse
-    /// click-to-play in the Queue pane. No-op if the id isn't queued.
-    pub fn jump_to(&mut self, id: &str) {
-        if let Some(pos) = self.items.iter().position(|x| x == id) {
-            if let Some(cursor) = self.order.iter().position(|&o| o == pos) {
-                self.order_cursor = cursor;
-            }
+    /// Artist-spaced shuffle: arrange track indices so no two adjacent share a
+    /// `primary_artist`. Greedy: repeatedly pick a random remaining track whose
+    /// artist differs from the last placed; if none qualify (one artist
+    /// dominates the context), place any remaining. Falls back to a plain
+    /// Fisher–Yates if it stalls repeatedly.
+    fn smart_shuffle(&mut self, r: &dyn ContextResolver, cat: &Catalog) -> Vec<usize> {
+        let ids = self.ids(r);
+        let n = ids.len();
+        if n <= 1 {
+            return (0..n).collect();
         }
-    }
-    pub fn prev(&mut self) {
-        if self.order.is_empty() { return; }
-        self.order_cursor = (self.order_cursor + self.order.len() - 1) % self.order.len();
-    }
-
-    /// The track that will play after the current one (wraps). `None` if the
-    /// queue has fewer than 2 items.
-    pub fn peek_next(&self) -> Option<&String> {
-        if self.order.len() < 2 { return None; }
-        let next_cursor = (self.order_cursor + 1) % self.order.len();
-        let &oidx = self.order.get(next_cursor)?;
-        self.items.get(oidx)
-    }
-
-    /// Remove the currently-playing track from the queue and leave the cursor
-    /// pointing at what was the next track (now shifted into the current
-    /// slot). Preserves shuffle order. Used by consume mode: a track is
-    /// dropped from the queue once it has finished playing.
-    pub fn consume_current(&mut self) {
-        if self.order.is_empty() { return; }
-        let cur_oidx = self.order[self.order_cursor];
-        self.items.remove(cur_oidx);
-        self.order.remove(self.order_cursor);
-        for o in self.order.iter_mut() {
-            if *o > cur_oidx { *o -= 1; }
+        let artist_of = |i: usize| -> String {
+            ids.get(i)
+                .and_then(|id| cat.tracks.iter().find(|t| &t.id == id))
+                .map(|t| t.primary_artist.clone())
+                .unwrap_or_default()
+        };
+        let mut remaining: Vec<usize> = (0..n).collect();
+        let mut out: Vec<usize> = Vec::with_capacity(n);
+        let mut last_artist = String::new();
+        let mut stall = 0;
+        while !remaining.is_empty() {
+            // candidates with a different artist than the last placed
+            let cands: Vec<usize> = remaining
+                .iter()
+                .enumerate()
+                .filter(|(_, &idx)| artist_of(idx) != last_artist)
+                .map(|(ri, _)| ri)
+                .collect();
+            let pick = if cands.is_empty() {
+                stall += 1;
+                if stall > n {
+                    return self.fisher_yates(n); // give up, pure random
+                }
+                (self.next_rand() as usize) % remaining.len()
+            } else {
+                cands[(self.next_rand() as usize) % cands.len()]
+            };
+            let idx = remaining.remove(pick);
+            last_artist = artist_of(idx);
+            out.push(idx);
         }
-        // If the cursor landed past the (now shorter) order, wrap to 0 — also
-        // covers the empty case (len 0, cursor >= 0 always true).
-        if self.order_cursor >= self.order.len() {
-            self.order_cursor = 0;
-        }
-    }
-    pub fn remove(&mut self, id: &str) {
-        if let Some(pos) = self.items.iter().position(|x| x == id) {
-            self.items.remove(pos);
-            self.order = (0..self.items.len()).collect();
-            if self.order_cursor >= self.order.len() && !self.order.is_empty() {
-                self.order_cursor = 0;
-            }
-        }
-    }
-    pub fn clear(&mut self) {
-        self.items.clear();
-        self.order.clear();
-        self.order_cursor = 0;
+        out
     }
 }

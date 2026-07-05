@@ -73,6 +73,19 @@ impl Context {
             Context::Queue => r.queue_ids(),
         }
     }
+
+    /// Static length of `track_ids` for variants that carry ids inline
+    /// (Album/Artist/Search). Playlist/Queue resolve lazily via a
+    /// [`ContextResolver`], so they return 0 here; `Transport` recomputes the
+    /// real length on demand once a resolver is available.
+    pub fn track_ids_placeholder_len(&self) -> usize {
+        match self {
+            Context::Album { track_ids, .. }
+            | Context::Artist { track_ids, .. }
+            | Context::Search { track_ids, .. } => track_ids.len(),
+            Context::Playlist { .. } | Context::Queue => 0,
+        }
+    }
 }
 
 /// Group catalog tracks into albums per artist, preserving `(disc, track)` order
