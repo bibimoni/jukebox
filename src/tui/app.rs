@@ -88,6 +88,7 @@ pub struct App {
     pub artist_index: BTreeMap<String, Vec<usize>>,
     pub albums_by_artist: BTreeMap<String, Vec<Album>>,
     pub view: View,
+    pub focus_col: usize,
     pub cursors: ColumnCursors,
     pub column_widths: ColumnWidths,
     pub volume: u8,
@@ -164,6 +165,7 @@ impl App {
             artist_index,
             albums_by_artist,
             view: View::Artists,
+            focus_col: 0,
             cursors: ColumnCursors::default(),
             column_widths: ColumnWidths::default(),
             volume: 70,
@@ -394,7 +396,7 @@ impl App {
     }
 
     pub fn volume_up(&mut self) {
-        self.volume = (self.volume + 5).min(100);
+        self.volume = self.volume.saturating_add(5).min(100);
         self.muted = false;
     }
 
