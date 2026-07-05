@@ -123,3 +123,30 @@ fn manual_queue_plays_after_context_ends() {
     t.play_at(&RQ, &cat, "t1");
     assert_eq!(t.next(&RQ, &cat), Some("t3".into())); // context exhausted → manual queue
 }
+
+#[test]
+fn prev_after_manual_queue_returns_last_context_track() {
+    // Regression: the manual_queue branch of `next()` used to pop the last
+    // context track's history entry, so `prev()` after a manual-queue
+    // transition skipped that track. With a multi-track context [t1,t2] and
+    // a manual queue [t3], play t1 → next→t2 → next→t3, then prev must
+    // return t2 (the last context track that actually finished), not t1.
+    let (_d, cat) = cat_with_artists();
+    let ctx = Context::Search {
+        query: "x".into(),
+        track_ids: vec!["t1".into(), "t2".into()],
+    };
+    struct RQ;
+    impl ContextResolver for RQ {
+        fn playlist_ids(&self, _: &str) -> Vec<String> { vec![] }
+        fn queue_ids(&self) -> Vec<String> { vec![] }
+    }
+    let mut t = Transport::new(ctx);
+    t.enqueue("t3".into());
+    t.play_at(&RQ, &cat, "t1");
+    assert_eq!(t.current(&RQ, &cat), Some("t1".into()));
+    assert_eq!(t.next(&RQ, &cat), Some("t2".into())); // advance within context
+    assert_eq!(t.next(&RQ, &cat), Some("t3".into())); // context exhausted → manual queue
+    // prev must walk back to t2 (the last context track that finished).
+    assert_eq!(t.prev(&RQ, &cat), Some("t2".into()));
+}

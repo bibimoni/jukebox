@@ -107,9 +107,9 @@ impl Transport {
             // and return it without mutating `self.context` (the controller's
             // approved simplification — keeps the original context intact).
             let id = self.manual_queue.remove(0);
-            // We didn't actually advance within the context, so undo the
-            // history push we just made for the now-finished track.
-            self.history.pop();
+            // The last context track played to completion (that's why we're
+            // advancing to the manual queue), so its history entry is
+            // legitimate and must be retained for `prev()`.
             Some(id)
         } else if self.repeat == RepeatMode::All && !self.order.is_empty() {
             self.cursor = 0;
