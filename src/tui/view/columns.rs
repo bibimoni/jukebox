@@ -218,10 +218,10 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
             let np = app.now_playing.as_deref() == Some(id);
             let glyph = if np { "▶" } else { " " };
             let num = format!("{:>2}", i + 1);
-            let left = format!("{glyph} {num} {}", t.title);
+            let album = t.album.as_deref().unwrap_or("");
+            let left = format!("{glyph} {num} {} — {album}", t.title);
             let quality = t.quality_label();
-            let right = quality.clone();
-            let line = pad_between(&left, &right, width);
+            let line = pad_between(&left, &quality, width);
             let selected = i == app.cursors.track;
             let style = if selected || np { accent } else { dim };
             Some(Line::from(Span::styled(line, style)))
