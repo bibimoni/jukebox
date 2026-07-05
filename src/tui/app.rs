@@ -99,6 +99,9 @@ pub struct App {
     pub switch_sample_rate: bool,
     pub should_quit: bool,
     pub overlay: Option<Overlay>,
+    /// Leader-key state for the `gg` mapping (top of column). `g` arms it;
+    /// a second `g` within one dispatch consumes it and jumps to row 0.
+    pub pending_g: bool,
 }
 
 impl ContextResolver for App {
@@ -176,6 +179,7 @@ impl App {
             switch_sample_rate: true,
             should_quit: false,
             overlay: None,
+            pending_g: false,
         }
     }
 
