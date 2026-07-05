@@ -7,6 +7,7 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// The pane names stored in the DB. Keep these stable — changing them would
@@ -101,6 +102,201 @@ pub fn load_focus() -> Result<Option<String>> {
 /// Clear saved state at the default DB path.
 pub fn clear() -> Result<()> {
     clear_at(&db_path())
+}
+
+// --- Layout (focus, column widths, volume, shuffle/repeat) ---
+
+/// Persisted browse layout + transport modes. `shuffle`/`repeat` are stored as
+/// strings (`"off"`/`"smart"`/`"random"`, `"off"`/`"all"`/`"one"`) rather than
+/// the enum types so we don't need serde derives on `ShuffleMode`/`RepeatMode`
+/// (defined in `tui::queue`).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct LayoutState {
+    #[serde(default = "default_focus")]
+    pub focus: String,
+    #[serde(default)]
+    pub widths: LayoutWidths,
+    #[serde(default = "default_volume")]
+    pub volume: u8,
+    #[serde(default = "default_off")]
+    pub shuffle: String,
+    #[serde(default = "default_off")]
+    pub repeat: String,
+}
+
+fn default_focus() -> String {
+    ARTISTS.to_string()
+}
+
+fn default_volume() -> u8 {
+    70
+}
+
+fn default_off() -> String {
+    "off".to_string()
+}
+
+impl Default for LayoutState {
+    fn default() -> Self {
+        LayoutState {
+            focus: ARTISTS.to_string(),
+            widths: LayoutWidths::default(),
+            volume: 70,
+            shuffle: "off".to_string(),
+            repeat: "off".to_string(),
+        }
+    }
+}
+
+/// Persisted column widths. Mirrors `tui::app::ColumnWidths` but owned by the
+/// state module so (de)serialization doesn't depend on that struct's layout.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct LayoutWidths {
+    #[serde(default = "default_rail")]
+    pub rail: u16,
+    #[serde(default = "default_col1")]
+    pub col1: u16,
+    #[serde(default = "default_col2")]
+    pub col2: u16,
+    #[serde(default = "default_col3")]
+    pub col3: u16,
+}
+
+fn default_rail() -> u16 {
+    4
+}
+fn default_col1() -> u16 {
+    24
+}
+fn default_col2() -> u16 {
+    28
+}
+fn default_col3() -> u16 {
+    48
+}
+
+impl Default for LayoutWidths {
+    fn default() -> Self {
+        LayoutWidths {
+            rail: 4,
+            col1: 24,
+            col2: 28,
+            col3: 48,
+        }
+    }
+}
+
+/// Save the layout (focus + widths + volume + shuffle/repeat) to `path`.
+/// `shuffle`/`repeat` are mapped from the enum modes to their string forms.
+pub fn save_layout_at(
+    path: &Path,
+    focus: &str,
+    widths: &crate::tui::app::ColumnWidths,
+    volume: u8,
+    shuffle: crate::tui::queue::ShuffleMode,
+    repeat: crate::tui::queue::RepeatMode,
+) -> Result<()> {
+    let conn = open_at(path)?;
+    let v = serde_json::to_string(&LayoutState {
+        focus: focus.to_string(),
+        widths: LayoutWidths {
+            rail: widths.rail,
+            col1: widths.col1,
+            col2: widths.col2,
+            col3: widths.col3,
+        },
+        volume,
+        shuffle: match shuffle {
+            crate::tui::queue::ShuffleMode::Off => "off",
+            crate::tui::queue::ShuffleMode::Smart => "smart",
+            crate::tui::queue::ShuffleMode::Random => "random",
+        }
+        .to_string(),
+        repeat: match repeat {
+            crate::tui::queue::RepeatMode::Off => "off",
+            crate::tui::queue::RepeatMode::All => "all",
+            crate::tui::queue::RepeatMode::One => "one",
+        }
+        .to_string(),
+    })?;
+    conn.execute(
+        "INSERT INTO state (key, value) VALUES ('layout', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [v],
+    )?;
+    Ok(())
+}
+
+/// Load the saved layout from `path`. Returns `LayoutState::default()` when no
+/// 'layout' row exists yet (first launch).
+pub fn load_layout_at(path: &Path) -> Result<LayoutState> {
+    let conn = open_at(path)?;
+    let v: Option<String> = conn
+        .query_row("SELECT value FROM state WHERE key = 'layout'", [], |r| {
+            r.get(0)
+        })
+        .ok();
+    match v {
+        Some(s) => Ok(serde_json::from_str(&s)?),
+        None => Ok(LayoutState::default()),
+    }
+}
+
+// --- Playlists ---
+
+/// Save the user's playlists to `path` as a JSON array of `{name, track_ids}`.
+pub fn save_playlists_at(path: &Path, playlists: &[crate::tui::app::Playlist]) -> Result<()> {
+    let conn = open_at(path)?;
+    let v = serde_json::to_string(playlists)?;
+    conn.execute(
+        "INSERT INTO state (key, value) VALUES ('playlists', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [v],
+    )?;
+    Ok(())
+}
+
+/// Load saved playlists from `path`. Returns an empty `Vec` if no 'playlists'
+/// row exists yet (first launch).
+pub fn load_playlists_at(path: &Path) -> Result<Vec<crate::tui::app::Playlist>> {
+    let conn = open_at(path)?;
+    match conn.query_row(
+        "SELECT value FROM state WHERE key = 'playlists'",
+        [],
+        |r| r.get::<_, String>(0),
+    ) {
+        Ok(s) => Ok(serde_json::from_str(&s)?),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+// --- Default-path convenience wrappers for layout + playlists ---
+
+/// Save the layout to the default DB path.
+pub fn save_layout(
+    focus: &str,
+    widths: &crate::tui::app::ColumnWidths,
+    volume: u8,
+    shuffle: crate::tui::queue::ShuffleMode,
+    repeat: crate::tui::queue::RepeatMode,
+) -> Result<()> {
+    save_layout_at(&db_path(), focus, widths, volume, shuffle, repeat)
+}
+
+/// Load the layout from the default DB path.
+pub fn load_layout() -> Result<LayoutState> {
+    load_layout_at(&db_path())
+}
+
+/// Save playlists to the default DB path.
+pub fn save_playlists(playlists: &[crate::tui::app::Playlist]) -> Result<()> {
+    save_playlists_at(&db_path(), playlists)
+}
+
+/// Load playlists from the default DB path.
+pub fn load_playlists() -> Result<Vec<crate::tui::app::Playlist>> {
+    load_playlists_at(&db_path())
 }
 
 #[cfg(test)]

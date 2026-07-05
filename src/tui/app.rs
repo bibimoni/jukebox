@@ -25,9 +25,10 @@ pub enum View {
 }
 
 /// A user-defined playlist: name + ordered track ids.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Playlist {
     pub name: String,
+    #[serde(default)]
     pub track_ids: Vec<String>,
 }
 
@@ -43,7 +44,7 @@ pub struct ColumnCursors {
 }
 
 /// Column widths for the three-pane browse layout.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ColumnWidths {
     pub rail: u16,
     pub col1: u16,
