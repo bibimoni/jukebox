@@ -39,6 +39,44 @@ mod inner {
         Ok(())
     }
 
+    /// Snapshot of the default output device's stream + its current physical
+    /// format, captured up-front so jukebox can restore it on exit (or after a
+    /// crash) and leave the user's device the way it found it. Best-effort:
+    /// `None` if any CoreAudio read fails — never panics.
+    pub struct CapturedFormat {
+        stream: AudioStreamID,
+        asbd: AudioStreamBasicDescription,
+    }
+
+    /// Read the default output device + its first output stream + that stream's
+    /// *current* physical format. Returns `None` on any CoreAudio error — this
+    /// is best-effort snapshotting, so jukebox never crashes on a quirky
+    /// device (e.g. one that exposes no physical format, or gets unplugged
+    /// mid-read). When `None`, `restore_output_format` is a no-op.
+    pub fn capture_default_format() -> Option<CapturedFormat> {
+        let device = default_output_device().ok()?;
+        let stream = first_output_stream(device).ok()?;
+        let asbd = current_physical_format(stream)?;
+        // A zeroed/unknown stream is useless to restore against — treat as
+        // "nothing to capture" so the caller's restore is a clean no-op.
+        if stream == kAudioObjectUnknown {
+            return None;
+        }
+        Some(CapturedFormat { stream, asbd })
+    }
+
+    /// Restore the device's physical format to whatever
+    /// `capture_default_format` snapshotted earlier. Best-effort + silent:
+    /// CoreAudio errors are ignored (this runs on shutdown, outside the alt-
+    /// screen TUI loop, and the one invariant we need is "don't panic"). A
+    /// `None` argument (capture failed, or non-macOS) is a no-op.
+    pub fn restore_output_format(fmt: Option<CapturedFormat>) {
+        if let Some(captured) = fmt {
+            // Ignore the result — best-effort restore on shutdown.
+            let _ = set_physical_format(captured.stream, captured.asbd);
+        }
+    }
+
     fn default_output_device() -> Result<AudioDeviceID> {
         let mut dev: AudioDeviceID = 0;
         let mut size = mem::size_of::<AudioDeviceID>() as u32;
@@ -375,6 +413,13 @@ mod inner {
     pub fn set_output_format(_sample_rate_hz: u32, _bit_depth: u32) -> Result<()> {
         Ok(())
     }
+
+    /// No-op capture on non-macOS: there's nothing to restore, so `None`.
+    pub struct CapturedFormat;
+    pub fn capture_default_format() -> Option<CapturedFormat> {
+        None
+    }
+    pub fn restore_output_format(_fmt: Option<CapturedFormat>) {}
 }
 
-pub use inner::set_output_format;
+pub use inner::{capture_default_format, restore_output_format, set_output_format, CapturedFormat};
