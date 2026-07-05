@@ -46,6 +46,7 @@ fn normalize_romaji(s: &str) -> String {
 ///
 /// - katakana text → romaji + hiragana
 /// - hiragana text → romaji + katakana
+///
 /// ASCII-only or kanji-only text yields no variants (kanji→romaji needs a
 /// dictionary, which we deliberately do not ship).
 ///

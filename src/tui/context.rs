@@ -118,7 +118,7 @@ pub fn build_albums_by_artist(cat: &Catalog) -> BTreeMap<String, Vec<Album>> {
                 (t.disc_number.unwrap_or(1), t.track_number.unwrap_or(0))
             });
         }
-        albums.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+        albums.sort_by_key(|a| a.title.to_lowercase());
     }
     map
 }
