@@ -212,3 +212,50 @@ fn search_overlay_accepts_capital_letters() {
     };
     assert_eq!(input, "F");
 }
+
+#[test]
+fn search_overlay_arrow_keys_move_selection() {
+    // Reproduces the "can't use arrow keys in search" bug: Down/Up must move
+    // the result cursor (previously only `n`/`N` did, so arrows were no-ops).
+    let (_d, cat) = cat_with_index();
+    let searcher = Searcher::open(&_d.path().join("search-index")).unwrap();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), Some(searcher));
+    // Type a query that yields multiple results ("a" matches Ado/Aimer/etc).
+    handle_key(&mut app, key('/'));
+    handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    let n_results = match &app.overlay {
+        Some(Overlay::Search { results, .. }) => results.len(),
+        _ => panic!("overlay should be open"),
+    };
+    assert!(n_results >= 2, "need >=2 results to test navigation, got {n_results}");
+    // Down moves the cursor to result 1.
+    handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let cursor = match &app.overlay {
+        Some(Overlay::Search { cursor, .. }) => *cursor,
+        _ => panic!("overlay should still be open"),
+    };
+    assert_eq!(cursor, 1, "Down should advance the search cursor to 1");
+    // Up moves it back to 0.
+    handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    let cursor = match &app.overlay {
+        Some(Overlay::Search { cursor, .. }) => *cursor,
+        _ => panic!("overlay should still be open"),
+    };
+    assert_eq!(cursor, 0, "Up should return the search cursor to 0");
+}
+
+#[test]
+fn search_overlay_typing_letters_not_intercepted_as_navigation() {
+    // 'j'/'k' are NOT navigation in the search overlay (only arrows are), so
+    // typing "joji" must put 'j' into the input rather than move the cursor.
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    handle_key(&mut app, key('/'));
+    handle_key(&mut app, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    let input = match &app.overlay {
+        Some(Overlay::Search { input, .. }) => input.clone(),
+        _ => panic!("overlay should be open"),
+    };
+    assert_eq!(input, "j", "'j' must be typed into the query, not navigate");
+}
+

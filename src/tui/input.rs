@@ -148,11 +148,34 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             // Track whether the query changed so we only re-search on mutation.
             let mut changed = false;
             match key.code {
+                // Enter picks the result under the cursor (play in context).
+                KeyCode::Enter => {
+                    if let Some(id) = results.get(cursor).cloned() {
+                        let ids = std::mem::take(&mut results);
+                        app.play_in_context_ids(ids, &id);
+                        return;
+                    }
+                }
+                // Arrow keys move the result selection. (Previously only
+                // `n`/`N` moved the cursor, so arrow keys were a no-op — the
+                // "can't use arrow keys in search" bug. We deliberately do
+                // NOT bind `j`/`k` here, so typing letters like 'j' into the
+                // query still works — arrows are the conflict-free navigator.)
+                KeyCode::Down if !results.is_empty() => {
+                    cursor = (cursor + 1) % results.len();
+                }
+                KeyCode::Up if !results.is_empty() => {
+                    cursor = cursor.checked_sub(1).unwrap_or(results.len().saturating_sub(1));
+                }
+                KeyCode::Char('n') if !results.is_empty() => {
+                    cursor = (cursor + 1) % results.len();
+                }
+                KeyCode::Char('N') if !results.is_empty() => {
+                    cursor = cursor.checked_sub(1).unwrap_or(results.len().saturating_sub(1));
+                }
                 // Accept Char regardless of SHIFT so capital letters (and
                 // shifted symbols) make it into the input — a Shift+F would
-                // otherwise be dropped because its modifiers != NONE. Other
-                // keycodes (Esc/Enter/Backspace) are separate variants, so
-                // they are unaffected by relaxing the guard here.
+                // otherwise be dropped because its modifiers != NONE.
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
                 {
@@ -162,21 +185,6 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Backspace => {
                     input.pop();
                     changed = true;
-                }
-                KeyCode::Enter => {
-                    // Play the result under the search cursor in context.
-                    if let Some(id) = results.get(cursor).cloned() {
-                        let ids = std::mem::take(&mut results);
-                        app.play_in_context_ids(ids, &id);
-                        // play_in_context_ids consumed `results`; nothing to restore.
-                        return;
-                    }
-                }
-                KeyCode::Char('n') if !results.is_empty() => {
-                    cursor = (cursor + 1) % results.len();
-                }
-                KeyCode::Char('N') if !results.is_empty() => {
-                    cursor = cursor.checked_sub(1).unwrap_or(results.len().saturating_sub(1));
                 }
                 _ => {}
             }
