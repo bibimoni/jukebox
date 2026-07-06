@@ -10,6 +10,14 @@ pub trait Player {
     fn play_pause(&mut self) -> Result<()>;
     fn seek(&mut self, secs: f64) -> Result<()>;
     fn stop(&mut self) -> Result<()>;
+    /// Set playback volume as 0..=100. Best-effort: backends that can't
+    /// (afplay has no IPC) return Ok(()) without doing anything, matching the
+    /// existing `seek` no-op pattern on afplay. mpv implements this for real
+    /// via the `volume` property.
+    fn set_volume(&mut self, _vol: u8) -> Result<()> { Ok(()) }
+    /// Mute/unmute. Best-effort like `set_volume`. mpv mutes via the `mute`
+    /// property; the default is a no-op so afplay/stub stay consistent.
+    fn set_muted(&mut self, _muted: bool) -> Result<()> { Ok(()) }
     fn position(&self) -> Option<f64>;
     fn duration(&self) -> Option<f64>;
     fn is_playing(&self) -> bool;
@@ -260,6 +268,18 @@ impl Player for MpvPlayer {
     }
     fn seek(&mut self, secs: f64) -> Result<()> {
         self.send(&["seek".into(), secs.into(), "relative".into()])?;
+        Ok(())
+    }
+    fn set_volume(&mut self, vol: u8) -> Result<()> {
+        // mpv's `volume` property is 0-100 (software volume, linear). Clamp
+        // defensively — the TUI clamps too, but a stray value shouldn't
+        // produce a nonsensical IPC command.
+        let v = vol.clamp(0, 100) as f64;
+        self.send(&["set_property".into(), "volume".into(), v.into()])?;
+        Ok(())
+    }
+    fn set_muted(&mut self, muted: bool) -> Result<()> {
+        self.send(&["set_property".into(), "mute".into(), muted.into()])?;
         Ok(())
     }
     fn stop(&mut self) -> Result<()> {

@@ -66,6 +66,11 @@ fn main() -> anyhow::Result<()> {
                 app.playlists = pls;
             }
 
+            // Apply the restored volume to the player backend so the persisted
+            // level actually takes effect on launch (mpv defaults to 100%).
+            let _ = app.player.set_volume(app.volume);
+            let _ = app.player.set_muted(app.muted);
+
             // Capture the default audio device's current format BEFORE entering
             // the loop, so the panic hook installed inside `event::run` can
             // restore it on exit/crash. `None` on non-macOS.

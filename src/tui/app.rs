@@ -551,14 +551,18 @@ impl App {
     pub fn volume_up(&mut self) {
         self.volume = self.volume.saturating_add(5).min(100);
         self.muted = false;
+        let _ = self.player.set_volume(self.volume);
+        let _ = self.player.set_muted(self.muted);
     }
 
     pub fn volume_down(&mut self) {
         self.volume = self.volume.saturating_sub(5);
+        let _ = self.player.set_volume(self.volume);
     }
 
     pub fn toggle_mute(&mut self) {
         self.muted = !self.muted;
+        let _ = self.player.set_muted(self.muted);
     }
 
     pub fn quit(&mut self) {
