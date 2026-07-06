@@ -42,6 +42,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
+    // Clamp browse cursors to valid ranges before rendering, so a stale
+    // album/track cursor (after an artist switch or view change) doesn't
+    // leave the Tracks column empty.
+    app.clamp_cursors();
+
     // Vertical split: main browse area gets the remainder, player bar gets a
     // fixed 2-line strip at the bottom. `Min(3)` guarantees the columns always
     // have at least a header + content + footer row even at exactly 80×24.

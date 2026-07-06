@@ -204,7 +204,36 @@ impl App {
     }
 
     /// Build the track-id list for the currently-focused track column.
-    fn current_context_ids(&self) -> Vec<String> {
+    /// Clamp every browse cursor to a valid index for its current list. Stale
+    /// cursors (e.g. `cursors.album` left at 5 after switching to an artist with
+    /// only 2 albums) otherwise make the Tracks column render empty and make
+    /// `play_selected` play the wrong/no track — the "this artist has no songs"
+    /// and "Enter doesn't play after picking a list" bugs.
+    pub fn clamp_cursors(&mut self) {
+        let n_artists = self.artists.len();
+        if n_artists > 0 && self.cursors.artist >= n_artists {
+            self.cursors.artist = n_artists - 1;
+        }
+        let n_albums = self
+            .artists
+            .get(self.cursors.artist)
+            .and_then(|a| self.albums_by_artist.get(a))
+            .map(|v| v.len())
+            .unwrap_or(0);
+        if n_albums > 0 && self.cursors.album >= n_albums {
+            self.cursors.album = n_albums - 1;
+        }
+        let n_tracks = self.current_context_ids().len();
+        if n_tracks > 0 && self.cursors.track >= n_tracks {
+            self.cursors.track = n_tracks - 1;
+        }
+        let n_playlists = self.playlists.len();
+        if n_playlists > 0 && self.cursors.playlist >= n_playlists {
+            self.cursors.playlist = n_playlists - 1;
+        }
+    }
+
+    pub fn current_context_ids(&self) -> Vec<String> {
         match self.view {
             View::Artists => {
                 let artist = self
@@ -341,6 +370,7 @@ impl App {
 
     /// Play the track under the track-column cursor in the current view.
     pub fn play_selected(&mut self) {
+        self.clamp_cursors();
         let ids = self.current_context_ids();
         if ids.is_empty() {
             return;

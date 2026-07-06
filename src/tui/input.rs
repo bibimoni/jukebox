@@ -329,12 +329,29 @@ fn focused_cursor(app: &App) -> usize {
 fn set_focused_cursor(app: &mut App, v: usize) {
     match app.view {
         View::Artists => match app.focus_col {
-            0 => app.cursors.artist = v,
-            1 => app.cursors.album = v,
+            // Changing the artist invalidates the album + track cursors: the
+            // new artist has a different album list, so the old album/track
+            // indices point at the wrong thing (or past the end → empty
+            // Tracks column, the "this artist has no songs" bug). Reset them.
+            0 => {
+                app.cursors.artist = v;
+                app.cursors.album = 0;
+                app.cursors.track = 0;
+            }
+            // Changing the album invalidates the track cursor (different track
+            // list). Reset it so Enter plays a valid track.
+            1 => {
+                app.cursors.album = v;
+                app.cursors.track = 0;
+            }
             _ => app.cursors.track = v,
         },
         View::Playlists => match app.focus_col {
-            0 => app.cursors.playlist = v,
+            // Changing the playlist invalidates the track cursor.
+            0 => {
+                app.cursors.playlist = v;
+                app.cursors.track = 0;
+            }
             _ => app.cursors.track = v,
         },
         View::Queue => app.cursors.queue = v,

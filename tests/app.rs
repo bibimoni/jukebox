@@ -175,6 +175,74 @@ fn collaboration_album_shows_and_plays_all_tracks() {
     assert!(["t2", "t3"].contains(&after.as_str()));
 }
 
+#[test]
+fn clamp_cursors_rescues_stale_album_cursor() {
+    // Simulate a stale album cursor: artist cursor on 40mP (1 album) but
+    // cursors.album = 5 (out of bounds). Without clamping, the Tracks column
+    // renders empty and play_selected plays nothing ("this artist has no
+    // songs"). clamp_cursors must pull it back into a valid range.
+    let (_d, cat, _l) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    app.cursors.artist = 0; // 40mP, 1 album
+    app.cursors.album = 5; // stale / out of bounds
+    app.cursors.track = 9; // stale / out of bounds
+    app.clamp_cursors();
+    let n_albums = app.albums_by_artist.get("40mP").map(|v| v.len()).unwrap();
+    assert!(app.cursors.album < n_albums, "album cursor must be in range");
+    let n_tracks = app.current_context_ids().len();
+    assert!(n_tracks > 0);
+    assert!(app.cursors.track < n_tracks, "track cursor must be in range");
+}
+
+#[test]
+fn changing_artist_resets_album_and_track_cursors() {
+    // Moving the artist cursor (col 0) must reset album+track to 0 so the
+    // new artist's first album/track is shown — not a stale index that leaves
+    // Tracks empty. Uses a 2-artist catalog so `Down` can actually advance.
+    let d = tempfile::tempdir().unwrap();
+    let lossless = d.path().join("lossless");
+    std::fs::create_dir_all(lossless.join("A")).unwrap();
+    std::fs::create_dir_all(lossless.join("B")).unwrap();
+    std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+    std::fs::write(lossless.join("B").join("01.flac"), b"x").unwrap();
+    let json = serde_json::json!({"version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),"tracks":[
+      {"id":"a1","artists":["Aaa"],"primary_artist":"Aaa","title":"A1","album":"AlbA","track_number":1,"bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/A/01.flac","symlinked_into_artists":["Aaa"]},
+      {"id":"b1","artists":["Bbb"],"primary_artist":"Bbb","title":"B1","album":"AlbB","track_number":1,"bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/B/01.flac","symlinked_into_artists":["Bbb"]},
+    ]}).to_string();
+    let p = d.path().join("catalog.json");
+    std::fs::write(&p, json).unwrap();
+    let cat = Catalog::load(&p).unwrap();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    // Park stale album/track cursors.
+    app.cursors.album = 4;
+    app.cursors.track = 7;
+    app.view = View::Artists;
+    app.focus_col = 0;
+    // `Down` moves artist Aaa → Bbb; set_focused_cursor must reset album+track.
+    use jukebox::tui::input::handle_key;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(app.cursors.artist, 1, "artist cursor should have advanced");
+    assert_eq!(app.cursors.album, 0, "album cursor must reset on artist change");
+    assert_eq!(app.cursors.track, 0, "track cursor must reset on artist change");
+}
+
+#[test]
+fn play_selected_plays_highlighted_track_not_a_stale_one() {
+    // After switching artist (which resets track to 0), play_selected must
+    // play the track under the cursor — not a stale track index from before.
+    let (_d, cat) = cat_two_albums();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    app.view = View::Artists;
+    app.cursors.artist = 0; // 40mP
+    app.cursors.album = 0;  // Cosmic
+    app.cursors.track = 2;  // t3 (the 3rd track)
+    app.play_selected();
+    assert_eq!(app.now_playing.as_deref(), Some("t3"),
+        "play_selected must play the highlighted track, not a stale one");
+}
+
+
 /// Catalog where artist "40mP" has TWO albums so we can verify NextAlbum
 /// auto-continuation: "Cosmic" (t1..t3) and "Solo" (s1).
 fn cat_two_albums() -> (tempfile::TempDir, Catalog) {
