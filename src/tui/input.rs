@@ -145,7 +145,14 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             // Track whether the query changed so we only re-search on mutation.
             let mut changed = false;
             match key.code {
-                KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE => {
+                // Accept Char regardless of SHIFT so capital letters (and
+                // shifted symbols) make it into the input — a Shift+F would
+                // otherwise be dropped because its modifiers != NONE. Other
+                // keycodes (Esc/Enter/Backspace) are separate variants, so
+                // they are unaffected by relaxing the guard here.
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
                     input.push(c);
                     changed = true;
                 }
@@ -177,7 +184,9 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         }
         Some(Overlay::Command { mut input }) => {
             match key.code {
-                KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE => input.push(c),
+                // Accept Char regardless of SHIFT — see the Search arm note.
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) => input.push(c),
                 KeyCode::Backspace => { input.pop(); }
                 KeyCode::Enter => {
                     // Command execution is best-effort + minimal for Task 11;
@@ -233,7 +242,7 @@ fn focused_track_count(app: &App) -> usize {
             app.albums_by_artist
                 .get(&artist)
                 .and_then(|v| v.get(app.cursors.album))
-                .map(|a| a.track_indices.len())
+                .map(|a| app.tracks_for_album(&a.title).len())
                 .unwrap_or(0)
         }
         View::Playlists => app

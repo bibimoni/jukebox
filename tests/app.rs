@@ -98,3 +98,79 @@ fn volume_clamps_and_mutes() {
     app.toggle_mute(); assert!(app.muted);
     app.toggle_mute(); assert!(!app.muted); assert_eq!(app.volume, was);
 }
+
+/// Regression for the "Previous does not go back across a context switch" bug.
+///
+/// `play_selected`/`play_in_context_ids` previously did not push the current
+/// playback to `transport.history` before `switch_context`, so after switching
+/// context (e.g. playing a search result, then a track from a different
+/// context) `prev()` had nothing to pop and just replayed the current track.
+/// After the fix, `prev()` pops back to the prior track+context.
+#[test]
+fn prev_across_context_switch_returns_prior_track() {
+    let (_d, cat, _l) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    // Play t1 in context X = Search{[t1,t2]}.
+    app.play_in_context_ids(vec!["t1".into(), "t2".into()], "t1");
+    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+    // Switch to t3 in a fresh context Y = Search{[t3]}.
+    app.play_in_context_ids(vec!["t3".into()], "t3");
+    assert_eq!(app.now_playing.as_deref(), Some("t3"));
+    // prev must return to the prior track (t1), not replay t3.
+    app.prev();
+    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+}
+
+/// Regression for the "Collaboration albums fragment" bug.
+///
+/// Albums are grouped by `primary_artist`, so a collaboration album (tracks
+/// with different primary_artists but the same album title) appeared under
+/// each artist with only that artist's tracks. Browsing it showed/played only
+/// a subset, so `>` ran out of tracks and stopped playback. After the fix,
+/// `tracks_for_album` returns the FULL album across all primary_artists, and
+/// both the rendered track list and the playback context use it.
+#[test]
+fn collaboration_album_shows_and_plays_all_tracks() {
+    let d = tempfile::tempdir().unwrap();
+    let lossless = d.path().join("lossless");
+    std::fs::create_dir_all(lossless.join("A")).unwrap();
+    std::fs::create_dir_all(lossless.join("B")).unwrap();
+    std::fs::create_dir_all(lossless.join("C")).unwrap();
+    for n in 1..=3 {
+        let artist = ["A", "B", "C"][n - 1];
+        std::fs::write(lossless.join(artist).join(format!("{n:02}.flac")), b"x").unwrap();
+    }
+    let json = serde_json::json!({
+        "version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+        "tracks":[
+          {"id":"t1","artists":["A"],"primary_artist":"A","title":"One","album":"Collab","track_number":1,"bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/A/01.flac","symlinked_into_artists":["A"]},
+          {"id":"t2","artists":["B"],"primary_artist":"B","title":"Two","album":"Collab","track_number":2,"bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/B/02.flac","symlinked_into_artists":["B"]},
+          {"id":"t3","artists":["C"],"primary_artist":"C","title":"Three","album":"Collab","track_number":3,"bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/C/03.flac","symlinked_into_artists":["C"]},
+        ]
+    }).to_string();
+    let p = d.path().join("catalog.json");
+    std::fs::write(&p, json).unwrap();
+    let cat = Catalog::load(&p).unwrap();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+
+    // tracks_for_album returns all 3 ids across all primary_artists, in
+    // (disc, track_number) order.
+    let ids = app.tracks_for_album("Collab");
+    assert_eq!(ids, vec!["t1".to_string(), "t2".to_string(), "t3".to_string()]);
+
+    // Browse A → "Collab" album (under A, the album only has t1 in its
+    // track_indices, but the focused-album track list and playback context
+    // must be the FULL album).
+    app.view = View::Artists;
+    app.cursors.artist = 0; // A
+    app.cursors.album = 0;   // Collab
+    app.cursors.track = 0;   // t1
+    app.play_selected();
+    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+    // `>` advances to a 2nd distinct track (previously stopped: only 1 track
+    // in the context).
+    app.next();
+    let after = app.now_playing.clone().expect("next must not stop playback");
+    assert_ne!(after, "t1", "next must advance to a distinct track");
+    assert!(["t2", "t3"].contains(&after.as_str()));
+}

@@ -138,14 +138,13 @@ fn render_artists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         &mut album_state,
     );
 
-    // col3: tracks for the focused album.
+    // col3: tracks for the focused album — the FULL album across all
+    // primary_artists, not just the focused artist's copy (collaboration
+    // albums have tracks under several primary_artists; the album is a
+    // cohesive object). See `App::tracks_for_album`.
     let focused_album = albums.get(app.cursors.album).cloned();
     let track_ids: Vec<String> = match &focused_album {
-        Some(a) => a
-            .track_indices
-            .iter()
-            .map(|&i| app.catalog.tracks[i].id.clone())
-            .collect(),
+        Some(a) => app.tracks_for_album(&a.title),
         None => vec![],
     };
     let track_lines = track_rows(app, &track_ids, track_area.width.saturating_sub(2) as usize, theme);

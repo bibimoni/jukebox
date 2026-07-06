@@ -188,3 +188,27 @@ fn four_key_opens_search_overlay() {
     handle_key(&mut app, key('4'));
     assert!(matches!(app.overlay, Some(Overlay::Search { .. })));
 }
+
+/// Regression for the "Capital letters dropped in search overlay input" bug.
+///
+/// Typing a capital letter (Shift+letter, e.g. `F`) is delivered by crossterm
+/// as `Char('F')` carrying the SHIFT modifier. The overlay char handler
+/// previously guarded on `KeyModifiers::NONE`, so the shifted `F` was dropped
+/// and the input stayed empty. After the fix, SHIFT is accepted and the char
+/// is appended.
+#[test]
+fn search_overlay_accepts_capital_letters() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    handle_key(&mut app, key('/'));
+    // Shift+F: a real terminal sends Char('F') with the SHIFT modifier.
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT),
+    );
+    let input = match &app.overlay {
+        Some(Overlay::Search { input, .. }) => input.clone(),
+        _ => panic!("expected Search overlay to still be open"),
+    };
+    assert_eq!(input, "F");
+}

@@ -187,6 +187,22 @@ impl App {
         self.catalog.tracks.iter().find(|t| t.id == id)
     }
 
+    /// All catalog tracks with the given album title, across all primary_artists,
+    /// sorted by (disc, track_number). An album is a cohesive object — browsing
+    /// it shows every track on it, not just the ones where the focused artist is
+    /// primary (collaboration albums have tracks under several primary_artists).
+    pub fn tracks_for_album(&self, album_title: &str) -> Vec<String> {
+        let mut idxs: Vec<usize> = self.catalog.tracks.iter().enumerate()
+            .filter(|(_, t)| t.album.as_deref() == Some(album_title))
+            .map(|(i, _)| i)
+            .collect();
+        idxs.sort_by_key(|&i| {
+            let t = &self.catalog.tracks[i];
+            (t.disc_number.unwrap_or(1), t.track_number.unwrap_or(0))
+        });
+        idxs.into_iter().map(|i| self.catalog.tracks[i].id.clone()).collect()
+    }
+
     /// Build the track-id list for the currently-focused track column.
     fn current_context_ids(&self) -> Vec<String> {
         match self.view {
@@ -202,11 +218,10 @@ impl App {
                     .and_then(|a| a.get(self.cursors.album))
                     .cloned();
                 match album {
-                    Some(a) => a
-                        .track_indices
-                        .iter()
-                        .map(|&i| self.catalog.tracks[i].id.clone())
-                        .collect(),
+                    // The full album across all primary_artists — collaboration
+                    // albums have tracks under several artists; the album is a
+                    // cohesive object (see `tracks_for_album`).
+                    Some(a) => self.tracks_for_album(&a.title),
                     None => vec![],
                 }
             }
@@ -335,6 +350,13 @@ impl App {
             None => return,
         };
         let ctx = self.context_for_current_view(ids);
+        // A context switch is a play transition: push the currently-playing
+        // (track, context) to history so `prev()` can pop back to it. Only
+        // `next()` pushed previously, so a switch (e.g. playing a search result
+        // then a track from another context) broke `prev` across the switch.
+        if let Some(id) = self.now_playing.clone() {
+            self.transport.history.push((id, self.transport.context.clone()));
+        }
         let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
         self.transport
             .switch_context(ctx, Some(&start), &r, &self.catalog);
@@ -347,6 +369,11 @@ impl App {
             query: String::new(),
             track_ids: ids,
         };
+        // Mirror `play_selected`: push the current playback to history so a
+        // subsequent `prev()` returns to it across the context switch.
+        if let Some(id) = self.now_playing.clone() {
+            self.transport.history.push((id, self.transport.context.clone()));
+        }
         let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
         self.transport
             .switch_context(ctx, Some(start), &r, &self.catalog);
