@@ -401,11 +401,13 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent) {
     match m.kind {
         MouseEventKind::ScrollUp => move_up(app),
         MouseEventKind::ScrollDown => move_down(app),
-        MouseEventKind::Down(_) | MouseEventKind::Drag(_) => {
-            // The player bar occupies the bottom 2 rows. Hits there are
-            // transport / progress / volume; hits above are browse.
-            let area_height: u16 = 24; // floor; ratatui reports the real size on draw
-            let bar_top = area_height.saturating_sub(2);
+        MouseEventKind::Down(_) => {
+            // A single click — route to the player bar (transport/seek) or the
+            // browse columns. Drag is deliberately NOT routed: a held-drag used
+            // to scrub volume on every mouse-move, which jumped the level
+            // erratically. Volume is keyboard-only (+/-/m) now.
+            let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
+            let bar_top = h.saturating_sub(2);
             if m.row >= bar_top {
                 handle_player_bar_click(app, m.column, m.row - bar_top);
             } else {
@@ -416,15 +418,16 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent) {
     }
 }
 
-/// Click in the bottom 2-row player bar. Row 0 = info line (transport glyphs
-/// ◀◀ ▶ ▶▶ + volume meter); row 1 = progress gauge.
+/// Click in the bottom 2-row player bar. Row 0 is the info line (now-playing
+/// text, transport glyphs, volume, mode flags); row 1 is the progress gauge.
+/// Only the transport glyphs and the progress gauge are clickable. The
+/// now-playing text and volume meter are intentionally not clickable, because
+/// coarse hit-testing there made a stray click jump volume to an arbitrary
+/// value.
 fn handle_player_bar_click(app: &mut App, col: u16, row_in_bar: u16) {
-    // Real terminal width so the proportional seek/volume math is correct at
-    // any size (a hardcoded 80 made far-right clicks map to >100% / wrong
-    // values on wider terminals — the "mouse resets to 100%" symptom).
     let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80).max(1);
     if row_in_bar == 1 {
-        // Progress gauge row: seek proportional to column / width.
+        // Progress gauge row: click-to-seek, proportional to column / width.
         let pct = (col as f64 / width as f64).clamp(0.0, 1.0);
         if let Some(dur) = app.player.duration() {
             if dur > 0.0 {
@@ -433,23 +436,15 @@ fn handle_player_bar_click(app: &mut App, col: u16, row_in_bar: u16) {
         }
         return;
     }
-    // Row 0: transport glyphs live in roughly columns 18..32 (◀◀ ▶ ▶▶). Clicks
-    // in that band map to prev / play-pause / next; clicks further right set
-    // volume proportionally.
+    // Row 0: only the transport glyphs (◀◀ ▶ ▶▶, roughly cols 18..32) are
+    // clickable. Anything else (now-playing text, volume, flags) is ignored.
     if (18..=32).contains(&col) {
         match col {
             18..=21 => app.prev(),
             22..=27 => { let _ = app.player.play_pause(); }
             _ => app.next(),
         }
-        return;
     }
-    // Otherwise treat as a volume meter click: proportional set. The volume
-    // meter sits in the right portion of the info line; map the click column
-    // across the full width to 0..=100. `set_volume` pushes to the player so
-    // audio matches the bar immediately (no desync on mouse interaction).
-    let pct = (col as f64 / width as f64).clamp(0.0, 1.0);
-    app.set_volume((pct * 100.0).round() as u8);
 }
 
 /// Click in the browse area: map `col` to a focus column using `column_widths`
