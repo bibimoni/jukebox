@@ -104,6 +104,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('z'), _) => app.cycle_shuffle(),
         (KeyCode::Char('Z'), _) => app.reshuffle(),
         (KeyCode::Char('r'), _) => app.cycle_repeat(),
+        // `c` cycles continue mode (off → next album → radio): what happens
+        // when the current context ends with repeat off.
+        (KeyCode::Char('c'), _) => app.cycle_continue(),
 
         // --- Overlays -------------------------------------------------------
         (KeyCode::Char('/'), _) => {

@@ -122,6 +122,8 @@ pub struct LayoutState {
     pub shuffle: String,
     #[serde(default = "default_off")]
     pub repeat: String,
+    #[serde(default = "default_off")]
+    pub continue_mode: String,
 }
 
 fn default_focus() -> String {
@@ -144,6 +146,7 @@ impl Default for LayoutState {
             volume: 70,
             shuffle: "off".to_string(),
             repeat: "off".to_string(),
+            continue_mode: "off".to_string(),
         }
     }
 }
@@ -195,6 +198,7 @@ pub fn save_layout_at(
     volume: u8,
     shuffle: crate::tui::queue::ShuffleMode,
     repeat: crate::tui::queue::RepeatMode,
+    continue_mode: crate::tui::queue::ContinueMode,
 ) -> Result<()> {
     let conn = open_at(path)?;
     let v = serde_json::to_string(&LayoutState {
@@ -216,6 +220,12 @@ pub fn save_layout_at(
             crate::tui::queue::RepeatMode::Off => "off",
             crate::tui::queue::RepeatMode::All => "all",
             crate::tui::queue::RepeatMode::One => "one",
+        }
+        .to_string(),
+        continue_mode: match continue_mode {
+            crate::tui::queue::ContinueMode::Off => "off",
+            crate::tui::queue::ContinueMode::NextAlbum => "next",
+            crate::tui::queue::ContinueMode::Radio => "radio",
         }
         .to_string(),
     })?;
@@ -280,8 +290,9 @@ pub fn save_layout(
     volume: u8,
     shuffle: crate::tui::queue::ShuffleMode,
     repeat: crate::tui::queue::RepeatMode,
+    continue_mode: crate::tui::queue::ContinueMode,
 ) -> Result<()> {
-    save_layout_at(&db_path(), focus, widths, volume, shuffle, repeat)
+    save_layout_at(&db_path(), focus, widths, volume, shuffle, repeat, continue_mode)
 }
 
 /// Load the layout from the default DB path.

@@ -22,7 +22,7 @@ use ratatui::{
 
 use crate::catalog::Track;
 use crate::tui::app::App;
-use crate::tui::queue::{RepeatMode, ShuffleMode};
+use crate::tui::queue::{ContinueMode, RepeatMode, ShuffleMode};
 use crate::tui::view::theme::{quality_color, Theme};
 
 /// Render the player bar into `area` using state from `app`.
@@ -144,9 +144,19 @@ fn build_info_line(app: &App, _width: usize) -> Line<'static> {
         RepeatMode::All => "all",
         RepeatMode::One => "one",
     };
+    // Continue mode: what plays when the current context ends (repeat off).
+    // off = stop; next = continue to the next album by the same artist;
+    // radio = continue with the whole library (shuffled), never stops.
+    let cont = match app.transport.continue_mode {
+        ContinueMode::Off => "off",
+        ContinueMode::NextAlbum => "next",
+        ContinueMode::Radio => "radio",
+    };
     spans.push(Span::styled(format!("SHUF {shuf}"), dim));
     spans.push(Span::raw("  "));
     spans.push(Span::styled(format!("RPT {rpt}"), dim));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(format!("CONT {cont}"), dim));
 
     Line::from(spans).alignment(Alignment::Left)
 }

@@ -6,7 +6,7 @@
 
 use jukebox::state::*;
 use jukebox::tui::app::{ColumnWidths, Playlist};
-use jukebox::tui::queue::{RepeatMode, ShuffleMode};
+use jukebox::tui::queue::{ContinueMode, RepeatMode, ShuffleMode};
 
 #[test]
 fn layout_round_trips() {
@@ -15,6 +15,7 @@ fn layout_round_trips() {
     assert_eq!(loaded.volume, 70); // default
     assert_eq!(loaded.shuffle, "off");
     assert_eq!(loaded.repeat, "off");
+    assert_eq!(loaded.continue_mode, "off");
     let widths = ColumnWidths {
         rail: 5,
         col1: 30,
@@ -28,6 +29,7 @@ fn layout_round_trips() {
         42,
         ShuffleMode::Smart,
         RepeatMode::One,
+        ContinueMode::Radio,
     )
     .unwrap();
     let loaded = load_layout_at(&path).unwrap();
@@ -36,6 +38,7 @@ fn layout_round_trips() {
     assert_eq!(loaded.volume, 42);
     assert_eq!(loaded.shuffle, "smart");
     assert_eq!(loaded.repeat, "one");
+    assert_eq!(loaded.continue_mode, "radio");
 }
 
 #[test]

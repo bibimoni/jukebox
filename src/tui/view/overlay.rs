@@ -149,6 +149,7 @@ fn help_lines<'a>() -> Vec<Line<'a>> {
         group("", "m   mute"),
         group("", "z / Z   cycle shuffle / reshuffle"),
         group("", "r   cycle repeat (off → all → one)"),
+        group("", "c   cycle continue (off → next album → radio)"),
         Line::from(""),
         group("modes", "/   search   ·   ?   help   ·   :   command"),
         group("", "a   add to playlist"),

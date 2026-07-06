@@ -1,7 +1,7 @@
 use jukebox::catalog::Catalog;
 use jukebox::player::StubPlayer;
 use jukebox::tui::app::{App, View};
-use jukebox::tui::queue::{ShuffleMode, RepeatMode};
+use jukebox::tui::queue::{ContinueMode, RepeatMode, ShuffleMode};
 
 fn cat_album() -> (tempfile::TempDir, Catalog, std::path::PathBuf) {
     let d = tempfile::tempdir().unwrap();
@@ -174,3 +174,87 @@ fn collaboration_album_shows_and_plays_all_tracks() {
     assert_ne!(after, "t1", "next must advance to a distinct track");
     assert!(["t2", "t3"].contains(&after.as_str()));
 }
+
+/// Catalog where artist "40mP" has TWO albums so we can verify NextAlbum
+/// auto-continuation: "Cosmic" (t1..t3) and "Solo" (s1).
+fn cat_two_albums() -> (tempfile::TempDir, Catalog) {
+    let d = tempfile::tempdir().unwrap();
+    let lossless = d.path().join("lossless");
+    std::fs::create_dir_all(lossless.join("40mP")).unwrap();
+    for n in 1..=3 {
+        std::fs::write(lossless.join("40mP").join(format!("c{n:02}.flac")), b"x").unwrap();
+    }
+    std::fs::write(lossless.join("40mP").join("s01.flac"), b"x").unwrap();
+    let tracks: Vec<_> = (1..=3).map(|n| serde_json::json!({
+        "id":format!("t{n}"),"artists":["40mP"],"primary_artist":"40mP","title":format!("Cosmic{n}"),
+        "album":"Cosmic","track_number":n,"bit_depth":24,"sample_rate_hz":96000,
+        "source_path":format!("lossless/40mP/c{n:02}.flac"),"symlinked_into_artists":["40mP"]
+    })).collect();
+    let mut tracks = tracks;
+    tracks.push(serde_json::json!({
+        "id":"s1","artists":["40mP"],"primary_artist":"40mP","title":"SoloTrack",
+        "album":"Solo","track_number":1,"bit_depth":16,"sample_rate_hz":44100,
+        "source_path":"lossless/40mP/s01.flac","symlinked_into_artists":["40mP"]
+    }));
+    let json = serde_json::json!({"version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),"tracks":tracks}).to_string();
+    let p = d.path().join("catalog.json");
+    std::fs::write(&p, json).unwrap();
+    (d, Catalog::load(&p).unwrap())
+}
+
+#[test]
+fn cycle_continue_advances_mode() {
+    let (_d, cat, _l) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    assert_eq!(app.transport.continue_mode, ContinueMode::Off);
+    app.cycle_continue();
+    assert_eq!(app.transport.continue_mode, ContinueMode::NextAlbum);
+    app.cycle_continue();
+    assert_eq!(app.transport.continue_mode, ContinueMode::Radio);
+    app.cycle_continue();
+    assert_eq!(app.transport.continue_mode, ContinueMode::Off);
+}
+
+#[test]
+fn continue_next_album_auto_advances_to_next_album() {
+    let (_d, cat) = cat_two_albums();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    app.transport.continue_mode = ContinueMode::NextAlbum;
+    // Browse 40mP (artist 0) → Cosmic (album 0) → last track (t3, index 2),
+    // then play. This builds a real Album context so NextAlbum can continue.
+    app.view = View::Artists;
+    app.cursors.artist = 0;
+    app.cursors.album = 0; // Cosmic (sorted before Solo)
+    app.cursors.track = 2; // t3 — the last track of Cosmic
+    app.play_selected();
+    assert_eq!(app.now_playing.as_deref(), Some("t3"));
+    // `>` at the end of Cosmic with continue=NextAlbum must switch to "Solo"
+    // and play its first track (s1) — not stop.
+    app.next();
+    assert_eq!(app.now_playing.as_deref(), Some("s1"),
+        "NextAlbum continue should advance to the next album's first track");
+    // prev returns to the prior track (t3) — history pushed across the switch.
+    app.prev();
+    assert_eq!(app.now_playing.as_deref(), Some("t3"));
+}
+
+#[test]
+fn continue_radio_keeps_playing_at_context_end() {
+    let (_d, cat) = cat_two_albums();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    app.transport.continue_mode = ContinueMode::Radio;
+    // Play a single-track context (t1) so `>` exhausts it immediately.
+    app.play_in_context_ids(vec!["t1".into()], "t1");
+    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+    // `>` with continue=Radio must NOT stop — it switches to the whole library
+    // (a Radio/Search context) and plays some track from it.
+    app.next();
+    assert!(app.now_playing.is_some(),
+        "Radio continue must keep playing, not stop");
+    let after = app.now_playing.clone().unwrap();
+    // The radio context is the whole library (t1,t2,t3,s1); the next track
+    // must be one of those and (smart shuffle, no back-to-back same artist)
+    // distinct from t1 when possible.
+    assert!(["t1","t2","t3","s1"].contains(&after.as_str()));
+}
+

@@ -26,6 +26,17 @@ pub enum RepeatMode {
     One,
 }
 
+/// What to do when the current context ends with repeat off. `Off` stops
+/// playback (the context is exhausted); `NextAlbum` auto-continues to the next
+/// album by the same artist; `Radio` auto-continues with the whole library
+/// (shuffled) so music never stops. Set by the `c` key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ContinueMode {
+    Off,
+    NextAlbum,
+    Radio,
+}
+
 pub struct Transport {
     pub context: Context,
     pub order: Vec<usize>, // permutation over context.track_ids
@@ -34,6 +45,7 @@ pub struct Transport {
     pub manual_queue: Vec<String>,
     pub shuffle: ShuffleMode,
     pub repeat: RepeatMode,
+    pub continue_mode: ContinueMode,
     // seeded RNG state so shuffle is deterministic across runs/tests
     rng_state: u64,
 }
@@ -49,6 +61,7 @@ impl Transport {
             manual_queue: Vec::new(),
             shuffle: ShuffleMode::Off,
             repeat: RepeatMode::Off,
+            continue_mode: ContinueMode::Off,
             rng_state: 0x9E3779B97F4A7C15,
         }
     }

@@ -51,6 +51,11 @@ fn main() -> anyhow::Result<()> {
                     "one" => RepeatMode::One,
                     _ => RepeatMode::Off,
                 };
+                app.transport.continue_mode = match layout.continue_mode.as_str() {
+                    "next" => tui::queue::ContinueMode::NextAlbum,
+                    "radio" => tui::queue::ContinueMode::Radio,
+                    _ => tui::queue::ContinueMode::Off,
+                };
                 app.view = match layout.focus.as_str() {
                     "playlists" => View::Playlists,
                     "queue" => View::Queue,
@@ -77,6 +82,7 @@ fn main() -> anyhow::Result<()> {
                 app.volume,
                 app.transport.shuffle,
                 app.transport.repeat,
+                app.transport.continue_mode,
             );
             let _ = state::save_playlists(&app.playlists);
         }

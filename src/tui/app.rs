@@ -14,7 +14,7 @@ use crate::catalog::{Catalog, Track};
 use crate::player::Player;
 use crate::search::Searcher;
 use crate::tui::context::{build_albums_by_artist, Album, Context, ContextResolver};
-use crate::tui::queue::{RepeatMode, ShuffleMode, Transport};
+use crate::tui::queue::{ContinueMode, RepeatMode, ShuffleMode, Transport};
 
 /// Which top-level browse view is active.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -386,8 +386,28 @@ impl App {
             self.now_playing = Some(id);
             self.start_playback_at_current();
         } else {
-            self.player.stop().ok();
-            self.now_playing = None;
+            // Context exhausted (repeat off, no manual queue). The continue
+            // mode decides whether playback stops or auto-advances to more
+            // music — this is the "auto discover" feature.
+            match self.transport.continue_mode {
+                ContinueMode::Off => {
+                    self.player.stop().ok();
+                    self.now_playing = None;
+                }
+                ContinueMode::NextAlbum => {
+                    if self.switch_to_next_album() {
+                        self.start_playback();
+                    } else {
+                        // Not in an album context, or no next album: stop.
+                        self.player.stop().ok();
+                        self.now_playing = None;
+                    }
+                }
+                ContinueMode::Radio => {
+                    self.switch_to_radio();
+                    self.start_playback();
+                }
+            }
         }
     }
 
@@ -425,6 +445,73 @@ impl App {
             RepeatMode::All => RepeatMode::One,
             RepeatMode::One => RepeatMode::Off,
         });
+    }
+
+    /// Cycle the continue mode: Off → NextAlbum → Radio → Off. Controls what
+    /// happens when the current context ends with repeat off (stop / continue
+    /// to the next album by the same artist / continue with the whole library).
+    pub fn cycle_continue(&mut self) {
+        self.transport.continue_mode = match self.transport.continue_mode {
+            ContinueMode::Off => ContinueMode::NextAlbum,
+            ContinueMode::NextAlbum => ContinueMode::Radio,
+            ContinueMode::Radio => ContinueMode::Off,
+        };
+    }
+
+    /// Auto-continue to the next album by the same artist. Pushes the current
+    /// (track, context) to history first so `prev` can return. Returns false
+    /// if the current context isn't an album or there's no next album.
+    fn switch_to_next_album(&mut self) -> bool {
+        let (artist, album) = match &self.transport.context {
+            Context::Album { artist, album, .. } => (artist.clone(), album.clone()),
+            _ => return false, // NextAlbum only applies to album contexts.
+        };
+        let albums = match self.albums_by_artist.get(&artist) {
+            Some(a) => a.clone(),
+            None => return false,
+        };
+        let cur_idx = albums.iter().position(|a| a.title == album);
+        let next_idx = match cur_idx {
+            Some(i) if i + 1 < albums.len() => i + 1,
+            _ => return false, // no next album by this artist
+        };
+        let next = &albums[next_idx];
+        let track_ids = self.tracks_for_album(&next.title);
+        if track_ids.is_empty() {
+            return false;
+        }
+        // A context switch is a play transition: push current to history so
+        // `prev` can pop back to the track that just finished.
+        if let Some(id) = self.now_playing.clone() {
+            self.transport.history.push((id, self.transport.context.clone()));
+        }
+        let ctx = Context::Album {
+            album: next.title.clone(),
+            artist: next.artist.clone(),
+            track_ids,
+        };
+        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+        self.transport.switch_context(ctx, None, &r, &self.catalog);
+        // Keep the browse cursor in sync so the UI shows the new album.
+        self.cursors.album = next_idx;
+        self.cursors.track = 0;
+        true
+    }
+
+    /// Auto-continue with the whole library as a shuffled "radio" context.
+    /// Music never stops — when this context eventually exhausts (the entire
+    /// library), `next` re-enters here and rebuilds it.
+    fn switch_to_radio(&mut self) {
+        if let Some(id) = self.now_playing.clone() {
+            self.transport.history.push((id, self.transport.context.clone()));
+        }
+        let all_ids: Vec<String> = self.catalog.tracks.iter().map(|t| t.id.clone()).collect();
+        let ctx = Context::Search { query: "radio".into(), track_ids: all_ids };
+        // Radio implies shuffled play; force smart shuffle so it actually
+        // discovers (catalog order would just be sequential).
+        self.transport.shuffle = ShuffleMode::Smart;
+        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+        self.transport.switch_context(ctx, None, &r, &self.catalog);
     }
 
     pub fn volume_up(&mut self) {
