@@ -153,7 +153,7 @@ fn help_lines<'a>() -> Vec<Line<'a>> {
         Line::from(""),
         group("modes", "/   search   ·   ?   help   ·   :   command"),
         group("", "a   add to playlist"),
-        group("", "n / N   next / prev search match"),
+        group("", "↑ / ↓   move search-result selection"),
         group("", "Esc   close overlay / cancel"),
         group("", "q   quit"),
         Line::from(""),

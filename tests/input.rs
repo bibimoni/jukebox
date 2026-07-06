@@ -214,6 +214,22 @@ fn search_overlay_accepts_capital_letters() {
 }
 
 #[test]
+fn search_overlay_n_types_into_query_not_navigation() {
+    // `n` was previously bound to "next search match", which swallowed it from
+    // the query — so you couldn't search for e.g. "nirvana". Now arrows are
+    // the only navigator; `n` must go into the input.
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    handle_key(&mut app, key('/'));
+    handle_key(&mut app, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+    let input = match &app.overlay {
+        Some(Overlay::Search { input, .. }) => input.clone(),
+        _ => panic!("overlay should be open"),
+    };
+    assert_eq!(input, "n", "'n' must be typed into the query, not navigate");
+}
+
+#[test]
 fn search_overlay_arrow_keys_move_selection() {
     // Reproduces the "can't use arrow keys in search" bug: Down/Up must move
     // the result cursor (previously only `n`/`N` did, so arrows were no-ops).

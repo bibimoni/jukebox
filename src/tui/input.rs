@@ -156,21 +156,15 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                         return;
                     }
                 }
-                // Arrow keys move the result selection. (Previously only
-                // `n`/`N` moved the cursor, so arrow keys were a no-op — the
-                // "can't use arrow keys in search" bug. We deliberately do
-                // NOT bind `j`/`k` here, so typing letters like 'j' into the
-                // query still works — arrows are the conflict-free navigator.)
+                // Arrow keys are the ONLY result navigators in the search
+                // overlay. Letters (including `n`, `j`, `k`) are never bound
+                // here — they always go into the query so you can search for
+                // anything ("nirvana", "joji", …) without a key being
+                // swallowed as navigation.
                 KeyCode::Down if !results.is_empty() => {
                     cursor = (cursor + 1) % results.len();
                 }
                 KeyCode::Up if !results.is_empty() => {
-                    cursor = cursor.checked_sub(1).unwrap_or(results.len().saturating_sub(1));
-                }
-                KeyCode::Char('n') if !results.is_empty() => {
-                    cursor = (cursor + 1) % results.len();
-                }
-                KeyCode::Char('N') if !results.is_empty() => {
                     cursor = cursor.checked_sub(1).unwrap_or(results.len().saturating_sub(1));
                 }
                 // Accept Char regardless of SHIFT so capital letters (and
