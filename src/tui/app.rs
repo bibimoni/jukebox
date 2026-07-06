@@ -565,6 +565,18 @@ impl App {
         let _ = self.player.set_muted(self.muted);
     }
 
+    /// Set volume to an absolute 0..=100 value (used by mouse clicks/drags on
+    /// the volume meter). Pushes to the player immediately so the audio
+    /// matches the on-screen bar — without this, the mouse path mutated
+    /// `volume` directly and mpv stayed at the old level until a keypress
+    /// re-synced (the "mouse resets to 100% but audio unchanged" bug).
+    pub fn set_volume(&mut self, vol: u8) {
+        self.volume = vol.min(100);
+        self.muted = false;
+        let _ = self.player.set_volume(self.volume);
+        let _ = self.player.set_muted(self.muted);
+    }
+
     pub fn quit(&mut self) {
         self.should_quit = true;
         self.player.stop().ok();

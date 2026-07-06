@@ -419,13 +419,13 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent) {
 /// Click in the bottom 2-row player bar. Row 0 = info line (transport glyphs
 /// ◀◀ ▶ ▶▶ + volume meter); row 1 = progress gauge.
 fn handle_player_bar_click(app: &mut App, col: u16, row_in_bar: u16) {
-    // We don't know the terminal width here without the renderer, so we use a
-    // coarse thirds partitioning of the transport region (which sits near the
-    // left of the info line) and a proportional seek/volume for the rest.
-    // This is best-effort; precise hit-testing is a view-layer concern.
+    // Real terminal width so the proportional seek/volume math is correct at
+    // any size (a hardcoded 80 made far-right clicks map to >100% / wrong
+    // values on wider terminals — the "mouse resets to 100%" symptom).
+    let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80).max(1);
     if row_in_bar == 1 {
-        // Progress gauge row: seek proportional to column / assumed width 80.
-        let pct = (col as f64 / 80.0).clamp(0.0, 1.0);
+        // Progress gauge row: seek proportional to column / width.
+        let pct = (col as f64 / width as f64).clamp(0.0, 1.0);
         if let Some(dur) = app.player.duration() {
             if dur > 0.0 {
                 let _ = app.player.seek(pct * dur - app.player.position().unwrap_or(0.0));
@@ -445,10 +445,11 @@ fn handle_player_bar_click(app: &mut App, col: u16, row_in_bar: u16) {
         return;
     }
     // Otherwise treat as a volume meter click: proportional set. The volume
-    // meter sits in roughly the right third of the info line.
-    let pct = (col as f64 / 80.0).clamp(0.0, 1.0);
-    app.volume = (pct * 100.0).round() as u8;
-    app.muted = false;
+    // meter sits in the right portion of the info line; map the click column
+    // across the full width to 0..=100. `set_volume` pushes to the player so
+    // audio matches the bar immediately (no desync on mouse interaction).
+    let pct = (col as f64 / width as f64).clamp(0.0, 1.0);
+    app.set_volume((pct * 100.0).round() as u8);
 }
 
 /// Click in the browse area: map `col` to a focus column using `column_widths`

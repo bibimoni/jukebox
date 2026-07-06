@@ -55,6 +55,35 @@ fn app_volume_up_reaches_player() {
     assert_eq!(rec_handle.borrow().muted, Some(true), "toggle_mute must push to player");
 }
 
+#[test]
+fn app_set_volume_reaches_player() {
+    // The mouse volume path used to mutate App.volume directly without
+    // pushing to the player — so the bar moved but audio stayed at the old
+    // level until a keypress re-synced (the "mouse resets to 100%" bug).
+    // set_volume must push to the player immediately.
+    use jukebox::catalog::Catalog;
+    use jukebox::tui::app::App;
+    let d = tempfile::tempdir().unwrap();
+    let json = serde_json::json!({"version":1,"built_at":"x","source_root":"/tmp","tracks":[
+      {"id":"t1","artists":["A"],"primary_artist":"A","title":"x","bit_depth":16,"sample_rate_hz":44100,"source_path":"x","symlinked_into_artists":["A"]}
+    ]}).to_string();
+    let p = d.path().join("catalog.json");
+    std::fs::write(&p, json).unwrap();
+    let cat = Catalog::load(&p).unwrap();
+    let rec_handle = std::rc::Rc::new(std::cell::RefCell::new(RecordingPlayer::default()));
+    let player: Box<dyn Player> = Box::new(RecProxy(rec_handle.clone()));
+    let mut app = App::new(cat, player, None);
+    app.volume = 100;
+    app.set_volume(33);
+    assert_eq!(app.volume, 33, "set_volume sets the absolute value");
+    assert_eq!(rec_handle.borrow().volume, Some(33), "set_volume must push to player");
+    assert_eq!(rec_handle.borrow().muted, Some(false), "set_volume unmutes via player");
+    // Values >100 clamp to 100.
+    app.set_volume(150);
+    assert_eq!(app.volume, 100);
+    assert_eq!(rec_handle.borrow().volume, Some(100));
+}
+
 // Tiny proxy so we can share the recorder with App while App owns the Box.
 struct RecProxy(std::rc::Rc<std::cell::RefCell<RecordingPlayer>>);
 impl Player for RecProxy {
