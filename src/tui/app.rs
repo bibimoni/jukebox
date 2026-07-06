@@ -349,23 +349,26 @@ impl App {
         }
     }
 
-    /// Load the track at the current transport cursor into the player (no
-    /// advance). Used after `next`/`prev` already moved the cursor.
-    fn start_playback_at_current(&mut self) {
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
-        if let Some(id) = self.transport.current(&r, &self.catalog) {
-            if self.dead.contains(&id) {
-                return;
-            }
-            if let Some(t) = self.track_by_id(&id) {
-                let path = t.resolve_source(&self.catalog.source_root);
-                if self.switch_sample_rate {
-                    let _ = crate::audio::set_output_format(t.sample_rate_hz, t.bit_depth);
-                }
-                let _ = self.player.load(&path);
-                self.now_playing = Some(id);
-            }
+    /// Load `id` into the player (switching the output device's sample rate
+    /// first when sample-rate switching is on). Used by `next`/`prev` after
+    /// they've already advanced the transport cursor and returned the id to
+    /// play. We load the explicit id rather than re-reading
+    /// `transport.current()` because the manual-queue advance path in
+    /// `Transport::next` returns a queued id WITHOUT updating `context`/`cursor`
+    /// — so `transport.current()` would still point at the just-finished track,
+    /// and the player would load the wrong audio (status line correct, no
+    /// playback).
+    fn load_track(&mut self, id: &str) {
+        if self.dead.contains(id) {
+            return;
         }
+        let Some(t) = self.track_by_id(id) else { return };
+        let path = t.resolve_source(&self.catalog.source_root);
+        if self.switch_sample_rate {
+            let _ = crate::audio::set_output_format(t.sample_rate_hz, t.bit_depth);
+        }
+        let _ = self.player.load(&path);
+        self.now_playing = Some(id.to_string());
     }
 
     /// Play the track under the track-column cursor in the current view.
@@ -413,8 +416,10 @@ impl App {
     pub fn next(&mut self) {
         let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
         if let Some(id) = self.transport.next(&r, &self.catalog) {
-            self.now_playing = Some(id);
-            self.start_playback_at_current();
+            // Load the returned id directly: `Transport::next`'s manual-queue
+            // path returns a queued id without updating the cursor, so
+            // re-reading `transport.current()` would load the wrong track.
+            self.load_track(&id);
         } else {
             // Context exhausted (repeat off, no manual queue). The continue
             // mode decides whether playback stops or auto-advances to more
@@ -444,8 +449,7 @@ impl App {
     pub fn prev(&mut self) {
         let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
         if let Some(id) = self.transport.prev(&r, &self.catalog) {
-            self.now_playing = Some(id);
-            self.start_playback_at_current();
+            self.load_track(&id);
         }
     }
 
