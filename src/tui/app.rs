@@ -160,6 +160,16 @@ pub struct App {
     /// `python3` + the manifest-dir script (works in dev).
     pub yt_python: std::path::PathBuf,
     pub yt_script: std::path::PathBuf,
+    /// Active inline filter (`f`) on the focused column, or `None`.
+    pub filter: Option<FilterState>,
+}
+
+/// Inline filter state for the `f` filter-on-focused-column (spec §5.4).
+/// `col` is the focus_col the filter was opened on; `text` is the query.
+#[derive(Clone, Default)]
+pub struct FilterState {
+    pub col: usize,
+    pub text: String,
 }
 
 /// What an id resolves to at load time, after the Local/YouTube/Mixed policy.
@@ -287,6 +297,7 @@ impl App {
             yt_error: None,
             yt_python: std::path::PathBuf::from("python3"),
             yt_script: std::path::PathBuf::from("scripts/yt/yt.py"),
+            filter: None,
         }
     }
 
@@ -897,6 +908,80 @@ impl App {
             h = h.wrapping_mul(0x100000001B3);
         }
         h
+    }
+
+    /// `f` toggle: open the inline filter on the focused column, or close it.
+    pub fn toggle_filter(&mut self) {
+        match &self.filter {
+            Some(f) if f.col == self.focus_col => self.filter = None,
+            _ => self.filter = Some(FilterState { col: self.focus_col, text: String::new() }),
+        }
+    }
+
+    /// `Enter` while a filter is active: jump the real cursor to the first
+    /// matching item on the filtered column, then clear the filter. So "type
+    /// ade, Enter" lands the cursor on Adele.
+    pub fn filter_jump(&mut self) {
+        let Some(f) = self.filter.clone() else {
+            return;
+        };
+        let q = f.text.trim().to_lowercase();
+        if q.is_empty() {
+            self.filter = None;
+            return;
+        }
+        let matches = |s: &str| s.to_lowercase().contains(&q);
+        match self.view {
+            View::Artists => match f.col {
+                0 => {
+                    if let Some(i) = self.artists.iter().position(|a| matches(a)) {
+                        self.cursors.artist = i;
+                        self.cursors.album = 0;
+                        self.cursors.track = 0;
+                    }
+                }
+                1 => {
+                    let artist = self.artists.get(self.cursors.artist).cloned().unwrap_or_default();
+                    if let Some(albums) = self.albums_by_artist.get(&artist).cloned() {
+                        if let Some(i) = albums.iter().position(|a| matches(&a.title)) {
+                            self.cursors.album = i;
+                            self.cursors.track = 0;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            View::Playlists => {
+                if f.col == 0 {
+                    if let Some(i) = self.playlists.iter().position(|p| matches(&p.name)) {
+                        self.cursors.playlist = i;
+                        self.cursors.track = 0;
+                    }
+                }
+            }
+            View::Youtube => {
+                if f.col == 0 {
+                    if let Some(i) = self.yt_lists.iter().position(|l| matches(&l.name)) {
+                        self.cursors.playlist = i;
+                        self.cursors.track = 0;
+                    }
+                }
+            }
+            View::Queue => {}
+        }
+        self.filter = None;
+    }
+
+    /// Does `id`'s resolved display name match the active filter (case-insensitive
+    /// substring)? Used by the track-column renderers.
+    pub fn filter_matches(&self, name: &str) -> bool {
+        let Some(f) = &self.filter else {
+            return true;
+        };
+        if f.text.is_empty() {
+            return true;
+        }
+        name.to_lowercase().contains(&f.text.to_lowercase())
     }
 
     /// Apply a discover-overlay selection (Enter): start the album/playlist.

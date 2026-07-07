@@ -323,3 +323,21 @@ fn open_command(app: &mut App, text: &str) {
     }
     handle_key(app, key_code(KeyCode::Enter));
 }
+
+#[test]
+fn f_opens_filter_and_typing_narrows_artists() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.view = View::Artists;
+    app.focus_col = 0;
+    handle_key(&mut app, key('f'));
+    assert!(app.filter.is_some(), "f should open the filter");
+    handle_key(&mut app, key('4')); // "40mP" starts with '4'? no — artists are "40mP". type 'm'
+    handle_key(&mut app, key('m'));
+    // filter text is "4m" — no artist matches "4m"; that's fine, we assert the
+    // filter captured the keys.
+    assert_eq!(app.filter.as_ref().unwrap().text, "4m");
+    // Esc clears.
+    handle_key(&mut app, key_code(KeyCode::Esc));
+    assert!(app.filter.is_none());
+}

@@ -54,6 +54,17 @@ fn border<'a>(title: &'a str, focused: bool, theme: &Theme) -> Block<'a> {
         .title(Span::styled(title, Style::default().fg(color)))
 }
 
+/// The column title with an inline filter prompt appended when the filter is
+/// active on this column: `Artists` → `Artists (filter: ade▏)`.
+fn filtered_title(base: &str, app: &App, col: usize) -> String {
+    if let Some(f) = &app.filter {
+        if f.col == col && !f.text.is_empty() {
+            return format!("{base} (filter: {}▏)", f.text);
+        }
+    }
+    base.to_string()
+}
+
 // --- Rail -------------------------------------------------------------------
 
 /// The left switcher rail. A/P/Q/Y rows highlight the active `View` with the
@@ -222,7 +233,7 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     state.select(Some(app.cursors.playlist));
     f.render_stateful_widget(
         List::new(items)
-            .block(border("YouTube", app.focus_col == 0, theme))
+            .block(border(&filtered_title("YouTube", app, 0), app.focus_col == 0, theme))
             .highlight_style(Style::default().fg(theme.accent)),
         cols[0],
         &mut state,
@@ -292,17 +303,18 @@ fn render_artists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let album_area = cols[1];
     let track_area = cols[2];
 
-    // col1: artists.
+    // col1: artists (narrowed by the inline filter when active on col 0).
     let items: Vec<ListItem> = app
         .artists
         .iter()
+        .filter(|a| app.filter_matches(a))
         .map(|a| ListItem::new(a.clone()))
         .collect();
     let mut state = ListState::default();
-    state.select(Some(app.cursors.artist));
+    state.select(Some(app.cursors.artist.min(items.len().saturating_sub(1))));
     f.render_stateful_widget(
         List::new(items)
-            .block(border("Artists", app.focus_col == 0, theme))
+            .block(border(&filtered_title("Artists", app, 0), app.focus_col == 0, theme))
             .highlight_style(Style::default().fg(theme.accent)),
         artist_area,
         &mut state,
@@ -365,7 +377,7 @@ fn render_playlists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     state.select(Some(app.cursors.playlist));
     f.render_stateful_widget(
         List::new(items)
-            .block(border("Playlists", app.focus_col == 0, theme))
+            .block(border(&filtered_title("Playlists", app, 0), app.focus_col == 0, theme))
             .highlight_style(Style::default().fg(theme.accent)),
         cols[0],
         &mut state,

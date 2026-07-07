@@ -40,6 +40,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Inline filter (`f`) routing: typing narrows the focused column, Esc/Enter
+    // clear. Navigation keys (arrows) fall through to normal dispatch and
+    // operate on the filtered list.
+    if app.filter.is_some() && handle_filter_key(app, key) {
+        return;
+    }
+
     // Leader-key (`gg`) handling: a pending `g` arms a top-of-column jump; a
     // second `g` consumes it. Any other key cancels the pending state and
     // falls through to normal dispatch.
@@ -116,6 +123,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 cursor: 0,
             });
         }
+        // `f` inline filter on the focused column (spec §5.4).
+        (KeyCode::Char('f'), _) => app.toggle_filter(),
         (KeyCode::Char('?'), _) => {
             app.overlay = Some(Overlay::Help);
         }
@@ -234,6 +243,38 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             app.overlay = Some(other);
         }
         None => {}
+    }
+}
+
+/// Keys that route to the active inline filter (`f`). Returns true if the key
+/// was consumed (Char/Backspace/Esc/Enter); false for navigation keys, which
+/// fall through to normal dispatch and operate on the filtered list.
+fn handle_filter_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc => {
+            app.filter = None;
+            true
+        }
+        KeyCode::Enter => {
+            // Enter on a filter jumps the cursor to the first match + clears.
+            app.filter_jump();
+            true
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            if let Some(f) = &mut app.filter {
+                f.text.push(c);
+            }
+            true
+        }
+        KeyCode::Backspace => {
+            if let Some(f) = &mut app.filter {
+                f.text.pop();
+            }
+            true
+        }
+        _ => false, // navigation keys fall through
     }
 }
 
