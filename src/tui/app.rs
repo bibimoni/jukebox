@@ -22,6 +22,25 @@ pub enum View {
     Artists,
     Playlists,
     Queue,
+    Youtube,
+}
+
+/// A YouTube playlist/mood list shown in the Y view. `track_ids` are the
+/// video_ids of the list's tracks, fetched lazily (via the sidecar) when the
+/// user focuses the list.
+#[derive(Clone, Default)]
+pub struct YtList {
+    pub id: String,
+    pub name: String,
+    pub kind: YtListKind,
+    pub track_ids: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum YtListKind {
+    #[default]
+    Account,
+    Suggested,
 }
 
 /// A user-defined playlist: name + ordered track ids.
@@ -111,6 +130,11 @@ pub struct App {
     pub radio: crate::yt::session::RadioCursor,
     /// CoreAudio re-clock cadence (switch-once-per-YT-session).
     pub device_rate: crate::source::device_rate::DeviceRateState,
+    /// YouTube lists for the Y view (account playlists + suggested/mood).
+    /// Empty until `refresh_yt_lists` populates them.
+    pub yt_lists: Vec<YtList>,
+    pub yt_lists_loading: bool,
+    pub yt_error: Option<String>,
 }
 
 /// What an id resolves to at load time, after the Local/YouTube/Mixed policy.
@@ -166,6 +190,7 @@ impl ContextResolver for App {
 struct ClonedResolver<'a> {
     playlists: &'a [Playlist],
     manual_queue: Vec<String>,
+    yt_lists: &'a [YtList],
 }
 
 impl ContextResolver for ClonedResolver<'_> {
@@ -178,6 +203,13 @@ impl ContextResolver for ClonedResolver<'_> {
     }
     fn queue_ids(&self) -> Vec<String> {
         self.manual_queue.clone()
+    }
+    fn yt_playlist_ids(&self, key: &str) -> Vec<String> {
+        self.yt_lists
+            .iter()
+            .find(|l| l.id == key)
+            .map(|l| l.track_ids.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -225,6 +257,9 @@ impl App {
             yt_session,
             radio: crate::yt::session::RadioCursor::new(),
             device_rate: crate::source::device_rate::DeviceRateState::default(),
+            yt_lists: Vec::new(),
+            yt_lists_loading: false,
+            yt_error: None,
         }
     }
 
@@ -337,6 +372,11 @@ impl App {
                 .get(self.cursors.playlist)
                 .map(|p| p.track_ids.clone())
                 .unwrap_or_default(),
+            View::Youtube => self
+                .yt_lists
+                .get(self.cursors.playlist)
+                .map(|l| l.track_ids.clone())
+                .unwrap_or_default(),
             View::Queue => self.transport.manual_queue.clone(),
         }
     }
@@ -371,6 +411,13 @@ impl App {
                     .map(|p| p.name.clone())
                     .unwrap_or_default(),
             },
+            View::Youtube => {
+                let l = self.yt_lists.get(self.cursors.playlist).cloned();
+                Context::Youtube {
+                    key: l.as_ref().map(|l| l.id.clone()).unwrap_or_default(),
+                    name: l.as_ref().map(|l| l.name.clone()).unwrap_or_default(),
+                }
+            }
             View::Queue => Context::Queue,
         }
     }
@@ -385,14 +432,14 @@ impl App {
         }
         let start = self.transport.cursor;
         for _ in 0..n.max(1) {
-            let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+            let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
             let id = match self.transport.current(&r, &self.catalog) {
                 Some(id) => id,
                 None => return,
             };
             drop(r);
             if self.dead.contains(&id) {
-                let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+                let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
                 let _ = self.transport.next(&r, &self.catalog);
                 if self.transport.cursor == start {
                     return;
@@ -403,7 +450,7 @@ impl App {
                 Some(Resolved::Local { path, sample_rate_hz, bit_depth }) => {
                     if std::fs::metadata(&path).is_err() {
                         self.dead.insert(id.clone());
-                        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+                        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
                         let _ = self.transport.next(&r, &self.catalog);
                         if self.transport.cursor == start {
                             return;
@@ -439,7 +486,7 @@ impl App {
                 None => {
                     // Unresolvable (unknown id, or remote resolve failed) → dead.
                     self.dead.insert(id.clone());
-                    let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+                    let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
                     let _ = self.transport.next(&r, &self.catalog);
                     if self.transport.cursor == start {
                         return;
@@ -548,7 +595,7 @@ impl App {
         if let Some(np) = self.now_playing.clone() {
             self.transport.history.push((np.id().to_string(), self.transport.context.clone()));
         }
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
         self.transport
             .switch_context(ctx, Some(&start), &r, &self.catalog);
         self.start_playback();
@@ -565,14 +612,14 @@ impl App {
         if let Some(np) = self.now_playing.clone() {
             self.transport.history.push((np.id().to_string(), self.transport.context.clone()));
         }
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
         self.transport
             .switch_context(ctx, Some(start), &r, &self.catalog);
         self.start_playback();
     }
 
     pub fn next(&mut self) {
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
         if let Some(id) = self.transport.next(&r, &self.catalog) {
             // Load the returned id directly: `Transport::next`'s manual-queue
             // path returns a queued id without updating the cursor, so
@@ -618,6 +665,7 @@ impl App {
                                 let r = ClonedResolver {
                                     playlists: &self.playlists,
                                     manual_queue: self.transport.manual_queue.clone(),
+                                    yt_lists: &self.yt_lists,
                                 };
                                 self.transport.switch_context(ctx, Some(&vid), &r, &self.catalog);
                                 self.start_playback();
@@ -638,7 +686,7 @@ impl App {
     }
 
     pub fn prev(&mut self) {
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
         if let Some(id) = self.transport.prev(&r, &self.catalog) {
             self.load_track(&id);
         }
@@ -655,12 +703,12 @@ impl App {
             ShuffleMode::Smart => ShuffleMode::Random,
             ShuffleMode::Random => ShuffleMode::Off,
         };
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
         self.transport.set_shuffle(m, &r, &self.catalog);
     }
 
     pub fn reshuffle(&mut self) {
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
         self.transport.reshuffle(&r, &self.catalog);
     }
 
@@ -732,7 +780,7 @@ impl App {
             artist: next.artist.clone(),
             track_ids,
         };
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
         self.transport.switch_context(ctx, None, &r, &self.catalog);
         // Keep the browse cursor in sync so the UI shows the new album.
         self.cursors.album = next_idx;
@@ -752,7 +800,7 @@ impl App {
         // Radio implies shuffled play; force smart shuffle so it actually
         // discovers (catalog order would just be sequential).
         self.transport.shuffle = ShuffleMode::Smart;
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
         self.transport.switch_context(ctx, None, &r, &self.catalog);
     }
 
@@ -822,6 +870,7 @@ impl App {
             View::Artists => "artists",
             View::Playlists => "playlists",
             View::Queue => "queue",
+            View::Youtube => "youtube",
         }
     }
 

@@ -15,6 +15,11 @@ use crate::catalog::Catalog;
 pub trait ContextResolver {
     fn playlist_ids(&self, name: &str) -> Vec<String>;
     fn queue_ids(&self) -> Vec<String>;
+    /// Resolve a YouTube playlist/list by its key (playlist id). Default
+    /// empty so existing fakes and tests keep compiling; `App` overrides it.
+    fn yt_playlist_ids(&self, _key: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// A single album grouped under an artist: its title, owning artist, and the
@@ -46,6 +51,13 @@ pub enum Context {
         query: String,
         track_ids: Vec<String>,
     },
+    /// A YouTube playlist/mood list. `key` is the playlist id; resolves via
+    /// `ContextResolver::yt_playlist_ids` (distinct from `Context::Playlist`,
+    /// which is local-only, so same-named local + YT lists can't collide).
+    Youtube {
+        key: String,
+        name: String,
+    },
     Queue,
 }
 
@@ -57,6 +69,7 @@ impl Context {
             Context::Artist { artist, .. } => artist.clone(),
             Context::Playlist { name } => format!("♫ {name}"),
             Context::Search { query, .. } => format!("search: {query}"),
+            Context::Youtube { name, .. } => format!("♫ {name}"),
             Context::Queue => "Queue".into(),
         }
     }
@@ -71,6 +84,7 @@ impl Context {
             | Context::Search { track_ids, .. } => track_ids.clone(),
             Context::Playlist { name } => r.playlist_ids(name),
             Context::Queue => r.queue_ids(),
+            Context::Youtube { key, .. } => r.yt_playlist_ids(key),
         }
     }
 
@@ -83,7 +97,7 @@ impl Context {
             Context::Album { track_ids, .. }
             | Context::Artist { track_ids, .. }
             | Context::Search { track_ids, .. } => track_ids.len(),
-            Context::Playlist { .. } | Context::Queue => 0,
+            Context::Playlist { .. } | Context::Youtube { .. } | Context::Queue => 0,
         }
     }
 }

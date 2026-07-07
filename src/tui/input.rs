@@ -235,6 +235,10 @@ fn focused_column_len(app: &App) -> usize {
             0 => app.playlists.len(),
             _ => focused_track_count(app),
         },
+        View::Youtube => match app.focus_col {
+            0 => app.yt_lists.len(),
+            _ => focused_track_count(app),
+        },
         View::Queue => app.transport.manual_queue.len(),
     }
 }
@@ -255,6 +259,11 @@ fn focused_track_count(app: &App) -> usize {
             .get(app.cursors.playlist)
             .map(|p| p.track_ids.len())
             .unwrap_or(0),
+        View::Youtube => app
+            .yt_lists
+            .get(app.cursors.playlist)
+            .map(|l| l.track_ids.len())
+            .unwrap_or(0),
         View::Queue => app.transport.manual_queue.len(),
     }
 }
@@ -264,6 +273,7 @@ fn max_focus_col(app: &App) -> usize {
     match app.view {
         View::Artists => 2,
         View::Playlists => 1,
+        View::Youtube => 1,
         View::Queue => 0,
     }
 }
@@ -324,6 +334,10 @@ fn focused_cursor(app: &App) -> usize {
             0 => app.cursors.playlist,
             _ => app.cursors.track,
         },
+        View::Youtube => match app.focus_col {
+            0 => app.cursors.playlist,
+            _ => app.cursors.track,
+        },
         View::Queue => app.cursors.queue,
     }
 }
@@ -356,6 +370,15 @@ fn set_focused_cursor(app: &mut App, v: usize) {
             }
             _ => app.cursors.track = v,
         },
+        View::Youtube => match app.focus_col {
+            // Changing the YT list invalidates the track cursor + triggers a
+            // lazy fetch of its tracks (wired in Task 13).
+            0 => {
+                app.cursors.playlist = v;
+                app.cursors.track = 0;
+            }
+            _ => app.cursors.track = v,
+        },
         View::Queue => app.cursors.queue = v,
     }
 }
@@ -370,8 +393,10 @@ fn cycle_view(app: &mut App, fwd: bool) {
     let next = match (app.view, fwd) {
         (View::Artists, true) => View::Playlists,
         (View::Playlists, true) => View::Queue,
-        (View::Queue, true) => View::Artists,
-        (View::Artists, false) => View::Queue,
+        (View::Queue, true) => View::Youtube,
+        (View::Youtube, true) => View::Artists,
+        (View::Artists, false) => View::Youtube,
+        (View::Youtube, false) => View::Queue,
         (View::Playlists, false) => View::Artists,
         (View::Queue, false) => View::Playlists,
     };
@@ -458,6 +483,7 @@ fn handle_browse_click(app: &mut App, col: u16, row: u16) {
             0 => switch_view(app, View::Artists),
             1 => switch_view(app, View::Playlists),
             2 => switch_view(app, View::Queue),
+            3 => switch_view(app, View::Youtube),
             _ => {}
         }
         return;
@@ -505,6 +531,10 @@ fn focused_column_len_with_focus(app: &App, focus: usize) -> usize {
         },
         View::Playlists => match focus {
             0 => app.playlists.len(),
+            _ => focused_track_count(app),
+        },
+        View::Youtube => match focus {
+            0 => app.yt_lists.len(),
             _ => focused_track_count(app),
         },
         View::Queue => app.transport.manual_queue.len(),
