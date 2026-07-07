@@ -38,7 +38,7 @@ fn two_artist_cat() -> (tempfile::TempDir, Catalog) {
 /// bar (title, artist, quality readout, progress gauge).
 fn build_app() -> App {
     let (_d, cat) = two_artist_cat();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     // Start playback on t1 so the player bar shows a now-playing track and a
     // non-zero progress gauge instead of the "— nothing playing —" placeholder.
     app.play_in_context_ids(vec!["t1".into()], "t1");

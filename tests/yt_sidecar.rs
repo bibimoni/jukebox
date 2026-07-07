@@ -115,3 +115,15 @@ fn sidecar_try_recv_none_when_idle() {
     assert!(matches!(s.try_recv().unwrap(), None));
     let _ = std::fs::remove_file(&script);
 }
+
+#[test]
+fn session_spawn_and_auth_status_no_cookies() {
+    // The fake script returns pong for any input; Session.auth_status sends
+    // AuthStatus, the fake returns Pong — so we just assert no panic/hang and
+    // that Session can be constructed against a fake sidecar.
+    let python = std::path::PathBuf::from("python3");
+    let script = fake_script();
+    let s = jukebox::yt::session::Session::spawn(&python, &script, None);
+    assert!(s.is_ok(), "session spawn failed");
+    let _ = std::fs::remove_file(&script);
+}

@@ -42,7 +42,7 @@ fn two_artist_catalog() -> (tempfile::TempDir, Catalog) {
 #[test]
 fn app_builds_artist_index() {
     let (_d, cat) = two_artist_catalog();
-    let app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None);
+    let app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, None);
     // The artist index is keyed by symlinked_into_artists and surfaced as a
     // sorted Vec<String>; both artists must appear.
     assert!(app.artists.iter().any(|a| a == "Ado"));
@@ -57,7 +57,7 @@ fn app_builds_artist_index() {
 #[test]
 fn play_in_context_ids_sets_now_playing_and_context() {
     let (_d, cat) = two_artist_catalog();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, None);
     // Play t1 from a Search context spanning both tracks.
     app.play_in_context_ids(vec!["t1".into(), "t2".into()], "t1");
     assert_eq!(app.now_playing.as_deref(), Some("t1"));
@@ -106,7 +106,7 @@ impl Player for EndAfterN {
 fn on_track_ended_auto_advances() {
     let (_d, cat) = two_artist_catalog();
     let player: Box<dyn Player> = Box::new(EndAfterN { end_after: 1, ..Default::default() });
-    let mut app = App::new(cat, player, None);
+    let mut app = App::new(cat, player, None, None);
 
     app.play_in_context_ids(vec!["t1".into(), "t2".into()], "t1");
     assert_eq!(app.now_playing.as_deref(), Some("t1"));
@@ -138,7 +138,7 @@ fn all_dead_context_terminates_without_looping() {
     std::fs::write(&p, json).unwrap();
     let cat = Catalog::load(&p).unwrap();
 
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, None);
     app.play_in_context_ids(vec!["d1".into(), "d2".into()], "d1");
 
     // Both marked dead; nothing loaded.
@@ -152,7 +152,7 @@ fn cycle_shuffle_via_app_persists_into_transport() {
     // Integration: App.cycle_shuffle drives Transport.set_shuffle, so the mode
     // change survives and the play order is rebuilt for the live context.
     let (_d, cat) = two_artist_catalog();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, None);
     app.play_in_context_ids(vec!["t1".into(), "t2".into()], "t1");
     assert_eq!(app.transport.shuffle, ShuffleMode::Off);
 

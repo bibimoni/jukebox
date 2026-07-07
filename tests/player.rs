@@ -45,7 +45,7 @@ fn app_volume_up_reaches_player() {
     // Box the recorder; we read its captured state after the calls.
     let rec_handle = std::rc::Rc::new(rec);
     let player: Box<dyn Player> = Box::new(RecProxy(rec_handle.clone()));
-    let mut app = App::new(cat, player, None);
+    let mut app = App::new(cat, player, None, None);
     app.volume = 50;
     app.volume_up();
     assert_eq!(app.volume, 55);
@@ -72,7 +72,7 @@ fn app_set_volume_reaches_player() {
     let cat = Catalog::load(&p).unwrap();
     let rec_handle = std::rc::Rc::new(std::cell::RefCell::new(RecordingPlayer::default()));
     let player: Box<dyn Player> = Box::new(RecProxy(rec_handle.clone()));
-    let mut app = App::new(cat, player, None);
+    let mut app = App::new(cat, player, None, None);
     app.volume = 100;
     app.set_volume(33);
     assert_eq!(app.volume, 33, "set_volume sets the absolute value");

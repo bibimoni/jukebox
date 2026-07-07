@@ -6,4 +6,5 @@
 //! - [`session`] — auth/cookies/cache + the autoplay radio cursor (Task 9).
 
 pub mod proto;
+pub mod session;
 pub mod sidecar;

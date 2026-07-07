@@ -39,7 +39,7 @@ fn rendered_bar(app: &App, w: u16, h: u16) -> String {
 #[test]
 fn bar_shows_title_artist_and_quality() {
     let (_d, cat, _l) = one_track_cat();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.play_in_context_ids(vec!["t1".into()], "t1");
     let bar = rendered_bar(&app, 120, 3);
     assert!(bar.contains("Freedom"), "bar must show the title: {bar}");
@@ -51,7 +51,7 @@ fn bar_shows_title_artist_and_quality() {
 #[test]
 fn bar_appends_bitperfect_when_switch_sample_rate() {
     let (_d, cat, _l) = one_track_cat();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.switch_sample_rate = true;
     app.play_in_context_ids(vec!["t1".into()], "t1");
     let bar = rendered_bar(&app, 120, 3);
@@ -64,7 +64,7 @@ fn bar_appends_bitperfect_when_switch_sample_rate() {
 #[test]
 fn bar_omits_bitperfect_when_not_switching() {
     let (_d, cat, _l) = one_track_cat();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.switch_sample_rate = false;
     app.play_in_context_ids(vec!["t1".into()], "t1");
     let bar = rendered_bar(&app, 120, 3);
@@ -77,7 +77,7 @@ fn bar_omits_bitperfect_when_not_switching() {
 #[test]
 fn bar_shows_volume_and_mode_flags() {
     let (_d, cat, _l) = one_track_cat();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.volume = 70;
     app.play_in_context_ids(vec!["t1".into()], "t1");
     let bar = rendered_bar(&app, 120, 3);
@@ -92,7 +92,7 @@ fn bar_renders_without_now_playing() {
     // No track loaded: the bar must still render without panicking and keep
     // its layout (no crash, just empty/dimmed chrome).
     let (_d, cat, _l) = one_track_cat();
-    let app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     let _bar = rendered_bar(&app, 120, 3);
     let _bar = rendered_bar(&app, 80, 3);
 }

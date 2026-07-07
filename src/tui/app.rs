@@ -104,6 +104,11 @@ pub struct App {
     pub pending_g: bool,
     /// The active source mode (Local / YouTube / Mixed). Cycled by `M`.
     pub source_mode: crate::mode::SourceMode,
+    /// YouTube session (sidecar + auth/cache). `None` when YT is unavailable
+    /// (deps missing / spawn failed) — YT features degrade to clean stops.
+    pub yt_session: Option<crate::yt::session::Session>,
+    /// Autoplay radio cursor for CONT=YouTube.
+    pub radio: crate::yt::session::RadioCursor,
 }
 
 impl ContextResolver for App {
@@ -148,7 +153,12 @@ impl ContextResolver for ClonedResolver<'_> {
 }
 
 impl App {
-    pub fn new(catalog: Catalog, player: Box<dyn Player>, searcher: Option<Searcher>) -> Self {
+    pub fn new(
+        catalog: Catalog,
+        player: Box<dyn Player>,
+        searcher: Option<Searcher>,
+        yt_session: Option<crate::yt::session::Session>,
+    ) -> Self {
         let mut artist_index: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (i, t) in catalog.tracks.iter().enumerate() {
             for a in &t.symlinked_into_artists {
@@ -183,6 +193,8 @@ impl App {
             overlay: None,
             pending_g: false,
             source_mode: crate::mode::SourceMode::default(),
+            yt_session,
+            radio: crate::yt::session::RadioCursor::new(),
         }
     }
 
@@ -446,10 +458,38 @@ impl App {
                     self.start_playback();
                 }
                 ContinueMode::YouTube => {
-                    // Wired to RadioCursor in Task 9 (sidecar). Until then,
-                    // CONT=YouTube stops playback cleanly rather than spinning.
-                    self.player.stop().ok();
-                    self.now_playing = None;
+                    // Drive YouTube autoplay via RadioCursor (spec §3.4). Ask
+                    // for the next video id seeded by the just-finished track;
+                    // switch context to a fresh radio Search + load it.
+                    let seed = self.now_playing.clone();
+                    if let Some(session) = self.yt_session.as_mut() {
+                        let seed_id = seed.clone();
+                        match self.radio.advance(session as &mut dyn crate::yt::session::YtClient, seed_id) {
+                            Some(vid) => {
+                                if let Some(id) = self.now_playing.clone() {
+                                    self.transport.history.push((id, self.transport.context.clone()));
+                                }
+                                let ctx = Context::Search {
+                                    query: "youtube radio".into(),
+                                    track_ids: vec![vid.clone()],
+                                };
+                                let r = ClonedResolver {
+                                    playlists: &self.playlists,
+                                    manual_queue: self.transport.manual_queue.clone(),
+                                };
+                                self.transport.switch_context(ctx, Some(&vid), &r, &self.catalog);
+                                self.start_playback();
+                            }
+                            None => {
+                                self.player.stop().ok();
+                                self.now_playing = None;
+                            }
+                        }
+                    } else {
+                        // No session — stop cleanly (degrade, spec §3.5).
+                        self.player.stop().ok();
+                        self.now_playing = None;
+                    }
                 }
             }
         }

@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
             let searcher = search::Searcher::open(&cfg.filtered_dir.join("search-index")).ok();
             let player = player::launch(cfg.player, &cfg.mpv_socket);
 
-            let mut app = tui::App::new(cat, player, searcher);
+            let mut app = tui::App::new(cat, player, searcher, None);
             app.switch_sample_rate = cfg.switch_sample_rate;
 
             // Restore persisted layout + transport modes. Best-effort: a missing

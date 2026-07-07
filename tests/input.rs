@@ -69,7 +69,7 @@ fn focus_track_col(app: &mut App) {
 #[test]
 fn enter_plays_selected_in_context() {
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     focus_track_col(&mut app);
     handle_key(&mut app, key_code(KeyCode::Enter));
     assert_eq!(app.now_playing.as_deref(), Some("t1"));
@@ -78,7 +78,7 @@ fn enter_plays_selected_in_context() {
 #[test]
 fn gt_advances_to_next_track() {
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     focus_track_col(&mut app);
     handle_key(&mut app, key_code(KeyCode::Enter));
     assert_eq!(app.now_playing.as_deref(), Some("t1"));
@@ -89,7 +89,7 @@ fn gt_advances_to_next_track() {
 #[test]
 fn z_cycles_shuffle_mode() {
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     assert_eq!(app.transport.shuffle, ShuffleMode::Off);
     handle_key(&mut app, key('z'));
     assert_eq!(app.transport.shuffle, ShuffleMode::Smart);
@@ -102,7 +102,7 @@ fn z_cycles_shuffle_mode() {
 #[test]
 fn r_cycles_repeat_mode() {
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     assert_eq!(app.transport.repeat, RepeatMode::Off);
     handle_key(&mut app, key('r'));
     assert_eq!(app.transport.repeat, RepeatMode::All);
@@ -115,7 +115,7 @@ fn r_cycles_repeat_mode() {
 #[test]
 fn q_sets_should_quit() {
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     assert!(!app.should_quit);
     handle_key(&mut app, key('q'));
     assert!(app.should_quit);
@@ -124,7 +124,7 @@ fn q_sets_should_quit() {
 #[test]
 fn slash_opens_search_overlay_and_esc_closes_it() {
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     assert!(app.overlay.is_none());
     handle_key(&mut app, key('/'));
     assert!(matches!(app.overlay, Some(Overlay::Search { .. })));
@@ -157,7 +157,7 @@ fn cat_with_index() -> (tempfile::TempDir, Catalog) {
 fn search_overlay_populates_results() {
     let (_d, cat) = cat_with_index();
     let searcher = Searcher::open(&_d.path().join("search-index")).unwrap();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), Some(searcher));
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), Some(searcher), None);
 
     // Open the search overlay (same as `/`).
     handle_key(&mut app, key('/'));
@@ -183,7 +183,7 @@ fn search_overlay_populates_results() {
 #[test]
 fn four_key_opens_search_overlay() {
     let (_d, cat) = cat_with_index();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     assert!(app.overlay.is_none());
     handle_key(&mut app, key('4'));
     assert!(matches!(app.overlay, Some(Overlay::Search { .. })));
@@ -199,7 +199,7 @@ fn four_key_opens_search_overlay() {
 #[test]
 fn search_overlay_accepts_capital_letters() {
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     handle_key(&mut app, key('/'));
     // Shift+F: a real terminal sends Char('F') with the SHIFT modifier.
     handle_key(
@@ -219,7 +219,7 @@ fn search_overlay_n_types_into_query_not_navigation() {
     // the query — so you couldn't search for e.g. "nirvana". Now arrows are
     // the only navigator; `n` must go into the input.
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     handle_key(&mut app, key('/'));
     handle_key(&mut app, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
     let input = match &app.overlay {
@@ -235,7 +235,7 @@ fn search_overlay_arrow_keys_move_selection() {
     // the result cursor (previously only `n`/`N` did, so arrows were no-ops).
     let (_d, cat) = cat_with_index();
     let searcher = Searcher::open(&_d.path().join("search-index")).unwrap();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), Some(searcher));
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), Some(searcher), None);
     // Type a query that yields multiple results ("a" matches Ado/Aimer/etc).
     handle_key(&mut app, key('/'));
     handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
@@ -265,7 +265,7 @@ fn search_overlay_typing_letters_not_intercepted_as_navigation() {
     // 'j'/'k' are NOT navigation in the search overlay (only arrows are), so
     // typing "joji" must put 'j' into the input rather than move the cursor.
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     handle_key(&mut app, key('/'));
     handle_key(&mut app, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     let input = match &app.overlay {

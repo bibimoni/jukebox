@@ -49,7 +49,7 @@ fn rendered(app: &mut App, w: u16, h: u16) -> String {
 #[test]
 fn columns_show_artists_and_albums_and_tracks() {
     let (_d, cat) = two_artist_cat();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     // cursors default to 0 -> 40mP / Cosmic / Song1.
     let buf = rendered(&mut app, 120, 30);
     assert!(buf.contains("40mP"), "artist column must show the artist: {buf}");
@@ -60,7 +60,7 @@ fn columns_show_artists_and_albums_and_tracks() {
 #[test]
 fn rail_highlights_active_view() {
     let (_d, cat) = two_artist_cat();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.view = jukebox::tui::app::View::Queue;
     let buf = rendered(&mut app, 120, 30);
     // Rail must still render its labels in every view; Queue view must show
@@ -71,7 +71,7 @@ fn rail_highlights_active_view() {
 #[test]
 fn queue_view_lists_manual_queue_titles() {
     let (_d, cat) = two_artist_cat();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.view = jukebox::tui::app::View::Queue;
     app.transport.manual_queue.push("t1".into());
     app.transport.manual_queue.push("t2".into());
@@ -83,7 +83,7 @@ fn queue_view_lists_manual_queue_titles() {
 #[test]
 fn now_playing_track_marked_with_glyph() {
     let (_d, cat) = two_artist_cat();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.play_in_context_ids(vec!["t1".into()], "t1");
     let buf = rendered(&mut app, 120, 30);
     assert!(buf.contains('▶'), "now-playing track must be marked with the play glyph: {buf}");

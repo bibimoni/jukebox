@@ -24,7 +24,7 @@ fn cat_album() -> (tempfile::TempDir, Catalog, std::path::PathBuf) {
 #[test]
 fn play_selected_sets_context_and_starts_playback() {
     let (_d, cat, _l) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     // Browse to the album's track column; cursor on track 2.
     app.view = View::Artists;
     app.cursors.artist = 0;          // 40mP
@@ -55,7 +55,7 @@ fn dead_track_skipped_and_marked() {
     let p = d.path().join("catalog.json");
     std::fs::write(&p, json).unwrap();
     let cat = Catalog::load(&p).unwrap();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     // Set context to both tracks, start at dead1.
     app.play_in_context_ids(vec!["dead1".into(),"alive2".into()], "dead1");
     assert!(app.dead.contains("dead1"));
@@ -65,7 +65,7 @@ fn dead_track_skipped_and_marked() {
 #[test]
 fn cycle_shuffle_advances_mode() {
     let (_d, cat, _l) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.play_in_context_ids(vec!["t1".into(),"t2".into(),"t3".into()], "t1");
     app.cycle_shuffle();  // Off -> Smart
     assert_eq!(app.transport.shuffle, ShuffleMode::Smart);
@@ -78,7 +78,7 @@ fn cycle_shuffle_advances_mode() {
 #[test]
 fn cycle_repeat_advances_mode() {
     let (_d, cat, _l) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.cycle_repeat(); assert_eq!(app.transport.repeat, RepeatMode::All);
     app.cycle_repeat(); assert_eq!(app.transport.repeat, RepeatMode::One);
     app.cycle_repeat(); assert_eq!(app.transport.repeat, RepeatMode::Off);
@@ -87,7 +87,7 @@ fn cycle_repeat_advances_mode() {
 #[test]
 fn volume_clamps_and_mutes() {
     let (_d, cat, _l) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.volume = 5;
     app.volume_down(); assert_eq!(app.volume, 0);
     app.volume_down(); assert_eq!(app.volume, 0); // clamped
@@ -109,7 +109,7 @@ fn volume_clamps_and_mutes() {
 #[test]
 fn prev_across_context_switch_returns_prior_track() {
     let (_d, cat, _l) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     // Play t1 in context X = Search{[t1,t2]}.
     app.play_in_context_ids(vec!["t1".into(), "t2".into()], "t1");
     assert_eq!(app.now_playing.as_deref(), Some("t1"));
@@ -151,7 +151,7 @@ fn collaboration_album_shows_and_plays_all_tracks() {
     let p = d.path().join("catalog.json");
     std::fs::write(&p, json).unwrap();
     let cat = Catalog::load(&p).unwrap();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
 
     // tracks_for_album returns all 3 ids across all primary_artists, in
     // (disc, track_number) order.
@@ -182,7 +182,7 @@ fn clamp_cursors_rescues_stale_album_cursor() {
     // renders empty and play_selected plays nothing ("this artist has no
     // songs"). clamp_cursors must pull it back into a valid range.
     let (_d, cat, _l) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.cursors.artist = 0; // 40mP, 1 album
     app.cursors.album = 5; // stale / out of bounds
     app.cursors.track = 9; // stale / out of bounds
@@ -212,7 +212,7 @@ fn changing_artist_resets_album_and_track_cursors() {
     let p = d.path().join("catalog.json");
     std::fs::write(&p, json).unwrap();
     let cat = Catalog::load(&p).unwrap();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     // Park stale album/track cursors.
     app.cursors.album = 4;
     app.cursors.track = 7;
@@ -232,7 +232,7 @@ fn play_selected_plays_highlighted_track_not_a_stale_one() {
     // After switching artist (which resets track to 0), play_selected must
     // play the track under the cursor — not a stale track index from before.
     let (_d, cat) = cat_two_albums();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.view = View::Artists;
     app.cursors.artist = 0; // 40mP
     app.cursors.album = 0;  // Cosmic
@@ -273,7 +273,7 @@ fn cat_two_albums() -> (tempfile::TempDir, Catalog) {
 #[test]
 fn cycle_continue_advances_mode() {
     let (_d, cat, _l) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     assert_eq!(app.transport.continue_mode, ContinueMode::Off);
     app.cycle_continue();
     assert_eq!(app.transport.continue_mode, ContinueMode::NextAlbum);
@@ -286,7 +286,7 @@ fn cycle_continue_advances_mode() {
 #[test]
 fn continue_next_album_auto_advances_to_next_album() {
     let (_d, cat) = cat_two_albums();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.transport.continue_mode = ContinueMode::NextAlbum;
     // Browse 40mP (artist 0) → Cosmic (album 0) → last track (t3, index 2),
     // then play. This builds a real Album context so NextAlbum can continue.
@@ -309,7 +309,7 @@ fn continue_next_album_auto_advances_to_next_album() {
 #[test]
 fn continue_radio_keeps_playing_at_context_end() {
     let (_d, cat) = cat_two_albums();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.transport.continue_mode = ContinueMode::Radio;
     // Play a single-track context (t1) so `>` exhausts it immediately.
     app.play_in_context_ids(vec!["t1".into()], "t1");
@@ -330,7 +330,7 @@ fn continue_radio_keeps_playing_at_context_end() {
 #[test]
 fn cycle_continue_is_mode_aware() {
     let (_d, cat, _l) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.source_mode = jukebox::mode::SourceMode::Local;
     app.cycle_continue();
     assert_eq!(app.transport.continue_mode, ContinueMode::NextAlbum);
