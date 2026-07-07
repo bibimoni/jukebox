@@ -1,0 +1,20 @@
+jukebox — Copyright (c) 2026 bibimoni (MIT License)
+
+This product includes runtime tools invoked as subprocesses (not linked
+into the jukebox binary):
+
+  ytmusicapi  — MIT License        — https://github.com/sigma67/ytmusicapi
+                Copyright (c) sigma67 and contributors.
+                Used via the scripts/yt/ sidecar for YouTube Music metadata,
+                playlists, and autoplay-radio.
+
+  yt-dlp      — The Unlicense      — https://github.com/yt-dlp/yt-dlp
+                Used as a subprocess for YouTube stream URL extraction.
+
+Both are optional runtime dependencies (`scripts/yt/requirements.txt`); local
+playback does not require them. Their licenses are reproduced for reference;
+the jukebox source remains MIT-licensed.
+
+YouTube® is a trademark of Google LLC. This project is not affiliated with or
+endorsed by YouTube. Automated access may be subject to YouTube's Terms of
+Service; users are responsible for compliance.
