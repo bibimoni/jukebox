@@ -10,3 +10,4 @@ pub mod source;
 pub mod state;
 pub mod translit;
 pub mod tui;
+pub mod yt;
