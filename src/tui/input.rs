@@ -236,7 +236,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         // Help / PlaylistPicker: any non-Esc key is a no-op (overlay stays open
         // until Esc). PlaylistPicker selection routing is wired up in a later
         // task; for now the picker is display-only.
-        Some(Overlay::Discover { mut items, mut cursor }) => {
+        Some(Overlay::Discover { items, mut cursor }) => {
             match key.code {
                 KeyCode::Esc => {
                     app.overlay = None;
