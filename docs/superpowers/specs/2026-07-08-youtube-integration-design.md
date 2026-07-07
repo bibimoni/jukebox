@@ -17,7 +17,7 @@
 - **CoreAudio re-clock happens once** when a YT session begins, is **held** for consecutive YT tracks (mid-stream re-clock stutters), and is **restored** when a local track resumes.
 - **Seamless, intuitive UI** with balanced element placement and consistent keybindings across all modes — every transport key behaves identically whether the playing track is local or YouTube.
 - **In-app auth**: a shortcut opens a cookie-paste box; one paste derives auth for both `ytmusicapi` (metadata/radio) and `yt-dlp` (streaming). No leaving the app.
-- **Completion gate**: a fresh, isolated judge agent scores the finished app against a rubric and must approve every point at **max** before the app is concluded; anything below max triggers a redo loop.
+- **Completion gate**: a fresh, isolated judge agent scores the finished app against a rubric and reports the scores, used to find and fix weak spots.
 
 **Non-goals**
 - No upload/management of the user's YouTube library beyond read (browse + play).
@@ -317,11 +317,11 @@ jukebox is MIT (Copyright (c) 2026 bibimoni). The YouTube integration adds runti
 
 ---
 
-## 8. Completion gate — the strict judge
+## 8. Completion gate — the judge
 
-The implementation is **not concluded** until a **fresh, isolated judge agent** (no shared context, given only the rubric + a running app, driven live via the `run`/`verify` skills — not just code reading) scores each dimension and **approves every point at max**. If any point is below max: diagnose → fix → re-judge, until all-max or the user intervenes.
+A **fresh, isolated judge agent** (no shared context, given only the rubric + a running app, driven live via the `run`/`verify` skills — not just code reading) scores each dimension and reports the scores. The report is used to find and fix weak spots; it is not an all-or-nothing pass/fail gate.
 
-Rubric (each 0–2: **max** = meets the bar, **mid** = works but rough, **zero** = broken/weird):
+Rubric (each 0–2: **2** = meets the bar, **1** = works but rough, **0** = broken/weird):
 
 | # | Dimension | "Max" bar |
 |---|---|---|

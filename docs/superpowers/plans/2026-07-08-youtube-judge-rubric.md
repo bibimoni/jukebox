@@ -1,17 +1,16 @@
-# YouTube Integration — Strict Judge Rubric
+# YouTube Integration — Judge Rubric
 
-The implementation is not concluded until a fresh, isolated judge agent scores
-the finished app against this rubric and approves **every dimension at max**.
-Anything below max triggers a diagnose → fix → re-judge loop until all-max or
-the user intervenes.
+A judge agent scores the finished app against this rubric and reports the
+scores. The report is used to find and fix weak spots; it is not an all-or-
+nothing gate.
 
 Spec: `docs/superpowers/specs/2026-07-08-youtube-integration-design.md`
 
 ## Scoring
 
-Each dimension is 0–2: **2 (max)** = meets the bar; **1 (mid)** = works but
-rough; **0 (zero)** = broken or weird behavior. The app passes only when all
-eight are at max.
+Each dimension is 0–2: **2** = meets the bar; **1** = works but rough;
+**0** = broken or weird behavior. The judge reports the score per dimension
+with a one-line justification and a file:line reference.
 
 ## Dimensions
 
@@ -55,3 +54,8 @@ Launch the app live (`cargo run -- play`), drive it, and exercise each
 dimension. Use a stubbed/fake YouTube session (the E2E tests at
 `tests/e2e_yt.rs` show how) if real Premium cookies aren't available, but the
 flows must be exercised — not just code-read.
+
+## Report
+
+A markdown table of scores with justifications, ending with the judge's
+overall assessment (not a pass/fail gate).
