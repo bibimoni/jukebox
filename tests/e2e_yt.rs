@@ -144,3 +144,35 @@ fn cont_youtube_advances_via_radio_cursor() {
     let _ = std::fs::remove_file(&script);
     let _ = std::fs::remove_file(&map);
 }
+
+#[test]
+fn refresh_then_on_tick_populates_yt_lists_and_clears_loading() {
+    // Fake sidecar returns account playlists + suggestions. refresh_yt_lists
+    // fires async; on_tick drains + folds results into yt_lists + clears
+    // loading. This is the path the unit tests missed (on_tick wiring).
+    let map = r#"{"library_playlists":"{\"ok\":true,\"data\":{\"playlists\":[{\"id\":\"PL1\",\"name\":\"Liked\",\"count\":3}]}}","home_suggestions":"{\"ok\":true,\"data\":{\"suggestions\":[{\"id\":\"RD1\",\"name\":\"Focus\",\"count\":0}]}}"}"#;
+    let (script, map_file) = fake_sidecar(map);
+    std::env::set_var("JK_FAKE_MAP", &map_file);
+    let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    app.view = jukebox::tui::app::View::Youtube;
+    app.refresh_yt_lists();
+    assert!(app.yt_lists_loading, "refresh should set loading");
+    // Pump on_tick until the lists land (the reader thread delivers async).
+    let mut populated = false;
+    for _ in 0..100 {
+        app.on_tick();
+        if !app.yt_lists.is_empty() {
+            populated = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(populated, "on_tick should fold the fetched lists into yt_lists");
+    assert!(!app.yt_lists_loading, "on_tick should clear loading");
+    assert!(app.yt_lists.iter().any(|l| l.name == "Liked"), "account list missing");
+    assert!(app.yt_lists.iter().any(|l| l.name == "Focus"), "suggested list missing");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&map_file);
+}

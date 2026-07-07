@@ -931,32 +931,38 @@ impl App {
         // Auto-respawn a dead sidecar (best-effort, once per tick). Preserves
         // the browser/pasted auth; local playback is unaffected either way.
         if let Some(session) = self.yt_session.as_mut() {
-            if !session.is_alive() {
+            if session.is_alive() {
+                session.mark_alive();
+            } else if session.should_respawn() {
+                // Backoff-gated auto-respawn (≤3 attempts, ≥5s apart) so a
+                // sidecar that dies on spawn (bad cookies, missing deps) isn't
+                // respawned every tick into a tight loop.
+                session.note_respawn();
+                let attempts = session.respawn_attempts;
                 let browser = session.browser.clone();
-                match browser {
-                    Some(b) => {
-                        match crate::yt::session::Session::spawn_browser(
-                            &self.yt_python, &self.yt_script, b,
-                        ) {
-                            Ok(new) => {
-                                *self.yt_session.as_mut().unwrap() = new;
-                                self.yt_status = Some("YT: sidecar restarted".into());
-                            }
-                            Err(e) => self.yt_error = Some(format!("sidecar respawn: {e}")),
-                        }
-                    }
+                let respawned = match browser {
+                    Some(b) => crate::yt::session::Session::spawn_browser(
+                        &self.yt_python, &self.yt_script, b,
+                    ),
                     None => {
-                        // Guest/pasted-cookies session: respawn guest. A pasted
-                        // cookies file is re-loaded by Session::spawn.
+                        // Guest/pasted-cookies: respawn guest (pasted cookies
+                        // file re-loaded by Session::spawn).
                         let cookies = crate::yt::session::load_cookies();
-                        match crate::yt::session::Session::spawn(
+                        crate::yt::session::Session::spawn(
                             &self.yt_python, &self.yt_script, cookies,
-                        ) {
-                            Ok(new) => {
-                                *self.yt_session.as_mut().unwrap() = new;
-                                self.yt_status = Some("YT: sidecar restarted".into());
-                            }
-                            Err(e) => self.yt_error = Some(format!("sidecar respawn: {e}")),
+                        )
+                    }
+                };
+                match respawned {
+                    Ok(new) => {
+                        *self.yt_session.as_mut().unwrap() = new;
+                        self.yt_status = Some("YT: sidecar restarted".into());
+                    }
+                    Err(e) => {
+                        self.yt_error = Some(format!("sidecar respawn ({attempts}/3): {e}"));
+                        if attempts >= 3 {
+                            self.yt_status =
+                                Some("YT: sidecar keeps dying — run :yt setup / :yt auth".into());
                         }
                     }
                 }

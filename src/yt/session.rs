@@ -146,7 +146,16 @@ pub struct Session {
     /// Lists fetched async by `send_refresh`, picked up by `App::on_tick`.
     pub pending_playlists: Option<Vec<crate::yt::proto::PlaylistSummary>>,
     pub pending_suggestions: Option<Vec<crate::yt::proto::PlaylistSummary>>,
+    /// Respawn-backoff state (cap 3 attempts, ≥5s apart) so a sidecar that dies
+    /// on spawn (bad cookies, missing deps) doesn't get respawned every tick.
+    pub respawn_attempts: u32,
+    last_respawn: Option<Instant>,
 }
+
+/// Max auto-respawn attempts before giving up (surfacing `yt_error` instead).
+const RESPAWN_MAX: u32 = 3;
+/// Minimum gap between respawn attempts.
+const RESPAWN_GAP: Duration = Duration::from_secs(5);
 
 const URL_CACHE_CAP: usize = 2;
 
@@ -166,6 +175,8 @@ impl Session {
             resolve_inflight: None,
             pending_playlists: None,
             pending_suggestions: None,
+            respawn_attempts: 0,
+            last_respawn: None,
         })
     }
 
@@ -184,11 +195,34 @@ impl Session {
             resolve_inflight: None,
             pending_playlists: None,
             pending_suggestions: None,
+            respawn_attempts: 0,
+            last_respawn: None,
         })
     }
 
     pub fn is_alive(&mut self) -> bool {
         self.sidecar.is_alive()
+    }
+
+    /// True if a crashed sidecar should be respawned now (under the backoff
+    /// cap: ≤3 attempts, ≥5s apart). Call `note_respawn` immediately after a
+    /// respawn attempt; `mark_alive` resets the counter once it's healthy.
+    pub fn should_respawn(&self) -> bool {
+        if self.respawn_attempts >= RESPAWN_MAX {
+            return false;
+        }
+        match self.last_respawn {
+            Some(t) => t.elapsed() >= RESPAWN_GAP,
+            None => true,
+        }
+    }
+    pub fn note_respawn(&mut self) {
+        self.respawn_attempts += 1;
+        self.last_respawn = Some(Instant::now());
+    }
+    pub fn mark_alive(&mut self) {
+        self.respawn_attempts = 0;
+        self.last_respawn = None;
     }
 
     /// Look up a cached (pre-resolved) stream URL for `video_id`.

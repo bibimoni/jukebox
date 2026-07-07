@@ -242,6 +242,12 @@ pub fn run(app: &mut App, captured: Option<CapturedFormat>) -> Result<()> {
             app.on_track_ended();
         }
 
+        // Per-tick housekeeping: drain async sidecar responses (Y-view refresh,
+        // pre-resolved stream URLs) + auto-restart a crashed sidecar. Without
+        // this, fire-and-forget fetches never land and the Y view stays on
+        // "loading…" forever (spec §3.1/§3.5).
+        app.on_tick();
+
         terminal.draw(|f| view::layout::draw(f, app))?;
 
         if event::poll(std::time::Duration::from_millis(POLL_TIMEOUT_MS))? {

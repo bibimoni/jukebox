@@ -320,11 +320,6 @@ fn execute_command(app: &mut App, cmd: &str) {
                 app.apply_yt_browser(browser);
             }
         }
-        "yt auth browser" => {
-            app.yt_error = Some(
-                "usage: :yt auth browser <chrome|firefox|safari|edge|brave|opera|chromium>".into(),
-            );
-        }
         _ => {}
     }
 }
