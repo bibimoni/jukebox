@@ -181,12 +181,11 @@ fn search_overlay_populates_results() {
 }
 
 #[test]
-fn four_key_opens_search_overlay() {
+fn four_key_switches_to_youtube_view() {
     let (_d, cat) = cat_with_index();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
-    assert!(app.overlay.is_none());
     handle_key(&mut app, key('4'));
-    assert!(matches!(app.overlay, Some(Overlay::Search { .. })));
+    assert_eq!(app.view, jukebox::tui::app::View::Youtube);
 }
 
 /// Regression for the "Capital letters dropped in search overlay input" bug.
@@ -340,4 +339,45 @@ fn f_opens_filter_and_typing_narrows_artists() {
     // Esc clears.
     handle_key(&mut app, key_code(KeyCode::Esc));
     assert!(app.filter.is_none());
+}
+
+#[test]
+fn m_cycles_source_mode_without_stopping() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.play_in_context_ids(vec!["t1".into()], "t1");
+    let playing = app.now_playing.clone();
+    handle_key(&mut app, key('M'));
+    assert_eq!(app.source_mode, jukebox::mode::SourceMode::Youtube);
+    assert_eq!(app.now_playing, playing, "M must not stop playback");
+    handle_key(&mut app, key('M'));
+    assert_eq!(app.source_mode, jukebox::mode::SourceMode::Mixed);
+    handle_key(&mut app, key('M'));
+    assert_eq!(app.source_mode, jukebox::mode::SourceMode::Local);
+}
+
+#[test]
+fn four_switches_to_youtube_view() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    handle_key(&mut app, key_code(KeyCode::Char('4')));
+    assert_eq!(app.view, View::Youtube);
+}
+
+#[test]
+fn s_instant_random_via_key() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.source_mode = jukebox::mode::SourceMode::Local;
+    handle_key(&mut app, key('s'));
+    assert!(app.now_playing.is_some(), "s should start a random track");
+}
+
+#[test]
+fn S_opens_discover_overlay() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.source_mode = jukebox::mode::SourceMode::Local;
+    handle_key(&mut app, key('S'));
+    assert!(matches!(app.overlay, Some(Overlay::Discover { .. })));
 }

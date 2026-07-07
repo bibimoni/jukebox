@@ -1150,7 +1150,22 @@ impl App {
     /// This is the single source of truth for the search overlay's `results`
     /// field: every mutation of the overlay's `input` should be followed by a
     /// call to [`App::update_search_results`] (which calls this internally).
-    pub fn run_search(&self, q: &str) -> Vec<String> {
+    pub fn run_search(&mut self, q: &str) -> Vec<String> {
+        // The `/` search is scoped to the active view: YouTube in the Y view,
+        // the local BM25 index otherwise (spec §5.8). The overlay form is the
+        // same either way.
+        if self.view == View::Youtube {
+            let Some(session) = self.yt_session.as_mut() else {
+                return Vec::new();
+            };
+            return session
+                .search(q, 25)
+                .ok()
+                .into_iter()
+                .flatten()
+                .map(|t| t.video_id)
+                .collect();
+        }
         let Some(searcher) = self.searcher.as_ref() else {
             return Vec::new();
         };

@@ -25,8 +25,27 @@ fn main() -> anyhow::Result<()> {
             let searcher = search::Searcher::open(&cfg.filtered_dir.join("search-index")).ok();
             let player = player::launch(cfg.player, &cfg.mpv_socket);
 
-            let mut app = tui::App::new(cat, player, searcher, None);
+            // Resolve the YouTube sidecar script (mirrors standardize.sh
+            // resolution): manifest dir in dev, sibling-of-binary when installed.
+            let yt_script = {
+                let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/yt/yt.py");
+                if p.exists() {
+                    p
+                } else {
+                    std::env::current_exe()?.parent().unwrap().join("scripts/yt/yt.py")
+                }
+            };
+            let yt_python = std::path::PathBuf::from("python3");
+            // Spawn the sidecar best-effort with persisted cookies. A missing
+            // python3 / script / cookies just means YT features degrade to clean
+            // stops — local playback is unaffected.
+            let cookies = jukebox::yt::session::load_cookies();
+            let yt_session = jukebox::yt::session::Session::spawn(&yt_python, &yt_script, cookies).ok();
+
+            let mut app = tui::App::new(cat, player, searcher, yt_session);
             app.switch_sample_rate = cfg.switch_sample_rate;
+            app.yt_python = yt_python;
+            app.yt_script = yt_script;
 
             // Restore persisted layout + transport modes. Best-effort: a missing
             // or corrupt DB just falls back to defaults. At startup the transport
@@ -60,8 +79,10 @@ fn main() -> anyhow::Result<()> {
                 app.view = match layout.focus.as_str() {
                     "playlists" => View::Playlists,
                     "queue" => View::Queue,
+                    "youtube" => View::Youtube,
                     _ => View::Artists,
                 };
+                app.source_mode = jukebox::mode::SourceMode::from_str(&layout.source_mode);
             }
             if let Ok(pls) = state::load_playlists() {
                 app.playlists = pls;
@@ -89,7 +110,7 @@ fn main() -> anyhow::Result<()> {
                 app.transport.shuffle,
                 app.transport.repeat,
                 app.transport.continue_mode,
-                jukebox::mode::SourceMode::default(),
+                app.source_mode,
             );
             let _ = state::save_playlists(&app.playlists);
         }

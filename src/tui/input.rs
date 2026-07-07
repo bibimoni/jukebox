@@ -78,19 +78,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // `G` bottom of column.
         (KeyCode::Char('G'), _) => bottom_of_column(app),
 
-        // View switching: 1/2/3 = Artists/Playlists/Queue.
+        // View switching: 1/2/3/4 = Artists/Playlists/Queue/YouTube.
         (KeyCode::Char('1'), m) if m == KeyModifiers::NONE => switch_view(app, View::Artists),
         (KeyCode::Char('2'), m) if m == KeyModifiers::NONE => switch_view(app, View::Playlists),
         (KeyCode::Char('3'), m) if m == KeyModifiers::NONE => switch_view(app, View::Queue),
-        // `4` opens the Search overlay (spec §Keymap maps `4` → Search; the
-        // `View` enum has no Search variant, so this is the consistent path).
-        (KeyCode::Char('4'), m) if m == KeyModifiers::NONE => {
-            app.overlay = Some(Overlay::Search {
-                input: String::new(),
-                results: Vec::new(),
-                cursor: 0,
-            });
-        }
+        (KeyCode::Char('4'), m) if m == KeyModifiers::NONE => switch_view(app, View::Youtube),
 
         // Tab / Shift+Tab cycle view forward / backward.
         (KeyCode::Tab, m) if m.contains(KeyModifiers::SHIFT) => cycle_view(app, false),
@@ -111,9 +103,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('z'), _) => app.cycle_shuffle(),
         (KeyCode::Char('Z'), _) => app.reshuffle(),
         (KeyCode::Char('r'), _) => app.cycle_repeat(),
-        // `c` cycles continue mode (off → next album → radio): what happens
-        // when the current context ends with repeat off.
+        // `c` cycles continue mode (mode-dependent: see App::cycle_continue).
         (KeyCode::Char('c'), _) => app.cycle_continue(),
+        // `M` cycles the source mode Local → YouTube → Mixed → Local (never
+        // stops playback).
+        (KeyCode::Char('M'), _) => app.cycle_mode(),
+        // `s` instant random track in context; `S` discover overlay (spec §5.5).
+        (KeyCode::Char('s'), _) => app.instant_random(),
+        (KeyCode::Char('S'), _) => app.open_discover(),
 
         // --- Overlays -------------------------------------------------------
         (KeyCode::Char('/'), _) => {
@@ -239,6 +236,27 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         // Help / PlaylistPicker: any non-Esc key is a no-op (overlay stays open
         // until Esc). PlaylistPicker selection routing is wired up in a later
         // task; for now the picker is display-only.
+        Some(Overlay::Discover { mut items, mut cursor }) => {
+            match key.code {
+                KeyCode::Esc => {
+                    app.overlay = None;
+                    return;
+                }
+                KeyCode::Down if !items.is_empty() => {
+                    cursor = (cursor + 1) % items.len();
+                }
+                KeyCode::Up if !items.is_empty() => {
+                    cursor = cursor.checked_sub(1).unwrap_or(items.len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    app.overlay = Some(Overlay::Discover { items, cursor });
+                    app.play_discover_selection();
+                    return;
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::Discover { items, cursor });
+        }
         Some(other) => {
             app.overlay = Some(other);
         }
