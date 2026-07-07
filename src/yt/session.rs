@@ -54,6 +54,9 @@ pub fn load_cookies() -> Option<String> {
 pub struct Session {
     sidecar: Sidecar,
     cookies: Option<String>,
+    /// Browser profile to read cookies from (`"chrome"` etc.), when set instead
+    /// of a pasted cookies file. Mutually exclusive with `cookies`.
+    browser: Option<String>,
     /// video_id → RemoteTrack metadata seen via search/get_playlist/watch.
     pub track_cache: HashMap<String, RemoteTrack>,
     /// video_id → (url, expires_at). Capped at current+next.
@@ -63,11 +66,29 @@ pub struct Session {
 const URL_CACHE_CAP: usize = 2;
 
 impl Session {
+    /// Spawn with pasted `cookies` (Netscape) OR `browser` (profile name) —
+    /// pass exactly one; both `None` runs guest mode. `browser` makes the
+    /// sidecar read cookies from the browser profile (no file written).
     pub fn spawn(python: &Path, script: &Path, cookies: Option<String>) -> Result<Self> {
-        let sidecar = Sidecar::spawn(python, script, cookies.clone())?;
+        let sidecar = Sidecar::spawn(python, script, cookies.clone(), None)?;
         Ok(Session {
             sidecar,
             cookies,
+            browser: None,
+            track_cache: HashMap::new(),
+            url_cache: Vec::new(),
+        })
+    }
+
+    /// Spawn reading cookies from a browser profile (e.g. `"chrome"`). No
+    /// cookie file is written; values stay in the browser. Used by
+    /// `:yt auth browser <name>`.
+    pub fn spawn_browser(python: &Path, script: &Path, browser: String) -> Result<Self> {
+        let sidecar = Sidecar::spawn(python, script, None, Some(browser.clone()))?;
+        Ok(Session {
+            sidecar,
+            cookies: None,
+            browser: Some(browser),
             track_cache: HashMap::new(),
             url_cache: Vec::new(),
         })
@@ -78,19 +99,21 @@ impl Session {
     }
 
     pub fn has_cookies(&self) -> bool {
-        self.cookies.is_some()
+        self.cookies.is_some() || self.browser.is_some()
     }
 
     /// Clear cookies and respawn guest.
     pub fn clear_cookies(&mut self, python: &Path, script: &Path) -> Result<()> {
         self.cookies = None;
-        self.sidecar = Sidecar::spawn(python, script, None)?;
+        self.browser = None;
+        self.sidecar = Sidecar::spawn(python, script, None, None)?;
         Ok(())
     }
 
     /// Persist `cookies` (Netscape cookies.txt) to the cookies file (perms
     /// 0600) and respawn the sidecar with them. One paste feeds both
     /// `ytmusicapi` (via the cookie header) and `yt-dlp` (via the file).
+    /// Clears any browser profile (mutually exclusive).
     pub fn set_cookies(&mut self, cookies: String, python: &Path, script: &Path) -> Result<()> {
         let p = cookies_file();
         if let Some(parent) = p.parent() {
@@ -100,7 +123,19 @@ impl Session {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
         self.cookies = Some(cookies);
-        self.sidecar = Sidecar::spawn(python, script, self.cookies.clone())?;
+        self.browser = None;
+        self.sidecar = Sidecar::spawn(python, script, self.cookies.clone(), None)?;
+        Ok(())
+    }
+
+    /// Respawn the sidecar reading cookies from a browser profile (e.g.
+    /// `"chrome"`, `"firefox"`, `"safari"`, `"edge"`). No cookie file is
+    /// written; the cookie values stay in the browser. Clears any pasted
+    /// cookies (mutually exclusive). Used by `:yt auth browser <name>`.
+    pub fn set_browser(&mut self, browser: String, python: &Path, script: &Path) -> Result<()> {
+        self.browser = Some(browser.clone());
+        self.cookies = None;
+        self.sidecar = Sidecar::spawn(python, script, None, Some(browser))?;
         Ok(())
     }
 

@@ -296,7 +296,8 @@ fn handle_filter_key(app: &mut App, key: KeyEvent) -> bool {
     }
 }
 
-/// Execute a `:` command. v1 supports `:yt auth`, `:yt logout`, `:yt setup`.
+/// Execute a `:` command. Supports `:yt auth`, `:yt auth browser <name>`,
+/// `:yt logout`, `:yt setup`.
 fn execute_command(app: &mut App, cmd: &str) {
     match cmd {
         "yt auth" => {
@@ -309,6 +310,16 @@ fn execute_command(app: &mut App, cmd: &str) {
             app.yt_error = Some(
                 "install deps: pip install -r scripts/yt/requirements.txt".into(),
             );
+        }
+        other if other.starts_with("yt auth browser ") => {
+            let browser = other.trim_start_matches("yt auth browser ").trim().to_string();
+            if browser.is_empty() {
+                app.yt_error = Some(
+                    "usage: :yt auth browser <chrome|firefox|safari|edge|brave>".into(),
+                );
+            } else {
+                app.apply_yt_browser(browser);
+            }
         }
         _ => {}
     }

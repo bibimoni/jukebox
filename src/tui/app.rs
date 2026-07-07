@@ -805,6 +805,25 @@ impl App {
         }
     }
 
+    /// `:yt auth browser <name>` — respawn the sidecar reading cookies from a
+    /// browser profile (chrome/firefox/safari/edge/brave). No cookie file is
+    /// written; the values stay in the browser. The preferred auth path: no
+    /// credentials ever enter the conversation or a paste buffer.
+    pub fn apply_yt_browser(&mut self, browser: String) {
+        if self.yt_session.is_none() {
+            match crate::yt::session::Session::spawn_browser(&self.yt_python, &self.yt_script, browser) {
+                Ok(s) => self.yt_session = Some(s),
+                Err(e) => {
+                    self.yt_error = Some(format!("auth failed: {e}"));
+                }
+            }
+        } else if let Some(session) = self.yt_session.as_mut() {
+            if let Err(e) = session.set_browser(browser, &self.yt_python, &self.yt_script) {
+                self.yt_error = Some(format!("auth failed: {e}"));
+            }
+        }
+    }
+
     /// Drain pending sidecar responses (called from the event loop's poll).
     /// Best-effort: parse errors are ignored (logged to the file-logger by the
     /// sidecar reader). This keeps async list/track fetch results landing on

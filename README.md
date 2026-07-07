@@ -64,12 +64,18 @@ library by ISRC or normalized artist+title, else stream from YouTube).
 - `/` searches (scoped to the view — YouTube in the Y view, local BM25
   otherwise); `f` filters the focused column; `s` plays a random track; `S`
   opens a discover overlay.
-- **Auth:** run `:yt auth` inside the TUI and paste your YouTube cookies
-  (Netscape cookies.txt — export with a "Get cookies.txt" browser extension
-  from a logged-in `youtube.com` tab; **a Premium account is recommended** — it
-  unlocks ad-free 256k AAC streams and account rate limits). One paste feeds
+- **Auth (recommended):** run `:yt auth browser chrome` inside the TUI to read
+  cookies straight from your logged-in Chrome profile — **no cookie file is
+  written and no credentials are pasted anywhere**. `firefox`, `safari`,
+  `edge`, `brave`, `opera`, `chromium` are also supported. One command feeds
   both the metadata sidecar (`ytmusicapi`) and the stream resolver (`yt-dlp`).
-  `:yt logout` clears the cookies.
+  Log into `youtube.com` in that browser first; **a Premium account is
+  recommended** (ad-free 256k AAC streams + account rate limits).
+- **Auth (paste):** `:yt auth` opens a cookie-paste box for a Netscape
+  `cookies.txt` (export with a "Get cookies.txt" browser extension). Prefer
+  `:yt auth browser <name>` — pasting credentials is less safe.
+- `:yt logout` clears auth; `:yt setup` shows the install hint for the Python
+  deps.
 
 > **YouTube Terms of Service.** Automated access to YouTube may violate
 > YouTube's Terms of Service. This integration is intended for personal use

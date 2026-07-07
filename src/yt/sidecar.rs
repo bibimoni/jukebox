@@ -23,20 +23,34 @@ pub struct Sidecar {
     /// lifetime; dropped (stopping the thread) when `Sidecar` drops.
     _reader: Option<std::thread::JoinHandle<()>>,
     cookies: Option<String>,
+    browser: Option<String>,
     python: std::path::PathBuf,
     script: std::path::PathBuf,
 }
 
 impl Sidecar {
-    /// Spawn `python script` with `cookies` (Netscape cookies.txt) passed via
-    /// the `JUKEBOX_YT_COOKIES` env var. `cookies == None` runs guest mode.
-    pub fn spawn(python: &Path, script: &Path, cookies: Option<String>) -> Result<Self> {
-        let mut child = Command::new(python)
-            .arg(script)
+    /// Spawn `python script` with auth passed to the sidecar:
+    /// - `cookies` (Netscape cookies.txt) via the `JUKEBOX_YT_COOKIES` env var,
+    ///   OR
+    /// - `browser` (e.g. `"chrome"`) via `JUKEBOX_YT_BROWSER`, which makes the
+    ///   sidecar read cookies from that browser's profile (yt-dlp's
+    ///   `--cookies-from-browser` + browser_cookie3 for ytmusicapi). No cookie
+    ///   file is written; values never leave the browser.
+    /// Both `None` → guest mode.
+    pub fn spawn(
+        python: &Path,
+        script: &Path,
+        cookies: Option<String>,
+        browser: Option<String>,
+    ) -> Result<Self> {
+        let mut cmd = Command::new(python);
+        cmd.arg(script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .env("JUKEBOX_YT_COOKIES", cookies.clone().unwrap_or_default())
+            .env("JUKEBOX_YT_BROWSER", browser.clone().unwrap_or_default());
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning sidecar {} {}", python.display(), script.display()))?;
         let stdin = child.stdin.take().expect("stdin piped");
@@ -67,6 +81,7 @@ impl Sidecar {
             rx,
             _reader: Some(reader),
             cookies,
+            browser,
             python: python.to_path_buf(),
             script: script.to_path_buf(),
         })
@@ -97,11 +112,11 @@ impl Sidecar {
     }
 
     /// Best-effort restart once: kill the old child + reader, respawn with the
-    /// same python/script/cookies. Returns Err if the respawn fails.
+    /// same python/script/cookies/browser. Returns Err if the respawn fails.
     pub fn respawn(&mut self) -> Result<()> {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let new = Sidecar::spawn(&self.python, &self.script, self.cookies.clone())?;
+        let new = Sidecar::spawn(&self.python, &self.script, self.cookies.clone(), self.browser.clone())?;
         *self = new;
         Ok(())
     }

@@ -92,7 +92,7 @@ fn fake_script() -> std::path::PathBuf {
 fn sidecar_send_then_recv_ping() {
     let python = std::path::PathBuf::from("python3");
     let script = fake_script();
-    let mut s = Sidecar::spawn(&python, &script, None).unwrap();
+    let mut s = Sidecar::spawn(&python, &script, None, None).unwrap();
     s.send(&Request::Ping).unwrap();
     let mut got = None;
     for _ in 0..50 {
@@ -110,7 +110,7 @@ fn sidecar_send_then_recv_ping() {
 fn sidecar_try_recv_none_when_idle() {
     let python = std::path::PathBuf::from("python3");
     let script = fake_script();
-    let mut s = Sidecar::spawn(&python, &script, None).unwrap();
+    let mut s = Sidecar::spawn(&python, &script, None, None).unwrap();
     // nothing sent yet — no response pending
     assert!(matches!(s.try_recv().unwrap(), None));
     let _ = std::fs::remove_file(&script);
