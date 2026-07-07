@@ -91,23 +91,38 @@ impl Context {
 /// Group catalog tracks into albums per artist, preserving `(disc, track)` order
 /// within each album and sorting albums by lowercase title.
 ///
-/// Albums are keyed by `t.album` (falling back to `"(no album)"`) under
-/// `t.primary_artist`. Within an album, tracks are sorted by
+/// Albums are keyed by `t.album` (falling back to `"(no album)"`) and filed
+/// under **every** artist in `t.symlinked_into_artists` (falling back to
+/// `t.primary_artist` when that list is empty). This keeps the Albums column
+/// consistent with the Artists pane, which is also keyed on
+/// `symlinked_into_artists` — otherwise a collaborator who is never a
+/// `primary_artist` (e.g. Lilas Ikuta on a `milet; Aimer; Lilas Ikuta` track)
+/// would appear as an artist but have an empty Albums column and no tracks.
+///
+/// `Album.artist` keeps the track's `primary_artist` (first-seen per
+/// `(artist, album)` pair) so the album-context bar still names the owner.
+/// Within an album, tracks are sorted by
 /// `(disc_number.unwrap_or(1), track_number.unwrap_or(0))`.
 pub fn build_albums_by_artist(cat: &Catalog) -> BTreeMap<String, Vec<Album>> {
     let mut map: BTreeMap<String, Vec<Album>> = BTreeMap::new();
     for (i, t) in cat.tracks.iter().enumerate() {
-        let artist = t.primary_artist.clone();
         let album = t.album.clone().unwrap_or_else(|| "(no album)".into());
-        let entry = map.entry(artist.clone()).or_default();
-        if let Some(a) = entry.iter_mut().find(|a| a.title == album) {
-            a.track_indices.push(i);
+        let owners: Vec<&String> = if t.symlinked_into_artists.is_empty() {
+            std::iter::once(&t.primary_artist).collect()
         } else {
-            entry.push(Album {
-                title: album,
-                artist,
-                track_indices: vec![i],
-            });
+            t.symlinked_into_artists.iter().collect()
+        };
+        for owner in owners {
+            let entry = map.entry(owner.clone()).or_default();
+            if let Some(a) = entry.iter_mut().find(|a| a.title == album) {
+                a.track_indices.push(i);
+            } else {
+                entry.push(Album {
+                    title: album.clone(),
+                    artist: t.primary_artist.clone(),
+                    track_indices: vec![i],
+                });
+            }
         }
     }
     // sort each album's tracks by (disc, track_number), then albums by title

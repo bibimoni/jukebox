@@ -36,6 +36,36 @@ fn albums_grouped_by_artist_and_title() {
     assert_eq!(cosmic.track_indices.len(), 2);
 }
 
+/// Regression: a collaborator who is never a `primary_artist` must still see
+/// the album they appear on. `symlinked_into_artists` includes Lilas Ikuta on
+/// a milet-primary track, so the album must be filed under Lilas Ikuta too —
+/// otherwise the Albums column is empty and "this artist has no songs".
+#[test]
+fn collaborator_album_appears_under_non_primary_artist() {
+    let d = tempfile::tempdir().unwrap();
+    let json = serde_json::json!({
+        "version":1,"built_at":"x","source_root":"/tmp/lossless",
+        "tracks":[
+          {"id":"c1","artists":["milet","Aimer","Lilas Ikuta"],"primary_artist":"milet","title":"Omokage","album":"Omokage","track_number":1,"bit_depth":24,"sample_rate_hz":48000,"source_path":"lossless/milet/01.flac","symlinked_into_artists":["milet","Aimer","Lilas Ikuta"]},
+        ]
+    }).to_string();
+    let p = d.path().join("catalog.json");
+    std::fs::write(&p, json).unwrap();
+    let cat = Catalog::load(&p).unwrap();
+    let albums = build_albums_by_artist(&cat);
+    // The album is filed under every collaborating artist, not just the primary.
+    let lilas = albums.get("Lilas Ikuta").expect("collaborator must have the album");
+    assert_eq!(lilas.len(), 1);
+    assert_eq!(lilas[0].title, "Omokage");
+    assert_eq!(lilas[0].track_indices, vec![0]);
+    // The album's owner label stays the primary artist.
+    assert_eq!(lilas[0].artist, "milet");
+    let aimer = albums.get("Aimer").expect("Aimer must have the album");
+    assert_eq!(aimer.len(), 1);
+    let milet = albums.get("milet").expect("milet must have the album");
+    assert_eq!(milet.len(), 1);
+}
+
 #[test]
 fn album_context_track_ids_preserve_album_order() {
     let (_d, _cat) = cat2();
