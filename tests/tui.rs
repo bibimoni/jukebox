@@ -60,16 +60,16 @@ fn play_in_context_ids_sets_now_playing_and_context() {
     let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, None);
     // Play t1 from a Search context spanning both tracks.
     app.play_in_context_ids(vec!["t1".into(), "t2".into()], "t1");
-    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
     assert!(matches!(app.transport.context, Context::Search { .. }));
 
     // next advances to t2 within the same context.
     app.next();
-    assert_eq!(app.now_playing.as_deref(), Some("t2"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t2"));
 
     // prev walks back to t1.
     app.prev();
-    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
 }
 
 /// A stub player whose `track_ended()` returns true after `end_after` loads,
@@ -109,13 +109,13 @@ fn on_track_ended_auto_advances() {
     let mut app = App::new(cat, player, None, None);
 
     app.play_in_context_ids(vec!["t1".into(), "t2".into()], "t1");
-    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
 
     // The TUI loop polls the player for end-of-track; when it fires, App
     // auto-advances via on_track_ended (which delegates to next).
     assert!(app.player.track_ended(), "stub should report end after first load");
     app.on_track_ended();
-    assert_eq!(app.now_playing.as_deref(), Some("t2"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t2"));
 }
 
 #[test]

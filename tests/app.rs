@@ -31,13 +31,13 @@ fn play_selected_sets_context_and_starts_playback() {
     app.cursors.album = 0;          // Cosmic
     app.cursors.track = 1;          // Song2
     app.play_selected();
-    assert_eq!(app.now_playing.as_deref(), Some("t2"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t2"));
     // context is the album; next → Song3 (t3)
     app.next();
-    assert_eq!(app.now_playing.as_deref(), Some("t3"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t3"));
     // prev → back to Song2 (consume off, history works)
     app.prev();
-    assert_eq!(app.now_playing.as_deref(), Some("t2"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t2"));
 }
 
 #[test]
@@ -59,7 +59,7 @@ fn dead_track_skipped_and_marked() {
     // Set context to both tracks, start at dead1.
     app.play_in_context_ids(vec!["dead1".into(),"alive2".into()], "dead1");
     assert!(app.dead.contains("dead1"));
-    assert_eq!(app.now_playing.as_deref(), Some("alive2"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("alive2"));
 }
 
 #[test]
@@ -112,13 +112,13 @@ fn prev_across_context_switch_returns_prior_track() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     // Play t1 in context X = Search{[t1,t2]}.
     app.play_in_context_ids(vec!["t1".into(), "t2".into()], "t1");
-    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
     // Switch to t3 in a fresh context Y = Search{[t3]}.
     app.play_in_context_ids(vec!["t3".into()], "t3");
-    assert_eq!(app.now_playing.as_deref(), Some("t3"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t3"));
     // prev must return to the prior track (t1), not replay t3.
     app.prev();
-    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
 }
 
 /// Regression for the "Collaboration albums fragment" bug.
@@ -166,13 +166,13 @@ fn collaboration_album_shows_and_plays_all_tracks() {
     app.cursors.album = 0;   // Collab
     app.cursors.track = 0;   // t1
     app.play_selected();
-    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
     // `>` advances to a 2nd distinct track (previously stopped: only 1 track
     // in the context).
     app.next();
     let after = app.now_playing.clone().expect("next must not stop playback");
-    assert_ne!(after, "t1", "next must advance to a distinct track");
-    assert!(["t2", "t3"].contains(&after.as_str()));
+    assert_ne!(after.id(), "t1", "next must advance to a distinct track");
+    assert!(["t2", "t3"].contains(&after.id()));
 }
 
 #[test]
@@ -238,7 +238,7 @@ fn play_selected_plays_highlighted_track_not_a_stale_one() {
     app.cursors.album = 0;  // Cosmic
     app.cursors.track = 2;  // t3 (the 3rd track)
     app.play_selected();
-    assert_eq!(app.now_playing.as_deref(), Some("t3"),
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t3"),
         "play_selected must play the highlighted track, not a stale one");
 }
 
@@ -295,15 +295,15 @@ fn continue_next_album_auto_advances_to_next_album() {
     app.cursors.album = 0; // Cosmic (sorted before Solo)
     app.cursors.track = 2; // t3 — the last track of Cosmic
     app.play_selected();
-    assert_eq!(app.now_playing.as_deref(), Some("t3"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t3"));
     // `>` at the end of Cosmic with continue=NextAlbum must switch to "Solo"
     // and play its first track (s1) — not stop.
     app.next();
-    assert_eq!(app.now_playing.as_deref(), Some("s1"),
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("s1"),
         "NextAlbum continue should advance to the next album's first track");
     // prev returns to the prior track (t3) — history pushed across the switch.
     app.prev();
-    assert_eq!(app.now_playing.as_deref(), Some("t3"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t3"));
 }
 
 #[test]
@@ -313,7 +313,7 @@ fn continue_radio_keeps_playing_at_context_end() {
     app.transport.continue_mode = ContinueMode::Radio;
     // Play a single-track context (t1) so `>` exhausts it immediately.
     app.play_in_context_ids(vec!["t1".into()], "t1");
-    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
     // `>` with continue=Radio must NOT stop — it switches to the whole library
     // (a Radio/Search context) and plays some track from it.
     app.next();
@@ -323,7 +323,7 @@ fn continue_radio_keeps_playing_at_context_end() {
     // The radio context is the whole library (t1,t2,t3,s1); the next track
     // must be one of those and (smart shuffle, no back-to-back same artist)
     // distinct from t1 when possible.
-    assert!(["t1","t2","t3","s1"].contains(&after.as_str()));
+    assert!(["t1","t2","t3","s1"].contains(&after.id()));
 }
 
 
@@ -352,4 +352,17 @@ fn cycle_continue_is_mode_aware() {
     assert_eq!(app.transport.continue_mode, ContinueMode::YouTube);
     app.cycle_continue();
     assert_eq!(app.transport.continue_mode, ContinueMode::Off);
+}
+
+#[test]
+fn mixed_mode_plays_local_when_track_in_catalog() {
+    let (_d, cat, _l) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.source_mode = jukebox::mode::SourceMode::Mixed;
+    app.play_in_context_ids(vec!["t1".into()], "t1");
+    // now_playing is Local (the catalog track), not Remote.
+    assert!(matches!(
+        app.now_playing,
+        Some(jukebox::source::TrackSource::Local { ref track_id }) if track_id == "t1"
+    ));
 }

@@ -214,7 +214,7 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
         .enumerate()
         .filter_map(|(i, id)| {
             let t = app.catalog.tracks.iter().find(|t| &t.id == id)?;
-            let np = app.now_playing.as_deref() == Some(id);
+            let np = app.now_playing.as_ref().map(|s| s.id()) == Some(id.as_str());
             let glyph = if np { "▶" } else { " " };
             let num = format!("{:>2}", i + 1);
             let album = t.album.as_deref().unwrap_or("");

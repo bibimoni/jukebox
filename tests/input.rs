@@ -72,7 +72,7 @@ fn enter_plays_selected_in_context() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     focus_track_col(&mut app);
     handle_key(&mut app, key_code(KeyCode::Enter));
-    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
 }
 
 #[test]
@@ -81,9 +81,9 @@ fn gt_advances_to_next_track() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     focus_track_col(&mut app);
     handle_key(&mut app, key_code(KeyCode::Enter));
-    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
     handle_key(&mut app, key('>'));
-    assert_eq!(app.now_playing.as_deref(), Some("t2"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t2"));
 }
 
 #[test]

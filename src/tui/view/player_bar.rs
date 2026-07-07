@@ -78,12 +78,12 @@ fn build_info_line(app: &App, _width: usize) -> Line<'static> {
     spans.push(Span::styled(format!("{play_glyph} "), text));
 
     // Now-playing: title — artist · album (or a dim placeholder).
-    match now_playing_track(app) {
-        Some(t) => {
-            spans.push(Span::styled(t.title.clone(), text));
+    match app.now_playing_view() {
+        Some(v) => {
+            spans.push(Span::styled(v.title.clone(), text));
             spans.push(Span::styled(" — ", dim));
-            spans.push(Span::styled(t.primary_artist.clone(), text));
-            if let Some(album) = &t.album {
+            spans.push(Span::styled(v.artist.clone(), text));
+            if let Some(album) = &v.album {
                 if !album.is_empty() {
                     spans.push(Span::styled(" · ", dim));
                     spans.push(Span::styled(album.clone(), dim));
@@ -103,16 +103,27 @@ fn build_info_line(app: &App, _width: usize) -> Line<'static> {
 
     spans.push(Span::raw("   "));
 
-    // Quality readout: `24-bit / 96 kHz` (+ `· bit-perfect`).
-    if let Some(t) = now_playing_track(app) {
-        let q_color = quality_color(t.bit_depth, t.sample_rate_hz);
-        let q_text = format!("{}-bit / {} kHz", t.bit_depth, khz(t.sample_rate_hz));
-        spans.push(Span::styled(q_text, Style::default().fg(q_color)));
-        if app.switch_sample_rate {
-            spans.push(Span::styled(" · bit-perfect", Style::default().fg(q_color)));
+    // Quality readout: local → `24-bit / 96 kHz` (+`· bit-perfect`);
+    // remote → stream format label (`Opus 160k · YT` / `AAC 256k · YT Premium`).
+    match app.now_playing_view() {
+        Some(v) if v.source.is_remote() => {
+            let label = v.fmt.as_ref().map(|f| f.yt_label()).unwrap_or_else(|| "YT".to_string());
+            // YT lossy: a distinct (non-hires) accent; pair the word with the
+            // label so it's not color-alone.
+            let color = if crate::tui::view::theme::no_color() { Color::Reset } else { Color::Yellow };
+            spans.push(Span::styled(label, Style::default().fg(color)));
         }
-    } else {
-        spans.push(Span::styled("--bit / -- kHz", dim));
+        Some(v) => {
+            let q_color = quality_color(v.bit_depth, v.sample_rate_hz);
+            let q_text = format!("{}-bit / {} kHz", v.bit_depth, khz(v.sample_rate_hz));
+            spans.push(Span::styled(q_text, Style::default().fg(q_color)));
+            if app.switch_sample_rate {
+                spans.push(Span::styled(" · bit-perfect", Style::default().fg(q_color)));
+            }
+        }
+        None => {
+            spans.push(Span::styled("--bit / -- kHz", dim));
+        }
     }
 
     spans.push(Span::raw("   "));
@@ -199,7 +210,8 @@ fn khz(sample_rate_hz: u32) -> String {
 }
 
 /// Find the currently-playing [`Track`] by `app.now_playing` id.
+#[allow(dead_code)]
 fn now_playing_track(app: &App) -> Option<&Track> {
-    let id = app.now_playing.as_ref()?;
-    app.catalog.tracks.iter().find(|t| &t.id == id)
+    let id = app.now_playing.as_ref().map(|s| s.id())?;
+    app.catalog.tracks.iter().find(|t| t.id == id)
 }

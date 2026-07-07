@@ -94,7 +94,7 @@ pub struct App {
     pub column_widths: ColumnWidths,
     pub volume: u8,
     pub muted: bool,
-    pub now_playing: Option<String>,
+    pub now_playing: Option<crate::source::TrackSource>,
     pub dead: HashSet<String>,
     pub switch_sample_rate: bool,
     pub should_quit: bool,
@@ -109,6 +109,35 @@ pub struct App {
     pub yt_session: Option<crate::yt::session::Session>,
     /// Autoplay radio cursor for CONT=YouTube.
     pub radio: crate::yt::session::RadioCursor,
+    /// CoreAudio re-clock cadence (switch-once-per-YT-session).
+    pub device_rate: crate::source::device_rate::DeviceRateState,
+}
+
+/// What an id resolves to at load time, after the Local/YouTube/Mixed policy.
+enum Resolved {
+    Local {
+        path: std::path::PathBuf,
+        sample_rate_hz: u32,
+        bit_depth: u32,
+    },
+    Remote {
+        url: String,
+        fmt: crate::source::StreamFormat,
+        video_id: String,
+    },
+}
+
+/// A display view of the now-playing track for the player bar. Carries the
+/// `TrackSource` so the bar can render the right quality readout
+/// (`24-bit / 96 kHz · bit-perfect` vs `Opus 160k · YT`).
+pub struct NowPlayingView {
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    pub source: crate::source::TrackSource,
+    pub bit_depth: u32,
+    pub sample_rate_hz: u32,
+    pub fmt: Option<crate::source::StreamFormat>,
 }
 
 impl ContextResolver for App {
@@ -195,11 +224,45 @@ impl App {
             source_mode: crate::mode::SourceMode::default(),
             yt_session,
             radio: crate::yt::session::RadioCursor::new(),
+            device_rate: crate::source::device_rate::DeviceRateState::default(),
         }
     }
 
     fn track_by_id(&self, id: &str) -> Option<&Track> {
         self.catalog.tracks.iter().find(|t| t.id == id)
+    }
+
+    /// A display view of the now-playing track, local or remote, for the
+    /// player bar. `None` when nothing is playing or the metadata isn't
+    /// available yet (a remote track whose `RemoteTrack` isn't cached).
+    pub fn now_playing_view(&self) -> Option<NowPlayingView> {
+        let ts = self.now_playing.as_ref()?;
+        match ts {
+            crate::source::TrackSource::Local { track_id } => {
+                let t = self.track_by_id(track_id)?;
+                Some(NowPlayingView {
+                    title: t.title.clone(),
+                    artist: t.primary_artist.clone(),
+                    album: t.album.clone(),
+                    source: ts.clone(),
+                    bit_depth: t.bit_depth,
+                    sample_rate_hz: t.sample_rate_hz,
+                    fmt: None,
+                })
+            }
+            crate::source::TrackSource::Remote { video_id } => {
+                let rt = self.yt_session.as_ref()?.track_for(video_id)?;
+                Some(NowPlayingView {
+                    title: rt.title.clone(),
+                    artist: rt.artist.clone(),
+                    album: rt.album.clone(),
+                    source: ts.clone(),
+                    bit_depth: 0,
+                    sample_rate_hz: rt.fmt.as_ref().map(|f| f.sample_rate).unwrap_or(48000),
+                    fmt: rt.fmt.clone(),
+                })
+            }
+        }
     }
 
     /// All catalog tracks with the given album title, across all primary_artists,
@@ -312,7 +375,9 @@ impl App {
         }
     }
 
-    /// Begin playback at the current transport cursor, skipping dead tracks.
+    /// Begin playback at the current transport cursor, skipping dead tracks
+    /// and resolving each id through [`resolve_source`] (Local / YouTube /
+    /// Mixed policy). Remote ids that fail to resolve are treated as dead.
     fn start_playback(&mut self) {
         let n = self.transport.order.len();
         if n == 0 {
@@ -334,9 +399,46 @@ impl App {
                 }
                 continue;
             }
-            let t = match self.track_by_id(&id) {
-                Some(t) => t,
+            match self.resolve_source(&id) {
+                Some(Resolved::Local { path, sample_rate_hz, bit_depth }) => {
+                    if std::fs::metadata(&path).is_err() {
+                        self.dead.insert(id.clone());
+                        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
+                        let _ = self.transport.next(&r, &self.catalog);
+                        if self.transport.cursor == start {
+                            return;
+                        }
+                        continue;
+                    }
+                    if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
+                        &mut self.device_rate,
+                        crate::source::device_rate::LoadKind::Local { sample_rate_hz, bit_depth },
+                        self.switch_sample_rate,
+                    ) {
+                        let _ = crate::audio::set_output_format(sr, bd);
+                    }
+                    let _ = self.player.load(&path);
+                    self.now_playing = Some(crate::source::TrackSource::Local { track_id: id });
+                    return;
+                }
+                Some(Resolved::Remote { url, fmt, video_id }) => {
+                    if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
+                        &mut self.device_rate,
+                        crate::source::device_rate::LoadKind::Remote { sample_rate: fmt.sample_rate },
+                        self.switch_sample_rate,
+                    ) {
+                        let _ = crate::audio::set_output_format(sr, bd);
+                    }
+                    // mpv loadfile accepts an https URL via the same path —
+                    // PathBuf carries the URL string verbatim.
+                    let p = std::path::PathBuf::from(&url);
+                    let _ = self.player.load(&p);
+                    self.now_playing = Some(crate::source::TrackSource::Remote { video_id });
+                    return;
+                }
                 None => {
+                    // Unresolvable (unknown id, or remote resolve failed) → dead.
+                    self.dead.insert(id.clone());
                     let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
                     let _ = self.transport.next(&r, &self.catalog);
                     if self.transport.cursor == start {
@@ -344,23 +446,43 @@ impl App {
                     }
                     continue;
                 }
-            };
-            let path = t.resolve_source(&self.catalog.source_root);
-            if std::fs::metadata(&path).is_err() {
-                self.dead.insert(id.clone());
-                let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
-                let _ = self.transport.next(&r, &self.catalog);
-                if self.transport.cursor == start {
-                    return;
-                }
-                continue;
             }
-            if self.switch_sample_rate {
-                let _ = crate::audio::set_output_format(t.sample_rate_hz, t.bit_depth);
+        }
+    }
+
+    /// Resolve an opaque id to a playable source under the active mode:
+    /// - Local: catalog track → local file; unknown id → None.
+    /// - YouTube: sidecar `resolve_url` → stream URL + fmt; no session/error
+    ///   → None (degrade to dead).
+    /// - Mixed: catalog track present → local; else remote stream.
+    fn resolve_source(&mut self, id: &str) -> Option<Resolved> {
+        // Local catalog match first (Local + Mixed both prefer it when present).
+        if let Some(t) = self.track_by_id(id) {
+            // In YouTube mode, catalog tracks are never played locally — only
+            // streamed. So only take the local path in Local/Mixed.
+            if self.source_mode != crate::mode::SourceMode::Youtube {
+                return Some(Resolved::Local {
+                    path: t.resolve_source(&self.catalog.source_root),
+                    sample_rate_hz: t.sample_rate_hz,
+                    bit_depth: t.bit_depth,
+                });
             }
-            let _ = self.player.load(&path);
-            self.now_playing = Some(id);
-            return;
+        }
+        // Remote (YouTube / Mixed-no-local-hit). Needs a live session.
+        let session = self.yt_session.as_mut()?;
+        match session.resolve_url(id) {
+            Ok(u) => Some(Resolved::Remote {
+                url: u.url,
+                fmt: crate::source::StreamFormat {
+                    codec: u.codec,
+                    abr: u.abr,
+                    sample_rate: u.sample_rate,
+                    container: u.container,
+                    premium: u.premium,
+                },
+                video_id: id.to_string(),
+            }),
+            Err(_) => None, // expired/unavailable/rate-limited → dead path
         }
     }
 
@@ -377,13 +499,34 @@ impl App {
         if self.dead.contains(id) {
             return;
         }
-        let Some(t) = self.track_by_id(id) else { return };
-        let path = t.resolve_source(&self.catalog.source_root);
-        if self.switch_sample_rate {
-            let _ = crate::audio::set_output_format(t.sample_rate_hz, t.bit_depth);
+        match self.resolve_source(id) {
+            Some(Resolved::Local { path, sample_rate_hz, bit_depth }) => {
+                if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
+                    &mut self.device_rate,
+                    crate::source::device_rate::LoadKind::Local { sample_rate_hz, bit_depth },
+                    self.switch_sample_rate,
+                ) {
+                    let _ = crate::audio::set_output_format(sr, bd);
+                }
+                let _ = self.player.load(&path);
+                self.now_playing = Some(crate::source::TrackSource::Local { track_id: id.to_string() });
+            }
+            Some(Resolved::Remote { url, fmt, video_id }) => {
+                if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
+                    &mut self.device_rate,
+                    crate::source::device_rate::LoadKind::Remote { sample_rate: fmt.sample_rate },
+                    self.switch_sample_rate,
+                ) {
+                    let _ = crate::audio::set_output_format(sr, bd);
+                }
+                let p = std::path::PathBuf::from(&url);
+                let _ = self.player.load(&p);
+                self.now_playing = Some(crate::source::TrackSource::Remote { video_id });
+            }
+            None => {
+                self.dead.insert(id.to_string());
+            }
         }
-        let _ = self.player.load(&path);
-        self.now_playing = Some(id.to_string());
     }
 
     /// Play the track under the track-column cursor in the current view.
@@ -402,8 +545,8 @@ impl App {
         // (track, context) to history so `prev()` can pop back to it. Only
         // `next()` pushed previously, so a switch (e.g. playing a search result
         // then a track from another context) broke `prev` across the switch.
-        if let Some(id) = self.now_playing.clone() {
-            self.transport.history.push((id, self.transport.context.clone()));
+        if let Some(np) = self.now_playing.clone() {
+            self.transport.history.push((np.id().to_string(), self.transport.context.clone()));
         }
         let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
         self.transport
@@ -419,8 +562,8 @@ impl App {
         };
         // Mirror `play_selected`: push the current playback to history so a
         // subsequent `prev()` returns to it across the context switch.
-        if let Some(id) = self.now_playing.clone() {
-            self.transport.history.push((id, self.transport.context.clone()));
+        if let Some(np) = self.now_playing.clone() {
+            self.transport.history.push((np.id().to_string(), self.transport.context.clone()));
         }
         let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone() };
         self.transport
@@ -461,13 +604,12 @@ impl App {
                     // Drive YouTube autoplay via RadioCursor (spec §3.4). Ask
                     // for the next video id seeded by the just-finished track;
                     // switch context to a fresh radio Search + load it.
-                    let seed = self.now_playing.clone();
+                    let seed_id = self.now_playing.clone().map(|s| s.id().to_string());
                     if let Some(session) = self.yt_session.as_mut() {
-                        let seed_id = seed.clone();
                         match self.radio.advance(session as &mut dyn crate::yt::session::YtClient, seed_id) {
                             Some(vid) => {
-                                if let Some(id) = self.now_playing.clone() {
-                                    self.transport.history.push((id, self.transport.context.clone()));
+                                if let Some(np) = self.now_playing.clone() {
+                                    self.transport.history.push((np.id().to_string(), self.transport.context.clone()));
                                 }
                                 let ctx = Context::Search {
                                     query: "youtube radio".into(),
@@ -582,8 +724,8 @@ impl App {
         }
         // A context switch is a play transition: push current to history so
         // `prev` can pop back to the track that just finished.
-        if let Some(id) = self.now_playing.clone() {
-            self.transport.history.push((id, self.transport.context.clone()));
+        if let Some(np) = self.now_playing.clone() {
+            self.transport.history.push((np.id().to_string(), self.transport.context.clone()));
         }
         let ctx = Context::Album {
             album: next.title.clone(),
@@ -602,8 +744,8 @@ impl App {
     /// Music never stops — when this context eventually exhausts (the entire
     /// library), `next` re-enters here and rebuilds it.
     fn switch_to_radio(&mut self) {
-        if let Some(id) = self.now_playing.clone() {
-            self.transport.history.push((id, self.transport.context.clone()));
+        if let Some(np) = self.now_playing.clone() {
+            self.transport.history.push((np.id().to_string(), self.transport.context.clone()));
         }
         let all_ids: Vec<String> = self.catalog.tracks.iter().map(|t| t.id.clone()).collect();
         let ctx = Context::Search { query: "radio".into(), track_ids: all_ids };
