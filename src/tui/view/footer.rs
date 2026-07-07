@@ -13,39 +13,54 @@ use ratatui::{
 use crate::tui::app::App;
 use crate::tui::view::theme::Theme;
 
-/// Render the 1-line footer hint bar into `area`.
+/// Render the 1-line footer. Shows a transient YT status/error when set
+/// (visible from any view, so auth/setup feedback isn't lost); otherwise the
+/// key-hint bar.
 pub fn render(f: &mut Frame, area: &ratatui::layout::Rect, app: &App) {
     let theme = Theme::default();
     let dim = Style::default().fg(if no_color() { Color::Reset } else { theme.dim });
+    let line = if let Some(e) = &app.yt_error {
+        Line::from(Span::styled(
+            format!("YT: {e}"),
+            Style::default().fg(if no_color() { Color::Reset } else { Color::Yellow }),
+        ))
+    } else if let Some(s) = &app.yt_status {
+        Line::from(Span::styled(
+            s.clone(),
+            Style::default().fg(if no_color() { Color::Reset } else { theme.accent }),
+        ))
+    } else {
+        hint_line(app, &dim)
+    };
+    f.render_widget(
+        Paragraph::new(line.alignment(Alignment::Left))
+            .block(Block::default().borders(Borders::NONE)),
+        *area,
+    );
+}
+
+fn hint_line(app: &App, dim: &Style) -> Line<'static> {
     let sep = " · ";
-    // Scope the hint to the active view so the suggestions stay accurate:
-    // - Y view → "/" searches YouTube; otherwise local.
-    // - the hint stays the same shape either way (consistency over verbosity).
     let search_hint = if app.view == crate::tui::app::View::Youtube {
         "/ search YT"
     } else {
         "/ search"
     };
-    let line = Line::from(vec![
-        Span::styled("Enter play", dim),
+    Line::from(vec![
+        Span::styled("Enter play", *dim),
         Span::raw(sep),
-        Span::styled("Space pause", dim),
+        Span::styled("Space pause", *dim),
         Span::raw(sep),
-        Span::styled("> < next prev", dim),
+        Span::styled("> < next prev", *dim),
         Span::raw(sep),
-        Span::styled("M mode", dim),
+        Span::styled("M mode", *dim),
         Span::raw(sep),
-        Span::styled(search_hint, dim),
+        Span::styled(search_hint, *dim),
         Span::raw(sep),
-        Span::styled("? help", dim),
+        Span::styled("? help", *dim),
         Span::raw(sep),
-        Span::styled("q quit", dim),
+        Span::styled("q quit", *dim),
     ])
-    .alignment(Alignment::Left);
-    f.render_widget(
-        Paragraph::new(line).block(Block::default().borders(Borders::NONE)),
-        *area,
-    );
 }
 
 fn no_color() -> bool {

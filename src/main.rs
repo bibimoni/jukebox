@@ -35,7 +35,17 @@ fn main() -> anyhow::Result<()> {
                     std::env::current_exe()?.parent().unwrap().join("scripts/yt/yt.py")
                 }
             };
-            let yt_python = std::path::PathBuf::from("python3");
+            // Resolve a python that has the YT deps. Prefer, in order:
+            //   $JUKEBOX_YT_PYTHON  →  the jukebox venv (`:yt setup` creates it)
+            //   →  system `python3`.
+            // The venv lives next to the cookies file in the config dir.
+            let yt_python = std::env::var_os("JUKEBOX_YT_PYTHON")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    let venv_py = jukebox::yt::session::venv_python();
+                    if venv_py.exists() { Some(venv_py) } else { None }
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("python3"));
             // Spawn the sidecar best-effort with persisted cookies. A missing
             // python3 / script / cookies just means YT features degrade to clean
             // stops — local playback is unaffected.

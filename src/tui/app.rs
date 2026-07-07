@@ -155,6 +155,10 @@ pub struct App {
     pub yt_lists: Vec<YtList>,
     pub yt_lists_loading: bool,
     pub yt_error: Option<String>,
+    /// Transient status message (e.g. "YT auth: connected via chrome"), shown
+    /// in the footer until overwritten/cleared. Success counterpart to
+    /// `yt_error`.
+    pub yt_status: Option<String>,
     /// `python3` path + the sidecar script path, used to (re)spawn the sidecar
     /// when cookies change via `:yt auth`. Set by `main.rs`; defaults to
     /// `python3` + the manifest-dir script (works in dev).
@@ -295,6 +299,7 @@ impl App {
             yt_lists: Vec::new(),
             yt_lists_loading: false,
             yt_error: None,
+            yt_status: None,
             yt_python: std::path::PathBuf::from("python3"),
             yt_script: std::path::PathBuf::from("scripts/yt/yt.py"),
             filter: None,
@@ -790,6 +795,7 @@ impl App {
     /// session if none, persists the cookies, and respawns the sidecar with
     /// them. Best-effort: on failure sets `yt_error` so the Y view surfaces it.
     pub fn apply_yt_auth(&mut self, cookies: String) {
+        self.yt_error = None;
         if self.yt_session.is_none() {
             match crate::yt::session::Session::spawn(&self.yt_python, &self.yt_script, Some(cookies.clone())) {
                 Ok(s) => self.yt_session = Some(s),
@@ -801,8 +807,10 @@ impl App {
         } else if let Some(session) = self.yt_session.as_mut() {
             if let Err(e) = session.set_cookies(cookies, &self.yt_python, &self.yt_script) {
                 self.yt_error = Some(format!("auth failed: {e}"));
+                return;
             }
         }
+        self.yt_status = Some("YT auth: connected via pasted cookies".into());
     }
 
     /// `:yt auth browser <name>` — respawn the sidecar reading cookies from a
@@ -810,16 +818,54 @@ impl App {
     /// written; the values stay in the browser. The preferred auth path: no
     /// credentials ever enter the conversation or a paste buffer.
     pub fn apply_yt_browser(&mut self, browser: String) {
+        self.yt_error = None;
         if self.yt_session.is_none() {
-            match crate::yt::session::Session::spawn_browser(&self.yt_python, &self.yt_script, browser) {
+            match crate::yt::session::Session::spawn_browser(&self.yt_python, &self.yt_script, browser.clone()) {
                 Ok(s) => self.yt_session = Some(s),
                 Err(e) => {
                     self.yt_error = Some(format!("auth failed: {e}"));
+                    return;
                 }
             }
         } else if let Some(session) = self.yt_session.as_mut() {
-            if let Err(e) = session.set_browser(browser, &self.yt_python, &self.yt_script) {
+            if let Err(e) = session.set_browser(browser.clone(), &self.yt_python, &self.yt_script) {
                 self.yt_error = Some(format!("auth failed: {e}"));
+                return;
+            }
+        }
+        self.yt_status = Some(format!("YT auth: connected via {browser}"));
+    }
+
+    /// `:yt setup` — create the jukebox venv and install the YT deps into it,
+    /// so the sidecar runs against a python that has them. Blocks (~30s,
+    /// one-time). On success, respawn the sidecar against the new venv python.
+    pub fn yt_setup(&mut self) {
+        self.yt_error = None;
+        self.yt_status = Some("YT setup: installing deps…".into());
+        let reqs = self.yt_script.parent().map(|p| p.join("requirements.txt"));
+        let Some(reqs) = reqs else {
+            self.yt_error = Some("setup: could not find requirements.txt".into());
+            self.yt_status = None;
+            return;
+        };
+        match crate::yt::session::run_setup(&reqs) {
+            Ok(msg) => {
+                self.yt_python = crate::yt::session::venv_python();
+                self.yt_status = Some(msg);
+                // Respawn the sidecar against the new venv python, preserving
+                // any browser/pasted auth.
+                if let Some(session) = self.yt_session.as_mut() {
+                    if let Some(browser) = session.browser.clone() {
+                        match crate::yt::session::Session::spawn_browser(&self.yt_python, &self.yt_script, browser) {
+                            Ok(new) => { *self.yt_session.as_mut().unwrap() = new; }
+                            Err(e) => self.yt_error = Some(format!("respawn after setup: {e}")),
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                self.yt_error = Some(format!("setup failed: {e}"));
+                self.yt_status = None;
             }
         }
     }
@@ -877,6 +923,8 @@ impl App {
         if let Some(session) = self.yt_session.as_mut() {
             let _ = session.clear_cookies(&self.yt_python, &self.yt_script);
         }
+        self.yt_status = Some("YT auth: logged out (guest mode)".into());
+        self.yt_error = None;
     }
 
     /// `s` — instant random track from the active source, played *in context*

@@ -51,12 +51,61 @@ pub fn load_cookies() -> Option<String> {
     }
 }
 
+/// The jukebox-owned venv directory (`<config>/jukebox/yt-venv`), created by
+/// `:yt setup`. Holds `ytmusicapi`/`yt-dlp`/`browser_cookie3` so the sidecar
+/// doesn't depend on the system python having them.
+pub fn venv_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::config_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/.config"));
+    base.join("jukebox").join("yt-venv")
+}
+
+/// The venv's python (`<venv>/bin/python3`), used as the sidecar interpreter
+/// when the venv exists.
+pub fn venv_python() -> std::path::PathBuf {
+    venv_dir().join("bin").join("python3")
+}
+
+/// Create the jukebox venv and install the sidecar requirements into it.
+/// Used by `:yt setup`. Runs `python3 -m venv <dir>` then
+/// `<venv>/bin/pip install -r <requirements>`. Returns a status string on
+/// success, or an error. **Blocks** the caller (~30s one-time) — acceptable
+/// because `:yt setup` is an explicit user action.
+pub fn run_setup(requirements: &std::path::Path) -> Result<String> {
+    let dir = venv_dir();
+    if !venv_python().exists() {
+        let status = std::process::Command::new("python3")
+            .args(["-m", "venv", dir.to_str().unwrap_or("")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("python3 -m venv failed (exit {status})");
+        }
+    }
+    let pip = dir.join("bin").join("pip");
+    let status = std::process::Command::new(&pip)
+        .args(["install", "-q", "-r"])
+        .arg(requirements)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("pip install failed (exit {status})");
+    }
+    Ok(format!("installed YT deps into {}", dir.display()))
+}
+
 pub struct Session {
     sidecar: Sidecar,
     cookies: Option<String>,
     /// Browser profile to read cookies from (`"chrome"` etc.), when set instead
     /// of a pasted cookies file. Mutually exclusive with `cookies`.
-    browser: Option<String>,
+    pub browser: Option<String>,
     /// video_id → RemoteTrack metadata seen via search/get_playlist/watch.
     pub track_cache: HashMap<String, RemoteTrack>,
     /// video_id → (url, expires_at). Capped at current+next.

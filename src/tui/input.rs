@@ -307,9 +307,7 @@ fn execute_command(app: &mut App, cmd: &str) {
             app.yt_logout();
         }
         "yt setup" => {
-            app.yt_error = Some(
-                "install deps: pip install -r scripts/yt/requirements.txt".into(),
-            );
+            app.yt_setup();
         }
         other if other.starts_with("yt auth browser ") => {
             let browser = other.trim_start_matches("yt auth browser ").trim().to_string();
