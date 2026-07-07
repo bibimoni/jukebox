@@ -69,3 +69,49 @@ fn response_playlists_and_suggestions() {
     .unwrap();
     assert!(matches!(sg, Response::Suggestions(v) if v[0].id=="RD1"));
 }
+
+use jukebox::yt::sidecar::Sidecar;
+use std::io::Write;
+
+/// A fake sidecar script that echoes a canned "pong" for any input.
+fn fake_script() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let p = std::env::temp_dir().join(format!("fake-sidecar-{}-{}.py", std::process::id(), n));
+    let mut f = std::fs::File::create(&p).unwrap();
+    writeln!(f, "import sys,json").unwrap();
+    writeln!(f, "for line in sys.stdin:").unwrap();
+    writeln!(f, "    line=line.strip()").unwrap();
+    writeln!(f, "    if not line: continue").unwrap();
+    writeln!(f, "    print(json.dumps({{'ok':True,'data':{{'pong':True}}}}), flush=True)").unwrap();
+    p
+}
+
+#[test]
+fn sidecar_send_then_recv_ping() {
+    let python = std::path::PathBuf::from("python3");
+    let script = fake_script();
+    let mut s = Sidecar::spawn(&python, &script, None).unwrap();
+    s.send(&Request::Ping).unwrap();
+    let mut got = None;
+    for _ in 0..50 {
+        if let Ok(Some(r)) = s.try_recv() {
+            got = Some(r);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(matches!(got, Some(Response::Pong)), "got {got:?}");
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+fn sidecar_try_recv_none_when_idle() {
+    let python = std::path::PathBuf::from("python3");
+    let script = fake_script();
+    let mut s = Sidecar::spawn(&python, &script, None).unwrap();
+    // nothing sent yet — no response pending
+    assert!(matches!(s.try_recv().unwrap(), None));
+    let _ = std::fs::remove_file(&script);
+}
