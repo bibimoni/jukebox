@@ -30,6 +30,7 @@ fn layout_round_trips() {
         ShuffleMode::Smart,
         RepeatMode::One,
         ContinueMode::Radio,
+        jukebox::mode::SourceMode::Mixed,
     )
     .unwrap();
     let loaded = load_layout_at(&path).unwrap();
@@ -39,6 +40,7 @@ fn layout_round_trips() {
     assert_eq!(loaded.shuffle, "smart");
     assert_eq!(loaded.repeat, "one");
     assert_eq!(loaded.continue_mode, "radio");
+    assert_eq!(loaded.source_mode, "mixed");
 }
 
 #[test]

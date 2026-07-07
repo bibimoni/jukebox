@@ -124,6 +124,8 @@ pub struct LayoutState {
     pub repeat: String,
     #[serde(default = "default_off")]
     pub continue_mode: String,
+    #[serde(default = "default_local")]
+    pub source_mode: String,
 }
 
 fn default_focus() -> String {
@@ -138,6 +140,10 @@ fn default_off() -> String {
     "off".to_string()
 }
 
+fn default_local() -> String {
+    "local".to_string()
+}
+
 impl Default for LayoutState {
     fn default() -> Self {
         LayoutState {
@@ -147,6 +153,7 @@ impl Default for LayoutState {
             shuffle: "off".to_string(),
             repeat: "off".to_string(),
             continue_mode: "off".to_string(),
+            source_mode: "local".to_string(),
         }
     }
 }
@@ -199,6 +206,7 @@ pub fn save_layout_at(
     shuffle: crate::tui::queue::ShuffleMode,
     repeat: crate::tui::queue::RepeatMode,
     continue_mode: crate::tui::queue::ContinueMode,
+    source_mode: crate::mode::SourceMode,
 ) -> Result<()> {
     let conn = open_at(path)?;
     let v = serde_json::to_string(&LayoutState {
@@ -228,6 +236,7 @@ pub fn save_layout_at(
             crate::tui::queue::ContinueMode::Radio => "radio",
         }
         .to_string(),
+        source_mode: source_mode.as_str().to_string(),
     })?;
     conn.execute(
         "INSERT INTO state (key, value) VALUES ('layout', ?1)
@@ -291,8 +300,9 @@ pub fn save_layout(
     shuffle: crate::tui::queue::ShuffleMode,
     repeat: crate::tui::queue::RepeatMode,
     continue_mode: crate::tui::queue::ContinueMode,
+    source_mode: crate::mode::SourceMode,
 ) -> Result<()> {
-    save_layout_at(&db_path(), focus, widths, volume, shuffle, repeat, continue_mode)
+    save_layout_at(&db_path(), focus, widths, volume, shuffle, repeat, continue_mode, source_mode)
 }
 
 /// Load the layout from the default DB path.

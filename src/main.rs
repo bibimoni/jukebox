@@ -88,6 +88,7 @@ fn main() -> anyhow::Result<()> {
                 app.transport.shuffle,
                 app.transport.repeat,
                 app.transport.continue_mode,
+                jukebox::mode::SourceMode::default(),
             );
             let _ = state::save_playlists(&app.playlists);
         }
