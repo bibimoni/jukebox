@@ -95,6 +95,11 @@ pub enum Overlay {
     Command {
         input: String,
     },
+    /// YouTube cookie-paste overlay (spec §5.7). `input` accumulates the pasted
+    /// Netscape cookies.txt content; `Enter` saves, `Esc` cancels.
+    YtAuth {
+        input: String,
+    },
 }
 
 /// The central TUI state struct.
@@ -135,6 +140,11 @@ pub struct App {
     pub yt_lists: Vec<YtList>,
     pub yt_lists_loading: bool,
     pub yt_error: Option<String>,
+    /// `python3` path + the sidecar script path, used to (re)spawn the sidecar
+    /// when cookies change via `:yt auth`. Set by `main.rs`; defaults to
+    /// `python3` + the manifest-dir script (works in dev).
+    pub yt_python: std::path::PathBuf,
+    pub yt_script: std::path::PathBuf,
 }
 
 /// What an id resolves to at load time, after the Local/YouTube/Mixed policy.
@@ -260,6 +270,8 @@ impl App {
             yt_lists: Vec::new(),
             yt_lists_loading: false,
             yt_error: None,
+            yt_python: std::path::PathBuf::from("python3"),
+            yt_script: std::path::PathBuf::from("scripts/yt/yt.py"),
         }
     }
 
@@ -746,6 +758,34 @@ impl App {
     /// engine is eligible.
     pub fn cycle_mode(&mut self) {
         self.source_mode = self.source_mode.cycle();
+    }
+
+    /// Apply pasted YouTube cookies (from the `:yt auth` overlay). Spawns a
+    /// session if none, persists the cookies, and respawns the sidecar with
+    /// them. Best-effort: on failure sets `yt_error` so the Y view surfaces it.
+    pub fn apply_yt_auth(&mut self, cookies: String) {
+        if self.yt_session.is_none() {
+            match crate::yt::session::Session::spawn(&self.yt_python, &self.yt_script, Some(cookies.clone())) {
+                Ok(s) => self.yt_session = Some(s),
+                Err(e) => {
+                    self.yt_error = Some(format!("auth failed: {e}"));
+                    return;
+                }
+            }
+        } else if let Some(session) = self.yt_session.as_mut() {
+            if let Err(e) = session.set_cookies(cookies, &self.yt_python, &self.yt_script) {
+                self.yt_error = Some(format!("auth failed: {e}"));
+            }
+        }
+    }
+
+    /// Logout: clear cookies + respawn the sidecar guest.
+    pub fn yt_logout(&mut self) {
+        let p = crate::yt::session::cookies_file();
+        let _ = std::fs::remove_file(&p);
+        if let Some(session) = self.yt_session.as_mut() {
+            let _ = session.clear_cookies(&self.yt_python, &self.yt_script);
+        }
     }
 
     /// Fetch account playlists + suggested/mood lists from the sidecar for the

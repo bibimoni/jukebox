@@ -29,6 +29,28 @@ pub trait YtClient {
     fn get_watch_playlist(&mut self, video_id: &str) -> Result<Vec<String>>;
 }
 
+/// Path to the persisted cookies file: `<config_dir>/jukebox/yt-cookies.txt`.
+pub fn cookies_file() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::config_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/.config"));
+    let dir = base.join("jukebox");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("yt-cookies.txt")
+}
+
+/// Load persisted cookies (Netscape cookies.txt). `None` if absent/empty.
+pub fn load_cookies() -> Option<String> {
+    let p = cookies_file();
+    let s = std::fs::read_to_string(&p).ok()?;
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 pub struct Session {
     sidecar: Sidecar,
     cookies: Option<String>,
@@ -59,17 +81,26 @@ impl Session {
         self.cookies.is_some()
     }
 
-    /// Set cookies and respawn the sidecar with them.
-    pub fn set_cookies(&mut self, cookies: String, python: &Path, script: &Path) -> Result<()> {
-        self.cookies = Some(cookies);
-        self.sidecar = Sidecar::spawn(python, script, self.cookies.clone())?;
-        Ok(())
-    }
-
     /// Clear cookies and respawn guest.
     pub fn clear_cookies(&mut self, python: &Path, script: &Path) -> Result<()> {
         self.cookies = None;
         self.sidecar = Sidecar::spawn(python, script, None)?;
+        Ok(())
+    }
+
+    /// Persist `cookies` (Netscape cookies.txt) to the cookies file (perms
+    /// 0600) and respawn the sidecar with them. One paste feeds both
+    /// `ytmusicapi` (via the cookie header) and `yt-dlp` (via the file).
+    pub fn set_cookies(&mut self, cookies: String, python: &Path, script: &Path) -> Result<()> {
+        let p = cookies_file();
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&p, &cookies)?;
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        self.cookies = Some(cookies);
+        self.sidecar = Sidecar::spawn(python, script, self.cookies.clone())?;
         Ok(())
     }
 

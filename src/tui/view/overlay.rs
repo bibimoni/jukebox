@@ -40,7 +40,50 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
         Overlay::Help => render_help(f, area),
         Overlay::PlaylistPicker => render_playlist_picker(f, area, app),
         Overlay::Command { input } => render_command(f, area, &input),
+        Overlay::YtAuth { input } => render_yt_auth(f, area, &input),
     }
+}
+
+/// The YouTube cookie-paste overlay (spec §5.7). A centered popup with the
+/// paste instructions and the accumulating cookie text; `Enter` saves.
+fn render_yt_auth(f: &mut Frame, area: Rect, input: &str) {
+    let theme = Theme::default();
+    let popup = centered(area, 70, 40);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(Span::styled(" YouTube auth ", Style::default().fg(theme.accent)));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "Paste your YouTube cookies (Premium recommended).",
+            Style::default().fg(theme.text),
+        )),
+        Line::from(Span::styled(
+            "Export from a logged-in youtube.com tab with a",
+            Style::default().fg(theme.dim),
+        )),
+        Line::from(Span::styled(
+            "\"Get cookies.txt\" browser extension, then paste:",
+            Style::default().fg(theme.dim),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(theme.accent)),
+            Span::styled(input.to_string(), Style::default().fg(theme.text)),
+            Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter: save & connect    ·    Esc: cancel",
+            Style::default().fg(theme.dim),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Center a popup rect at ~60% of `area`, clamped to a minimum so its content

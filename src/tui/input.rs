@@ -194,15 +194,38 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     && !key.modifiers.contains(KeyModifiers::ALT) => input.push(c),
                 KeyCode::Backspace => { input.pop(); }
                 KeyCode::Enter => {
-                    // Command execution is best-effort + minimal for Task 11;
-                    // the command parser is wired up in a later task. For now
-                    // we just close the command line on submit.
+                    let cmd = input.trim().to_string();
                     app.overlay = None;
+                    execute_command(app, &cmd);
                     return;
                 }
                 _ => {}
             }
             app.overlay = Some(Overlay::Command { input });
+        }
+        Some(Overlay::YtAuth { mut input }) => {
+            // The auth overlay's own keymap: typing accumulates the pasted
+            // cookies; `Enter` saves+connects; `Esc` cancels (handled above).
+            // Pasted newlines arrive as Char('\n') — push them as spaces so the
+            // whole cookies.txt stays on one logical line (Netscape format is
+            // tab-delimited; joining with spaces still parses).
+            match key.code {
+                KeyCode::Enter => {
+                    app.apply_yt_auth(std::mem::take(&mut input));
+                    app.overlay = None;
+                    return;
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    input.push(if c == '\n' || c == '\r' { ' ' } else { c });
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::YtAuth { input });
         }
         // Help / PlaylistPicker: any non-Esc key is a no-op (overlay stays open
         // until Esc). PlaylistPicker selection routing is wired up in a later
@@ -211,6 +234,24 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             app.overlay = Some(other);
         }
         None => {}
+    }
+}
+
+/// Execute a `:` command. v1 supports `:yt auth`, `:yt logout`, `:yt setup`.
+fn execute_command(app: &mut App, cmd: &str) {
+    match cmd {
+        "yt auth" => {
+            app.overlay = Some(Overlay::YtAuth { input: String::new() });
+        }
+        "yt logout" => {
+            app.yt_logout();
+        }
+        "yt setup" => {
+            app.yt_error = Some(
+                "install deps: pip install -r scripts/yt/requirements.txt".into(),
+            );
+        }
+        _ => {}
     }
 }
 

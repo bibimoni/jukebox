@@ -275,3 +275,51 @@ fn search_overlay_typing_letters_not_intercepted_as_navigation() {
     assert_eq!(input, "j", "'j' must be typed into the query, not navigate");
 }
 
+
+
+fn isolate_xdg() -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("jk-xdg-{}-{}", std::process::id(),
+        std::sync::atomic::AtomicU64::new(0).fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+    std::fs::create_dir_all(&d).unwrap();
+    std::env::set_var("XDG_CONFIG_HOME", &d);
+    d
+}
+
+#[test]
+fn yt_auth_command_opens_overlay() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    open_command(&mut app, "yt auth");
+    assert!(matches!(app.overlay, Some(Overlay::YtAuth { .. })));
+}
+
+#[test]
+fn yt_auth_enter_saves_closes_esc_cancels() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::YtAuth { input: "# Netscape cookies".into() });
+    // Enter submits → writes cookies, closes overlay.
+    handle_key(&mut app, key_code(KeyCode::Enter));
+    assert!(app.overlay.is_none(), "Enter should close the auth overlay");
+    let _ = std::fs::remove_file(jukebox::yt::session::cookies_file());
+}
+
+#[test]
+fn yt_auth_esc_cancels_without_saving() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::YtAuth { input: "x".into() });
+    handle_key(&mut app, key_code(KeyCode::Esc));
+    assert!(app.overlay.is_none());
+}
+
+fn open_command(app: &mut App, text: &str) {
+    handle_key(app, key(':'));
+    for c in text.chars() {
+        handle_key(app, key(c));
+    }
+    handle_key(app, key_code(KeyCode::Enter));
+}
