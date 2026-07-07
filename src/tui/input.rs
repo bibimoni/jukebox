@@ -386,6 +386,11 @@ fn set_focused_cursor(app: &mut App, v: usize) {
 fn switch_view(app: &mut App, view: View) {
     app.view = view;
     app.focus_col = 0;
+    // Entering the Y view fetches the account + suggested lists (bounded
+    // synchronous roundtrip at the view-enter boundary; spec §5.3).
+    if view == View::Youtube {
+        app.refresh_yt_lists();
+    }
 }
 
 /// Cycle the browse view forward (`fwd=true`, Tab) or backward (Shift+Tab).

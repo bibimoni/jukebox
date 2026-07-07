@@ -86,12 +86,26 @@ fn render_rail(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 // --- YouTube view ----------------------------------------------------------
 
 /// Render the Y view: col1 = YT lists (account ♫ + suggested ✦), col2 = the
-/// focused list's tracks. Filled in Task 13; this stub renders loading/error
-/// states so the view is never blank.
+/// focused list's tracks. Below the tracks, a "Suggested / Up Next" pane
+/// lists the other suggested lists so short track lists don't waste space.
 fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let cw = &app.column_widths;
+    // Split off a 3-row Up-Next pane at the bottom when there are suggested
+    // lists to show; otherwise use the whole area for the 2-col browse.
+    let has_suggestions = app
+        .yt_lists
+        .iter()
+        .any(|l| l.kind == crate::tui::app::YtListKind::Suggested);
+    let split = if has_suggestions && area.height > 8 {
+        Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).split(area)
+    } else {
+        Layout::vertical([Constraint::Min(1)]).split(area)
+    };
+    let browse_area = split[0];
+    let upnext_area = split.get(1).copied();
+
     let cols = Layout::horizontal([Constraint::Length(cw.col1), Constraint::Min(cw.col2)])
-        .split(area);
+        .split(browse_area);
     let dim = Style::default().fg(theme.dim);
 
     // col1: YT list names (♫ account, ✦ suggested).
@@ -141,6 +155,23 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         f.render_widget(
             Paragraph::new(lines).block(border("Tracks", app.focus_col == 1, theme)),
             cols[1],
+        );
+    }
+
+    // Up-Next pane: the other suggested lists, one per line as `▶ name →`.
+    if let Some(up) = upnext_area {
+        let sugg: Vec<&crate::tui::app::YtList> = app
+            .yt_lists
+            .iter()
+            .filter(|l| l.kind == crate::tui::app::YtListKind::Suggested)
+            .collect();
+        let lines: Vec<Line> = sugg
+            .iter()
+            .map(|l| Line::from(Span::styled(format!("▶ {} →", l.name), dim)))
+            .collect();
+        f.render_widget(
+            Paragraph::new(lines).block(border("Suggested / Up Next", false, theme)),
+            up,
         );
     }
 }

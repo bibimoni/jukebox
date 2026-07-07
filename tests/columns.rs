@@ -88,3 +88,84 @@ fn now_playing_track_marked_with_glyph() {
     let buf = rendered(&mut app, 120, 30);
     assert!(buf.contains('▶'), "now-playing track must be marked with the play glyph: {buf}");
 }
+
+#[test]
+fn youtube_view_renders_account_and_suggested_lists() {
+    let (_d, cat) = cat_albums_for_yt();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.view = jukebox::tui::app::View::Youtube;
+    app.yt_lists = vec![
+        jukebox::tui::app::YtList { id: "PL1".into(), name: "Liked Songs".into(),
+            kind: jukebox::tui::app::YtListKind::Account, track_ids: vec![] },
+        jukebox::tui::app::YtList { id: "RD1".into(), name: "Focus Flow".into(),
+            kind: jukebox::tui::app::YtListKind::Suggested, track_ids: vec![] },
+    ];
+    let s = render(&app);
+    assert!(s.contains("♫ Liked Songs"), "{s}");
+    assert!(s.contains("✦ Focus Flow"), "{s}");
+    assert!(s.contains("Up Next") || s.contains("Suggested"), "missing up-next: {s}");
+}
+
+#[test]
+fn youtube_view_shows_setup_hint_when_no_session() {
+    let (_d, cat) = cat_albums_for_yt();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.view = jukebox::tui::app::View::Youtube;
+    let s = render(&app);
+    assert!(s.contains(":yt auth") || s.contains(":yt setup"), "missing setup hint: {s}");
+}
+
+fn cat_albums_for_yt() -> (tempfile::TempDir, Catalog) {
+    let d = tempfile::tempdir().unwrap();
+    let lossless = d.path().join("lossless");
+    std::fs::create_dir_all(lossless.join("A")).unwrap();
+    std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+    let json = serde_json::json!({
+        "version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+        "tracks":[{"id":"t1","artists":["A"],"primary_artist":"A","title":"S","album":"Al",
+        "bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/A/01.flac",
+        "symlinked_into_artists":["A"]}]
+    }).to_string();
+    let p = d.path().join("catalog.json");
+    std::fs::write(&p, json).unwrap();
+    (d, Catalog::load(&p).unwrap())
+}
+
+use jukebox::tui::view::layout::draw;
+fn render(app: &App) -> String {
+    // draw needs &mut App, but render is read-only for our assertion; clone
+    // state into a mut app via a fresh build to avoid mutating the test's app.
+    let mut app2 = clone_for_render(app);
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| draw(f, &mut app2)).unwrap();
+    let buf = term.backend().buffer();
+    let mut s = String::new();
+    for y in 0..30 {
+        for x in 0..120 {
+            s.push_str(buf[(x, y)].symbol());
+        }
+        s.push('\n');
+    }
+    s
+}
+fn clone_for_render(app: &App) -> App {
+    // Simplest: rebuild an app with the same yt_lists. App isn't Clone, so
+    // rebuild from a trivial catalog (the renderer only reads app state we set).
+    let d = tempfile::tempdir().unwrap();
+    let lossless = d.path().join("lossless");
+    std::fs::create_dir_all(lossless.join("A")).unwrap();
+    std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+    let json = serde_json::json!({"version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+        "tracks":[{"id":"t1","artists":["A"],"primary_artist":"A","title":"S","album":"Al",
+        "bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/A/01.flac","symlinked_into_artists":["A"]}]})
+        .to_string();
+    let p = d.path().join("catalog.json");
+    std::fs::write(&p, json).unwrap();
+    let cat = Catalog::load(&p).unwrap();
+    let mut a = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    a.view = app.view;
+    a.yt_lists = app.yt_lists.clone();
+    a.yt_error = app.yt_error.clone();
+    a.yt_session = None; // tests have no session
+    a
+}

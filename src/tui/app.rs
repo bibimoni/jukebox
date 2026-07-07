@@ -748,6 +748,45 @@ impl App {
         self.source_mode = self.source_mode.cycle();
     }
 
+    /// Fetch account playlists + suggested/mood lists from the sidecar for the
+    /// Y view. Bounded synchronous roundtrip (~3s) at the view-enter boundary;
+    /// on error sets `yt_error` so the view shows a message instead of blank.
+    /// No-op when there's no session (the view then shows the setup hint).
+    pub fn refresh_yt_lists(&mut self) {
+        let Some(session) = self.yt_session.as_mut() else {
+            self.yt_lists.clear();
+            return;
+        };
+        self.yt_lists_loading = true;
+        self.yt_error = None;
+        let account = session.library_playlists();
+        let suggested = session.home_suggestions();
+        self.yt_lists_loading = false;
+        match (account, suggested) {
+            (Ok(a), Ok(s)) => {
+                let mut lists: Vec<YtList> = a
+                    .into_iter()
+                    .map(|p| YtList {
+                        id: p.id,
+                        name: p.name,
+                        kind: YtListKind::Account,
+                        track_ids: Vec::new(),
+                    })
+                    .collect();
+                lists.extend(s.into_iter().map(|p| YtList {
+                    id: p.id,
+                    name: p.name,
+                    kind: YtListKind::Suggested,
+                    track_ids: Vec::new(),
+                }));
+                self.yt_lists = lists;
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                self.yt_error = Some(e.to_string());
+            }
+        }
+    }
+
     /// Auto-continue to the next album by the same artist. Pushes the current
     /// (track, context) to history first so `prev` can return. Returns false
     /// if the current context isn't an album or there's no next album.
