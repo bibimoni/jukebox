@@ -74,9 +74,22 @@ The UX-critical path — shuffle, repeat, prev, history, the queue, browse curso
 
 Is just the resolver's policy: given an id, prefer the local catalog match (ISRC-strong, then normalized artist+title fuzzy) → if a hit, play local; if no hit, treat the id as a `videoId` and stream. The `Y` view lists and the local Artists/Playlists lists both feed the same `Transport`.
 
+### `ContinueMode` enum change
+
+A new `ContinueMode::YouTube` variant is added (existing: `Off`/`NextAlbum`/`Radio`). The `c` cycle becomes mode-dependent (§5.8):
+- Local: `Off → NextAlbum → Radio → Off`
+- YouTube: `Off → YouTube → Off`
+- Mixed: `Off → NextAlbum → YouTube → Off`
+
+When `ContinueMode::YouTube` fires (context exhausted, repeat off), `RadioCursor` calls `get_watch_playlist(current_video_id, radio=True)` and feeds the returned queue as a new `Context::Search { track_ids: [videoIds...] }`, pre-resolving the first URL for gapless handoff (§3.4). `LayoutState.continue_mode` gains the `"youtube"` string mapping (alongside `"off"`/`"next"`/`"radio"`).
+
 ### `now_playing` widening
 
 `now_playing` widens from `Option<String>` (catalog id) to `Option<TrackSource>`, so the player bar can render either `24-bit / 96 kHz · bit-perfect` or `Opus 160k · YT` / `AAC 256k · YT Premium`. The `track_by_id` lookups in the view layer route through the same resolver so YT rows render titles/artists instead of raw videoIds.
+
+### No new `Context` variant
+
+YouTube track-id lists reuse existing `Context::Search { track_ids }` (the ids are videoIds, opaque to `Transport`). A YT playlist browse reuses `Context::Playlist { name }` where `name` resolves through a resolver that returns videoIds — so `ContextResolver` grows a `yt_playlist_ids(&self, key) -> Vec<String>` method parallel to `playlist_ids`. This keeps `Transport` and the `Context` enum untouched; only the resolver widens.
 
 ---
 
