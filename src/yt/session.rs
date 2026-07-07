@@ -283,7 +283,10 @@ impl RadioCursor {
     }
 
     /// Returns the next radio video id, refilling from `yt` (seeded by `seed`)
-    /// when the current queue is exhausted. `seed` is the just-finished video.
+    /// when the current queue is exhausted. `seed` is the just-finished video;
+    /// if the returned radio queue starts with the seed itself, it's dropped so
+    /// the cursor advances to a *different* track (matching YouTube's "Up
+    /// Next" behaviour).
     pub fn advance(&mut self, yt: &mut dyn YtClient, seed: Option<String>) -> Option<String> {
         if self.pos < self.queue.len() {
             let id = self.queue[self.pos].clone();
@@ -292,7 +295,12 @@ impl RadioCursor {
         }
         // Exhausted — refill.
         if let Some(seed) = seed {
-            if let Ok(next) = yt.get_watch_playlist(&seed) {
+            if let Ok(mut next) = yt.get_watch_playlist(&seed) {
+                // Drop a leading entry equal to the seed so we advance past it
+                // (YouTube's "Up Next" excludes the just-played track).
+                if next.first().map(|s| s == &seed).unwrap_or(false) {
+                    next.remove(0);
+                }
                 if next.is_empty() {
                     return None;
                 }

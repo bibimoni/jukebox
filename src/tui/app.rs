@@ -805,6 +805,52 @@ impl App {
         }
     }
 
+    /// Drain pending sidecar responses (called from the event loop's poll).
+    /// Best-effort: parse errors are ignored (logged to the file-logger by the
+    /// sidecar reader). This keeps async list/track fetch results landing on
+    /// the next tick without blocking the UI.
+    pub fn on_tick(&mut self) {
+        if let Some(session) = self.yt_session.as_mut() {
+            for resp in session.drain() {
+                match resp {
+                    crate::yt::proto::Response::Search(v) => {
+                        for t in v {
+                            session.track_cache.insert(
+                                t.video_id.clone(),
+                                crate::source::RemoteTrack {
+                                    video_id: t.video_id,
+                                    title: t.title,
+                                    artist: t.artist,
+                                    album: t.album,
+                                    dur: t.dur,
+                                    fmt: None,
+                                    isrc: t.isrc,
+                                },
+                            );
+                        }
+                    }
+                    crate::yt::proto::Response::Tracks(v) => {
+                        for t in v {
+                            session.track_cache.insert(
+                                t.video_id.clone(),
+                                crate::source::RemoteTrack {
+                                    video_id: t.video_id,
+                                    title: t.title,
+                                    artist: t.artist,
+                                    album: t.album,
+                                    dur: t.dur,
+                                    fmt: None,
+                                    isrc: t.isrc,
+                                },
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// Logout: clear cookies + respawn the sidecar guest.
     pub fn yt_logout(&mut self) {
         let p = crate::yt::session::cookies_file();
