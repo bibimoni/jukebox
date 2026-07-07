@@ -25,6 +25,55 @@ use crate::tui::app::App;
 use crate::tui::queue::{ContinueMode, RepeatMode, ShuffleMode};
 use crate::tui::view::theme::{quality_color, Theme};
 
+/// Compact 1-row player bar for the narrow (60–80 col) fallback: now-playing +
+/// quality + flags all on one line, no gauge (spec §5.6).
+pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
+    let theme = Theme::default();
+    let dim = Style::default().fg(theme.dim);
+    let text = Style::default().fg(theme.text);
+    let play_glyph = if app.player.is_playing() { "⏸" } else { "▶" };
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(format!("{play_glyph} "), text)];
+
+    match app.now_playing_view() {
+        Some(v) => {
+            spans.push(Span::styled(v.title.clone(), text));
+            spans.push(Span::styled(" — ", dim));
+            spans.push(Span::styled(v.artist.clone(), text));
+        }
+        None => spans.push(Span::styled("—", dim)),
+    }
+    spans.push(Span::raw("  "));
+    // quality
+    match app.now_playing_view() {
+        Some(v) if v.source.is_remote() => {
+            let label = v.fmt.as_ref().map(|f| f.yt_label()).unwrap_or_else(|| "YT".to_string());
+            let color = if crate::tui::view::theme::no_color() { Color::Reset } else { Color::Yellow };
+            spans.push(Span::styled(label, Style::default().fg(color)));
+        }
+        Some(v) => {
+            let q_color = quality_color(v.bit_depth, v.sample_rate_hz);
+            spans.push(Span::styled(
+                format!("{}bit/{}", v.bit_depth, khz(v.sample_rate_hz)),
+                Style::default().fg(q_color),
+            ));
+        }
+        None => spans.push(Span::styled("--", dim)),
+    }
+    spans.push(Span::raw("  "));
+    let cont = match app.transport.continue_mode {
+        ContinueMode::Off => "off",
+        ContinueMode::NextAlbum => "next",
+        ContinueMode::Radio => "radio",
+        ContinueMode::YouTube => "youtube",
+    };
+    spans.push(Span::styled(format!("CONT {cont} · MODE {}", app.source_mode.as_str()), dim));
+    f.render_widget(
+        Paragraph::new(Line::from(spans).alignment(Alignment::Left))
+            .block(Block::default().borders(Borders::NONE)),
+        area,
+    );
+}
+
 /// Render the player bar into `area` using state from `app`. Two rows:
 /// row 1 = now-playing + quality + volume; row 2 = progress gauge + mode
 /// flags (SHUF · RPT · CONT · MODE), `·`-separated, right-anchored.

@@ -95,15 +95,20 @@ fn layout_80x24() {
 }
 
 #[test]
+fn layout_70x24_narrow() {
+    snapshot_at(70, 24, "narrow");
+}
+
+#[test]
 fn layout_too_small() {
-    snapshot_at(70, 20, "too_small");
+    snapshot_at(50, 18, "too_small");
     // Hard invariant: the too-small terminal must show the "terminal too small"
-    // message and nothing else.
-    let backend = TestBackend::new(70, 20);
+    // message and nothing else. Below the narrow floor (60×20).
+    let backend = TestBackend::new(50, 18);
     let mut term = Terminal::new(backend).unwrap();
     let mut app = build_app();
     term.draw(|f| draw(f, &mut app)).unwrap();
-    let s = buffer_string(&term, 70, 20);
+    let s = buffer_string(&term, 50, 18);
     assert!(
         s.contains("terminal too small"),
         "too-small render must contain the resize message: {s}"

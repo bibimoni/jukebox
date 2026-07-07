@@ -2,4 +2,4 @@
 source: tests/layout.rs
 expression: s
 ---
-            terminal too small — resize or press q to quit
+  terminal too small — resize or press q to quit

@@ -85,6 +85,107 @@ fn render_rail(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
 // --- YouTube view ----------------------------------------------------------
 
+/// Narrow fallback (spec §5.6): rail + a single focused pane with a breadcrumb
+/// title. `h`/`l` drills in/out (focus_col changes which column is shown).
+pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
+    let theme = Theme::default();
+    let split = Layout::horizontal([Constraint::Length(app.column_widths.rail), Constraint::Min(1)])
+        .split(area);
+    render_rail(f, split[0], app, &theme);
+    let pane = split[1];
+
+    let (title, lines): (String, Vec<Line>) = match app.view {
+        View::Artists => match app.focus_col {
+            0 => (
+                "Artists".into(),
+                app.artists
+                    .iter()
+                    .map(|a| Line::from(Span::styled(a.clone(), Style::default().fg(theme.text))))
+                    .collect(),
+            ),
+            1 => {
+                let artist = app.artists.get(app.cursors.artist).cloned().unwrap_or_default();
+                let albums = app.albums_by_artist.get(&artist).cloned().unwrap_or_default();
+                (
+                    format!("Albums · {artist} ← Artists"),
+                    albums
+                        .iter()
+                        .map(|a| Line::from(Span::styled(a.title.clone(), Style::default().fg(theme.text))))
+                        .collect(),
+                )
+            }
+            _ => {
+                let artist = app.artists.get(app.cursors.artist).cloned().unwrap_or_default();
+                let album = app
+                    .albums_by_artist
+                    .get(&artist)
+                    .and_then(|a| a.get(app.cursors.album))
+                    .map(|a| a.title.clone())
+                    .unwrap_or_default();
+                let ids = app.tracks_for_album(&album);
+                (
+                    format!("Tracks · {album} ← Albums · {artist}"),
+                    track_rows(app, &ids, pane.width.saturating_sub(2) as usize, &theme),
+                )
+            }
+        },
+        View::Playlists => match app.focus_col {
+            0 => (
+                "Playlists".into(),
+                app.playlists
+                    .iter()
+                    .map(|p| Line::from(Span::styled(p.name.clone(), Style::default().fg(theme.text))))
+                    .collect(),
+            ),
+            _ => {
+                let name = app
+                    .playlists
+                    .get(app.cursors.playlist)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                let ids = app
+                    .playlists
+                    .get(app.cursors.playlist)
+                    .map(|p| p.track_ids.clone())
+                    .unwrap_or_default();
+                (
+                    format!("Tracks · {name} ← Playlists"),
+                    track_rows(app, &ids, pane.width.saturating_sub(2) as usize, &theme),
+                )
+            }
+        },
+        View::Youtube => match app.focus_col {
+            0 => (
+                "YouTube".into(),
+                app.yt_lists
+                    .iter()
+                    .map(|l| {
+                        let g = if l.kind == crate::tui::app::YtListKind::Account { "♫" } else { "✦" };
+                        Line::from(Span::styled(format!("{g} {}", l.name), Style::default().fg(theme.text)))
+                    })
+                    .collect(),
+            ),
+            _ => {
+                let name = app.yt_lists.get(app.cursors.playlist).map(|l| l.name.clone()).unwrap_or_default();
+                let ids = app.yt_lists.get(app.cursors.playlist).map(|l| l.track_ids.clone()).unwrap_or_default();
+                (
+                    format!("Tracks · {name} ← YouTube"),
+                    yt_track_rows(app, &ids, pane.width.saturating_sub(2) as usize, &theme),
+                )
+            }
+        },
+        View::Queue => (
+            "Queue".into(),
+            track_rows(app, &app.transport.manual_queue.clone(), pane.width.saturating_sub(2) as usize, &theme),
+        ),
+    };
+
+    f.render_widget(
+        Paragraph::new(lines).block(border(&title, true, &theme)),
+        pane,
+    );
+}
+
 /// Render the Y view: col1 = YT lists (account ♫ + suggested ✦), col2 = the
 /// focused list's tracks. Below the tracks, a "Suggested / Up Next" pane
 /// lists the other suggested lists so short track lists don't waste space.
