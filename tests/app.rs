@@ -326,3 +326,30 @@ fn continue_radio_keeps_playing_at_context_end() {
     assert!(["t1","t2","t3","s1"].contains(&after.as_str()));
 }
 
+
+#[test]
+fn cycle_continue_is_mode_aware() {
+    let (_d, cat, _l) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    app.source_mode = jukebox::mode::SourceMode::Local;
+    app.cycle_continue();
+    assert_eq!(app.transport.continue_mode, ContinueMode::NextAlbum);
+    app.cycle_continue();
+    assert_eq!(app.transport.continue_mode, ContinueMode::Radio);
+    app.cycle_continue();
+    assert_eq!(app.transport.continue_mode, ContinueMode::Off);
+
+    app.source_mode = jukebox::mode::SourceMode::Youtube;
+    app.cycle_continue();
+    assert_eq!(app.transport.continue_mode, ContinueMode::YouTube);
+    app.cycle_continue();
+    assert_eq!(app.transport.continue_mode, ContinueMode::Off);
+
+    app.source_mode = jukebox::mode::SourceMode::Mixed;
+    app.cycle_continue();
+    assert_eq!(app.transport.continue_mode, ContinueMode::NextAlbum);
+    app.cycle_continue();
+    assert_eq!(app.transport.continue_mode, ContinueMode::YouTube);
+    app.cycle_continue();
+    assert_eq!(app.transport.continue_mode, ContinueMode::Off);
+}

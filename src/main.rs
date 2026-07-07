@@ -54,6 +54,7 @@ fn main() -> anyhow::Result<()> {
                 app.transport.continue_mode = match layout.continue_mode.as_str() {
                     "next" => tui::queue::ContinueMode::NextAlbum,
                     "radio" => tui::queue::ContinueMode::Radio,
+                    "youtube" => tui::queue::ContinueMode::YouTube,
                     _ => tui::queue::ContinueMode::Off,
                 };
                 app.view = match layout.focus.as_str() {

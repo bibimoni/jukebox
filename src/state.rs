@@ -234,6 +234,7 @@ pub fn save_layout_at(
             crate::tui::queue::ContinueMode::Off => "off",
             crate::tui::queue::ContinueMode::NextAlbum => "next",
             crate::tui::queue::ContinueMode::Radio => "radio",
+            crate::tui::queue::ContinueMode::YouTube => "youtube",
         }
         .to_string(),
         source_mode: source_mode.as_str().to_string(),

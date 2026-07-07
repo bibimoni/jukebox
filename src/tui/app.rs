@@ -102,6 +102,8 @@ pub struct App {
     /// Leader-key state for the `gg` mapping (top of column). `g` arms it;
     /// a second `g` within one dispatch consumes it and jumps to row 0.
     pub pending_g: bool,
+    /// The active source mode (Local / YouTube / Mixed). Cycled by `M`.
+    pub source_mode: crate::mode::SourceMode,
 }
 
 impl ContextResolver for App {
@@ -180,6 +182,7 @@ impl App {
             should_quit: false,
             overlay: None,
             pending_g: false,
+            source_mode: crate::mode::SourceMode::default(),
         }
     }
 
@@ -442,6 +445,12 @@ impl App {
                     self.switch_to_radio();
                     self.start_playback();
                 }
+                ContinueMode::YouTube => {
+                    // Wired to RadioCursor in Task 9 (sidecar). Until then,
+                    // CONT=YouTube stops playback cleanly rather than spinning.
+                    self.player.stop().ok();
+                    self.now_playing = None;
+                }
             }
         }
     }
@@ -481,15 +490,32 @@ impl App {
         });
     }
 
-    /// Cycle the continue mode: Off → NextAlbum → Radio → Off. Controls what
-    /// happens when the current context ends with repeat off (stop / continue
-    /// to the next album by the same artist / continue with the whole library).
+    /// Cycle the continue mode, mode-dependent (spec §2 ContinueMode::YouTube):
+    /// - Local:  Off → NextAlbum → Radio → Off
+    /// - YouTube: Off → YouTube → Off
+    /// - Mixed:  Off → NextAlbum → YouTube → Off
     pub fn cycle_continue(&mut self) {
-        self.transport.continue_mode = match self.transport.continue_mode {
-            ContinueMode::Off => ContinueMode::NextAlbum,
-            ContinueMode::NextAlbum => ContinueMode::Radio,
-            ContinueMode::Radio => ContinueMode::Off,
+        self.transport.continue_mode = match (self.source_mode, self.transport.continue_mode) {
+            (crate::mode::SourceMode::Local, ContinueMode::Off) => ContinueMode::NextAlbum,
+            (crate::mode::SourceMode::Local, ContinueMode::NextAlbum) => ContinueMode::Radio,
+            (crate::mode::SourceMode::Local, ContinueMode::Radio) => ContinueMode::Off,
+            (crate::mode::SourceMode::Local, ContinueMode::YouTube) => ContinueMode::Off,
+
+            (crate::mode::SourceMode::Youtube, ContinueMode::Off) => ContinueMode::YouTube,
+            (crate::mode::SourceMode::Youtube, _) => ContinueMode::Off,
+
+            (crate::mode::SourceMode::Mixed, ContinueMode::Off) => ContinueMode::NextAlbum,
+            (crate::mode::SourceMode::Mixed, ContinueMode::NextAlbum) => ContinueMode::YouTube,
+            (crate::mode::SourceMode::Mixed, ContinueMode::YouTube) => ContinueMode::Off,
+            (crate::mode::SourceMode::Mixed, ContinueMode::Radio) => ContinueMode::Off,
         };
+    }
+
+    /// Cycle the source mode Local → YouTube → Mixed → Local. Never stops
+    /// playback — only changes where new browsing happens and which CONT
+    /// engine is eligible.
+    pub fn cycle_mode(&mut self) {
+        self.source_mode = self.source_mode.cycle();
     }
 
     /// Auto-continue to the next album by the same artist. Pushes the current

@@ -151,6 +151,7 @@ fn build_info_line(app: &App, _width: usize) -> Line<'static> {
         ContinueMode::Off => "off",
         ContinueMode::NextAlbum => "next",
         ContinueMode::Radio => "radio",
+        ContinueMode::YouTube => "youtube",
     };
     spans.push(Span::styled(format!("SHUF {shuf}"), dim));
     spans.push(Span::raw("  "));
