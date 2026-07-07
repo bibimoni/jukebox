@@ -100,6 +100,21 @@ pub enum Overlay {
     YtAuth {
         input: String,
     },
+    /// Suggested albums / playlists to start from (`S`). Local mode lists local
+    /// albums; YouTube/Mixed can list YT mood playlists.
+    Discover {
+        items: Vec<DiscoverItem>,
+        cursor: usize,
+    },
+}
+
+/// A discover-overlay suggestion.
+#[derive(Clone)]
+pub enum DiscoverItem {
+    /// A local catalog album (Local / Mixed).
+    Album { artist: String, album: String },
+    /// A YouTube mood/suggested playlist (YouTube / Mixed).
+    Playlist { id: String, name: String },
 }
 
 /// The central TUI state struct.
@@ -785,6 +800,132 @@ impl App {
         let _ = std::fs::remove_file(&p);
         if let Some(session) = self.yt_session.as_mut() {
             let _ = session.clear_cookies(&self.yt_python, &self.yt_script);
+        }
+    }
+
+    /// `s` — instant random track from the active source, played *in context*
+    /// (its album/playlist becomes the context so `>`/`<` and CONT behave
+    /// coherently). Local/Mixed: a random catalog track. YouTube: a random
+    /// track from the first loaded YT list (if any).
+    pub fn instant_random(&mut self) {
+        if self.source_mode != crate::mode::SourceMode::Youtube && !self.catalog.tracks.is_empty() {
+            let i = self.simple_rand() % self.catalog.tracks.len();
+            let id = self.catalog.tracks[i].id.clone();
+            let album = self.catalog.tracks[i].album.clone();
+            let ids = match album {
+                Some(a) => self.tracks_for_album(&a),
+                None => vec![id.clone()],
+            };
+            let start = if ids.contains(&id) { id } else { ids.first().cloned().unwrap_or(id) };
+            self.play_in_context_ids(ids, &start);
+            return;
+        }
+        if let Some(l) = self.yt_lists.iter().find(|l| !l.track_ids.is_empty()).cloned() {
+            if let Some(id) = l.track_ids.first().cloned() {
+                self.play_in_context_ids(l.track_ids.clone(), &id);
+            }
+        }
+    }
+
+    /// `S` — open the discover overlay: local smart-album suggestions (Local /
+    /// Mixed) or YouTube mood playlists (YouTube / Mixed-with-session).
+    pub fn open_discover(&mut self) {
+        let items = match self.source_mode {
+            crate::mode::SourceMode::Youtube => self.yt_discover_items(),
+            _ => {
+                let mut albums = self.local_smart_albums();
+                if albums.is_empty() {
+                    albums.extend(self.yt_discover_items());
+                }
+                albums
+            }
+        };
+        self.overlay = Some(Overlay::Discover { items, cursor: 0 });
+    }
+
+    /// Local smart-album heuristic (spec §5.5): score each album by artist
+    /// diversity (deprioritize the currently-playing artist) + a deterministic
+    /// per-album pseudo-random so suggestions vary but stay stable. Pick 5.
+    fn local_smart_albums(&self) -> Vec<DiscoverItem> {
+        let cur_artist = self.now_playing_view().map(|v| v.artist).unwrap_or_default();
+        let mut scored: Vec<(u64, DiscoverItem)> = Vec::new();
+        for (artist, albums) in &self.albums_by_artist {
+            for a in albums {
+                let key = format!("{artist}|{}", a.title);
+                let r = Self::hash_rand(&key);
+                let penalty = if *artist == cur_artist { 1_000_000 } else { 0 };
+                scored.push((
+                    r + penalty,
+                    DiscoverItem::Album {
+                        artist: a.artist.clone(),
+                        album: a.title.clone(),
+                    },
+                ));
+            }
+        }
+        scored.sort_by_key(|(s, _)| *s);
+        scored.into_iter().take(5).map(|(_, d)| d).collect()
+    }
+
+    fn yt_discover_items(&mut self) -> Vec<DiscoverItem> {
+        let Some(session) = self.yt_session.as_mut() else {
+            return Vec::new();
+        };
+        match session.home_suggestions() {
+            Ok(s) => s
+                .into_iter()
+                .map(|p| DiscoverItem::Playlist { id: p.id, name: p.name })
+                .take(5)
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn simple_rand(&mut self) -> usize {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x9E3779B97F4A7C15);
+        let mut x = COUNTER.fetch_add(0x632BE59BD9B4C0A1, std::sync::atomic::Ordering::Relaxed);
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        (x.wrapping_mul(0x2545F4914F6CDD1D)) as usize
+    }
+
+    fn hash_rand(key: &str) -> u64 {
+        let mut h: u64 = 0xCBF29CE484222325;
+        for b in key.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001B3);
+        }
+        h
+    }
+
+    /// Apply a discover-overlay selection (Enter): start the album/playlist.
+    pub fn play_discover_selection(&mut self) {
+        let Some(Overlay::Discover { items, cursor }) = self.overlay.clone() else {
+            return;
+        };
+        let Some(item) = items.get(cursor).cloned() else {
+            return;
+        };
+        match item {
+            DiscoverItem::Album { album, .. } => {
+                let ids = self.tracks_for_album(&album);
+                if let Some(start) = ids.first().cloned() {
+                    self.transport.continue_mode = ContinueMode::NextAlbum;
+                    self.play_in_context_ids(ids, &start);
+                }
+            }
+            DiscoverItem::Playlist { id, .. } => {
+                let tracks = self
+                    .yt_session
+                    .as_mut()
+                    .and_then(|s| s.get_playlist(&id).ok())
+                    .unwrap_or_default();
+                let ids: Vec<String> = tracks.into_iter().map(|t| t.video_id).collect();
+                if let Some(start) = ids.first().cloned() {
+                    self.play_in_context_ids(ids, &start);
+                }
+            }
         }
     }
 

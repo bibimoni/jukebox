@@ -41,7 +41,40 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
         Overlay::PlaylistPicker => render_playlist_picker(f, area, app),
         Overlay::Command { input } => render_command(f, area, &input),
         Overlay::YtAuth { input } => render_yt_auth(f, area, &input),
+        Overlay::Discover { items, cursor } => render_discover(f, area, &items, cursor),
     }
+}
+
+/// The discover overlay (`S`): a centered list of suggested albums / YT
+/// playlists. `Enter` plays the selection (wired in input.rs).
+fn render_discover(f: &mut Frame, area: Rect, items: &[crate::tui::app::DiscoverItem], cursor: usize) {
+    let theme = Theme::default();
+    let popup = centered(area, 55, 45);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(Span::styled(" discover — press Enter to play ", Style::default().fg(theme.accent)));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let lines: Vec<Line> = items
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let (glyph, text) = match d {
+                crate::tui::app::DiscoverItem::Album { artist, album } => ("♫", format!("{artist} — {album}")),
+                crate::tui::app::DiscoverItem::Playlist { name, .. } => ("✦", name.clone()),
+            };
+            let style = if i == cursor {
+                Style::default().fg(theme.hi_fg).bg(theme.accent)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            Line::from(Span::styled(format!("{glyph} {text}"), style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The YouTube cookie-paste overlay (spec §5.7). A centered popup with the

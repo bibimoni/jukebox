@@ -366,3 +366,27 @@ fn mixed_mode_plays_local_when_track_in_catalog() {
         Some(jukebox::source::TrackSource::Local { ref track_id }) if track_id == "t1"
     ));
 }
+
+#[test]
+fn s_instant_random_plays_in_context_local() {
+    let (_d, cat, _l) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.source_mode = jukebox::mode::SourceMode::Local;
+    app.instant_random();
+    assert!(app.now_playing.is_some(), "instant random should play something");
+}
+
+#[test]
+fn S_discover_lists_local_albums_in_local_mode() {
+    let (_d, cat, _l) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.source_mode = jukebox::mode::SourceMode::Local;
+    app.open_discover();
+    match &app.overlay {
+        Some(jukebox::tui::app::Overlay::Discover { items, .. }) => {
+            assert!(!items.is_empty(), "discover should list albums");
+            assert!(items.iter().any(|i| matches!(i, jukebox::tui::app::DiscoverItem::Album{..})));
+        }
+        _ => panic!("expected Discover"),
+    }
+}
