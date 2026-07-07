@@ -220,17 +220,18 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         .split(browse_area);
     let dim = Style::default().fg(theme.dim);
 
-    // col1: YT list names (♫ account, ✦ suggested).
+    // col1: YT list names (♫ account, ✦ suggested), narrowed by the filter.
     let items: Vec<ListItem> = app
         .yt_lists
         .iter()
+        .filter(|l| app.filter_matches(&l.name))
         .map(|l| {
             let glyph = if l.kind == crate::tui::app::YtListKind::Account { "♫" } else { "✦" };
             ListItem::new(format!("{glyph} {}", l.name))
         })
         .collect();
     let mut state = ListState::default();
-    state.select(Some(app.cursors.playlist));
+    state.select(Some(app.cursors.playlist.min(items.len().saturating_sub(1))));
     f.render_stateful_widget(
         List::new(items)
             .block(border(&filtered_title("YouTube", app, 0), app.focus_col == 0, theme))
@@ -367,14 +368,15 @@ fn render_playlists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let cw = &app.column_widths;
     let cols = Layout::horizontal([Constraint::Length(cw.col1), Constraint::Min(cw.col2)]).split(area);
 
-    // col1: playlist names.
+    // col1: playlist names (narrowed by the inline filter when active on col 0).
     let items: Vec<ListItem> = app
         .playlists
         .iter()
+        .filter(|p| app.filter_matches(&p.name))
         .map(|p| ListItem::new(p.name.clone()))
         .collect();
     let mut state = ListState::default();
-    state.select(Some(app.cursors.playlist));
+    state.select(Some(app.cursors.playlist.min(items.len().saturating_sub(1))));
     f.render_stateful_widget(
         List::new(items)
             .block(border(&filtered_title("Playlists", app, 0), app.focus_col == 0, theme))

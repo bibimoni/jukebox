@@ -100,6 +100,32 @@ pub fn run_setup(requirements: &std::path::Path) -> Result<String> {
     Ok(format!("installed YT deps into {}", dir.display()))
 }
 
+/// The kind of an in-flight request, so drained responses can be paired with
+/// what asked for them (the sidecar replies in send order, so this is a FIFO
+/// queue). `Resolve` carries the video_id the URL is for.
+#[derive(Clone, Debug)]
+enum Pending {
+    Playlists,
+    Suggestions,
+    Resolve(String),
+    Search,
+    Tracks,
+    Watch,
+    Auth,
+    Pong,
+}
+
+impl Pending {
+    /// True if `self` and `other` are the same request kind (Resolve compares
+    /// the video_id too).
+    fn matches(&self, other: &Pending) -> bool {
+        match (self, other) {
+            (Pending::Resolve(a), Pending::Resolve(b)) => a == b,
+            (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
+        }
+    }
+}
+
 pub struct Session {
     sidecar: Sidecar,
     cookies: Option<String>,
@@ -110,6 +136,16 @@ pub struct Session {
     pub track_cache: HashMap<String, RemoteTrack>,
     /// video_id → (url, expires_at). Capped at current+next.
     url_cache: Vec<(String, String, Option<f64>)>,
+    /// FIFO of in-flight request kinds, paired one-to-one with drained responses
+    /// (the sidecar replies in send order). Lets fire-and-forget sends
+    /// (refresh, pre-resolve) interleave safely with sync roundtrips.
+    pending: std::collections::VecDeque<Pending>,
+    /// A resolve currently outstanding (only one at a time, to keep pairing
+    /// simple + avoid flooding yt-dlp).
+    resolve_inflight: Option<String>,
+    /// Lists fetched async by `send_refresh`, picked up by `App::on_tick`.
+    pub pending_playlists: Option<Vec<crate::yt::proto::PlaylistSummary>>,
+    pub pending_suggestions: Option<Vec<crate::yt::proto::PlaylistSummary>>,
 }
 
 const URL_CACHE_CAP: usize = 2;
@@ -126,6 +162,10 @@ impl Session {
             browser: None,
             track_cache: HashMap::new(),
             url_cache: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            resolve_inflight: None,
+            pending_playlists: None,
+            pending_suggestions: None,
         })
     }
 
@@ -140,11 +180,28 @@ impl Session {
             browser: Some(browser),
             track_cache: HashMap::new(),
             url_cache: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            resolve_inflight: None,
+            pending_playlists: None,
+            pending_suggestions: None,
         })
     }
 
     pub fn is_alive(&mut self) -> bool {
         self.sidecar.is_alive()
+    }
+
+    /// Look up a cached (pre-resolved) stream URL for `video_id`.
+    pub fn url_for(&self, video_id: &str) -> Option<String> {
+        self.url_cache
+            .iter()
+            .find(|(v, _, _)| v == video_id)
+            .map(|(_, url, _)| url.clone())
+    }
+
+    /// Is a resolve already in flight for `video_id` (or any resolve)?
+    pub fn resolve_busy(&self) -> bool {
+        self.resolve_inflight.is_some()
     }
 
     pub fn has_cookies(&self) -> bool {
@@ -189,12 +246,108 @@ impl Session {
     }
 
     /// Send a request and poll for the matching response until `deadline`.
+    /// Apply one (response, its pending kind) pair to the caches Session owns
+    /// (`track_cache`, `url_cache`, `pending_playlists/suggestions`). Returns
+    /// `Some(response)` if it's the caller's target kind (so a sync roundtrip
+    /// can return it), else `None` (applied as a stray).
+    fn apply_pair(&mut self, kind: Pending, resp: Response, target: &Pending) -> Option<Response> {
+        match (&resp, &kind) {
+            (Response::Search(v), Pending::Search) => {
+                for t in v {
+                    self.cache_track(t);
+                }
+            }
+            (Response::Tracks(v), Pending::Tracks) => {
+                for t in v {
+                    self.cache_track(t);
+                }
+            }
+            (Response::WatchPlaylist(v), Pending::Watch) => {
+                for t in v {
+                    self.cache_track(t);
+                }
+            }
+            (Response::Resolve(u), Pending::Resolve(vid)) => {
+                // Cache the resolved URL + format for this video_id.
+                self.url_cache.retain(|(v, _, _)| v != vid);
+                self.url_cache.push((vid.clone(), u.url.clone(), u.expires_at));
+                if self.url_cache.len() > URL_CACHE_CAP {
+                    self.url_cache.remove(0);
+                }
+                if let Some(t) = self.track_cache.get_mut(vid) {
+                    t.fmt = Some(StreamFormat {
+                        codec: u.codec.clone(),
+                        abr: u.abr,
+                        sample_rate: u.sample_rate,
+                        container: u.container.clone(),
+                        premium: u.premium,
+                    });
+                }
+                self.resolve_inflight = None;
+            }
+            (Response::Playlists(v), Pending::Playlists) => {
+                self.pending_playlists = Some(v.clone());
+            }
+            (Response::Suggestions(v), Pending::Suggestions) => {
+                self.pending_suggestions = Some(v.clone());
+            }
+            (Response::Auth(_), Pending::Auth) | (Response::Pong, Pending::Pong) => {}
+            _ => {}
+        }
+        if kind.matches(target) {
+            Some(resp)
+        } else {
+            None
+        }
+    }
+
+    fn cache_track(&mut self, t: &RemoteTrackSummary) {
+        self.track_cache.insert(
+            t.video_id.clone(),
+            RemoteTrack {
+                video_id: t.video_id.clone(),
+                title: t.title.clone(),
+                artist: t.artist.clone(),
+                album: t.album.clone(),
+                dur: t.dur,
+                fmt: None,
+                isrc: t.isrc.clone(),
+            },
+        );
+    }
+
+    fn kind_for(req: &Request) -> Pending {
+        match req {
+            Request::Search { .. } => Pending::Search,
+            Request::LibraryPlaylists => Pending::Playlists,
+            Request::GetPlaylist { .. } => Pending::Tracks,
+            Request::HomeSuggestions => Pending::Suggestions,
+            Request::GetWatchPlaylist { .. } => Pending::Watch,
+            Request::ResolveUrl { video_id } => Pending::Resolve(video_id.clone()),
+            Request::AuthStatus => Pending::Auth,
+            Request::Ping => Pending::Pong,
+        }
+    }
+
     fn roundtrip(&mut self, req: Request, deadline: Duration) -> Result<Response> {
+        let kind = Self::kind_for(&req);
+        self.pending.push_back(kind.clone());
         self.sidecar.send(&req)?;
+        let target = kind.clone();
         let start = Instant::now();
         loop {
             match self.sidecar.try_recv()? {
-                Some(resp) => return Ok(resp),
+                Some(resp) => {
+                    // Pair with the oldest in-flight kind (FIFO).
+                    let pk = self.pending.pop_front();
+                    if let Some(pk) = pk {
+                        if let Some(r) = self.apply_pair(pk, resp, &target) {
+                            return Ok(r);
+                        }
+                        continue; // applied as a stray; keep waiting for ours
+                    }
+                    return Ok(resp);
+                }
                 None => {
                     if start.elapsed() >= deadline {
                         return Err(anyhow!("sidecar roundtrip timeout"));
@@ -205,8 +358,53 @@ impl Session {
         }
     }
 
-    /// Drain any pending responses without blocking (used by App::on_tick to
-    /// apply async list-fetch results). Returns parsed responses.
+    /// Drain + apply all ready responses (used by App::on_tick). Side-effects
+    /// (track_cache, url_cache, `pending_playlists`/`pending_suggestions`) are
+    /// applied via `apply_pair`; the raw responses are returned so App can do
+    /// any extra mapping. Non-blocking.
+    pub fn drain_paired(&mut self) -> Vec<Response> {
+        let mut out = Vec::new();
+        while let Ok(Some(resp)) = self.sidecar.try_recv() {
+            let kind = self.pending.pop_front();
+            if let Some(k) = kind {
+                let target = k.clone();
+                self.apply_pair(k, resp.clone(), &target);
+            }
+            out.push(resp);
+        }
+        out
+    }
+
+    /// Fire-and-forget: ask for the account playlists + suggested/mood lists.
+    /// Results land in `pending_playlists`/`pending_suggestions` and are
+    /// picked up by `App::on_tick`. Non-blocking — doesn't wait for a reply.
+    pub fn send_refresh(&mut self) -> Result<()> {
+        self.pending.push_back(Pending::Playlists);
+        self.sidecar.send(&Request::LibraryPlaylists)?;
+        self.pending.push_back(Pending::Suggestions);
+        self.sidecar.send(&Request::HomeSuggestions)?;
+        Ok(())
+    }
+
+    /// Fire-and-forget: pre-resolve a stream URL for `video_id` so gapless
+    /// handoff has the URL ready before the track starts. Only one resolve is
+    /// outstanding at a time (`resolve_inflight`); on_tick clears it on the
+    /// Resolve response. Non-blocking.
+    pub fn send_resolve(&mut self, video_id: String) -> Result<()> {
+        if self.resolve_inflight.is_some() {
+            return Ok(());
+        }
+        if self.url_for(&video_id).is_some() {
+            return Ok(()); // already resolved
+        }
+        self.resolve_inflight = Some(video_id.clone());
+        self.pending.push_back(Pending::Resolve(video_id.clone()));
+        self.sidecar.send(&Request::ResolveUrl { video_id })?;
+        Ok(())
+    }
+
+    /// Drain any pending responses without pairing (legacy). Returns parsed
+    /// responses in arrival order.
     pub fn drain(&mut self) -> Vec<Response> {
         let mut out = Vec::new();
         while let Ok(Some(r)) = self.sidecar.try_recv() {
@@ -224,53 +422,21 @@ impl Session {
     }
 
     pub fn search(&mut self, q: &str, limit: u32) -> Result<Vec<RemoteTrackSummary>> {
+        // roundtrip's pairing caches each track into track_cache.
         match self.roundtrip(Request::Search { q: q.into(), limit }, Duration::from_secs(3))? {
-            Response::Search(v) => {
-                for t in &v {
-                    self.track_cache.insert(
-                        t.video_id.clone(),
-                        RemoteTrack {
-                            video_id: t.video_id.clone(),
-                            title: t.title.clone(),
-                            artist: t.artist.clone(),
-                            album: t.album.clone(),
-                            dur: t.dur,
-                            fmt: None,
-                            isrc: t.isrc.clone(),
-                        },
-                    );
-                }
-                Ok(v)
-            }
+            Response::Search(v) => Ok(v),
             Response::Error(e) => Err(anyhow!(e)),
             _ => Err(anyhow!("unexpected search response")),
         }
     }
 
-    /// Resolve a stream URL + format for `video_id`. Premium-aware. Caches the
-    /// resolved url (current + next) for gapless handoff; the format is always
-    /// returned fresh so CoreAudio re-clocks against the real stream.
+    /// Resolve a stream URL + format for `video_id` (synchronous, with an
+    /// up-to-8s bound). `roundtrip`'s pairing already caches the URL + format.
+    /// Prefer `send_resolve` (fire-and-forget) for pre-fetching so the hot path
+    /// can hit `url_for` instead of blocking.
     pub fn resolve_url(&mut self, video_id: &str) -> Result<ResolvedUrl> {
         match self.roundtrip(Request::ResolveUrl { video_id: video_id.into() }, Duration::from_secs(8))? {
-            Response::Resolve(u) => {
-                // Cache current+next.
-                self.url_cache.retain(|(v, _, _)| v != video_id);
-                self.url_cache.push((video_id.into(), u.url.clone(), u.expires_at));
-                if self.url_cache.len() > URL_CACHE_CAP {
-                    self.url_cache.remove(0);
-                }
-                // Record format on the cached track.
-                if let Some(t) = self.track_cache.get_mut(video_id) {
-                    t.fmt = Some(StreamFormat {
-                        codec: u.codec.clone(),
-                        abr: u.abr,
-                        sample_rate: u.sample_rate,
-                        container: u.container.clone(),
-                        premium: u.premium,
-                    });
-                }
-                Ok(u)
-            }
+            Response::Resolve(u) => Ok(u),
             Response::Error(e) => Err(anyhow!(e)),
             _ => Err(anyhow!("unexpected resolve_url response")),
         }
@@ -286,23 +452,7 @@ impl Session {
 
     pub fn get_playlist(&mut self, id: &str) -> Result<Vec<RemoteTrackSummary>> {
         match self.roundtrip(Request::GetPlaylist { id: id.into() }, Duration::from_secs(4))? {
-            Response::Tracks(v) => {
-                for t in &v {
-                    self.track_cache.insert(
-                        t.video_id.clone(),
-                        RemoteTrack {
-                            video_id: t.video_id.clone(),
-                            title: t.title.clone(),
-                            artist: t.artist.clone(),
-                            album: t.album.clone(),
-                            dur: t.dur,
-                            fmt: None,
-                            isrc: t.isrc.clone(),
-                        },
-                    );
-                }
-                Ok(v)
-            }
+            Response::Tracks(v) => Ok(v),
             Response::Error(e) => Err(anyhow!(e)),
             _ => Err(anyhow!("unexpected get_playlist response")),
         }
@@ -324,23 +474,7 @@ impl Session {
 impl YtClient for Session {
     fn get_watch_playlist(&mut self, video_id: &str) -> Result<Vec<String>> {
         match self.roundtrip(Request::GetWatchPlaylist { video_id: video_id.into() }, Duration::from_secs(4))? {
-            Response::WatchPlaylist(v) => {
-                for t in &v {
-                    self.track_cache.insert(
-                        t.video_id.clone(),
-                        RemoteTrack {
-                            video_id: t.video_id.clone(),
-                            title: t.title.clone(),
-                            artist: t.artist.clone(),
-                            album: t.album.clone(),
-                            dur: t.dur,
-                            fmt: None,
-                            isrc: t.isrc.clone(),
-                        },
-                    );
-                }
-                Ok(v.into_iter().map(|t| t.video_id).collect())
-            }
+            Response::WatchPlaylist(v) => Ok(v.into_iter().map(|t| t.video_id).collect()),
             Response::Error(e) => Err(anyhow!(e)),
             _ => Err(anyhow!("unexpected watch_playlist response")),
         }

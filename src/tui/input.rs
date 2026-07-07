@@ -238,10 +238,6 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         // task; for now the picker is display-only.
         Some(Overlay::Discover { items, mut cursor }) => {
             match key.code {
-                KeyCode::Esc => {
-                    app.overlay = None;
-                    return;
-                }
                 KeyCode::Down if !items.is_empty() => {
                     cursor = (cursor + 1) % items.len();
                 }
@@ -281,7 +277,12 @@ fn handle_filter_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT) =>
         {
-            if let Some(f) = &mut app.filter {
+            // `f` on an empty filter closes it (toggle semantics); otherwise
+            // the char goes into the query. Backspace-to-empty + `f` also
+            // closes, so you don't get a stranded empty filter.
+            if c == 'f' && app.filter.as_ref().map(|f| f.text.is_empty()).unwrap_or(false) {
+                app.filter = None;
+            } else if let Some(f) = &mut app.filter {
                 f.text.push(c);
             }
             true
@@ -309,15 +310,20 @@ fn execute_command(app: &mut App, cmd: &str) {
         "yt setup" => {
             app.yt_setup();
         }
-        other if other.starts_with("yt auth browser ") => {
-            let browser = other.trim_start_matches("yt auth browser ").trim().to_string();
+        other if other.starts_with("yt auth browser") => {
+            let browser = other.trim_start_matches("yt auth browser").trim().to_string();
             if browser.is_empty() {
                 app.yt_error = Some(
-                    "usage: :yt auth browser <chrome|firefox|safari|edge|brave>".into(),
+                    "usage: :yt auth browser <chrome|firefox|safari|edge|brave|opera|chromium>".into(),
                 );
             } else {
                 app.apply_yt_browser(browser);
             }
+        }
+        "yt auth browser" => {
+            app.yt_error = Some(
+                "usage: :yt auth browser <chrome|firefox|safari|edge|brave|opera|chromium>".into(),
+            );
         }
         _ => {}
     }

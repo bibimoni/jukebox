@@ -136,13 +136,21 @@ fn centered(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
     .split(pop)[1]
 }
 
-/// Resolve a track id to a `Title — Artist` display string.
+/// Resolve a track id to a `Title — Artist` display string. Catalog tracks
+/// (Local/Mixed local results) resolve from the catalog; YouTube video ids
+/// resolve from the session's `track_cache` (populated by search). Falls back
+/// to the raw id only when neither has the metadata yet.
 fn track_label(app: &App, id: &str) -> String {
-    let t = app.catalog.tracks.iter().find(|t| t.id == id);
-    match t {
-        Some(Track { title, primary_artist, .. }) => format!("{title} — {primary_artist}"),
-        None => id.to_string(),
+    if let Some(Track { title, primary_artist, .. }) = app.catalog.tracks.iter().find(|t| t.id == id) {
+        return format!("{title} — {primary_artist}");
     }
+    if let Some(rt) = app.yt_session.as_ref().and_then(|s| s.track_for(id)) {
+        if rt.artist.is_empty() {
+            return rt.title.clone();
+        }
+        return format!("{} — {}", rt.title, rt.artist);
+    }
+    id.to_string()
 }
 
 // ---------------------------------------------------------------------------

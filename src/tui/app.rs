@@ -509,6 +509,7 @@ impl App {
                     }
                     let _ = self.player.load(&path);
                     self.now_playing = Some(crate::source::TrackSource::Local { track_id: id });
+                    self.preload_next_url();
                     return;
                 }
                 Some(Resolved::Remote { url, fmt, video_id }) => {
@@ -524,6 +525,7 @@ impl App {
                     let p = std::path::PathBuf::from(&url);
                     let _ = self.player.load(&p);
                     self.now_playing = Some(crate::source::TrackSource::Remote { video_id });
+                    self.preload_next_url();
                     return;
                 }
                 None => {
@@ -558,8 +560,25 @@ impl App {
                 });
             }
         }
-        // Remote (YouTube / Mixed-no-local-hit). Needs a live session.
+        // Remote (YouTube / Mixed-no-local-hit). Needs a live session. Prefer
+        // a pre-resolved (cached) URL — instant, no block — so gapless handoff
+        // lands the next track without a resolve roundtrip gap.
         let session = self.yt_session.as_mut()?;
+        if let Some(url) = session.url_for(id) {
+            let fmt = session
+                .track_for(id)
+                .and_then(|t| t.fmt.clone())
+                .unwrap_or_else(|| crate::source::StreamFormat {
+                    codec: "AAC".into(),
+                    abr: 0,
+                    sample_rate: 48000,
+                    container: "m4a".into(),
+                    premium: false,
+                });
+            return Some(Resolved::Remote { url, fmt, video_id: id.to_string() });
+        }
+        // Cache miss → synchronous resolve (bounded ~8s). Pre-resolve via
+        // `preload_next_url` usually prevents this on the hot path.
         match session.resolve_url(id) {
             Ok(u) => Some(Resolved::Remote {
                 url: u.url,
@@ -574,6 +593,32 @@ impl App {
             }),
             Err(_) => None, // expired/unavailable/rate-limited → dead path
         }
+    }
+
+    /// Pre-resolve the next track's stream URL (fire-and-forget) so gapless
+    /// handoff has it ready. Called after a track starts + on tick.
+    fn preload_next_url(&mut self) {
+        // Resolve the next id + whether it'll stream BEFORE the session borrow,
+        // so we don't hold an immutable borrow of self across the mutable one.
+        let r = ClonedResolver {
+            playlists: &self.playlists,
+            manual_queue: self.transport.manual_queue.clone(),
+            yt_lists: &self.yt_lists,
+        };
+        let next_id = self.transport.peek_next(&r, &self.catalog);
+        let Some(id) = next_id else { return };
+        // Only pre-resolve ids we'll actually stream (not local catalog hits in
+        // Local/Mixed — those play from disk).
+        let will_stream = self.source_mode == crate::mode::SourceMode::Youtube
+            || self.track_by_id(&id).is_none();
+        if !will_stream {
+            return;
+        }
+        let Some(session) = self.yt_session.as_mut() else { return };
+        if session.resolve_busy() {
+            return;
+        }
+        let _ = session.send_resolve(id);
     }
 
     /// Load `id` into the player (switching the output device's sample rate
@@ -612,6 +657,7 @@ impl App {
                 let p = std::path::PathBuf::from(&url);
                 let _ = self.player.load(&p);
                 self.now_playing = Some(crate::source::TrackSource::Remote { video_id });
+                self.preload_next_url();
             }
             None => {
                 self.dead.insert(id.to_string());
@@ -631,6 +677,11 @@ impl App {
             None => return,
         };
         let ctx = self.context_for_current_view(ids);
+        // A fresh context starts with a clean dead-set: a transient resolve
+        // failure earlier (network blip, sidecar hiccup) must not permanently
+        // blacklist a track for the whole session. Genuinely-missing local
+        // files re-add themselves on this pass if still missing.
+        self.dead.clear();
         // A context switch is a play transition: push the currently-playing
         // (track, context) to history so `prev()` can pop back to it. Only
         // `next()` pushed previously, so a switch (e.g. playing a search result
@@ -650,8 +701,9 @@ impl App {
             query: String::new(),
             track_ids: ids,
         };
-        // Mirror `play_selected`: push the current playback to history so a
-        // subsequent `prev()` returns to it across the context switch.
+        // Mirror `play_selected`: clear the dead-set on a context switch, then
+        // push the current playback to history so a subsequent `prev()` returns.
+        self.dead.clear();
         if let Some(np) = self.now_playing.clone() {
             self.transport.history.push((np.id().to_string(), self.transport.context.clone()));
         }
@@ -870,50 +922,80 @@ impl App {
         }
     }
 
-    /// Drain pending sidecar responses (called from the event loop's poll).
-    /// Best-effort: parse errors are ignored (logged to the file-logger by the
-    /// sidecar reader). This keeps async list/track fetch results landing on
-    /// the next tick without blocking the UI.
+    /// Per-tick housekeeping (called from the event loop's poll):
+    /// - auto-respawn a crashed sidecar once (so a mid-session sidecar death
+    ///   doesn't permanently blackhole every subsequent remote id);
+    /// - apply drained async responses (refresh lists → yt_lists, pre-resolve
+    ///   → url_cache; Search/Tracks caching happens in Session::apply_pair).
     pub fn on_tick(&mut self) {
+        // Auto-respawn a dead sidecar (best-effort, once per tick). Preserves
+        // the browser/pasted auth; local playback is unaffected either way.
         if let Some(session) = self.yt_session.as_mut() {
-            for resp in session.drain() {
-                match resp {
-                    crate::yt::proto::Response::Search(v) => {
-                        for t in v {
-                            session.track_cache.insert(
-                                t.video_id.clone(),
-                                crate::source::RemoteTrack {
-                                    video_id: t.video_id,
-                                    title: t.title,
-                                    artist: t.artist,
-                                    album: t.album,
-                                    dur: t.dur,
-                                    fmt: None,
-                                    isrc: t.isrc,
-                                },
-                            );
+            if !session.is_alive() {
+                let browser = session.browser.clone();
+                match browser {
+                    Some(b) => {
+                        match crate::yt::session::Session::spawn_browser(
+                            &self.yt_python, &self.yt_script, b,
+                        ) {
+                            Ok(new) => {
+                                *self.yt_session.as_mut().unwrap() = new;
+                                self.yt_status = Some("YT: sidecar restarted".into());
+                            }
+                            Err(e) => self.yt_error = Some(format!("sidecar respawn: {e}")),
                         }
                     }
-                    crate::yt::proto::Response::Tracks(v) => {
-                        for t in v {
-                            session.track_cache.insert(
-                                t.video_id.clone(),
-                                crate::source::RemoteTrack {
-                                    video_id: t.video_id,
-                                    title: t.title,
-                                    artist: t.artist,
-                                    album: t.album,
-                                    dur: t.dur,
-                                    fmt: None,
-                                    isrc: t.isrc,
-                                },
-                            );
+                    None => {
+                        // Guest/pasted-cookies session: respawn guest. A pasted
+                        // cookies file is re-loaded by Session::spawn.
+                        let cookies = crate::yt::session::load_cookies();
+                        match crate::yt::session::Session::spawn(
+                            &self.yt_python, &self.yt_script, cookies,
+                        ) {
+                            Ok(new) => {
+                                *self.yt_session.as_mut().unwrap() = new;
+                                self.yt_status = Some("YT: sidecar restarted".into());
+                            }
+                            Err(e) => self.yt_error = Some(format!("sidecar respawn: {e}")),
                         }
                     }
-                    _ => {}
                 }
             }
         }
+
+        // Drain + apply async responses. Session::apply_pair already cached
+        // tracks/URLs; here we also fold the fetched lists into yt_lists.
+        if let Some(session) = self.yt_session.as_mut() {
+            session.drain_paired();
+            // Pull any lists the session buffered for us.
+            let got_playlists = session.pending_playlists.take();
+            let got_suggestions = session.pending_suggestions.take();
+            // Merge once we have at least the playlists (suggestions optional).
+            if let Some(p) = got_playlists {
+                let mut lists: Vec<YtList> = p
+                    .into_iter()
+                    .map(|pl| YtList {
+                        id: pl.id,
+                        name: pl.name,
+                        kind: YtListKind::Account,
+                        track_ids: Vec::new(),
+                    })
+                    .collect();
+                if let Some(s) = got_suggestions {
+                    lists.extend(s.into_iter().map(|pl| YtList {
+                        id: pl.id,
+                        name: pl.name,
+                        kind: YtListKind::Suggested,
+                        track_ids: Vec::new(),
+                    }));
+                }
+                self.yt_lists = lists;
+                self.yt_lists_loading = false;
+            }
+        }
+
+        // Keep pre-resolving the next track so gapless handoff stays warm.
+        self.preload_next_url();
     }
 
     /// Logout: clear cookies + respawn the sidecar guest.
@@ -1024,7 +1106,14 @@ impl App {
     }
 
     /// `f` toggle: open the inline filter on the focused column, or close it.
+    /// No-op in the Queue view (no list to filter) and in the track columns of
+    /// Artists (col 2) where there's no jump target — only the list columns are
+    /// filterable, so an accidental `f` elsewhere doesn't open a dead filter.
     pub fn toggle_filter(&mut self) {
+        // Queue has nothing to filter.
+        if self.view == View::Queue {
+            return;
+        }
         match &self.filter {
             Some(f) if f.col == self.focus_col => self.filter = None,
             _ => self.filter = Some(FilterState { col: self.focus_col, text: String::new() }),
@@ -1127,42 +1216,24 @@ impl App {
         }
     }
 
-    /// Fetch account playlists + suggested/mood lists from the sidecar for the
-    /// Y view. Bounded synchronous roundtrip (~3s) at the view-enter boundary;
-    /// on error sets `yt_error` so the view shows a message instead of blank.
-    /// No-op when there's no session (the view then shows the setup hint).
+    /// Kick off an async fetch of the account + suggested lists for the Y view.
+    /// Non-blocking: sends the requests and returns immediately, showing
+    /// "loading…" until `on_tick` folds the results into `yt_lists`. No-op
+    /// (and clears the lists) when there's no session — the view then shows
+    /// the setup hint. A refresh already in flight is not re-sent.
     pub fn refresh_yt_lists(&mut self) {
         let Some(session) = self.yt_session.as_mut() else {
             self.yt_lists.clear();
             return;
         };
-        self.yt_lists_loading = true;
         self.yt_error = None;
-        let account = session.library_playlists();
-        let suggested = session.home_suggestions();
-        self.yt_lists_loading = false;
-        match (account, suggested) {
-            (Ok(a), Ok(s)) => {
-                let mut lists: Vec<YtList> = a
-                    .into_iter()
-                    .map(|p| YtList {
-                        id: p.id,
-                        name: p.name,
-                        kind: YtListKind::Account,
-                        track_ids: Vec::new(),
-                    })
-                    .collect();
-                lists.extend(s.into_iter().map(|p| YtList {
-                    id: p.id,
-                    name: p.name,
-                    kind: YtListKind::Suggested,
-                    track_ids: Vec::new(),
-                }));
-                self.yt_lists = lists;
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                self.yt_error = Some(e.to_string());
-            }
+        self.yt_lists_loading = true;
+        // Drop a stale partial fetch so on_tick merges the fresh pair together.
+        session.pending_playlists = None;
+        session.pending_suggestions = None;
+        if let Err(e) = session.send_refresh() {
+            self.yt_lists_loading = false;
+            self.yt_error = Some(format!("refresh: {e}"));
         }
     }
 
