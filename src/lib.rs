@@ -6,6 +6,7 @@ pub mod mode;
 pub mod player;
 pub mod prompt;
 pub mod search;
+pub mod source;
 pub mod state;
 pub mod translit;
 pub mod tui;
