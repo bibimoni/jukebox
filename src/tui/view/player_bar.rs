@@ -25,10 +25,10 @@ use crate::tui::app::App;
 use crate::tui::queue::{ContinueMode, RepeatMode, ShuffleMode};
 use crate::tui::view::theme::{quality_color, Theme};
 
-/// Render the player bar into `area` using state from `app`.
+/// Render the player bar into `area` using state from `app`. Two rows:
+/// row 1 = now-playing + quality + volume; row 2 = progress gauge + mode
+/// flags (SHUF · RPT · CONT · MODE), `·`-separated, right-anchored.
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
-    // Split into an info row + a gauge row. When we only have one row, drop
-    // the gauge so the info always fits.
     let rows = Layout::vertical(if area.height >= 2 {
         vec![Constraint::Length(1), Constraint::Length(1)]
     } else {
@@ -46,6 +46,15 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     );
 
     if let Some(g) = gauge_area {
+        // Row 2: gauge on the left (~55%) + flags right-anchored. We render
+        // the gauge into a left sub-rect and the flags into a right sub-rect so
+        // the flags stay flush against the right edge and the gauge never
+        // overruns them.
+        let split = Layout::horizontal([
+            Constraint::Percentage(55),
+            Constraint::Min(1),
+        ])
+        .split(g);
         let (pct, label) = progress(app);
         f.render_widget(
             Gauge::default()
@@ -53,24 +62,26 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 .gauge_style(Style::default().fg(Color::DarkGray))
                 .percent(pct)
                 .label(label),
-            g,
+            split[0],
+        );
+        f.render_widget(
+            Paragraph::new(build_flags_line(app, split[1].width as usize))
+                .block(Block::default().borders(Borders::NONE))
+                .alignment(Alignment::Right),
+            split[1],
         );
     }
 }
 
-/// Compose the single info [`Line`]: play glyph, title — artist · album on the
-/// left; transport, quality, volume, and mode flags toward the right. The
-/// pieces are joined with a thin separator and the line is left-aligned; if it
-/// overflows the area width it simply wraps (Paragraph with height 1 shows
-/// only the first visual row, which is what we want).
+/// Row 1: play glyph + title — artist · album (left) + quality + volume.
+/// The decorative ◀◀ ⏸ ▶▶ transport glyphs are gone — the play glyph already
+/// shows state, and the `>`/`<` keys handle skip. (spec §5.1 cut #1.)
 fn build_info_line(app: &App, _width: usize) -> Line<'static> {
     let theme = Theme::default();
     let dim = Style::default().fg(theme.dim);
     let text = Style::default().fg(theme.text);
 
     let playing = app.player.is_playing();
-    // Play/pause glyph: show ⏸ while playing, ▶ while paused/stopped. Both are
-    // geometric/control symbols (not emoji), so they render in monochrome.
     let play_glyph = if playing { "⏸" } else { "▶" };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -97,19 +108,11 @@ fn build_info_line(app: &App, _width: usize) -> Line<'static> {
 
     spans.push(Span::raw("   "));
 
-    // Transport: ◀◀ ⏸/▶ ▶▶. Plain-text-friendly glyphs.
-    let transport = format!("◀◀ {play_glyph} ▶▶");
-    spans.push(Span::styled(transport, dim));
-
-    spans.push(Span::raw("   "));
-
     // Quality readout: local → `24-bit / 96 kHz` (+`· bit-perfect`);
     // remote → stream format label (`Opus 160k · YT` / `AAC 256k · YT Premium`).
     match app.now_playing_view() {
         Some(v) if v.source.is_remote() => {
             let label = v.fmt.as_ref().map(|f| f.yt_label()).unwrap_or_else(|| "YT".to_string());
-            // YT lossy: a distinct (non-hires) accent; pair the word with the
-            // label so it's not color-alone.
             let color = if crate::tui::view::theme::no_color() { Color::Reset } else { Color::Yellow };
             spans.push(Span::styled(label, Style::default().fg(color)));
         }
@@ -142,9 +145,16 @@ fn build_info_line(app: &App, _width: usize) -> Line<'static> {
         Style::default().fg(if app.muted { theme.dim } else { theme.text }),
     ));
 
-    spans.push(Span::raw("   "));
+    Line::from(spans).alignment(Alignment::Left)
+}
 
-    // Mode flags as plain text (monochrome-safe): `SHUF smart` / `RPT all`.
+/// Row 2 right-anchored flags: `SHUF off · RPT off · CONT off · MODE local`.
+/// `·`-separated and right-anchored so they read as one rhythm; `MODE` last
+/// (spec §5.1 cut #4).
+fn build_flags_line(app: &App, _width: usize) -> Line<'static> {
+    let theme = Theme::default();
+    let dim = Style::default().fg(theme.dim);
+
     let shuf = match app.transport.shuffle {
         ShuffleMode::Off => "off",
         ShuffleMode::Smart => "smart",
@@ -155,22 +165,23 @@ fn build_info_line(app: &App, _width: usize) -> Line<'static> {
         RepeatMode::All => "all",
         RepeatMode::One => "one",
     };
-    // Continue mode: what plays when the current context ends (repeat off).
-    // off = stop; next = continue to the next album by the same artist;
-    // radio = continue with the whole library (shuffled), never stops.
     let cont = match app.transport.continue_mode {
         ContinueMode::Off => "off",
         ContinueMode::NextAlbum => "next",
         ContinueMode::Radio => "radio",
         ContinueMode::YouTube => "youtube",
     };
-    spans.push(Span::styled(format!("SHUF {shuf}"), dim));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(format!("RPT {rpt}"), dim));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(format!("CONT {cont}"), dim));
-
-    Line::from(spans).alignment(Alignment::Left)
+    let mode = app.source_mode.as_str();
+    Line::from(vec![
+        Span::styled(format!("SHUF {shuf}"), dim),
+        Span::raw(" · "),
+        Span::styled(format!("RPT {rpt}"), dim),
+        Span::raw(" · "),
+        Span::styled(format!("CONT {cont}"), dim),
+        Span::raw(" · "),
+        Span::styled(format!("MODE {mode}"), dim),
+    ])
+    .alignment(Alignment::Right)
 }
 
 /// `(percent, "M:SS / M:SS")` for the progress gauge. When position/duration

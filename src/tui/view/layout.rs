@@ -24,7 +24,7 @@ use ratatui::{
 };
 
 use crate::tui::app::App;
-use super::{columns, overlay, player_bar};
+use super::{columns, footer, overlay, player_bar};
 
 /// Minimum terminal size we'll attempt to render the full browse layout in.
 pub const MIN_WIDTH: u16 = 80;
@@ -32,9 +32,11 @@ pub const MIN_HEIGHT: u16 = 24;
 
 /// Height of the persistent player bar at the bottom of the screen.
 const PLAYER_BAR_HEIGHT: u16 = 2;
+/// Height of the always-visible footer hint bar.
+const FOOTER_HEIGHT: u16 = 1;
 
 /// The single entry point the event loop calls. Renders the full TUI frame:
-/// too-small guard, columns + player bar, and any active overlay on top.
+/// too-small guard, columns + player bar + footer, and any active overlay on top.
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -47,19 +49,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // leave the Tracks column empty.
     app.clamp_cursors();
 
-    // Vertical split: main browse area gets the remainder, player bar gets a
-    // fixed 2-line strip at the bottom. `Min(3)` guarantees the columns always
-    // have at least a header + content + footer row even at exactly 80×24.
+    // Vertical split: main browse area gets the remainder; player bar gets a
+    // fixed 2-line strip; footer gets a fixed 1-line hint strip. At 80×24
+    // that's content 21 + bar 2 + footer 1.
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
             Constraint::Length(PLAYER_BAR_HEIGHT),
+            Constraint::Length(FOOTER_HEIGHT),
         ])
         .split(area);
 
     columns::render(f, outer[0], app);
     player_bar::render(f, outer[1], app);
+    footer::render(f, &outer[2], app);
 
     if app.overlay.is_some() {
         overlay::render(f, area, app);

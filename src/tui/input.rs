@@ -432,12 +432,16 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent) {
             // to scrub volume on every mouse-move, which jumped the level
             // erratically. Volume is keyboard-only (+/-/m) now.
             let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-            let bar_top = h.saturating_sub(2);
-            if m.row >= bar_top {
+            // Player bar is 2 rows above the 1-row footer hint bar, so its top
+            // is at h-3; the footer (row h-1) is intentionally not clickable.
+            let bar_top = h.saturating_sub(3);
+            let footer_row = h.saturating_sub(1);
+            if m.row >= bar_top && m.row < footer_row {
                 handle_player_bar_click(app, m.column, m.row - bar_top);
-            } else {
+            } else if m.row < bar_top {
                 handle_browse_click(app, m.column, m.row);
             }
+            // clicks on the footer row are ignored
         }
         _ => {}
     }
