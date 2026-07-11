@@ -35,6 +35,7 @@ pub enum ContinueMode {
     Off,
     NextAlbum,
     Radio,
+    YouTube,
 }
 
 pub struct Transport {

@@ -40,6 +40,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Inline filter (`f`) routing: typing narrows the focused column, Esc/Enter
+    // clear. Navigation keys (arrows) fall through to normal dispatch and
+    // operate on the filtered list.
+    if app.filter.is_some() && handle_filter_key(app, key) {
+        return;
+    }
+
     // Leader-key (`gg`) handling: a pending `g` arms a top-of-column jump; a
     // second `g` consumes it. Any other key cancels the pending state and
     // falls through to normal dispatch.
@@ -71,19 +78,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // `G` bottom of column.
         (KeyCode::Char('G'), _) => bottom_of_column(app),
 
-        // View switching: 1/2/3 = Artists/Playlists/Queue.
+        // View switching: 1/2/3/4 = Artists/Playlists/Queue/YouTube.
         (KeyCode::Char('1'), m) if m == KeyModifiers::NONE => switch_view(app, View::Artists),
         (KeyCode::Char('2'), m) if m == KeyModifiers::NONE => switch_view(app, View::Playlists),
         (KeyCode::Char('3'), m) if m == KeyModifiers::NONE => switch_view(app, View::Queue),
-        // `4` opens the Search overlay (spec §Keymap maps `4` → Search; the
-        // `View` enum has no Search variant, so this is the consistent path).
-        (KeyCode::Char('4'), m) if m == KeyModifiers::NONE => {
-            app.overlay = Some(Overlay::Search {
-                input: String::new(),
-                results: Vec::new(),
-                cursor: 0,
-            });
-        }
+        (KeyCode::Char('4'), m) if m == KeyModifiers::NONE => switch_view(app, View::Youtube),
 
         // Tab / Shift+Tab cycle view forward / backward.
         (KeyCode::Tab, m) if m.contains(KeyModifiers::SHIFT) => cycle_view(app, false),
@@ -104,19 +103,38 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('z'), _) => app.cycle_shuffle(),
         (KeyCode::Char('Z'), _) => app.reshuffle(),
         (KeyCode::Char('r'), _) => app.cycle_repeat(),
-        // `c` cycles continue mode (off → next album → radio): what happens
-        // when the current context ends with repeat off.
+        // `c` cycles continue mode (mode-dependent: see App::cycle_continue).
         (KeyCode::Char('c'), _) => app.cycle_continue(),
+        // `M` cycles the source mode Local → YouTube → Mixed → Local (never
+        // stops playback).
+        (KeyCode::Char('M'), _) => app.cycle_mode(),
+        // `s` instant random track in context; `S` discover overlay (spec §5.5).
+        (KeyCode::Char('s'), _) => app.instant_random(),
+        (KeyCode::Char('S'), _) => app.open_discover(),
 
         // --- Overlays -------------------------------------------------------
         (KeyCode::Char('/'), _) => {
+            // Default the search scope to the active view: YouTube search in
+            // the Y view (explicit-submit — ytmusicapi is slow), local BM25
+            // elsewhere (instant, live). `Tab` inside the overlay toggles.
+            let scope = if app.view == crate::tui::app::View::Youtube {
+                crate::tui::app::SearchScope::Youtube
+            } else {
+                crate::tui::app::SearchScope::Local
+            };
             app.overlay = Some(Overlay::Search {
                 input: String::new(),
                 results: Vec::new(),
                 cursor: 0,
+                scope,
+                submitted: None,
+                searching: false,
             });
         }
+        // `f` inline filter on the focused column (spec §5.4).
+        (KeyCode::Char('f'), _) => app.toggle_filter(),
         (KeyCode::Char('?'), _) => {
+            app.help_scroll = 0;
             app.overlay = Some(Overlay::Help);
         }
         (KeyCode::Char('a'), _) => {
@@ -144,16 +162,71 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
     }
 
     match app.overlay.take() {
-        Some(Overlay::Search { mut input, mut results, mut cursor }) => {
-            // Track whether the query changed so we only re-search on mutation.
-            let mut changed = false;
+        Some(Overlay::Search {
+            mut input,
+            mut results,
+            mut cursor,
+            mut scope,
+            mut submitted,
+            mut searching,
+        }) => {
+            // Two search models, by scope:
+            //   Local  — instant: typing re-runs the BM25 index live.
+            //   Youtube — explicit-submit: typing only accumulates the query;
+            //     Enter sends ONE async request (no per-keystroke network, which
+            //     would stall the UI for ~3s/char). A second Enter on fresh
+            //     results picks the track instead of re-searching.
             match key.code {
-                // Enter picks the result under the cursor (play in context).
+                // Tab toggles scope (local ↔ youtube) so the user can search the
+                // local catalog from the Y view, or YouTube from a local view.
+                // Results are scope-specific, so clear them on toggle.
+                KeyCode::Tab => {
+                    scope = match scope {
+                        crate::tui::app::SearchScope::Local => crate::tui::app::SearchScope::Youtube,
+                        crate::tui::app::SearchScope::Youtube => crate::tui::app::SearchScope::Local,
+                    };
+                    results.clear();
+                    cursor = 0;
+                    submitted = None;
+                    searching = false;
+                    // Local is instant: run the (now-local) query immediately.
+                    if scope == crate::tui::app::SearchScope::Local && !input.is_empty() {
+                        results = app.run_search_local(&input);
+                        submitted = Some(input.clone());
+                        if cursor >= results.len() {
+                            cursor = results.len().saturating_sub(1);
+                        }
+                    }
+                }
+                // Enter: submit (Youtube dirty) or pick (results fresh) or pick
+                // (Local, where results are always live).
                 KeyCode::Enter => {
-                    if let Some(id) = results.get(cursor).cloned() {
-                        let ids = std::mem::take(&mut results);
-                        app.play_in_context_ids(ids, &id);
-                        return;
+                    if searching {
+                        // A request is already in flight; ignore.
+                    } else if scope == crate::tui::app::SearchScope::Local {
+                        if let Some(id) = results.get(cursor).cloned() {
+                            let ids = std::mem::take(&mut results);
+                            app.play_in_context_ids(ids, &id);
+                            return;
+                        }
+                    } else {
+                        // Youtube scope.
+                        let fresh = submitted.as_deref() == Some(input.as_str()) && !results.is_empty();
+                        if fresh {
+                            // Results match the current query → pick.
+                            if let Some(id) = results.get(cursor).cloned() {
+                                let ids = std::mem::take(&mut results);
+                                app.play_in_context_ids(ids, &id);
+                                return;
+                            }
+                        } else if !input.trim().is_empty() {
+                            // Dirty / never submitted → fire-and-forget search.
+                            app.submit_yt_search(input.clone());
+                            submitted = Some(input.clone());
+                            searching = true;
+                            results.clear();
+                            cursor = 0;
+                        }
                     }
                 }
                 // Arrow keys are the ONLY result navigators in the search
@@ -174,18 +247,38 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
                 {
                     input.push(c);
-                    changed = true;
+                    if scope == crate::tui::app::SearchScope::Local {
+                        // Local is instant: live-search on every keystroke.
+                        results = app.run_search_local(&input);
+                        submitted = Some(input.clone());
+                        if cursor >= results.len() {
+                            cursor = results.len().saturating_sub(1);
+                        }
+                    } else {
+                        // Youtube: typing marks the query dirty (a later
+                        // Enter re-submits). Don't touch results here — leave
+                        // the stale list visible until the user submits.
+                        searching = false;
+                        // submitted no longer matches input → next Enter submits.
+                    }
                 }
                 KeyCode::Backspace => {
                     input.pop();
-                    changed = true;
+                    if scope == crate::tui::app::SearchScope::Local {
+                        results = app.run_search_local(&input);
+                        submitted = Some(input.clone());
+                        if cursor >= results.len() {
+                            cursor = results.len().saturating_sub(1);
+                        }
+                    } else {
+                        searching = false;
+                    }
                 }
                 _ => {}
             }
-            app.overlay = Some(Overlay::Search { input, results, cursor });
-            if changed {
-                app.update_search_results();
-            }
+            app.overlay = Some(Overlay::Search {
+                input, results, cursor, scope, submitted, searching,
+            });
         }
         Some(Overlay::Command { mut input }) => {
             match key.code {
@@ -194,23 +287,154 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     && !key.modifiers.contains(KeyModifiers::ALT) => input.push(c),
                 KeyCode::Backspace => { input.pop(); }
                 KeyCode::Enter => {
-                    // Command execution is best-effort + minimal for Task 11;
-                    // the command parser is wired up in a later task. For now
-                    // we just close the command line on submit.
+                    let cmd = input.trim().to_string();
                     app.overlay = None;
+                    execute_command(app, &cmd);
                     return;
                 }
                 _ => {}
             }
             app.overlay = Some(Overlay::Command { input });
         }
+        Some(Overlay::YtAuth { mut input }) => {
+            // The auth overlay's own keymap: typing accumulates the pasted
+            // cookies; `Enter` saves+connects; `Esc` cancels (handled above).
+            // Pasted newlines arrive as Char('\n') — push them as spaces so the
+            // whole cookies.txt stays on one logical line (Netscape format is
+            // tab-delimited; joining with spaces still parses).
+            match key.code {
+                KeyCode::Enter => {
+                    app.apply_yt_auth(std::mem::take(&mut input));
+                    app.overlay = None;
+                    return;
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    input.push(if c == '\n' || c == '\r' { ' ' } else { c });
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::YtAuth { input });
+        }
+        // Help overlay: scroll the keymap (it's taller than the popup). Esc
+        // (handled above) closes; j/k/↑/↓ scroll a line, PgUp/PgDn half a page,
+        // g/G jump to top/bottom. Any other key is a no-op.
+        Some(Overlay::Help) => {
+            // Upper bound is the content length; over-scrolling just shows
+            // blank space, so a generous constant is safe and avoids needing
+            // the rendered height here.
+            const HELP_LINES: u16 = 31;
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.help_scroll = app.help_scroll.saturating_add(1).min(HELP_LINES);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.help_scroll = app.help_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    app.help_scroll = app.help_scroll.saturating_add(10).min(HELP_LINES);
+                }
+                KeyCode::PageUp => {
+                    app.help_scroll = app.help_scroll.saturating_sub(10);
+                }
+                KeyCode::Char('g') => app.help_scroll = 0,
+                KeyCode::Char('G') => app.help_scroll = HELP_LINES,
+                _ => {}
+            }
+            app.overlay = Some(Overlay::Help);
+        }
         // Help / PlaylistPicker: any non-Esc key is a no-op (overlay stays open
         // until Esc). PlaylistPicker selection routing is wired up in a later
         // task; for now the picker is display-only.
+        Some(Overlay::Discover { items, mut cursor }) => {
+            match key.code {
+                KeyCode::Down if !items.is_empty() => {
+                    cursor = (cursor + 1) % items.len();
+                }
+                KeyCode::Up if !items.is_empty() => {
+                    cursor = cursor.checked_sub(1).unwrap_or(items.len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    app.overlay = Some(Overlay::Discover { items, cursor });
+                    app.play_discover_selection();
+                    return;
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::Discover { items, cursor });
+        }
         Some(other) => {
             app.overlay = Some(other);
         }
         None => {}
+    }
+}
+
+/// Keys that route to the active inline filter (`f`). Returns true if the key
+/// was consumed (Char/Backspace/Esc/Enter); false for navigation keys, which
+/// fall through to normal dispatch and operate on the filtered list.
+fn handle_filter_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc => {
+            app.filter = None;
+            true
+        }
+        KeyCode::Enter => {
+            // Enter on a filter jumps the cursor to the first match + clears.
+            app.filter_jump();
+            true
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            // `f` on an empty filter closes it (toggle semantics); otherwise
+            // the char goes into the query. Backspace-to-empty + `f` also
+            // closes, so you don't get a stranded empty filter.
+            if c == 'f' && app.filter.as_ref().map(|f| f.text.is_empty()).unwrap_or(false) {
+                app.filter = None;
+            } else if let Some(f) = &mut app.filter {
+                f.text.push(c);
+            }
+            true
+        }
+        KeyCode::Backspace => {
+            if let Some(f) = &mut app.filter {
+                f.text.pop();
+            }
+            true
+        }
+        _ => false, // navigation keys fall through
+    }
+}
+
+/// Execute a `:` command. Supports `:yt auth`, `:yt auth browser <name>`,
+/// `:yt logout`, `:yt setup`.
+fn execute_command(app: &mut App, cmd: &str) {
+    match cmd {
+        "yt auth" => {
+            app.overlay = Some(Overlay::YtAuth { input: String::new() });
+        }
+        "yt logout" => {
+            app.yt_logout();
+        }
+        "yt setup" => {
+            app.yt_setup();
+        }
+        other if other.starts_with("yt auth browser") => {
+            let browser = other.trim_start_matches("yt auth browser").trim().to_string();
+            if browser.is_empty() {
+                app.yt_error = Some(
+                    "usage: :yt auth browser <chrome|firefox|safari|edge|brave|opera|chromium>".into(),
+                );
+            } else {
+                app.apply_yt_browser(browser);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -235,6 +459,10 @@ fn focused_column_len(app: &App) -> usize {
             0 => app.playlists.len(),
             _ => focused_track_count(app),
         },
+        View::Youtube => match app.focus_col {
+            0 => app.yt_lists.len(),
+            _ => focused_track_count(app),
+        },
         View::Queue => app.transport.manual_queue.len(),
     }
 }
@@ -255,6 +483,11 @@ fn focused_track_count(app: &App) -> usize {
             .get(app.cursors.playlist)
             .map(|p| p.track_ids.len())
             .unwrap_or(0),
+        View::Youtube => app
+            .yt_lists
+            .get(app.cursors.playlist)
+            .map(|l| l.track_ids.len())
+            .unwrap_or(0),
         View::Queue => app.transport.manual_queue.len(),
     }
 }
@@ -264,6 +497,7 @@ fn max_focus_col(app: &App) -> usize {
     match app.view {
         View::Artists => 2,
         View::Playlists => 1,
+        View::Youtube => 1,
         View::Queue => 0,
     }
 }
@@ -324,6 +558,10 @@ fn focused_cursor(app: &App) -> usize {
             0 => app.cursors.playlist,
             _ => app.cursors.track,
         },
+        View::Youtube => match app.focus_col {
+            0 => app.cursors.playlist,
+            _ => app.cursors.track,
+        },
         View::Queue => app.cursors.queue,
     }
 }
@@ -356,6 +594,15 @@ fn set_focused_cursor(app: &mut App, v: usize) {
             }
             _ => app.cursors.track = v,
         },
+        View::Youtube => match app.focus_col {
+            // Changing the YT list invalidates the track cursor + triggers a
+            // lazy fetch of its tracks (wired in Task 13).
+            0 => {
+                app.cursors.playlist = v;
+                app.cursors.track = 0;
+            }
+            _ => app.cursors.track = v,
+        },
         View::Queue => app.cursors.queue = v,
     }
 }
@@ -363,6 +610,11 @@ fn set_focused_cursor(app: &mut App, v: usize) {
 fn switch_view(app: &mut App, view: View) {
     app.view = view;
     app.focus_col = 0;
+    // Entering the Y view fetches the account + suggested lists (bounded
+    // synchronous roundtrip at the view-enter boundary; spec §5.3).
+    if view == View::Youtube {
+        app.refresh_yt_lists();
+    }
 }
 
 /// Cycle the browse view forward (`fwd=true`, Tab) or backward (Shift+Tab).
@@ -370,8 +622,10 @@ fn cycle_view(app: &mut App, fwd: bool) {
     let next = match (app.view, fwd) {
         (View::Artists, true) => View::Playlists,
         (View::Playlists, true) => View::Queue,
-        (View::Queue, true) => View::Artists,
-        (View::Artists, false) => View::Queue,
+        (View::Queue, true) => View::Youtube,
+        (View::Youtube, true) => View::Artists,
+        (View::Artists, false) => View::Youtube,
+        (View::Youtube, false) => View::Queue,
         (View::Playlists, false) => View::Artists,
         (View::Queue, false) => View::Playlists,
     };
@@ -407,12 +661,16 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent) {
             // to scrub volume on every mouse-move, which jumped the level
             // erratically. Volume is keyboard-only (+/-/m) now.
             let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-            let bar_top = h.saturating_sub(2);
-            if m.row >= bar_top {
+            // Player bar is 2 rows above the 1-row footer hint bar, so its top
+            // is at h-3; the footer (row h-1) is intentionally not clickable.
+            let bar_top = h.saturating_sub(3);
+            let footer_row = h.saturating_sub(1);
+            if m.row >= bar_top && m.row < footer_row {
                 handle_player_bar_click(app, m.column, m.row - bar_top);
-            } else {
+            } else if m.row < bar_top {
                 handle_browse_click(app, m.column, m.row);
             }
+            // clicks on the footer row are ignored
         }
         _ => {}
     }
@@ -458,6 +716,7 @@ fn handle_browse_click(app: &mut App, col: u16, row: u16) {
             0 => switch_view(app, View::Artists),
             1 => switch_view(app, View::Playlists),
             2 => switch_view(app, View::Queue),
+            3 => switch_view(app, View::Youtube),
             _ => {}
         }
         return;
@@ -505,6 +764,10 @@ fn focused_column_len_with_focus(app: &App, focus: usize) -> usize {
         },
         View::Playlists => match focus {
             0 => app.playlists.len(),
+            _ => focused_track_count(app),
+        },
+        View::Youtube => match focus {
+            0 => app.yt_lists.len(),
             _ => focused_track_count(app),
         },
         View::Queue => app.transport.manual_queue.len(),

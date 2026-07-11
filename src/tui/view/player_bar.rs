@@ -25,10 +25,77 @@ use crate::tui::app::App;
 use crate::tui::queue::{ContinueMode, RepeatMode, ShuffleMode};
 use crate::tui::view::theme::{quality_color, Theme};
 
-/// Render the player bar into `area` using state from `app`.
+/// Braille spinner frames (U+2800–28FF, width 1) — the same set Claude Code's
+/// CLI uses. Animated in `App::on_tick` while a YouTube resolve is in flight.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Compact 1-row player bar for the narrow (60–80 col) fallback: now-playing +
+/// quality + flags all on one line, no gauge (spec §5.6).
+pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
+    let theme = Theme::default();
+    let dim = Style::default().fg(theme.dim);
+    let text = Style::default().fg(theme.text);
+    let resolving = app.is_resolving();
+    let play_glyph = if resolving {
+        SPINNER[app.spinner_frame as usize % SPINNER.len()]
+    } else if app.player.is_playing() {
+        "⏸"
+    } else {
+        "▶"
+    };
+    // Accent (Cyan) while resolving — an attention/progress signal — else the
+    // normal text color. Both auto-degrade to Reset under NO_COLOR (theme).
+    let glyph_style = if resolving {
+        Style::default().fg(theme.accent)
+    } else {
+        text
+    };
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(format!("{play_glyph} "), glyph_style)];
+
+    match app.now_playing_view() {
+        Some(v) => {
+            spans.push(Span::styled(v.title.clone(), text));
+            spans.push(Span::styled(" — ", dim));
+            spans.push(Span::styled(v.artist.clone(), text));
+        }
+        None => spans.push(Span::styled("—", dim)),
+    }
+    spans.push(Span::raw("  "));
+    // quality
+    match app.now_playing_view() {
+        Some(v) if v.source.is_remote() => {
+            let label = v.fmt.as_ref().map(|f| f.yt_label()).unwrap_or_else(|| "YT".to_string());
+            let color = if crate::tui::view::theme::no_color() { Color::Reset } else { Color::Yellow };
+            spans.push(Span::styled(label, Style::default().fg(color)));
+        }
+        Some(v) => {
+            let q_color = quality_color(v.bit_depth, v.sample_rate_hz);
+            spans.push(Span::styled(
+                format!("{}bit/{}", v.bit_depth, khz(v.sample_rate_hz)),
+                Style::default().fg(q_color),
+            ));
+        }
+        None => spans.push(Span::styled("--", dim)),
+    }
+    spans.push(Span::raw("  "));
+    let cont = match app.transport.continue_mode {
+        ContinueMode::Off => "off",
+        ContinueMode::NextAlbum => "next",
+        ContinueMode::Radio => "radio",
+        ContinueMode::YouTube => "youtube",
+    };
+    spans.push(Span::styled(format!("CONT {cont} · MODE {}", app.source_mode.as_str()), dim));
+    f.render_widget(
+        Paragraph::new(Line::from(spans).alignment(Alignment::Left))
+            .block(Block::default().borders(Borders::NONE)),
+        area,
+    );
+}
+
+/// Render the player bar into `area` using state from `app`. Two rows:
+/// row 1 = now-playing + quality + volume; row 2 = progress gauge + mode
+/// flags (SHUF · RPT · CONT · MODE), `·`-separated, right-anchored.
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
-    // Split into an info row + a gauge row. When we only have one row, drop
-    // the gauge so the info always fits.
     let rows = Layout::vertical(if area.height >= 2 {
         vec![Constraint::Length(1), Constraint::Length(1)]
     } else {
@@ -46,6 +113,15 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     );
 
     if let Some(g) = gauge_area {
+        // Row 2: gauge on the left (~55%) + flags right-anchored. We render
+        // the gauge into a left sub-rect and the flags into a right sub-rect so
+        // the flags stay flush against the right edge and the gauge never
+        // overruns them.
+        let split = Layout::horizontal([
+            Constraint::Percentage(55),
+            Constraint::Min(1),
+        ])
+        .split(g);
         let (pct, label) = progress(app);
         f.render_widget(
             Gauge::default()
@@ -53,37 +129,51 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 .gauge_style(Style::default().fg(Color::DarkGray))
                 .percent(pct)
                 .label(label),
-            g,
+            split[0],
+        );
+        f.render_widget(
+            Paragraph::new(build_flags_line(app, split[1].width as usize))
+                .block(Block::default().borders(Borders::NONE))
+                .alignment(Alignment::Right),
+            split[1],
         );
     }
 }
 
-/// Compose the single info [`Line`]: play glyph, title — artist · album on the
-/// left; transport, quality, volume, and mode flags toward the right. The
-/// pieces are joined with a thin separator and the line is left-aligned; if it
-/// overflows the area width it simply wraps (Paragraph with height 1 shows
-/// only the first visual row, which is what we want).
+/// Row 1: play glyph + title — artist · album (left) + quality + volume.
+/// The decorative ◀◀ ⏸ ▶▶ transport glyphs are gone — the play glyph already
+/// shows state, and the `>`/`<` keys handle skip. (spec §5.1 cut #1.)
 fn build_info_line(app: &App, _width: usize) -> Line<'static> {
     let theme = Theme::default();
     let dim = Style::default().fg(theme.dim);
     let text = Style::default().fg(theme.text);
 
     let playing = app.player.is_playing();
-    // Play/pause glyph: show ⏸ while playing, ▶ while paused/stopped. Both are
-    // geometric/control symbols (not emoji), so they render in monochrome.
-    let play_glyph = if playing { "⏸" } else { "▶" };
+    let resolving = app.is_resolving();
+    let play_glyph = if resolving {
+        SPINNER[app.spinner_frame as usize % SPINNER.len()]
+    } else if playing {
+        "⏸"
+    } else {
+        "▶"
+    };
+    let glyph_style = if resolving {
+        Style::default().fg(theme.accent)
+    } else {
+        text
+    };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
 
-    spans.push(Span::styled(format!("{play_glyph} "), text));
+    spans.push(Span::styled(format!("{play_glyph} "), glyph_style));
 
     // Now-playing: title — artist · album (or a dim placeholder).
-    match now_playing_track(app) {
-        Some(t) => {
-            spans.push(Span::styled(t.title.clone(), text));
+    match app.now_playing_view() {
+        Some(v) => {
+            spans.push(Span::styled(v.title.clone(), text));
             spans.push(Span::styled(" — ", dim));
-            spans.push(Span::styled(t.primary_artist.clone(), text));
-            if let Some(album) = &t.album {
+            spans.push(Span::styled(v.artist.clone(), text));
+            if let Some(album) = &v.album {
                 if !album.is_empty() {
                     spans.push(Span::styled(" · ", dim));
                     spans.push(Span::styled(album.clone(), dim));
@@ -97,22 +187,25 @@ fn build_info_line(app: &App, _width: usize) -> Line<'static> {
 
     spans.push(Span::raw("   "));
 
-    // Transport: ◀◀ ⏸/▶ ▶▶. Plain-text-friendly glyphs.
-    let transport = format!("◀◀ {play_glyph} ▶▶");
-    spans.push(Span::styled(transport, dim));
-
-    spans.push(Span::raw("   "));
-
-    // Quality readout: `24-bit / 96 kHz` (+ `· bit-perfect`).
-    if let Some(t) = now_playing_track(app) {
-        let q_color = quality_color(t.bit_depth, t.sample_rate_hz);
-        let q_text = format!("{}-bit / {} kHz", t.bit_depth, khz(t.sample_rate_hz));
-        spans.push(Span::styled(q_text, Style::default().fg(q_color)));
-        if app.switch_sample_rate {
-            spans.push(Span::styled(" · bit-perfect", Style::default().fg(q_color)));
+    // Quality readout: local → `24-bit / 96 kHz` (+`· bit-perfect`);
+    // remote → stream format label (`Opus 160k · YT` / `AAC 256k · YT Premium`).
+    match app.now_playing_view() {
+        Some(v) if v.source.is_remote() => {
+            let label = v.fmt.as_ref().map(|f| f.yt_label()).unwrap_or_else(|| "YT".to_string());
+            let color = if crate::tui::view::theme::no_color() { Color::Reset } else { Color::Yellow };
+            spans.push(Span::styled(label, Style::default().fg(color)));
         }
-    } else {
-        spans.push(Span::styled("--bit / -- kHz", dim));
+        Some(v) => {
+            let q_color = quality_color(v.bit_depth, v.sample_rate_hz);
+            let q_text = format!("{}-bit / {} kHz", v.bit_depth, khz(v.sample_rate_hz));
+            spans.push(Span::styled(q_text, Style::default().fg(q_color)));
+            if app.switch_sample_rate {
+                spans.push(Span::styled(" · bit-perfect", Style::default().fg(q_color)));
+            }
+        }
+        None => {
+            spans.push(Span::styled("--bit / -- kHz", dim));
+        }
     }
 
     spans.push(Span::raw("   "));
@@ -131,9 +224,16 @@ fn build_info_line(app: &App, _width: usize) -> Line<'static> {
         Style::default().fg(if app.muted { theme.dim } else { theme.text }),
     ));
 
-    spans.push(Span::raw("   "));
+    Line::from(spans).alignment(Alignment::Left)
+}
 
-    // Mode flags as plain text (monochrome-safe): `SHUF smart` / `RPT all`.
+/// Row 2 right-anchored flags: `SHUF off · RPT off · CONT off · MODE local`.
+/// `·`-separated and right-anchored so they read as one rhythm; `MODE` last
+/// (spec §5.1 cut #4).
+fn build_flags_line(app: &App, _width: usize) -> Line<'static> {
+    let theme = Theme::default();
+    let dim = Style::default().fg(theme.dim);
+
     let shuf = match app.transport.shuffle {
         ShuffleMode::Off => "off",
         ShuffleMode::Smart => "smart",
@@ -144,21 +244,23 @@ fn build_info_line(app: &App, _width: usize) -> Line<'static> {
         RepeatMode::All => "all",
         RepeatMode::One => "one",
     };
-    // Continue mode: what plays when the current context ends (repeat off).
-    // off = stop; next = continue to the next album by the same artist;
-    // radio = continue with the whole library (shuffled), never stops.
     let cont = match app.transport.continue_mode {
         ContinueMode::Off => "off",
         ContinueMode::NextAlbum => "next",
         ContinueMode::Radio => "radio",
+        ContinueMode::YouTube => "youtube",
     };
-    spans.push(Span::styled(format!("SHUF {shuf}"), dim));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(format!("RPT {rpt}"), dim));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(format!("CONT {cont}"), dim));
-
-    Line::from(spans).alignment(Alignment::Left)
+    let mode = app.source_mode.as_str();
+    Line::from(vec![
+        Span::styled(format!("SHUF {shuf}"), dim),
+        Span::raw(" · "),
+        Span::styled(format!("RPT {rpt}"), dim),
+        Span::raw(" · "),
+        Span::styled(format!("CONT {cont}"), dim),
+        Span::raw(" · "),
+        Span::styled(format!("MODE {mode}"), dim),
+    ])
+    .alignment(Alignment::Right)
 }
 
 /// `(percent, "M:SS / M:SS")` for the progress gauge. When position/duration
@@ -198,7 +300,8 @@ fn khz(sample_rate_hz: u32) -> String {
 }
 
 /// Find the currently-playing [`Track`] by `app.now_playing` id.
+#[allow(dead_code)]
 fn now_playing_track(app: &App) -> Option<&Track> {
-    let id = app.now_playing.as_ref()?;
-    app.catalog.tracks.iter().find(|t| &t.id == id)
+    let id = app.now_playing.as_ref().map(|s| s.id())?;
+    app.catalog.tracks.iter().find(|t| t.id == id)
 }

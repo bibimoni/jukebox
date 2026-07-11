@@ -84,3 +84,18 @@ fn playlist_context_resolves_via_resolver() {
     let ctx = Context::Playlist { name: "Faves".into() };
     assert_eq!(ctx.track_ids(&resolver), vec!["a3".to_string(), "a1".to_string()]);
 }
+
+struct R2;
+impl jukebox::tui::context::ContextResolver for R2 {
+    fn playlist_ids(&self, _: &str) -> Vec<String> { vec![] }
+    fn queue_ids(&self) -> Vec<String> { vec![] }
+    fn yt_playlist_ids(&self, key: &str) -> Vec<String> {
+        if key == "yt1" { vec!["v1".into(), "v2".into()] } else { vec![] }
+    }
+}
+
+#[test]
+fn yt_playlist_resolver_returns_video_ids() {
+    let ctx = jukebox::tui::context::Context::Youtube { key: "yt1".into(), name: "Y1".into() };
+    assert_eq!(ctx.track_ids(&R2), vec!["v1".to_string(), "v2".to_string()]);
+}

@@ -150,3 +150,9 @@ fn prev_after_manual_queue_returns_last_context_track() {
     // prev must walk back to t2 (the last context track that finished).
     assert_eq!(t.prev(&RQ, &cat), Some("t2".into()));
 }
+
+#[test]
+fn continue_mode_youtube_variant_exists() {
+    use jukebox::tui::queue::ContinueMode;
+    assert_ne!(ContinueMode::YouTube, ContinueMode::Off);
+}

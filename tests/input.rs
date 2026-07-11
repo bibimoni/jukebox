@@ -69,27 +69,27 @@ fn focus_track_col(app: &mut App) {
 #[test]
 fn enter_plays_selected_in_context() {
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     focus_track_col(&mut app);
     handle_key(&mut app, key_code(KeyCode::Enter));
-    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
 }
 
 #[test]
 fn gt_advances_to_next_track() {
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     focus_track_col(&mut app);
     handle_key(&mut app, key_code(KeyCode::Enter));
-    assert_eq!(app.now_playing.as_deref(), Some("t1"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
     handle_key(&mut app, key('>'));
-    assert_eq!(app.now_playing.as_deref(), Some("t2"));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t2"));
 }
 
 #[test]
 fn z_cycles_shuffle_mode() {
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     assert_eq!(app.transport.shuffle, ShuffleMode::Off);
     handle_key(&mut app, key('z'));
     assert_eq!(app.transport.shuffle, ShuffleMode::Smart);
@@ -102,7 +102,7 @@ fn z_cycles_shuffle_mode() {
 #[test]
 fn r_cycles_repeat_mode() {
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     assert_eq!(app.transport.repeat, RepeatMode::Off);
     handle_key(&mut app, key('r'));
     assert_eq!(app.transport.repeat, RepeatMode::All);
@@ -115,7 +115,7 @@ fn r_cycles_repeat_mode() {
 #[test]
 fn q_sets_should_quit() {
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     assert!(!app.should_quit);
     handle_key(&mut app, key('q'));
     assert!(app.should_quit);
@@ -124,7 +124,7 @@ fn q_sets_should_quit() {
 #[test]
 fn slash_opens_search_overlay_and_esc_closes_it() {
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     assert!(app.overlay.is_none());
     handle_key(&mut app, key('/'));
     assert!(matches!(app.overlay, Some(Overlay::Search { .. })));
@@ -157,7 +157,7 @@ fn cat_with_index() -> (tempfile::TempDir, Catalog) {
 fn search_overlay_populates_results() {
     let (_d, cat) = cat_with_index();
     let searcher = Searcher::open(&_d.path().join("search-index")).unwrap();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), Some(searcher));
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), Some(searcher), None);
 
     // Open the search overlay (same as `/`).
     handle_key(&mut app, key('/'));
@@ -181,12 +181,11 @@ fn search_overlay_populates_results() {
 }
 
 #[test]
-fn four_key_opens_search_overlay() {
+fn four_key_switches_to_youtube_view() {
     let (_d, cat) = cat_with_index();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
-    assert!(app.overlay.is_none());
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     handle_key(&mut app, key('4'));
-    assert!(matches!(app.overlay, Some(Overlay::Search { .. })));
+    assert_eq!(app.view, jukebox::tui::app::View::Youtube);
 }
 
 /// Regression for the "Capital letters dropped in search overlay input" bug.
@@ -199,7 +198,7 @@ fn four_key_opens_search_overlay() {
 #[test]
 fn search_overlay_accepts_capital_letters() {
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     handle_key(&mut app, key('/'));
     // Shift+F: a real terminal sends Char('F') with the SHIFT modifier.
     handle_key(
@@ -219,7 +218,7 @@ fn search_overlay_n_types_into_query_not_navigation() {
     // the query — so you couldn't search for e.g. "nirvana". Now arrows are
     // the only navigator; `n` must go into the input.
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     handle_key(&mut app, key('/'));
     handle_key(&mut app, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
     let input = match &app.overlay {
@@ -235,7 +234,7 @@ fn search_overlay_arrow_keys_move_selection() {
     // the result cursor (previously only `n`/`N` did, so arrows were no-ops).
     let (_d, cat) = cat_with_index();
     let searcher = Searcher::open(&_d.path().join("search-index")).unwrap();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), Some(searcher));
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), Some(searcher), None);
     // Type a query that yields multiple results ("a" matches Ado/Aimer/etc).
     handle_key(&mut app, key('/'));
     handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
@@ -265,7 +264,7 @@ fn search_overlay_typing_letters_not_intercepted_as_navigation() {
     // 'j'/'k' are NOT navigation in the search overlay (only arrows are), so
     // typing "joji" must put 'j' into the input rather than move the cursor.
     let (_d, cat) = cat_album();
-    let mut app = App::new(cat, Box::new(StubPlayer::default()), None);
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     handle_key(&mut app, key('/'));
     handle_key(&mut app, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     let input = match &app.overlay {
@@ -275,3 +274,110 @@ fn search_overlay_typing_letters_not_intercepted_as_navigation() {
     assert_eq!(input, "j", "'j' must be typed into the query, not navigate");
 }
 
+
+
+fn isolate_xdg() -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("jk-xdg-{}-{}", std::process::id(),
+        std::sync::atomic::AtomicU64::new(0).fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+    std::fs::create_dir_all(&d).unwrap();
+    std::env::set_var("XDG_CONFIG_HOME", &d);
+    d
+}
+
+#[test]
+fn yt_auth_command_opens_overlay() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    open_command(&mut app, "yt auth");
+    assert!(matches!(app.overlay, Some(Overlay::YtAuth { .. })));
+}
+
+#[test]
+fn yt_auth_enter_saves_closes_esc_cancels() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::YtAuth { input: "# Netscape cookies".into() });
+    // Enter submits → writes cookies, closes overlay.
+    handle_key(&mut app, key_code(KeyCode::Enter));
+    assert!(app.overlay.is_none(), "Enter should close the auth overlay");
+    let _ = std::fs::remove_file(jukebox::yt::session::cookies_file());
+}
+
+#[test]
+fn yt_auth_esc_cancels_without_saving() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::YtAuth { input: "x".into() });
+    handle_key(&mut app, key_code(KeyCode::Esc));
+    assert!(app.overlay.is_none());
+}
+
+fn open_command(app: &mut App, text: &str) {
+    handle_key(app, key(':'));
+    for c in text.chars() {
+        handle_key(app, key(c));
+    }
+    handle_key(app, key_code(KeyCode::Enter));
+}
+
+#[test]
+fn f_opens_filter_and_typing_narrows_artists() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.view = View::Artists;
+    app.focus_col = 0;
+    handle_key(&mut app, key('f'));
+    assert!(app.filter.is_some(), "f should open the filter");
+    handle_key(&mut app, key('4')); // "40mP" starts with '4'? no — artists are "40mP". type 'm'
+    handle_key(&mut app, key('m'));
+    // filter text is "4m" — no artist matches "4m"; that's fine, we assert the
+    // filter captured the keys.
+    assert_eq!(app.filter.as_ref().unwrap().text, "4m");
+    // Esc clears.
+    handle_key(&mut app, key_code(KeyCode::Esc));
+    assert!(app.filter.is_none());
+}
+
+#[test]
+fn m_cycles_source_mode_without_stopping() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.play_in_context_ids(vec!["t1".into()], "t1");
+    let playing = app.now_playing.clone();
+    handle_key(&mut app, key('M'));
+    assert_eq!(app.source_mode, jukebox::mode::SourceMode::Youtube);
+    assert_eq!(app.now_playing, playing, "M must not stop playback");
+    handle_key(&mut app, key('M'));
+    assert_eq!(app.source_mode, jukebox::mode::SourceMode::Mixed);
+    handle_key(&mut app, key('M'));
+    assert_eq!(app.source_mode, jukebox::mode::SourceMode::Local);
+}
+
+#[test]
+fn four_switches_to_youtube_view() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    handle_key(&mut app, key_code(KeyCode::Char('4')));
+    assert_eq!(app.view, View::Youtube);
+}
+
+#[test]
+fn s_instant_random_via_key() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.source_mode = jukebox::mode::SourceMode::Local;
+    handle_key(&mut app, key('s'));
+    assert!(app.now_playing.is_some(), "s should start a random track");
+}
+
+#[test]
+fn S_opens_discover_overlay() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.source_mode = jukebox::mode::SourceMode::Local;
+    handle_key(&mut app, key('S'));
+    assert!(matches!(app.overlay, Some(Overlay::Discover { .. })));
+}

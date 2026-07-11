@@ -7,8 +7,24 @@ use crate::config::PlayerKind;
 
 pub trait Player {
     fn load(&mut self, path: &Path) -> Result<()>;
+    /// Load `path` and begin playback at `start_secs` (no from-0 replay).
+    /// Used by the premium-upgrade swap to resume the new stream at the
+    /// captured position. Default falls back to `load` + `seek_to` so backends
+    /// without a native start-offset load (afplay, stub) stay consistent.
+    fn load_at(&mut self, path: &Path, start_secs: f64) -> Result<()> {
+        self.load(path)?;
+        self.seek_to(start_secs)
+    }
     fn play_pause(&mut self) -> Result<()>;
     fn seek(&mut self, secs: f64) -> Result<()>;
+    /// Seek to an absolute position (seconds from the track start). Used by
+    /// `load_at`'s default fallback (load + seek_to) on backends without a
+    /// native start-offset load. Default falls back to relative `seek` (which
+    /// lands at the absolute target since a fresh load starts at 0) so afplay
+    /// and the stub stay consistent.
+    fn seek_to(&mut self, secs: f64) -> Result<()> {
+        self.seek(secs)
+    }
     fn stop(&mut self) -> Result<()>;
     /// Set playback volume as 0..=100. Best-effort: backends that can't
     /// (afplay has no IPC) return Ok(()) without doing anything, matching the
@@ -250,6 +266,12 @@ impl MpvPlayer {
 }
 impl Player for MpvPlayer {
     fn load(&mut self, path: &Path) -> Result<()> {
+        // Fresh track → start at 0. `start` persists across files (a prior
+        // `load_at` premium-swap may have left it at the old captured pos),
+        // so reset it here.
+        self.load_at(path, 0.0)
+    }
+    fn load_at(&mut self, path: &Path, start_secs: f64) -> Result<()> {
         // Drain any pending events for the track we're replacing so its
         // end-file doesn't trigger an auto-advance right after this load.
         self.drain_socket();
@@ -258,6 +280,16 @@ impl Player for MpvPlayer {
         // new track's.
         self.position = None;
         self.duration = None;
+        // mpv's `start` option seeks to a position at playback start, so the
+        // new stream begins at `start_secs` directly — no from-0 replay before
+        // a `seek` lands (the old load+seek path audibly restarted). It
+        // persists across files, so `load` resets it to 0 for fresh tracks.
+        let start_val = if start_secs.is_finite() && start_secs > 0.0 {
+            format!("{}", start_secs)
+        } else {
+            "0".into()
+        };
+        self.send(&["set_property".into(), "start".into(), start_val.into()])?;
         self.send(&["loadfile".into(), path.to_string_lossy().into()])?;
         Ok(())
     }
@@ -268,6 +300,14 @@ impl Player for MpvPlayer {
     }
     fn seek(&mut self, secs: f64) -> Result<()> {
         self.send(&["seek".into(), secs.into(), "relative".into()])?;
+        Ok(())
+    }
+    fn seek_to(&mut self, secs: f64) -> Result<()> {
+        // Absolute seek — used by the premium-upgrade swap to resume at the
+        // captured position after `load` resets to 0. mpv supports an absolute
+        // seek mode directly, which is cleaner than relative (no dependence on
+        // the fresh load being at 0 when the command lands).
+        self.send(&["seek".into(), secs.into(), "absolute".into()])?;
         Ok(())
     }
     fn set_volume(&mut self, vol: u8) -> Result<()> {

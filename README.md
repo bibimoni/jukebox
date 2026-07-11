@@ -44,6 +44,48 @@ cargo build --release
 
 - `metaflac`, `ffprobe`, `jq`, `yq` — for `jukebox sync`
 - `mpv` — for playback (falls back to `afplay` on macOS if unavailable)
+- **YouTube (optional):** `python3` + `ytmusicapi` + `yt-dlp` — install with
+  `pip install -r scripts/yt/requirements.txt` (or run `:yt setup` from inside
+  the TUI). Without these, the YouTube view shows a setup hint; local
+  playback is fully functional regardless.
+
+## YouTube integration
+
+jukebox can also stream from YouTube alongside your local hi-res library. Three
+source modes are cycled with `M`: **Local** (your lossless catalog only),
+**YouTube** (account playlists, suggested playlists, search, and YouTube's own
+autoplay radio), and **Mixed** (play the local copy when a track matches your
+library by ISRC or normalized artist+title, else stream from YouTube).
+
+- `4` switches to the **Y** view (account playlists `♫` + suggested/mood
+  `✦`, with an Up-Next pane for short lists).
+- `M` cycles the source mode; the active mode is shown as a `MODE` flag in the
+  player bar. Switching mode never stops playback.
+- `/` searches (scoped to the view — YouTube in the Y view, local BM25
+  otherwise); `f` filters the focused column; `s` plays a random track; `S`
+  opens a discover overlay.
+- **Auth (recommended):** run `:yt auth browser chrome` inside the TUI to read
+  cookies straight from your logged-in Chrome profile — **no cookie file is
+  written and no credentials are pasted anywhere**. `firefox`, `safari`,
+  `edge`, `brave`, `opera`, `chromium` are also supported. One command feeds
+  both the metadata sidecar (`ytmusicapi`) and the stream resolver (`yt-dlp`).
+  Log into `youtube.com` in that browser first; **a Premium account is
+  recommended** (ad-free 256k AAC streams + account rate limits).
+- **Auth (paste):** `:yt auth` opens a cookie-paste box for a Netscape
+  `cookies.txt` (export with a "Get cookies.txt" browser extension). Prefer
+  `:yt auth browser <name>` — pasting credentials is less safe.
+- `:yt logout` clears auth; `:yt setup` shows the install hint for the Python
+  deps.
+
+> **YouTube Terms of Service.** Automated access to YouTube may violate
+> YouTube's Terms of Service. This integration is intended for personal use
+> with content you have the right to access (e.g. your own Premium account).
+> YouTube audio is lossy (~256k AAC / ~160k Opus, ≤ 48 kHz) — local tracks stay
+> bit-perfect and CoreAudio re-clocks the device to the stream's rate when a
+> YouTube session begins (held across consecutive YT tracks, restored on
+> return to local). You are responsible for your use; the authors provide no
+> warranty. "YouTube" is a trademark of Google LLC; this project is not
+> affiliated with or endorsed by YouTube.
 
 
 `jukebox sync` walks every `.flac` under the configured source dir, reads tags
