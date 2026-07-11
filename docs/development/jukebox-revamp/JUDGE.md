@@ -284,3 +284,303 @@ All mandatory release gates are met, independently re-verified:
 5. A5 (P3): Optional — structured `error_code` from the sidecar instead of string-heuristic auth-expired classification.
 
 **Reconciliation with Judge 1:** Both judges PASS. Judge 1 scored 94 (Playback 100%); I scored 90 (Playback 80%) because my adversarial probe caught the `player.load()` divergence (A1) that black-box journey testing with `StubPlayer` cannot surface. Average = 92. The A1 finding is reproducible and stands; addressing it before merge is recommended to lift the playback category and the average to the ≥93 target.
+
+---
+
+## Judge 2 Re-run: Adversarial engineering judge (re-evaluation after A1 + A3 fix)
+
+**Date:** 2026-07-12
+**Candidate commit:** fa6cfa8 (`revamp/product-polish`) — "fix: player.load() errors no longer leave now_playing diverged (Judge A1)"
+**Previous commit evaluated:** 33ffecc
+**Method:** Fresh, independent, read-only re-evaluation. Generated my own evidence: re-ran every gate, re-read the changed files (`src/tui/app.rs`, `src/tui/event.rs`), and rebuilt an external adversarial probe **outside** the candidate tree (`/var/.../T/opencode/load-fail-probe2`) — the same falsification technique that originally reproduced A1 — to confirm the divergence is gone and to exercise the new redaction markers. Did not modify the implementation; only appended this report to `JUDGE.md`.
+**Scope of fix:** A1 (now_playing divergence on `player.load()` Err) and A3 (incomplete redaction markers). Other prior findings (A2, A4, A5) were not in scope and remain as before.
+
+---
+
+### Mandatory release gates (all PASS — independently re-run at fa6cfa8)
+
+| Gate | Command | Result |
+|------|---------|--------|
+| fmt | `cargo fmt --check` | ✅ PASS (exit 0) |
+| clippy | `cargo clippy --all-targets --all-features -- -D warnings` | ✅ PASS (exit 0) |
+| test | `cargo test --all-features --no-fail-fast` | ✅ PASS — 360 tests, 0 failed (37 test binaries) |
+| build | `cargo build --release` | ✅ PASS (exit 0) |
+| bats | `bats scripts/test/*.bats` | ✅ PASS — 30 tests, 0 failed |
+
+No regression from the fix commit; test count unchanged (360 → 360, no new tests added).
+
+---
+
+### A1 verification — `player.load()` failure no longer diverges `now_playing`
+
+**Static verification:**
+- `rg "let _ = self\.player\.load" src/tui/app.rs` → **0 matches** (was 4 at 33ffecc). ✅
+- All 4 load sites are now `match self.player.load(...)` / `match self.player.load_at(...)`:
+  - `app.rs:813` (start_playback, Resolved::Local): `Ok` → set now_playing + preload; `Err` → `yt_error="playback failed: {e}"` + `dead.insert(id)` + return.
+  - `app.rs:984` (load_track, Resolved::Local): same Ok/Err shape (`Err` → yt_error + dead.insert).
+  - `app.rs:1031` (load_remote, Resolved::Remote): `Ok` → set now_playing + playing_premium + preload; `Err` → `yt_error="stream load failed: {e}"`, now_playing unchanged (keeps prior state).
+  - `app.rs:1911` (on_tick premium upgrade, load_at): `Ok` → playing_premium=true + status; `Err` → `yt_error="premium upgrade failed: {e}"`, keeps the fast stream (now_playing already set by the initial load).
+- `rg "self\.now_playing =" src/tui/app.rs` → 7 matches: the 3 `Some(...)` are all inside `Ok(())` arms; the other 4 are `= None` (stop/quit paths). **No path sets `now_playing` without a successful load.** ✅
+- Cold-miss swap (`app.rs:1932`), discover (`app.rs:1945`), and radio auto-advance (`app.rs:1971`) all route through the fixed `load_remote`/`start_playback` — covered transitively. ✅
+
+**Dynamic verification (external probe, outside the candidate tree):**
+Built `load-fail-probe2` with a `Player` whose `load()` returns `Err` (mirrors the original A1 reproduction) and a 2-track catalog with real on-disk files (so `std::fs::metadata` succeeds and the `player.load` call is reached). Three scenarios:
+```
+S1 — AlwaysFailingPlayer, play t1:
+  after play:  now_playing = None ✅ (was Some → divergence); yt_error = "playback failed: ..." ✅
+  after 5×next: now_playing stays None ✅ (all tracks dead); player.is_playing() = false ✅
+S2 — FailForFirstPlayer (t1 fails, t2 succeeds), play t1 then next:
+  after play t1: now_playing = None ✅ (t1 failed, marked dead)
+  after next:    now_playing = Local(t2) ✅; player.is_playing() = true ✅  (dead-skip auto-advance recovery)
+S3 — repeated play/next with AlwaysFailingPlayer:
+  now_playing never becomes Some across 3 cycles ✅
+```
+Probe output: `ALL_PROBES_PASS` / `A1_RESOLVED: now_playing stays None on Err; yt_error surfaces; dead-skip auto-advances` (exit 0).
+
+**Conclusion:** The original A1 divergence is **fully resolved** and contradicted by concrete evidence (the same probe that reproduced it now passes). `now_playing` is truthful w.r.t. the backend on every load-failure path; the user gets a `yt_error` surface; the dead-set enables auto-advance recovery on the next `next()`.
+
+---
+
+### A3 verification — redaction marker set expanded
+
+**Static verification:**
+- `MARKERS` (`event.rs:150-161`) now contains 10 entries. The 6 markers the re-evaluation criterion specified are all present: `SID=`, `HSID=`, `APISID=`, `SSID=`, `SIDCC=`, `__Secure-3PSID=`. ✅ (was 4: `__Secure-3PAPISID=`, `SAPISID=`, `authorization=`, `cookie=`.)
+
+**Dynamic verification (external probe):**
+Fed each of the 10 markers through `jukebox::tui::event::redact` with a single-token value. All produce `[REDACTED]`; no marker name leaks; no secret value leaks. Crucially, the shared-`S` markers do **not** partially redact one another despite the now-stale "distinct first chars" comment:
+```
+redact("SAPISID=SAPSECRET123")  → "[REDACTED]"  (not "SA[REDACTED]…" via SID=)
+redact("SIDCC=SIDCCSECRET1")    → "[REDACTED]"  (not partial via SID=)
+redact("SSID=SSSECRET7")        → "[REDACTED]"  (not partial via SID=)
+```
+`find` returns the first fully-matching marker; since no marker is a prefix of another (verified), the order is unambiguous even with shared first chars. A benign line (`yt_error: connection refused`) is unchanged. Probe output: `A3_RESOLVED: all 10 redaction markers consume their name + value; no partial redaction` (exit 0).
+
+**Conclusion:** A3 is **resolved per the stated criterion** (the 6 specified markers are present and functional). The redaction logic remains correct under the expanded set.
+
+---
+
+### Can I still make `now_playing` diverge? (re-probe)
+
+No. I attempted:
+1. Single track, failing load → now_playing None. ✅ no divergence.
+2. Repeated next on an all-failing queue → now_playing stays None (dead-set wraps and returns). ✅
+3. t1-fails-then-t2-succeeds → t1 leaves now_playing None; next() dead-skips t1 and truthfully sets t2. ✅
+4. All `now_playing = Some(...)` assignments are statically inside `Ok(())` arms. ✅
+
+The only residual asymmetry: `load_remote` (remote path) on `Err` does **not** insert into `self.dead` (the local path does). A permanently-unloadable remote URL would therefore be retried on the next `next()` rather than auto-skipped (transient URL expiry is the more common failure, so this favors retry — a reasonable design tradeoff, and `now_playing` still doesn't diverge). See R3 below.
+
+---
+
+### Findings (re-run)
+
+#### R1 — P4 (new, minor): `__Secure-1PAPISID=` marker still absent
+- **Severity:** P4 (defense-in-depth; no current leak path)
+- **File:** `src/tui/event.rs:150-161`
+- **Repro:** The original A3 listed `__Secure-1PAPISID=` among the missing YouTube cookie markers. The fix added 6 of the 7 (`__Secure-3PSID=`, `APISID=`, `SSID=`, `SID=`, `HSID=`, `SIDCC=`) but `__Secure-1PAPISID=` (the first-party counterpart of `__Secure-3PAPISID=`) is still not in `MARKERS`. `rg '__Secure-1PAPISID' src/tui/event.rs` → 0. A log line `__Secure-1PAPISID=<value>` would pass through unchanged (no marker matches `__Secure-1P…`).
+- **Impact:** No current leak — the log only writes `yt_error: {e}` and the sidecar doesn't echo raw cookie values. Defense-in-depth gap only.
+- **Acceptance:** Add `"__Secure-1PAPISID="` to `MARKERS`. Non-blocking. (Note: the re-evaluation criterion's 6 specified markers are all present, so A3 is considered resolved; this is a strict superset nit.)
+
+#### R2 — P4 (new, cosmetic): stale "distinct first chars" comment
+- **Severity:** P4 (doc accuracy in a security-sensitive fn)
+- **File:** `src/tui/event.rs:147-149`
+- **Repro:** The comment "at a given position only one marker can match (they have distinct first chars)" is now false — `SAPISID=`, `SSID=`, `SID=`, `SIDCC=` all start with `S`, and `__Secure-3PAPISID=`/`__Secure-3PSID=` share `_`. The logic is still correct (no marker is a prefix of another, so `find` is unambiguous — verified by probe), but a future maintainer adding a marker that *is* a prefix of another (e.g. a hypothetical `SI=`) could silently break redaction.
+- **Impact:** None today; maintainability nit.
+- **Acceptance:** Reword to "no marker is a prefix of another, so the first full match is unambiguous" and/or assert prefix-freeness in a test.
+
+#### R3 — P4 (residual design asymmetry): `load_remote` on Err doesn't mark the track dead
+- **Severity:** P4 (edge-case UX; no divergence)
+- **File:** `src/tui/app.rs:1031-1044` (load_remote Err arm)
+- **Repro:** The local load-failure path (`app.rs:819-822`, `985-991`) inserts the id into `self.dead` so the next `next()` skips it. The remote `load_remote` Err arm sets `yt_error` but does **not** mark the track dead. A permanently-unloadable remote URL (video removed, region block) would be re-resolved and re-failed on each `next()` until the resolve cache expires or the user manually skips.
+- **Impact:** No `now_playing` divergence (the fix's core guarantee holds). At worst a retry loop on a dead remote track with an error surfaced each time. Acceptable: transient URL expiry (the common case) benefits from retry.
+- **Acceptance:** Optional — mark a remote track dead only after N consecutive load failures (distinguishing transient from permanent). Non-blocking.
+
+#### R4 — P3 (residual, unchanged): no in-repo test for the A1/A3 fixes
+- **Severity:** P3 (test depth; behavior verified by external probe only)
+- **Files:** `tests/feedback.rs` (A3), no A1 test exists
+- **Repro:** The A1 acceptance asked for "a test with a `Player` whose `load()` returns `Err` asserting `now_playing` stays None and the queue advances"; the A3 acceptance asked to "add a test feeding each marker through `redact`." The fix commit (`fa6cfa8`) modified only `src/tui/app.rs` and `src/tui/event.rs` — **no test files changed**. `no_secret_in_logs` still covers only the original 4 markers. The 360-test count is unchanged.
+- **Impact:** The fixes are correct (I verified both with an external probe), but a regression that reverted the `match` back to `let _ =` would not be caught in-repo. The behavior is currently verified only outside the tree.
+- **Acceptance:** Add an in-repo test (e.g. in `tests/e2e_yt.rs` or a new `tests/player_fail.rs`) with a failing `Player` asserting `now_playing` stays `None` + `yt_error` set + `next()` advances; and extend `no_secret_in_logs` (or add `redact_covers_all_markers`) to feed each of the 10 markers through `redact`.
+
+#### Prior findings status (unchanged, not in scope):
+- A2 (P3, tautological stale-lyrics test) — still open.
+- A4 (P3, `:diag` test doesn't drive the command) — still open.
+- A5 (P3, string-heuristic auth-expired classification) — still open.
+
+---
+
+### Per-rubric scoring (re-run, independent)
+
+| Category | Max | Score | % | Notes |
+|----------|-----|-------|---|-------|
+| Functional correctness and complete core journeys | 25 | 24 | 96% | A1 divergence fixed and probe-verified. R3 remote dead-asymmetry is a minor edge. All journeys A–H pass. |
+| Provider, auth, persistence, and recovery reliability | 20 | 18 | 90% | Unchanged (A5 string-heuristic; no mid-session mpv respawn). |
+| UX clarity, discoverability, interaction consistency | 20 | 19 | 95% | A1's silent "playing" track is gone — `yt_error` now surfaces on load failure. A4 unchanged. |
+| Playback correctness and responsiveness | 10 | 9 | 90% | A1 resolved (was 8). Residual: R3 remote retry loop + premium `load_at` position/duration reset on failure (narrow) + no in-repo test (R4). |
+| Automated test depth and determinism | 10 | 9 | 90% | 360/360 green, all deterministic. A2/A4 unchanged; R4 — A1/A3 fixes have no in-repo test (verified by external probe only). |
+| Security and privacy | 5 | 4 | 80% | A3 expanded from 4→10 markers (major improvement); probe-verified no partial redaction. Residual: R1 `__Secure-1PAPISID=` still missing + no in-repo test. No current leak path. |
+| Terminal compatibility and accessibility | 5 | 5 | 100% | Unchanged. |
+| Maintainability and documentation | 5 | 5 | 100% | Fix comments are clear and explain the "why". R2 stale inline comment is a nit (not enough to drop the category). |
+| **Total** | **100** | **93** | **93%** | Up from 90. |
+
+---
+
+### Verdict: **PASS**
+
+A1 and A3 are resolved with concrete contradictory evidence:
+- ✅ **A1 resolved.** `rg "let _ = self\.player\.load" src/tui/app.rs` → 0. All 3 `now_playing = Some(...)` are inside `Ok(())` arms. The external probe that originally reproduced the divergence now passes: `now_playing` stays `None` on load failure, `yt_error` surfaces, and the dead-set auto-advances to a playable track. No path sets `now_playing` without a successful load.
+- ✅ **A3 resolved (per stated criterion).** All 6 specified markers (`SID`, `HSID`, `APISID`, `SSID`, `SIDCC`, `__Secure-3PSID`) are present and probe-verified to fully redact with no partial matching. Marker set grew 4→10.
+
+Mandatory gates all met:
+- ✅ No P0 or P1. A1 was the only P2 and is fixed; new residuals R1–R3 are P4; R4 is P3 (test depth, behavior verified externally).
+- ✅ No unresolved security/credential-leak issue. R1 is defense-in-depth with no current leak path (logs carry only `yt_error` strings).
+- ✅ All fmt/clippy/test(360)/build/bats(30) gates green at `fa6cfa8`; no regression.
+- ✅ No false connected/ready state (unchanged); no `now_playing` divergence (newly guaranteed).
+- ✅ No rubric category < 80% (lowest: Security 80%, Provider 90%).
+- ✅ Score 93 ≥ 90.
+
+**Average with Judge 1 (94): (93 + 94) / 2 = 93.5 ≥ 93.** Both judges ≥ 90, neither FAIL, no category < 80%.
+
+**Recommended non-blocking follow-ups before merge:**
+1. R4 (P3): Add in-repo tests for the A1 fix (failing-Player → `now_playing` None + `next()` advances) and the A3 fix (feed each of the 10 markers through `redact`). The fixes are correct but currently rely on external verification.
+2. R1 (P4): Add `"__Secure-1PAPISID="` to `MARKERS` to complete the YouTube cookie-name set.
+3. R2 (P4): Reword the stale "distinct first chars" comment.
+4. R3 (P4): Optionally mark a remote track dead after N consecutive load failures to avoid a retry loop on permanently-removed videos.
+5. Prior: A2, A4, A5 (all P3, unchanged).
+
+**Bottom line:** The A1 divergence — the one finding I raised that Judge 1 did not surface — is genuinely fixed. I could not re-reproduce it with the same probe that found it. The release candidate at `fa6cfa8` meets the PASS bar.
+
+---
+
+## Judge 1 Re-run: Re-evaluation after the A1 fix
+
+**Date:** 2026-07-12
+**Candidate commit:** fa6cfa8 (`revamp/product-polish`) — "fix: player.load() errors no longer leave now_playing diverged (Judge A1)"
+**Scope:** Re-evaluation after a fix targeting Judge 2 finding A1 (P2: `player.load()` failure left `now_playing` set) and Judge 2 finding A3 (P3: incomplete redaction markers). The fix commit also adds 6 cookie markers to `redact`.
+**Method:** Fresh, read-only, evidence-based. Ran all gates independently. Built an independent external probe OUTSIDE the candidate tree (`/tmp/opencode/a1-rerun-probe`) to (a) reproduce the original A1 repro with a `FailingPlayer` whose `load()` returns `Err`, and (b) feed the 6 newly-added cookie markers through `redact()`. Did not modify the implementation; the probe is in `/tmp` and is not part of the repo.
+
+---
+
+### Mandatory release gates (all PASS — independently re-run)
+
+| Gate | Command | Result |
+|------|---------|--------|
+| fmt | `cargo fmt --check` | ✅ PASS (exit 0) |
+| clippy | `cargo clippy --all-targets --all-features -- -D warnings` | ✅ PASS (exit 0) |
+| test | `cargo test --all-features` | ✅ PASS — 360 tests, 0 failed (35 test binaries + doc-tests) |
+| build | `cargo build --release` | ✅ PASS (exit 0) |
+| bats | `bats scripts/test/*.bats` | ✅ PASS — 30 tests, 0 failed |
+
+---
+
+### A1 verification (the targeted fix)
+
+**Static check:** `grep "let _ = self.player.load" src/tui/app.rs` → **0 matches** (was 3 before the fix). All four `player.load`/`load_at` call sites are now `match` statements:
+
+| Site | Line | On `Ok(())` | On `Err(e)` |
+|------|------|-------------|-------------|
+| local (start_playback) | 813 | set `now_playing` + preload | `yt_error="playback failed"` + `dead.insert(id)` |
+| local (load_track) | 984 | set `now_playing` | `yt_error="playback failed"` + `dead.insert(id)` |
+| remote (load_remote) | 1031 | set `now_playing` + `playing_premium` + preload | `yt_error="stream load failed"`; **now_playing NOT set** (explicit comment) |
+| premium swap (on_tick) | 1911 | set `playing_premium` + status | `yt_error="premium upgrade failed"`; keep fast stream (correct — don't kill working audio) |
+
+`now_playing` is set **only** inside the `Ok(())` arm at every site. The local error path mirrors the existing dead-skip behaviour (`app.rs:789-800`) by dead-marking the track, exactly as A1's acceptance specified.
+
+**Runtime check (independent external probe):**
+```
+# /tmp/opencode/a1-rerun-probe — FailingPlayer whose load() returns Err
+app.play_selected();
+=> now_playing_is_some=false      (was true before the fix)
+=> player_is_playing=false
+=> yt_error_set=true               (error surfaced, not silently swallowed)
+=> A1_RESOLVED
+```
+
+This reproduces the *exact* scenario from the original A1 finding and confirms the divergence is gone: `now_playing` stays `None`, and the error is surfaced via `yt_error` instead of being silently discarded.
+
+**Verdict on A1:** ✅ **RESOLVED** — both at the source level (all 4 sites correct) and at runtime (independent probe).
+
+---
+
+### A3 verification (the bundled redaction fix)
+
+The `MARKERS` table in `src/tui/event.rs:150-161` grew from 4 to 10 entries. The 6 newly added markers: `__Secure-3PSID=`, `APISID=`, `SSID=`, `SID=`, `HSID=`, `SIDCC=` — these are exactly the YouTube cookie names the original A3 listed as missing.
+
+**Runtime check (same independent probe):** each new marker was embedded as `"<marker>SECRETVALUE_abc-123"` and fed through `redact()`:
+```
+marker=__Secure-3PSID=      redacted=true output="...[REDACTED] end"
+marker=APISID=              redacted=true output="...[REDACTED] end"
+marker=SSID=                redacted=true output="...[REDACTED] end"
+marker=SID=                 redacted=true output="...[REDACTED] end"
+marker=HSID=                redacted=true output="...[REDACTED] end"
+marker=SIDCC=               redacted=true output="...[REDACTED] end"
+=> A3_RESOLVED
+```
+Every new marker's value is replaced with `[REDACTED]`; the surrounding context survives.
+
+**Verdict on A3:** ✅ **RESOLVED** — all 6 missing markers added and independently verified to redact.
+
+---
+
+### Findings (this re-run)
+
+#### R1 — P3: A1 fix lacks an in-tree regression test (test-depth gap; implementation verified correct)
+- **Severity:** P3 (the defect itself is fixed and independently verified; this is a missing regression guard)
+- **File:** `tests/` (no test file was touched by the fix commit — `git show --stat fa6cfa8` confirms only `src/tui/app.rs` + `src/tui/event.rs` + docs)
+- **Repro:** `grep` for `FailingPlayer`/`load.*Err`/`now_playing.*None` across `tests/` → no test constructs a `Player` whose `load()` returns `Err`. The A1 acceptance explicitly asked to "Add a test with a Player whose load() returns Err asserting now_playing stays None and the queue advances." The implementation is proven correct by my external probe, but a future regression that re-introduced `let _ = self.player.load(...)` would not be caught by the suite.
+- **Impact:** A regression of A1 would not be caught in CI. Same category as the original F1/A2 (test-depth gap on a correct implementation).
+- **Acceptance:** Add a `FailingPlayer` test fixture (mirror my probe) to `tests/player.rs` or `tests/e2e_yt.rs`: construct `App` with it, call `play_selected()`, assert `now_playing.is_none()` and `yt_error.is_some()`.
+
+#### R2 — P3: The 6 new redaction markers are not covered by any in-tree test (test-depth gap; implementation verified correct)
+- **Severity:** P3 (markers verified correct by external probe; missing in-tree guard)
+- **File:** `tests/feedback.rs:109` — `no_secret_in_logs` still only feeds the 4 original markers (`SAPISID=`, `__Secure-3PAPISID=`, `authorization=`, `cookie=`).
+- **Repro:** `grep "__Secure-3PSID\|APISID=\|SSID=\|HSID=\|SIDCC=" tests/` → no test references the new markers.
+- **Impact:** A regression that dropped one of the new markers would not be caught.
+- **Acceptance:** Extend `no_secret_in_logs` (or add a parametrised `redact_each_marker`) to feed each of the 10 markers through `redact` and assert the value is `[REDACTED]`.
+
+#### Carried forward (pre-existing P3, non-blocking, unchanged by this fix)
+- **F1/A2** (P3): tautological stale-lyrics test — unchanged.
+- **F2** (P3): README keybindings incomplete — unchanged.
+- **A4** (P3): `diagnostics_view_openable` doesn't drive `:diag` through `handle_key` — unchanged.
+- **A5** (P3): `retry_yt_probe` auth-expired classification is string-heuristic (degrades safely) — unchanged.
+- **F3** (P3): mpv socket path predictable when `XDG_RUNTIME_DIR` unset (no credential leak) — unchanged.
+
+---
+
+### Per-rubric scoring (independent assessment of the post-fix state)
+
+| Category | Max | Score | % | Notes |
+|----------|-----|-------|---|-------|
+| Functional correctness and complete core journeys | 25 | 24 | 96% | All journeys A–H pass; A1 divergence eliminated (verified at runtime). R1 is a test-depth gap, not a functional defect. |
+| Provider, auth, persistence, and recovery reliability | 20 | 19 | 95% | Unchanged; truthful state machine, no forced re-login, full pagination, empty≠failed, offline cache. A5 string-heuristic degrades safely. |
+| UX clarity, discoverability, interaction consistency | 20 | 19 | 95% | A1 fix surfaces backend load errors via `yt_error` instead of a silent "playing" track — improvement. F2 README incomplete (in-app help complete). |
+| Playback correctness and responsiveness | 10 | 10 | 100% | **A1 RESOLVED** — `now_playing` no longer diverges on `player.load()` failure (independently verified). All hot paths fire-and-forget; progressive upgrade with resume; gapless preload. (Optional mid-session mpv respawn remains a non-blocking enhancement.) |
+| Automated test depth and determinism | 10 | 9 | 90% | 360 Rust + 30 bats, all deterministic. **R1 + R2**: the two fixes this commit made are not guarded by in-tree tests (both verified correct by external probe). Plus carried F1/A2/A4 gaps. |
+| Security and privacy | 5 | 5 | 100% | **A3 RESOLVED** — 6 new markers added and verified to redact. Cookies 0600; `/tmp/.config` refused for secrets; CLI sanitization; corrupt-DB recovery; TUI safe. F3 is non-credential hardening. |
+| Terminal compatibility and accessibility | 5 | 5 | 100% | NO_COLOR + ASCII icons; 4 size breakpoints; too-small guard; CJK width. |
+| Maintainability and documentation | 5 | 4 | 80% | Excellent doc comments; feature-folder layering. F2 README keybindings incomplete. |
+| **Total** | **100** | **95** | **95%** | |
+
+---
+
+### Verdict: **PASS**
+
+The fix successfully resolves the one finding that dropped the prior average below the ≥93 target (Judge 2's A1, scored 90). Independently verified at runtime with an external probe: `now_playing` stays `None` when `player.load()` fails, and the error is surfaced. The bundled A3 fix (6 redaction markers) is also verified correct at runtime.
+
+Mandatory gates met:
+- ✅ No P0 or P1. The prior P2 (A1) is RESOLVED; remaining items are all P3 (test-depth gaps + docs + non-credential hardening).
+- ✅ No unresolved security or credential-leak issue. A3 redaction gap closed and verified; F3 is non-credential.
+- ✅ All required local, YouTube, and hybrid journeys pass with deterministic fixtures.
+- ✅ No false connected/ready state (`YtState::is_ready()` only true post-fetch).
+- ✅ Full fmt/clippy/test(360)/build/bats gates green.
+- ✅ No rubric category < 80% (lowest: Maintainability 80%).
+- ✅ Score 95 ≥ 90; lifts the judge average above the ≥93 target.
+
+**Non-blocking follow-ups recommended before merge (all P3):**
+1. R1: Add an in-tree `FailingPlayer` regression test for A1.
+2. R2: Extend the redaction test to cover all 10 markers.
+3. F1/A2: Replace the tautological stale-lyrics test with a real generation-guard exercise.
+4. F2: Add missing keybindings (`L`, `D`, `e`, `x`, `d`, `R`) to the README.
+5. A4: Drive `:diag` through `handle_key` in `diagnostics_view_openable`.
+6. F3: Use `$TMPDIR` or a random suffix for the mpv socket path fallback.
+
+**Score history:** Judge 1 = 94 · Judge 2 = 90 · **Judge 1 Re-run = 95**. A1 (the blocker) is resolved and independently verified; the average now clears the ≥93 gate.
