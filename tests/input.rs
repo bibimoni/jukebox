@@ -175,9 +175,15 @@ fn search_overlay_populates_results() {
         Some(Overlay::Search { results, .. }) => results.clone(),
         _ => panic!("expected Search overlay to still be open"),
     };
-    assert!(!results.is_empty(), "search overlay results must be non-empty after a matching query");
-    assert!(results.iter().any(|id| id == "t1"),
-        "results must contain the matched track id t1: {:?}", results);
+    assert!(
+        !results.is_empty(),
+        "search overlay results must be non-empty after a matching query"
+    );
+    assert!(
+        results.iter().any(|id| id == "t1"),
+        "results must contain the matched track id t1: {:?}",
+        results
+    );
 }
 
 #[test]
@@ -220,7 +226,10 @@ fn search_overlay_n_types_into_query_not_navigation() {
     let (_d, cat) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     handle_key(&mut app, key('/'));
-    handle_key(&mut app, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
     let input = match &app.overlay {
         Some(Overlay::Search { input, .. }) => input.clone(),
         _ => panic!("overlay should be open"),
@@ -237,12 +246,18 @@ fn search_overlay_arrow_keys_move_selection() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), Some(searcher), None);
     // Type a query that yields multiple results ("a" matches Ado/Aimer/etc).
     handle_key(&mut app, key('/'));
-    handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+    );
     let n_results = match &app.overlay {
         Some(Overlay::Search { results, .. }) => results.len(),
         _ => panic!("overlay should be open"),
     };
-    assert!(n_results >= 2, "need >=2 results to test navigation, got {n_results}");
+    assert!(
+        n_results >= 2,
+        "need >=2 results to test navigation, got {n_results}"
+    );
     // Down moves the cursor to result 1.
     handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     let cursor = match &app.overlay {
@@ -266,7 +281,10 @@ fn search_overlay_typing_letters_not_intercepted_as_navigation() {
     let (_d, cat) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     handle_key(&mut app, key('/'));
-    handle_key(&mut app, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
     let input = match &app.overlay {
         Some(Overlay::Search { input, .. }) => input.clone(),
         _ => panic!("overlay should be open"),
@@ -274,11 +292,12 @@ fn search_overlay_typing_letters_not_intercepted_as_navigation() {
     assert_eq!(input, "j", "'j' must be typed into the query, not navigate");
 }
 
-
-
 fn isolate_xdg() -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("jk-xdg-{}-{}", std::process::id(),
-        std::sync::atomic::AtomicU64::new(0).fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+    let d = std::env::temp_dir().join(format!(
+        "jk-xdg-{}-{}",
+        std::process::id(),
+        std::sync::atomic::AtomicU64::new(0).fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
     std::fs::create_dir_all(&d).unwrap();
     std::env::set_var("XDG_CONFIG_HOME", &d);
     d
@@ -298,7 +317,9 @@ fn yt_auth_enter_saves_closes_esc_cancels() {
     let _xdg = isolate_xdg();
     let (_d, cat) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
-    app.overlay = Some(Overlay::YtAuth { input: "# Netscape cookies".into() });
+    app.overlay = Some(Overlay::YtAuth {
+        input: "# Netscape cookies".into(),
+    });
     // Enter submits → writes cookies, closes overlay.
     handle_key(&mut app, key_code(KeyCode::Enter));
     assert!(app.overlay.is_none(), "Enter should close the auth overlay");
@@ -373,8 +394,8 @@ fn s_instant_random_via_key() {
     assert!(app.now_playing.is_some(), "s should start a random track");
 }
 
-#[test]
-fn S_opens_discover_overlay() {
+#[test] // `s` documents the shift+s Discover keybinding under test
+fn s_opens_discover_overlay() {
     let (_d, cat) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.source_mode = jukebox::mode::SourceMode::Local;

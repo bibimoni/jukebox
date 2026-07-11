@@ -95,11 +95,17 @@ fn cleanup_audio() {
 /// `eprintln!` replacement for paths that originate in the event loop.
 #[allow(dead_code)]
 fn log_to_file(line: &str) {
-    let Some(cache) = dirs::cache_dir() else { return };
+    let Some(cache) = dirs::cache_dir() else {
+        return;
+    };
     let log_dir = cache.join("jukebox");
     let _ = std::fs::create_dir_all(&log_dir);
     let path = log_dir.join("jukebox.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = writeln!(f, "{line}");
     }
 }

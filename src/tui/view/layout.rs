@@ -23,8 +23,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::tui::app::App;
 use super::{columns, footer, overlay, player_bar};
+use crate::tui::app::App;
 
 /// Minimum terminal size we'll attempt to render the full browse layout in.
 pub const MIN_WIDTH: u16 = 80;

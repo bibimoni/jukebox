@@ -24,10 +24,28 @@ pub struct Config {
     pub switch_sample_rate: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
+
+/// Default mpv IPC socket path. Prefers `$XDG_RUNTIME_DIR` (per-user, 0700
+/// by systemd convention) so the socket isn't in a shared /tmp. Falls back
+/// to `/tmp/jukebox-mpv.sock` when `XDG_RUNTIME_DIR` is unset — the player
+/// (`player.rs`) removes any existing socket before spawning mpv, which
+/// mitigates the symlink-race attack on the fallback path.
+fn default_mpv_socket() -> PathBuf {
+    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(rt).join("jukebox-mpv.sock");
+    }
+    PathBuf::from("/tmp/jukebox-mpv.sock")
+}
 
 /// Resolve the config file path.
 /// Honors `$XDG_CONFIG_HOME`, else falls back to `~/.config` (via `dirs`).
+///
+/// The `/tmp/.config` fallback is acceptable here: `config.yml` contains only
+/// the source dir path + player prefs (no secrets). Cookie secrets use
+/// `yt::session::cookies_file_opt()` which refuses the fallback.
 pub fn config_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -49,7 +67,7 @@ impl Config {
             source_dir,
             filtered_dir,
             player: PlayerKind::Mpv,
-            mpv_socket: PathBuf::from("/tmp/jukebox-mpv.sock"),
+            mpv_socket: default_mpv_socket(),
             switch_sample_rate: true,
         }
     }
@@ -60,16 +78,15 @@ impl Config {
             return Ok(None);
         }
         let text = fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
-        let cfg: Config = serde_yaml_compat(&text)
-            .with_context(|| format!("parsing {}", p.display()))?;
+        let cfg: Config =
+            serde_yaml_compat(&text).with_context(|| format!("parsing {}", p.display()))?;
         Ok(Some(cfg))
     }
 
     pub fn save(&self) -> Result<()> {
         let p = config_path();
         if let Some(parent) = p.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
             // 0700 on the dir
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).ok();
         }
@@ -87,7 +104,10 @@ pub fn validate_source_dir(p: &Path) -> Result<()> {
     }
     let has_flac = walkdir_has_flac(p);
     if !has_flac {
-        return Err(anyhow!("source dir contains no .flac files: {}", p.display()));
+        return Err(anyhow!(
+            "source dir contains no .flac files: {}",
+            p.display()
+        ));
     }
     Ok(())
 }
@@ -103,7 +123,12 @@ fn walkdir_has_flac(root: &Path) -> bool {
             let path = e.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("flac")).unwrap_or(false) {
+            } else if path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("flac"))
+                .unwrap_or(false)
+            {
                 return true;
             }
         }
@@ -120,29 +145,50 @@ fn serde_yaml_compat(text: &str) -> Result<Config> {
     let mut source_dir = PathBuf::new();
     let mut filtered_dir = PathBuf::new();
     let mut player = PlayerKind::Mpv;
-    let mut mpv_socket = PathBuf::from("/tmp/jukebox-mpv.sock");
+    let mut mpv_socket = default_mpv_socket();
     let mut switch_sample_rate = true;
     for line in text.lines() {
         let line = line.split('#').next().unwrap().trim();
-        if line.is_empty() { continue; }
-        let (k, v) = match line.split_once(':') { Some(kv) => kv, None => continue };
+        if line.is_empty() {
+            continue;
+        }
+        let (k, v) = match line.split_once(':') {
+            Some(kv) => kv,
+            None => continue,
+        };
         let k = k.trim();
         let v = v.trim().trim_matches('"');
         match k {
             "version" => version = v.parse().unwrap_or(1),
             "source_dir" => source_dir = PathBuf::from(v),
             "filtered_dir" => filtered_dir = PathBuf::from(v),
-            "player" => player = if v == "afplay" { PlayerKind::Afplay } else { PlayerKind::Mpv },
+            "player" => {
+                player = if v == "afplay" {
+                    PlayerKind::Afplay
+                } else {
+                    PlayerKind::Mpv
+                }
+            }
             "mpv_socket" => mpv_socket = PathBuf::from(v),
             "switch_sample_rate" => switch_sample_rate = matches!(v, "true" | "yes" | "1"),
             _ => {}
         }
     }
-    Ok(Config { version, source_dir, filtered_dir, player, mpv_socket, switch_sample_rate })
+    Ok(Config {
+        version,
+        source_dir,
+        filtered_dir,
+        player,
+        mpv_socket,
+        switch_sample_rate,
+    })
 }
 
 fn format_yaml(c: &Config) -> Result<String> {
-    let player = match c.player { PlayerKind::Mpv => "mpv", PlayerKind::Afplay => "afplay" };
+    let player = match c.player {
+        PlayerKind::Mpv => "mpv",
+        PlayerKind::Afplay => "afplay",
+    };
     Ok(format!(
         "# jukebox config — written by `jukebox`\n\
          version: {v}\n\

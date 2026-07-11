@@ -8,7 +8,7 @@
 //! [`ContextResolver`] (since `playlists` / `transport.manual_queue` live in
 //! separate fields, this split-borrow works).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::catalog::{Catalog, Track};
 use crate::player::Player;
@@ -102,7 +102,7 @@ impl SearchScope {
 
 /// Modal overlays drawn on top of the browse layout. Defined minimally here so
 /// `App.overlay: Option<Overlay>` compiles; Task 11 fills in the full surface.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Overlay {
     Search {
         input: String,
@@ -124,7 +124,12 @@ pub enum Overlay {
         searching: bool,
     },
     Help,
-    PlaylistPicker,
+    /// `a` — add the focused track to a playlist. `track_id` is the id to add;
+    /// `cursor` selects among existing playlists + the "new playlist…" entry.
+    PlaylistPicker {
+        track_id: String,
+        cursor: usize,
+    },
     Command {
         input: String,
     },
@@ -139,10 +144,49 @@ pub enum Overlay {
         items: Vec<DiscoverItem>,
         cursor: usize,
     },
+    /// Lyrics overlay (`L`). `content` holds the parsed lyrics once loaded;
+    /// `state` is the truthful lifecycle (Loading / Available / NotFound /
+    /// Error); `scroll` is the j/k/PgUp/PgDn scroll offset. `gen` mirrors
+    /// `App::lyrics_gen` at request time so a stale response (the user moved
+    /// to a different track) is discarded by `on_tick` (D5 generation guard).
+    Lyrics {
+        content: Option<crate::lyrics::Lyrics>,
+        state: LyricsState,
+        scroll: u16,
+        /// The track id these lyrics are for (so a re-toggle on the same track
+        /// reuses the cache without re-fetching).
+        track_id: String,
+        /// The generation tag captured at request time; `on_tick` discards the
+        /// result if `App::lyrics_gen` has advanced past it.
+        gen: u64,
+    },
+}
+
+/// The lifecycle state of the lyrics overlay. Distinct from `Overlay::Lyrics`
+/// because the renderer needs to show "loading…", "lyrics unavailable", and
+/// "lyrics error" as separate truthful states (AC-M3.2.1: 6 states).
+/// `Error(String)` carries the message; `Available` carries whether the lines
+/// are synced (for the source/timestamp label).
+#[derive(Clone, Debug)]
+pub enum LyricsState {
+    /// No request yet (the overlay was just opened).
+    Idle,
+    /// A fetch is in flight (local read or sidecar `get_lyrics`).
+    Loading,
+    /// Lyrics loaded; `true` when timestamped (synced LRC), `false` for plain.
+    Available(bool),
+    /// The track has no lyrics (no embedded tag, no sidecar file, ytmusicapi
+    /// returned empty). Truthful "unavailable" — never fabricated text
+    /// (AC-M3.5.1).
+    NotFound,
+    /// The provider failed (network/parse error). Carries the message so the
+    /// overlay can show it (the sidecar's stderr is null'd, so this is the
+    /// only error path).
+    Error(String),
 }
 
 /// A discover-overlay suggestion.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum DiscoverItem {
     /// A local catalog album (Local / Mixed).
     Album { artist: String, album: String },
@@ -160,6 +204,17 @@ pub struct App {
     pub artists: Vec<String>,
     pub artist_index: BTreeMap<String, Vec<usize>>,
     pub albums_by_artist: BTreeMap<String, Vec<Album>>,
+    /// `track id` → index into `catalog.tracks`, built once in [`App::new`].
+    /// Turns `track_by_id` from a per-call O(n) linear scan into an O(1)
+    /// lookup (PB7: the scan ran per visible track row, per frame).
+    pub track_index: HashMap<String, usize>,
+    /// `album title` → track ids of that album, across ALL primary_artists,
+    /// in `(disc_number, track_number)` order, built once in [`App::new`].
+    /// Turns `tracks_for_album` from a per-frame full-catalog scan into an O(1)
+    /// lookup (PB8). Grouped by title (not by owner) so collaboration albums
+    /// show every track regardless of the focused artist — see
+    /// `collaboration_album_shows_and_plays_all_tracks` in `tests/app.rs`.
+    pub album_tracks: HashMap<String, Vec<String>>,
     pub view: View,
     pub focus_col: usize,
     pub cursors: ColumnCursors,
@@ -195,6 +250,15 @@ pub struct App {
     /// in the footer until overwritten/cleared. Success counterpart to
     /// `yt_error`.
     pub yt_status: Option<String>,
+    /// The truthful YouTube provider lifecycle state (M2). Replaces the
+    /// optimistic `yt_status = "connected…"` assignments (which could claim
+    /// "connected" before any data fetch verified the credential — the
+    /// "connected but empty" bug). The footer and Y-view status line derive
+    /// their label from `yt_state.human_label()`, NOT from `yt_status`.
+    /// `yt_status` is kept for backward compat with the few non-state messages
+    /// (e.g. "upgraded to AAC 256k"); the state machine owns the auth/sync
+    /// lifecycle. `yt_error` carries error *detail* alongside the state.
+    pub yt_state: crate::yt::state::YtState,
     /// `python3` path + the sidecar script path, used to (re)spawn the sidecar
     /// when cookies change via `:yt auth`. Set by `main.rs`; defaults to
     /// `python3` + the manifest-dir script (works in dev).
@@ -225,6 +289,21 @@ pub struct App {
     /// or clears it if the fast resolve finishes without a URL. Single slot:
     /// a new pick replaces it. The old track keeps playing until the swap.
     pub pending_play: Option<String>,
+    /// In-session `:` command history (most recent first, bounded, adjacent-
+    /// deduped). Up/Down in the Command overlay traverses this.
+    pub command_history: Vec<String>,
+    /// Cursor into `command_history` during Up/Down traversal. `None` = at the
+    /// draft (not traversing); `Some(i)` = showing history[i].
+    pub command_history_cursor: Option<usize>,
+    /// The draft text saved before traversing up into history, restored on
+    /// Down past the end.
+    pub command_draft: String,
+    /// Generation counter for lyrics requests (D5 stale-discard). Bumped on
+    /// every `request_lyrics`; the overlay captures the gen at request time
+    /// and `on_tick` discards a response whose gen != the current gen (the
+    /// user moved to a different track). Guarantees stale lyrics can't
+    /// overwrite a newer track's lyrics overlay.
+    pub lyrics_gen: u64,
 }
 
 /// Inline filter state for the `f` filter-on-focused-column (spec §5.4).
@@ -253,9 +332,7 @@ enum Resolved {
     /// spinner signals the pending swap — the UI never blocks on the ~1.3s
     /// resolve. `App::pending_play` carries the id between this call and the
     /// `on_tick` swap.
-    Pending {
-        video_id: String,
-    },
+    Pending { video_id: String },
 }
 
 /// A display view of the now-playing track for the player bar. Carries the
@@ -335,6 +412,38 @@ impl App {
         }
         let artists: Vec<String> = artist_index.keys().cloned().collect();
         let albums_by_artist = build_albums_by_artist(&catalog);
+
+        // Build id→index and album→track_ids lookup tables once. The catalog
+        // is immutable for the app's lifetime (rebuild via `jukebox sync` +
+        // relaunch), so these never need invalidation. They turn the per-frame
+        // O(n) scans in `track_by_id` (PB7) and `tracks_for_album` (PB8) into
+        // O(1) lookups.
+        let mut track_index: HashMap<String, usize> = HashMap::with_capacity(catalog.tracks.len());
+        let mut album_idxs: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, t) in catalog.tracks.iter().enumerate() {
+            track_index.insert(t.id.clone(), i);
+            if let Some(album) = &t.album {
+                album_idxs.entry(album.clone()).or_default().push(i);
+            }
+        }
+        // `tracks_for_album` groups by album TITLE across all primary_artists
+        // (collaboration albums are a cohesive object), then sorts by
+        // (disc, track_number) — mirror that exactly so the precompute is a
+        // drop-in replacement for the linear scan.
+        let mut album_tracks: HashMap<String, Vec<String>> =
+            HashMap::with_capacity(album_idxs.len());
+        for (album, mut idxs) in album_idxs {
+            idxs.sort_by_key(|&i| {
+                let t = &catalog.tracks[i];
+                (t.disc_number.unwrap_or(1), t.track_number.unwrap_or(0))
+            });
+            album_tracks.insert(
+                album,
+                idxs.into_iter()
+                    .map(|i| catalog.tracks[i].id.clone())
+                    .collect(),
+            );
+        }
         let transport = Transport::new(Context::Artist {
             artist: String::new(),
             track_ids: vec![],
@@ -348,6 +457,8 @@ impl App {
             artists,
             artist_index,
             albums_by_artist,
+            track_index,
+            album_tracks,
             view: View::Artists,
             focus_col: 0,
             cursors: ColumnCursors::default(),
@@ -368,6 +479,7 @@ impl App {
             yt_lists_loading: false,
             yt_error: None,
             yt_status: None,
+            yt_state: crate::yt::state::YtState::default(),
             yt_python: std::path::PathBuf::from("python3"),
             yt_script: std::path::PathBuf::from("scripts/yt/yt.py"),
             filter: None,
@@ -377,11 +489,24 @@ impl App {
             pending_play: None,
             loaded_yt_lists: HashSet::new(),
             yt_browser: String::new(),
+            command_history: Vec::new(),
+            command_history_cursor: None,
+            command_draft: String::new(),
+            lyrics_gen: 0,
         }
     }
 
+    /// O(1) track lookup by id, backed by [`App::track_index`]. Public so the
+    /// view layer (which holds `&App`) can resolve ids without a linear scan
+    /// of `catalog.tracks` (PB7 — the scan ran per visible row, per frame).
+    pub fn track_by_id_fast(&self, id: &str) -> Option<&Track> {
+        self.track_index
+            .get(id)
+            .and_then(|&i| self.catalog.tracks.get(i))
+    }
+
     fn track_by_id(&self, id: &str) -> Option<&Track> {
-        self.catalog.tracks.iter().find(|t| t.id == id)
+        self.track_by_id_fast(id)
     }
 
     /// A display view of the now-playing track, local or remote, for the
@@ -432,16 +557,15 @@ impl App {
     /// sorted by (disc, track_number). An album is a cohesive object — browsing
     /// it shows every track on it, not just the ones where the focused artist is
     /// primary (collaboration albums have tracks under several primary_artists).
+    ///
+    /// Backed by the [`App::album_tracks`] precompute (built once in
+    /// [`App::new`]), so this is an O(1) HashMap lookup — the old form did a
+    /// full-catalog `iter().enumerate().filter()` scan per frame (PB8).
     pub fn tracks_for_album(&self, album_title: &str) -> Vec<String> {
-        let mut idxs: Vec<usize> = self.catalog.tracks.iter().enumerate()
-            .filter(|(_, t)| t.album.as_deref() == Some(album_title))
-            .map(|(i, _)| i)
-            .collect();
-        idxs.sort_by_key(|&i| {
-            let t = &self.catalog.tracks[i];
-            (t.disc_number.unwrap_or(1), t.track_number.unwrap_or(0))
-        });
-        idxs.into_iter().map(|i| self.catalog.tracks[i].id.clone()).collect()
+        self.album_tracks
+            .get(album_title)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Build the track-id list for the currently-focused track column.
@@ -529,7 +653,10 @@ impl App {
                         artist,
                         track_ids: ids,
                     },
-                    None => Context::Artist { artist, track_ids: ids },
+                    None => Context::Artist {
+                        artist,
+                        track_ids: ids,
+                    },
                 }
             }
             View::Playlists => Context::Playlist {
@@ -563,14 +690,22 @@ impl App {
         }
         let start = self.transport.cursor;
         for _ in 0..n.max(1) {
-            let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
+            let r = ClonedResolver {
+                playlists: &self.playlists,
+                manual_queue: self.transport.manual_queue.clone(),
+                yt_lists: &self.yt_lists,
+            };
             let id = match self.transport.current(&r, &self.catalog) {
                 Some(id) => id,
                 None => return,
             };
             drop(r);
             if self.dead.contains(&id) {
-                let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
+                let r = ClonedResolver {
+                    playlists: &self.playlists,
+                    manual_queue: self.transport.manual_queue.clone(),
+                    yt_lists: &self.yt_lists,
+                };
                 let _ = self.transport.next(&r, &self.catalog);
                 if self.transport.cursor == start {
                     return;
@@ -578,10 +713,18 @@ impl App {
                 continue;
             }
             match self.resolve_source(&id) {
-                Some(Resolved::Local { path, sample_rate_hz, bit_depth }) => {
+                Some(Resolved::Local {
+                    path,
+                    sample_rate_hz,
+                    bit_depth,
+                }) => {
                     if std::fs::metadata(&path).is_err() {
                         self.dead.insert(id.clone());
-                        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
+                        let r = ClonedResolver {
+                            playlists: &self.playlists,
+                            manual_queue: self.transport.manual_queue.clone(),
+                            yt_lists: &self.yt_lists,
+                        };
                         let _ = self.transport.next(&r, &self.catalog);
                         if self.transport.cursor == start {
                             return;
@@ -590,7 +733,10 @@ impl App {
                     }
                     if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
                         &mut self.device_rate,
-                        crate::source::device_rate::LoadKind::Local { sample_rate_hz, bit_depth },
+                        crate::source::device_rate::LoadKind::Local {
+                            sample_rate_hz,
+                            bit_depth,
+                        },
                         self.switch_sample_rate,
                     ) {
                         let _ = crate::audio::set_output_format(sr, bd);
@@ -619,7 +765,11 @@ impl App {
                     // cold misses return Pending (handled above), NOT None, so
                     // they aren't dead-marked.
                     self.dead.insert(id.clone());
-                    let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
+                    let r = ClonedResolver {
+                        playlists: &self.playlists,
+                        manual_queue: self.transport.manual_queue.clone(),
+                        yt_lists: &self.yt_lists,
+                    };
                     let _ = self.transport.next(&r, &self.catalog);
                     if self.transport.cursor == start {
                         return;
@@ -673,14 +823,20 @@ impl App {
                     container: "m4a".into(),
                     premium: false,
                 });
-            return Some(Resolved::Remote { url, fmt, video_id: id.to_string() });
+            return Some(Resolved::Remote {
+                url,
+                fmt,
+                video_id: id.to_string(),
+            });
         }
         // Cache miss → arm both tiers fire-and-forget and defer the swap to
         // on_tick (Pending). Guards in send_resolve/send_resolve_premium make
         // re-arming a no-op if a tier is already in flight or cached.
         let _ = session.send_resolve(id.to_string());
         let _ = session.send_resolve_premium(id.to_string());
-        Some(Resolved::Pending { video_id: id.to_string() })
+        Some(Resolved::Pending {
+            video_id: id.to_string(),
+        })
     }
 
     /// Pre-resolve the next track's stream URL (fire-and-forget) so gapless
@@ -697,12 +853,14 @@ impl App {
         let Some(id) = next_id else { return };
         // Only pre-resolve ids we'll actually stream (not local catalog hits in
         // Local/Mixed — those play from disk).
-        let will_stream = self.source_mode == crate::mode::SourceMode::Youtube
-            || self.track_by_id(&id).is_none();
+        let will_stream =
+            self.source_mode == crate::mode::SourceMode::Youtube || self.track_by_id(&id).is_none();
         if !will_stream {
             return;
         }
-        let Some(session) = self.yt_session.as_mut() else { return };
+        let Some(session) = self.yt_session.as_mut() else {
+            return;
+        };
         // Pre-resolve the PREMIUM (256k) URL ahead of time — it's slow (~10-15s
         // cold, with the EJS nsig solver) but happens during the current track,
         // so the next track starts instantly at Premium quality (gapless). The
@@ -731,16 +889,25 @@ impl App {
         // A fresh explicit load (next/prev) owns the pending slot.
         self.pending_play = None;
         match self.resolve_source(id) {
-            Some(Resolved::Local { path, sample_rate_hz, bit_depth }) => {
+            Some(Resolved::Local {
+                path,
+                sample_rate_hz,
+                bit_depth,
+            }) => {
                 if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
                     &mut self.device_rate,
-                    crate::source::device_rate::LoadKind::Local { sample_rate_hz, bit_depth },
+                    crate::source::device_rate::LoadKind::Local {
+                        sample_rate_hz,
+                        bit_depth,
+                    },
                     self.switch_sample_rate,
                 ) {
                     let _ = crate::audio::set_output_format(sr, bd);
                 }
                 let _ = self.player.load(&path);
-                self.now_playing = Some(crate::source::TrackSource::Local { track_id: id.to_string() });
+                self.now_playing = Some(crate::source::TrackSource::Local {
+                    track_id: id.to_string(),
+                });
             }
             Some(Resolved::Remote { url, fmt, video_id }) => {
                 // Cached URL → swap in immediately.
@@ -769,7 +936,9 @@ impl App {
     fn load_remote(&mut self, url: String, fmt: crate::source::StreamFormat, video_id: String) {
         if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
             &mut self.device_rate,
-            crate::source::device_rate::LoadKind::Remote { sample_rate: fmt.sample_rate },
+            crate::source::device_rate::LoadKind::Remote {
+                sample_rate: fmt.sample_rate,
+            },
             self.switch_sample_rate,
         ) {
             let _ = crate::audio::set_output_format(sr, bd);
@@ -806,9 +975,15 @@ impl App {
         // `next()` pushed previously, so a switch (e.g. playing a search result
         // then a track from another context) broke `prev` across the switch.
         if let Some(np) = self.now_playing.clone() {
-            self.transport.history.push((np.id().to_string(), self.transport.context.clone()));
+            self.transport
+                .history
+                .push((np.id().to_string(), self.transport.context.clone()));
         }
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
+        let r = ClonedResolver {
+            playlists: &self.playlists,
+            manual_queue: self.transport.manual_queue.clone(),
+            yt_lists: &self.yt_lists,
+        };
         self.transport
             .switch_context(ctx, Some(&start), &r, &self.catalog);
         self.start_playback();
@@ -824,16 +999,26 @@ impl App {
         // push the current playback to history so a subsequent `prev()` returns.
         self.dead.clear();
         if let Some(np) = self.now_playing.clone() {
-            self.transport.history.push((np.id().to_string(), self.transport.context.clone()));
+            self.transport
+                .history
+                .push((np.id().to_string(), self.transport.context.clone()));
         }
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
+        let r = ClonedResolver {
+            playlists: &self.playlists,
+            manual_queue: self.transport.manual_queue.clone(),
+            yt_lists: &self.yt_lists,
+        };
         self.transport
             .switch_context(ctx, Some(start), &r, &self.catalog);
         self.start_playback();
     }
 
     pub fn next(&mut self) {
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
+        let r = ClonedResolver {
+            playlists: &self.playlists,
+            manual_queue: self.transport.manual_queue.clone(),
+            yt_lists: &self.yt_lists,
+        };
         if let Some(id) = self.transport.next(&r, &self.catalog) {
             // Load the returned id directly: `Transport::next`'s manual-queue
             // path returns a queued id without updating the cursor, so
@@ -867,10 +1052,16 @@ impl App {
                     // switch context to a fresh radio Search + load it.
                     let seed_id = self.now_playing.clone().map(|s| s.id().to_string());
                     if let Some(session) = self.yt_session.as_mut() {
-                        match self.radio.advance(session as &mut dyn crate::yt::session::YtClient, seed_id) {
+                        match self
+                            .radio
+                            .advance(session as &mut dyn crate::yt::session::YtClient, seed_id)
+                        {
                             Some(vid) => {
                                 if let Some(np) = self.now_playing.clone() {
-                                    self.transport.history.push((np.id().to_string(), self.transport.context.clone()));
+                                    self.transport.history.push((
+                                        np.id().to_string(),
+                                        self.transport.context.clone(),
+                                    ));
                                 }
                                 let ctx = Context::Search {
                                     query: "youtube radio".into(),
@@ -881,7 +1072,8 @@ impl App {
                                     manual_queue: self.transport.manual_queue.clone(),
                                     yt_lists: &self.yt_lists,
                                 };
-                                self.transport.switch_context(ctx, Some(&vid), &r, &self.catalog);
+                                self.transport
+                                    .switch_context(ctx, Some(&vid), &r, &self.catalog);
                                 self.start_playback();
                             }
                             None => {
@@ -900,7 +1092,11 @@ impl App {
     }
 
     pub fn prev(&mut self) {
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
+        let r = ClonedResolver {
+            playlists: &self.playlists,
+            manual_queue: self.transport.manual_queue.clone(),
+            yt_lists: &self.yt_lists,
+        };
         if let Some(id) = self.transport.prev(&r, &self.catalog) {
             self.load_track(&id);
         }
@@ -917,12 +1113,20 @@ impl App {
             ShuffleMode::Smart => ShuffleMode::Random,
             ShuffleMode::Random => ShuffleMode::Off,
         };
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
+        let r = ClonedResolver {
+            playlists: &self.playlists,
+            manual_queue: self.transport.manual_queue.clone(),
+            yt_lists: &self.yt_lists,
+        };
         self.transport.set_shuffle(m, &r, &self.catalog);
     }
 
     pub fn reshuffle(&mut self) {
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
+        let r = ClonedResolver {
+            playlists: &self.playlists,
+            manual_queue: self.transport.manual_queue.clone(),
+            yt_lists: &self.yt_lists,
+        };
         self.transport.reshuffle(&r, &self.catalog);
     }
 
@@ -972,20 +1176,30 @@ impl App {
         // browser profile the user abandoned.
         self.yt_browser.clear();
         if self.yt_session.is_none() {
-            match crate::yt::session::Session::spawn(&self.yt_python, &self.yt_script, Some(cookies.clone())) {
+            match crate::yt::session::Session::spawn(
+                &self.yt_python,
+                &self.yt_script,
+                Some(cookies.clone()),
+            ) {
                 Ok(s) => self.yt_session = Some(s),
                 Err(e) => {
                     self.yt_error = Some(format!("auth failed: {e}"));
+                    self.yt_state = crate::yt::state::YtState::ProviderError;
                     return;
                 }
             }
         } else if let Some(session) = self.yt_session.as_mut() {
             if let Err(e) = session.set_cookies(cookies, &self.yt_python, &self.yt_script) {
                 self.yt_error = Some(format!("auth failed: {e}"));
+                self.yt_state = crate::yt::state::YtState::ProviderError;
                 return;
             }
         }
-        self.yt_status = Some("YT auth: connected via pasted cookies".into());
+        // Authenticated but NOT synced — the credential hasn't been verified
+        // by a data fetch yet. The old code set yt_status = "connected" here,
+        // which was false-ready (yt-recon §8 location 3). The launch probe or
+        // refresh_yt_lists must succeed to promote this to Ready.
+        self.yt_state = crate::yt::state::YtState::AuthenticatedNotSynced;
     }
 
     /// `:yt auth browser <name>` — respawn the sidecar reading cookies from a
@@ -998,20 +1212,29 @@ impl App {
         // browser profile (no re-auth). Saved to state.db on clean exit.
         self.yt_browser = browser.clone();
         if self.yt_session.is_none() {
-            match crate::yt::session::Session::spawn_browser(&self.yt_python, &self.yt_script, browser.clone()) {
+            match crate::yt::session::Session::spawn_browser(
+                &self.yt_python,
+                &self.yt_script,
+                browser.clone(),
+            ) {
                 Ok(s) => self.yt_session = Some(s),
                 Err(e) => {
                     self.yt_error = Some(format!("auth failed: {e}"));
+                    self.yt_state = crate::yt::state::YtState::ProviderError;
                     return;
                 }
             }
         } else if let Some(session) = self.yt_session.as_mut() {
             if let Err(e) = session.set_browser(browser.clone(), &self.yt_python, &self.yt_script) {
                 self.yt_error = Some(format!("auth failed: {e}"));
+                self.yt_state = crate::yt::state::YtState::ProviderError;
                 return;
             }
         }
-        self.yt_status = Some(format!("YT auth: connected via {browser}"));
+        // Authenticated but NOT synced — see apply_yt_auth for the rationale.
+        // The old code set yt_status = "connected via {browser}" here (yt-recon
+        // §8 location 4); the launch probe or refresh must verify data first.
+        self.yt_state = crate::yt::state::YtState::AuthenticatedNotSynced;
     }
 
     /// `:yt setup` — create the jukebox venv and install the YT deps into it,
@@ -1034,8 +1257,14 @@ impl App {
                 // any browser/pasted auth.
                 if let Some(session) = self.yt_session.as_mut() {
                     if let Some(browser) = session.browser.clone() {
-                        match crate::yt::session::Session::spawn_browser(&self.yt_python, &self.yt_script, browser) {
-                            Ok(new) => { *self.yt_session.as_mut().unwrap() = new; }
+                        match crate::yt::session::Session::spawn_browser(
+                            &self.yt_python,
+                            &self.yt_script,
+                            browser,
+                        ) {
+                            Ok(new) => {
+                                *self.yt_session.as_mut().unwrap() = new;
+                            }
                             Err(e) => self.yt_error = Some(format!("respawn after setup: {e}")),
                         }
                     }
@@ -1076,24 +1305,34 @@ impl App {
                 };
                 let respawned = match browser {
                     Some(b) => crate::yt::session::Session::spawn_browser(
-                        &self.yt_python, &self.yt_script, b,
+                        &self.yt_python,
+                        &self.yt_script,
+                        b,
                     ),
                     None => {
                         // Guest/pasted-cookies: respawn guest (pasted cookies
                         // file re-loaded by Session::spawn).
                         let cookies = crate::yt::session::load_cookies();
                         crate::yt::session::Session::spawn(
-                            &self.yt_python, &self.yt_script, cookies,
+                            &self.yt_python,
+                            &self.yt_script,
+                            cookies,
                         )
                     }
                 };
                 match respawned {
                     Ok(new) => {
                         *self.yt_session.as_mut().unwrap() = new;
-                        self.yt_status = Some("YT: sidecar restarted".into());
+                        // Sidecar restarted — need to re-verify auth/data before
+                        // claiming ready. The old code set yt_status = "sidecar
+                        // restarted" (yt-recon §8 location 5); now we transition
+                        // to AuthenticatedNotSynced so the next probe/refresh
+                        // can promote to Ready.
+                        self.yt_state = crate::yt::state::YtState::AuthenticatedNotSynced;
                     }
                     Err(e) => {
                         self.yt_error = Some(format!("sidecar respawn ({attempts}/3): {e}"));
+                        self.yt_state = crate::yt::state::YtState::ProviderError;
                         if attempts >= 3 {
                             self.yt_status =
                                 Some("YT: sidecar keeps dying — run :yt setup / :yt auth".into());
@@ -1143,6 +1382,13 @@ impl App {
                 }
                 self.yt_lists = lists;
                 self.yt_lists_loading = false;
+                // A data fetch succeeded → the provider is Ready. This is the
+                // single promotion point from AuthenticatedNotSynced/Synchronizing
+                // to Ready — the credential actually works, data is usable.
+                self.yt_state = crate::yt::state::YtState::Ready;
+                // Persist the fresh lists to the disk cache so the next launch
+                // (even offline) shows them marked stale.
+                crate::yt::cache::save_yt_lists(&self.yt_lists);
                 // Lists were replaced; forget which had been expanded so a
                 // re-focused list re-fetches its tracks.
                 self.loaded_yt_lists.clear();
@@ -1193,10 +1439,53 @@ impl App {
                             cursor = results.len().saturating_sub(1);
                         }
                         self.overlay = Some(Overlay::Search {
-                            input, results, cursor, scope, submitted, searching: false,
+                            input,
+                            results,
+                            cursor,
+                            scope,
+                            submitted,
+                            searching: false,
                         });
                     }
                     // else: not ours — leave the overlay exactly as it was.
+                }
+            }
+
+            // Fold completed lyrics into the open Lyrics overlay. The
+            // generation guard (D5) discards a stale response: the overlay's
+            // `gen` was captured at request time; if `lyrics_gen` has advanced
+            // past it (the user moved to a different track), the response is
+            // for a prior track and must NOT overwrite the current overlay.
+            // The video_id carried in the response is a second staleness check.
+            if let Some((vid, lines, synced)) = session.pending_lyrics.take() {
+                if let Some(Overlay::Lyrics {
+                    content: _,
+                    state: _,
+                    scroll,
+                    track_id,
+                    gen,
+                }) = self.overlay.clone()
+                {
+                    // Apply only if the overlay is still waiting for THIS track
+                    // AND the generation matches (no newer request has superseded
+                    // it). A stale response (track changed) is dropped.
+                    if track_id == vid && gen == self.lyrics_gen {
+                        let lyrics = crate::lyrics::from_proto(&lines, synced);
+                        let new_state = if lyrics.is_empty() {
+                            LyricsState::NotFound
+                        } else {
+                            LyricsState::Available(lyrics.synced)
+                        };
+                        self.overlay = Some(Overlay::Lyrics {
+                            content: Some(lyrics),
+                            state: new_state,
+                            scroll,
+                            track_id,
+                            gen,
+                        });
+                    }
+                    // else: stale — leave the overlay as-is (it's either still
+                    // Loading for a newer track, or already showing newer lyrics).
                 }
             }
 
@@ -1248,7 +1537,41 @@ impl App {
                     }) = self.overlay.clone()
                     {
                         self.overlay = Some(Overlay::Search {
-                            input, results, cursor, scope, submitted, searching: false,
+                            input,
+                            results,
+                            cursor,
+                            scope,
+                            submitted,
+                            searching: false,
+                        });
+                    }
+                }
+                // Lyrics overlay: a sidecar error while Loading → Error state
+                // (so the overlay exits "loading…" and shows "lyrics error"
+                // instead of hanging forever). Any error transitions the
+                // overlay (lyrics errors aren't query-tagged, so we can't
+                // distinguish "for this track" vs "for a prior track" — but the
+                // generation guard already discarded truly stale responses,
+                // and a Loading overlay is by definition waiting for the
+                // current track).
+                if let Some(Overlay::Lyrics {
+                    content,
+                    state,
+                    scroll,
+                    track_id,
+                    gen,
+                }) = self.overlay.clone()
+                {
+                    if matches!(state, LyricsState::Loading) {
+                        let msg = last
+                            .map(|(_, e)| e.clone())
+                            .unwrap_or_else(|| "lyrics request failed".to_string());
+                        self.overlay = Some(Overlay::Lyrics {
+                            content,
+                            state: LyricsState::Error(msg),
+                            scroll,
+                            track_id,
+                            gen,
                         });
                     }
                 }
@@ -1256,7 +1579,43 @@ impl App {
                 // relevant to what the user searched), else the last error.
                 let footer = matching_search.or(last).map(|(_, e)| e.clone());
                 if let Some(e) = footer {
-                    self.yt_error = Some(e);
+                    self.yt_error = Some(e.clone());
+                    // Transition the provider state on a non-Search error.
+                    // Search errors are overlay-scoped and don't indicate the
+                    // provider itself is broken; Other errors (resolve,
+                    // playlist fetch, refresh) do. Don't demote from Ready to
+                    // ProviderError on a Search error — the provider is fine.
+                    let is_search_only = errors.iter().all(|(scope, _)| {
+                        matches!(scope, crate::yt::session::ErrorScope::Search(_))
+                    });
+                    if !is_search_only {
+                        // Heuristic auth-expiry detection: an error mentioning
+                        // auth/401/unauthorized/expired → AuthExpired (needs
+                        // re-auth, not retry). S2.3.1 will make this structured.
+                        let looks_like_auth_error = e.to_lowercase().contains("auth")
+                            || e.to_lowercase().contains("401")
+                            || e.to_lowercase().contains("unauthorized")
+                            || e.to_lowercase().contains("expired")
+                            || e.to_lowercase().contains("login");
+                        if looks_like_auth_error {
+                            self.yt_state = crate::yt::state::YtState::AuthExpired;
+                        } else if self.yt_state == crate::yt::state::YtState::Ready {
+                            // Was Ready, now an error → degrade to ReadyStale
+                            // (cached data still visible, retry can recover).
+                            self.yt_state = crate::yt::state::YtState::ReadyStale;
+                        } else if !self.yt_lists.is_empty() {
+                            // Have cached data from a prior sync → show it as
+                            // stale (offline) rather than a bare error. The
+                            // user can still browse cached playlists.
+                            self.yt_state = crate::yt::state::YtState::ReadyStale;
+                        } else {
+                            self.yt_state = crate::yt::state::YtState::ProviderError;
+                        }
+                        // A non-search error means the refresh/resolve failed:
+                        // clear the loading indicator so the Y view shows the
+                        // error state instead of hanging on "loading…".
+                        self.yt_lists_loading = false;
+                    }
                 }
             }
 
@@ -1316,7 +1675,9 @@ impl App {
                 if !near_end {
                     if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
                         &mut self.device_rate,
-                        crate::source::device_rate::LoadKind::Remote { sample_rate: u.sample_rate },
+                        crate::source::device_rate::LoadKind::Remote {
+                            sample_rate: u.sample_rate,
+                        },
                         self.switch_sample_rate,
                     ) {
                         let _ = crate::audio::set_output_format(sr, bd);
@@ -1370,6 +1731,22 @@ impl App {
         // stays warm (the slow 256k resolve happens during the current track).
         self.preload_next_url();
 
+        // Lyrics overlay follows the music: if it's open and the now-playing
+        // track changed since the last request, re-request for the new track.
+        // (The generation guard in `request_lyrics` + `on_tick` discards any
+        // in-flight response for the old track.) This is the "call request_lyrics
+        // when now_playing changes" wire — only while the overlay is open, so
+        // we don't fire a sidecar request on every track change when the user
+        // isn't looking at lyrics.
+        if let Some(Overlay::Lyrics { track_id, .. }) = self.overlay.clone() {
+            if let Some(np) = self.now_playing.as_ref() {
+                if np.id() != track_id.as_str() {
+                    let new_id = np.id().to_string();
+                    self.request_lyrics(&new_id);
+                }
+            }
+        }
+
         // Braille spinner: advance one frame per tick while a resolve is in
         // flight, else freeze at 0 (returns the glyph to play/pause). ~150ms
         // per tick (event loop POLL_TIMEOUT) ≈ 6.7fps — smooth for 10 frames.
@@ -1380,7 +1757,48 @@ impl App {
         }
     }
 
-    /// Logout: clear cookies + browser choice + respawn the sidecar guest.
+    /// The footer / Y-view status text, derived from the truthful `yt_state`
+    /// enum (not the legacy `yt_status`/`yt_error` free-text). Replaces the old
+    /// `yt_status = "connected…"` assignments that could claim "connected"
+    /// before any data fetch verified the credential (yt-recon §8).
+    ///
+    /// - `Ready` with a transient non-state message (e.g. "upgraded to AAC
+    ///   256k"): returns that message (accent-colored in the footer).
+    /// - `Ready` with no transient message: returns `None` (the footer shows
+    ///   the key-hint bar instead).
+    /// - Any non-ready state: returns `Some("YT: [icon] <label> [— detail]")`
+    ///   built from `human_label()` + `icon()` + the error detail (`yt_error`).
+    ///   The icon gives NO_COLOR distinction (accessibility: not color-only).
+    ///   Never contains "connected" — that word was the false-ready bug.
+    pub fn yt_status_text(&self) -> Option<String> {
+        // Only Ready is silent (the hint bar shows). ReadyStale shows its
+        // "offline — showing cached" label so the user knows they're degraded.
+        if self.yt_state == crate::yt::state::YtState::Ready {
+            // Ready: show the transient non-state message (e.g. "upgraded to
+            // AAC 256k · YT Premium"), or None for the hint line.
+            return self.yt_status.clone();
+        }
+        // Non-ready: derive from the state machine. The label already embeds
+        // the recovery action (e.g. "not configured — run :yt auth browser"),
+        // so we don't append retry_hint() separately.
+        let label = self.yt_state.human_label();
+        let icon = self.yt_state.icon().unwrap_or("");
+        let mut s = if icon.is_empty() {
+            format!("YT: {label}")
+        } else {
+            format!("YT: {icon} {label}")
+        };
+        if let Some(detail) = &self.yt_error {
+            if !detail.is_empty() {
+                s.push_str(&format!(" — {detail}"));
+            }
+        }
+        Some(s)
+    }
+
+    /// Logout: clear cookies + browser choice + cached lists, and respawn the
+    /// sidecar guest. Stale data must not survive logout — the Y view would
+    /// show playlists from the logged-out account, which is misleading.
     pub fn yt_logout(&mut self) {
         let p = crate::yt::session::cookies_file();
         let _ = std::fs::remove_file(&p);
@@ -1390,6 +1808,90 @@ impl App {
         }
         self.yt_status = Some("YT auth: logged out (guest mode)".into());
         self.yt_error = None;
+        // Drop cached lists + the loaded-set so the Y view doesn't show stale
+        // playlists from the logged-out account. A re-focus after re-auth
+        // re-fetches everything fresh.
+        self.yt_lists.clear();
+        self.loaded_yt_lists.clear();
+        self.yt_lists_loading = false;
+        // Also clear the disk cache so the next launch doesn't show the
+        // logged-out account's playlists.
+        crate::yt::cache::clear_yt_lists();
+        // Transition to SignedOut (distinct from Unconfigured: the user took
+        // an explicit action). The footer says "signed out — run :yt auth to
+        // reconnect" rather than "not configured."
+        self.yt_state = crate::yt::state::YtState::SignedOut;
+    }
+
+    /// `R` — retry the YouTube provider probe after a `ProviderError` /
+    /// `AuthExpired` / `RateLimited` / `ReadyStale` state. Re-runs a real
+    /// `library_playlists` fetch (the same probe the launch path uses) and
+    /// transitions to `Ready` on success or `ProviderError`/`AuthExpired` on
+    /// failure. Keeps the session (sidecar + caches) — does NOT re-spawn or
+    /// re-prompt the Keychain. This is the fix for the "repeated login" root
+    /// cause: the user presses R instead of re-authenticating.
+    ///
+    /// Blocks briefly (~1-3s) for the probe — acceptable because it's an
+    /// explicit user action (not a hot path), and the alternative (fire-and-
+    /// forget `refresh_yt_lists`) can't distinguish "auth expired" from
+    /// "network blip" until the response lands, leaving the footer on
+    /// "synchronizing…" without a verdict.
+    pub fn retry_yt_probe(&mut self) {
+        let Some(session) = self.yt_session.as_mut() else {
+            // No session — nothing to retry. The footer's state hint tells the
+            // user to auth (`:yt auth browser`), not to press R.
+            return;
+        };
+        if !self.yt_state.can_retry() {
+            // Only retry from error/stale/syncing states — not from Ready
+            // (already healthy) or Unconfigured/SignedOut (need auth, not retry).
+            return;
+        }
+        self.yt_error = None;
+        self.yt_state = crate::yt::state::YtState::Synchronizing;
+        match session.library_playlists() {
+            Ok(playlists) => {
+                // The probe succeeded — the credential works. Fold the result
+                // into yt_lists immediately (the probe returned data) and mark
+                // Ready. Also fire refresh for the suggestions (the probe only
+                // fetches playlists).
+                self.yt_state = crate::yt::state::YtState::Ready;
+                let lists: Vec<YtList> = playlists
+                    .into_iter()
+                    .map(|pl| YtList {
+                        id: pl.id,
+                        name: pl.name,
+                        kind: YtListKind::Account,
+                        track_ids: Vec::new(),
+                    })
+                    .collect();
+                self.yt_lists = lists;
+                self.yt_lists_loading = false;
+                self.loaded_yt_lists.clear();
+                // Fire-and-forget the suggestions half of a refresh so the Y
+                // view's "Suggested / Up Next" pane populates too.
+                let _ = session.send_refresh();
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                self.yt_error = Some(format!("retry failed: {msg}"));
+                let lower = msg.to_lowercase();
+                if lower.contains("login required")
+                    || lower.contains("unauthorized")
+                    || lower.contains("expired")
+                    || lower.contains("logged out")
+                {
+                    self.yt_state = crate::yt::state::YtState::AuthExpired;
+                } else if lower.contains("rate")
+                    || lower.contains("429")
+                    || lower.contains("throttl")
+                {
+                    self.yt_state = crate::yt::state::YtState::RateLimited;
+                } else {
+                    self.yt_state = crate::yt::state::YtState::ProviderError;
+                }
+            }
+        }
     }
 
     /// `s` — instant random track from the active source, played *in context*
@@ -1405,14 +1907,23 @@ impl App {
                 Some(a) => self.tracks_for_album(&a),
                 None => vec![id.clone()],
             };
-            let start = if ids.contains(&id) { id } else { ids.first().cloned().unwrap_or(id) };
+            let start = if ids.contains(&id) {
+                id
+            } else {
+                ids.first().cloned().unwrap_or(id)
+            };
             self.play_in_context_ids(ids, &start);
             return;
         }
         // Youtube mode (or empty local catalog): pick from the first list that
         // has tracks loaded. `s` on a fresh Y view kicks off a load of the
         // focused list, so a second `s` plays once it lands.
-        if let Some(l) = self.yt_lists.iter().find(|l| !l.track_ids.is_empty()).cloned() {
+        if let Some(l) = self
+            .yt_lists
+            .iter()
+            .find(|l| !l.track_ids.is_empty())
+            .cloned()
+        {
             if let Some(id) = l.track_ids.first().cloned() {
                 self.play_in_context_ids(l.track_ids.clone(), &id);
                 return;
@@ -1421,9 +1932,11 @@ impl App {
         // Nothing to play yet — tell the user why instead of silently no-op'ing.
         if self.source_mode == crate::mode::SourceMode::Youtube || self.catalog.tracks.is_empty() {
             if self.yt_session.is_none() {
-                self.yt_error = Some("s: YouTube not configured — run :yt auth browser <chrome>".into());
+                self.yt_error =
+                    Some("s: YouTube not configured — run :yt auth browser <chrome>".into());
             } else if self.yt_lists.is_empty() {
-                self.yt_status = Some("s: no YouTube lists loaded yet (open the Y view with 4)".into());
+                self.yt_status =
+                    Some("s: no YouTube lists loaded yet (open the Y view with 4)".into());
             } else {
                 // Lists present but none expanded: nudge the focused one to load.
                 if self.view != View::Youtube {
@@ -1443,7 +1956,8 @@ impl App {
                         }
                     }
                 }
-                self.yt_status = Some("s: loading the focused list — press s again in a moment".into());
+                self.yt_status =
+                    Some("s: loading the focused list — press s again in a moment".into());
             }
         }
     }
@@ -1468,7 +1982,10 @@ impl App {
     /// diversity (deprioritize the currently-playing artist) + a deterministic
     /// per-album pseudo-random so suggestions vary but stay stable. Pick 5.
     fn local_smart_albums(&self) -> Vec<DiscoverItem> {
-        let cur_artist = self.now_playing_view().map(|v| v.artist).unwrap_or_default();
+        let cur_artist = self
+            .now_playing_view()
+            .map(|v| v.artist)
+            .unwrap_or_default();
         let mut scored: Vec<(u64, DiscoverItem)> = Vec::new();
         for (artist, albums) in &self.albums_by_artist {
             for a in albums {
@@ -1495,7 +2012,10 @@ impl App {
         match session.home_suggestions() {
             Ok(s) => s
                 .into_iter()
-                .map(|p| DiscoverItem::Playlist { id: p.id, name: p.name })
+                .map(|p| DiscoverItem::Playlist {
+                    id: p.id,
+                    name: p.name,
+                })
                 .take(5)
                 .collect(),
             Err(_) => Vec::new(),
@@ -1510,7 +2030,8 @@ impl App {
         // counter still advances across calls so successive `s` presses differ.
         use std::sync::OnceLock;
         static SEED: OnceLock<u64> = OnceLock::new();
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x9E3779B97F4A7C15);
+        static COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0x9E3779B97F4A7C15);
         let seed = *SEED.get_or_init(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1545,7 +2066,12 @@ impl App {
         }
         match &self.filter {
             Some(f) if f.col == self.focus_col => self.filter = None,
-            _ => self.filter = Some(FilterState { col: self.focus_col, text: String::new() }),
+            _ => {
+                self.filter = Some(FilterState {
+                    col: self.focus_col,
+                    text: String::new(),
+                })
+            }
         }
     }
 
@@ -1572,7 +2098,11 @@ impl App {
                     }
                 }
                 1 => {
-                    let artist = self.artists.get(self.cursors.artist).cloned().unwrap_or_default();
+                    let artist = self
+                        .artists
+                        .get(self.cursors.artist)
+                        .cloned()
+                        .unwrap_or_default();
                     if let Some(albums) = self.albums_by_artist.get(&artist).cloned() {
                         if let Some(i) = albums.iter().position(|a| matches(&a.title)) {
                             self.cursors.album = i;
@@ -1645,6 +2175,41 @@ impl App {
         }
     }
 
+    /// Load cached `yt_lists` from the default state DB so an offline launch
+    /// shows known playlists immediately. When the sidecar couldn't start
+    /// (`yt_session` is `None`), transitions to `ReadyStale` — the footer then
+    /// reads "offline — showing cached (press R to retry)" instead of an
+    /// empty Y view. Best-effort: a missing/corrupt cache is silently ignored
+    /// (the fire-and-forget refresh, when the session is up, repopulates
+    /// fresh lists and promotes to `Ready`).
+    pub fn load_yt_lists_from_cache(&mut self) {
+        let cached = crate::yt::cache::load_yt_lists();
+        if cached.is_empty() {
+            return;
+        }
+        self.yt_lists = cached;
+        if self.yt_session.is_none() {
+            self.yt_state = crate::yt::state::YtState::ReadyStale;
+        }
+    }
+
+    /// Same as `load_yt_lists_from_cache` but reads from `path` instead of the
+    /// default state DB. For tests: avoids the process-global `XDG_CONFIG_HOME`
+    /// env race by using an explicit temp DB path.
+    pub fn load_yt_lists_from_cache_at(&mut self, path: &std::path::Path) {
+        let cached = match crate::yt::cache::load_yt_lists_at(path) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if cached.is_empty() {
+            return;
+        }
+        self.yt_lists = cached;
+        if self.yt_session.is_none() {
+            self.yt_state = crate::yt::state::YtState::ReadyStale;
+        }
+    }
+
     /// Kick off an async fetch of the account + suggested lists for the Y view.
     /// Non-blocking: sends the requests and returns immediately, showing
     /// "loading…" until `on_tick` folds the results into `yt_lists`. No-op
@@ -1657,12 +2222,16 @@ impl App {
         };
         self.yt_error = None;
         self.yt_lists_loading = true;
+        // Transition to Synchronizing — a data fetch is in flight. on_tick will
+        // promote to Ready when playlists land, or ProviderError on error.
+        self.yt_state = crate::yt::state::YtState::Synchronizing;
         // Drop a stale partial fetch so on_tick merges the fresh pair together.
         session.pending_playlists = None;
         session.pending_suggestions = None;
         if let Err(e) = session.send_refresh() {
             self.yt_lists_loading = false;
             self.yt_error = Some(format!("refresh: {e}"));
+            self.yt_state = crate::yt::state::YtState::ProviderError;
         }
         // Pre-warm the PREMIUM tier on the first refresh: the deno EJS nsig
         // solver downloads once (~10s cold) and caches, and the macOS Keychain
@@ -1699,14 +2268,20 @@ impl App {
         // A context switch is a play transition: push current to history so
         // `prev` can pop back to the track that just finished.
         if let Some(np) = self.now_playing.clone() {
-            self.transport.history.push((np.id().to_string(), self.transport.context.clone()));
+            self.transport
+                .history
+                .push((np.id().to_string(), self.transport.context.clone()));
         }
         let ctx = Context::Album {
             album: next.title.clone(),
             artist: next.artist.clone(),
             track_ids,
         };
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
+        let r = ClonedResolver {
+            playlists: &self.playlists,
+            manual_queue: self.transport.manual_queue.clone(),
+            yt_lists: &self.yt_lists,
+        };
         self.transport.switch_context(ctx, None, &r, &self.catalog);
         // Keep the browse cursor in sync so the UI shows the new album.
         self.cursors.album = next_idx;
@@ -1719,14 +2294,23 @@ impl App {
     /// library), `next` re-enters here and rebuilds it.
     fn switch_to_radio(&mut self) {
         if let Some(np) = self.now_playing.clone() {
-            self.transport.history.push((np.id().to_string(), self.transport.context.clone()));
+            self.transport
+                .history
+                .push((np.id().to_string(), self.transport.context.clone()));
         }
         let all_ids: Vec<String> = self.catalog.tracks.iter().map(|t| t.id.clone()).collect();
-        let ctx = Context::Search { query: "radio".into(), track_ids: all_ids };
+        let ctx = Context::Search {
+            query: "radio".into(),
+            track_ids: all_ids,
+        };
         // Radio implies shuffled play; force smart shuffle so it actually
         // discovers (catalog order would just be sequential).
         self.transport.shuffle = ShuffleMode::Smart;
-        let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
+        let r = ClonedResolver {
+            playlists: &self.playlists,
+            manual_queue: self.transport.manual_queue.clone(),
+            yt_lists: &self.yt_lists,
+        };
         self.transport.switch_context(ctx, None, &r, &self.catalog);
     }
 
@@ -1791,12 +2375,127 @@ impl App {
     /// session — typing locally without a configured sidecar.
     pub fn submit_yt_search(&mut self, q: String) {
         let Some(session) = self.yt_session.as_mut() else {
-            self.yt_error = Some("search: YouTube not configured — run :yt auth browser <chrome>".into());
+            self.yt_error =
+                Some("search: YouTube not configured — run :yt auth browser <chrome>".into());
             return;
         };
         if let Err(e) = session.send_search(q) {
             self.yt_error = Some(format!("search: {e}"));
         }
+    }
+
+    /// Toggle the lyrics overlay (`L`). On open: requests lyrics for the
+    /// currently-playing track (local read first, else sidecar). On close: just
+    /// dismisses (the cached content is dropped with the overlay; a re-open
+    /// re-requests, which is cheap — local reads are instant and the sidecar
+    /// inflight guard dedups). No-op if nothing is playing.
+    pub fn toggle_lyrics(&mut self) {
+        if matches!(self.overlay, Some(Overlay::Lyrics { .. })) {
+            self.overlay = None;
+            return;
+        }
+        let Some(np) = self.now_playing.clone() else {
+            self.yt_error = Some("lyrics: nothing is playing".into());
+            return;
+        };
+        self.overlay = Some(Overlay::Lyrics {
+            content: None,
+            state: LyricsState::Idle,
+            scroll: 0,
+            track_id: np.id().to_string(),
+            gen: self.lyrics_gen,
+        });
+        self.request_lyrics(np.id());
+    }
+
+    /// Request lyrics for `track_id`. Bumps `lyrics_gen` (so any in-flight
+    /// response for a prior track is discarded by `on_tick`), updates the open
+    /// Lyrics overlay to `Loading`, then tries local sources first (embedded
+    /// FLAC tag / sidecar `.lrc` for a catalog track) — if found, sets
+    /// `Available` immediately. Else fires the sidecar `get_lyrics` for a
+    /// YouTube track; `on_tick` folds the response in under the generation
+    /// guard. For a local track with no embedded/sidecar lyrics, sets
+    /// `NotFound` (we have no video_id to ask ytmusicapi). Non-blocking.
+    pub fn request_lyrics(&mut self, track_id: &str) {
+        // Bump the generation so a stale in-flight response is discarded.
+        self.lyrics_gen = self.lyrics_gen.wrapping_add(1);
+        let gen = self.lyrics_gen;
+        // Update the overlay to Loading if it's the Lyrics overlay.
+        if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
+            self.overlay = Some(Overlay::Lyrics {
+                content: None,
+                state: LyricsState::Loading,
+                scroll,
+                track_id: track_id.to_string(),
+                gen,
+            });
+        }
+        // Local catalog track → try embedded FLAC tag + sidecar .lrc/.txt.
+        // These are fast (one metaflac subprocess + filesystem reads) and
+        // never block; a miss falls through to NotFound for local tracks (no
+        // video_id to ask ytmusicapi).
+        if let Some(track) = self.track_by_id_fast(track_id).cloned() {
+            if let Some(lyrics) = crate::lyrics::read_embedded(&track, &self.catalog.source_root) {
+                let new_state = if lyrics.is_empty() {
+                    LyricsState::NotFound
+                } else {
+                    LyricsState::Available(lyrics.synced)
+                };
+                if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
+                    self.overlay = Some(Overlay::Lyrics {
+                        content: Some(lyrics),
+                        state: new_state,
+                        scroll,
+                        track_id: track_id.to_string(),
+                        gen,
+                    });
+                }
+                return;
+            }
+            // Local track, no embedded/sidecar lyrics → NotFound (truthful; no
+            // fabricated text, AC-M3.5.1).
+            if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
+                self.overlay = Some(Overlay::Lyrics {
+                    content: None,
+                    state: LyricsState::NotFound,
+                    scroll,
+                    track_id: track_id.to_string(),
+                    gen,
+                });
+            }
+            return;
+        }
+        // Remote (YouTube) track → fire-and-forget sidecar get_lyrics. The
+        // response lands in `pending_lyrics` and is drained by on_tick under
+        // the generation guard. No session → Error (truthful; the user needs
+        // :yt auth to fetch YouTube lyrics).
+        let Some(session) = self.yt_session.as_mut() else {
+            if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
+                self.overlay = Some(Overlay::Lyrics {
+                    content: None,
+                    state: LyricsState::Error(
+                        "YouTube not configured — run :yt auth browser <chrome>".into(),
+                    ),
+                    scroll,
+                    track_id: track_id.to_string(),
+                    gen,
+                });
+            }
+            return;
+        };
+        if let Err(e) = session.send_get_lyrics(track_id.to_string()) {
+            if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
+                self.overlay = Some(Overlay::Lyrics {
+                    content: None,
+                    state: LyricsState::Error(format!("lyrics: {e}")),
+                    scroll,
+                    track_id: track_id.to_string(),
+                    gen,
+                });
+            }
+        }
+        // else: sent — on_tick will fold the response in (Loading → Available /
+        // NotFound / Error).
     }
 
     /// The current browse view as a stable string key, for state persistence.
@@ -1810,6 +2509,127 @@ impl App {
             View::Queue => "queue",
             View::Youtube => "youtube",
         }
+    }
+
+    // --- Queue & playlist operations -------------------------------------
+
+    /// The track id under the cursor in the current view, or `None` if the
+    /// view/cursor has no track under it. Mirrors the logic of
+    /// [`play_selected`] for non-Queue views (uses `cursors.track`); for the
+    /// Queue view uses `cursors.queue` (the actual navigation cursor for that
+    /// single-column view). Clamps cursors first so a stale cursor doesn't
+    /// silently miss.
+    pub fn selected_track_id(&mut self) -> Option<String> {
+        self.clamp_cursors();
+        let ids = self.current_context_ids();
+        if ids.is_empty() {
+            return None;
+        }
+        let cursor = match self.view {
+            View::Queue => self.cursors.queue,
+            _ => self.cursors.track,
+        };
+        let cursor = cursor.min(ids.len() - 1);
+        ids.get(cursor).cloned()
+    }
+
+    /// `e` — enqueue the track under the cursor to the manual "play next"
+    /// queue. No-op if there's no selected track.
+    pub fn enqueue_selected(&mut self) {
+        if let Some(id) = self.selected_track_id() {
+            self.transport.enqueue(id);
+        }
+    }
+
+    /// `x` (Queue view) — remove the track under the cursor from the manual
+    /// queue. Adjusts the cursor so it stays valid. No-op outside the Queue
+    /// view or when the queue is empty.
+    pub fn remove_selected_from_queue(&mut self) {
+        if self.view != View::Queue {
+            return;
+        }
+        let ids = self.transport.manual_queue.clone();
+        let Some(id) = ids.get(self.cursors.queue).cloned() else {
+            return;
+        };
+        self.transport.remove_from_queue(&id);
+        // Keep the cursor valid: if we removed the last item, step back.
+        let new_len = self.transport.manual_queue.len();
+        if new_len > 0 && self.cursors.queue >= new_len {
+            self.cursors.queue = new_len - 1;
+        } else if new_len == 0 {
+            self.cursors.queue = 0;
+        }
+    }
+
+    /// Add `track_id` to an existing playlist at `playlist_idx`. Skips
+    /// duplicates (a track already in the playlist isn't added twice).
+    /// Returns true if the track was added, false if it was already present
+    /// or the index was out of bounds.
+    pub fn add_track_to_playlist(&mut self, track_id: &str, playlist_idx: usize) -> bool {
+        let Some(pl) = self.playlists.get_mut(playlist_idx) else {
+            return false;
+        };
+        if pl.track_ids.iter().any(|t| t == track_id) {
+            return false;
+        }
+        pl.track_ids.push(track_id.to_string());
+        true
+    }
+
+    /// Create a new playlist containing `track_id` and append it to
+    /// `self.playlists`. Generates a unique name ("New Playlist N"). Returns
+    /// the index of the new playlist.
+    pub fn create_playlist_with_track(&mut self, track_id: &str) -> usize {
+        let name = self.unique_playlist_name();
+        let pl = Playlist {
+            name,
+            track_ids: vec![track_id.to_string()],
+        };
+        self.playlists.push(pl);
+        self.playlists.len() - 1
+    }
+
+    /// Generate a unique "New Playlist N" name that doesn't collide with any
+    /// existing playlist name.
+    fn unique_playlist_name(&self) -> String {
+        let mut n = self.playlists.len() + 1;
+        loop {
+            let candidate = format!("New Playlist {n}");
+            if !self.playlists.iter().any(|p| p.name == candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// `d` (Playlists view, col 0) — delete the focused playlist. Adjusts the
+    /// cursor, saves to state.db, and sets a status message. No-op outside the
+    /// Playlists view or col 0, or when there are no playlists.
+    pub fn delete_focused_playlist(&mut self) {
+        if self.view != View::Playlists || self.focus_col != 0 {
+            return;
+        }
+        let Some(pl) = self.playlists.get(self.cursors.playlist).cloned() else {
+            return;
+        };
+        self.playlists.remove(self.cursors.playlist);
+        // Keep the cursor valid.
+        let n = self.playlists.len();
+        if n > 0 && self.cursors.playlist >= n {
+            self.cursors.playlist = n - 1;
+        } else if n == 0 {
+            self.cursors.playlist = 0;
+        }
+        self.cursors.track = 0;
+        self.save_playlists_db();
+        self.yt_status = Some(format!("deleted playlist \"{}\"", pl.name));
+    }
+
+    /// Best-effort persist of `self.playlists` to the state DB. Errors are
+    /// ignored (matching the existing `let _ = state::save_layout(...)` pattern).
+    pub fn save_playlists_db(&self) {
+        let _ = crate::state::save_playlists(&self.playlists);
     }
 }
 

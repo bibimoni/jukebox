@@ -52,9 +52,18 @@ fn columns_show_artists_and_albums_and_tracks() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     // cursors default to 0 -> 40mP / Cosmic / Song1.
     let buf = rendered(&mut app, 120, 30);
-    assert!(buf.contains("40mP"), "artist column must show the artist: {buf}");
-    assert!(buf.contains("Cosmic"), "album column must show the album: {buf}");
-    assert!(buf.contains("Song1"), "track column must show the track: {buf}");
+    assert!(
+        buf.contains("40mP"),
+        "artist column must show the artist: {buf}"
+    );
+    assert!(
+        buf.contains("Cosmic"),
+        "album column must show the album: {buf}"
+    );
+    assert!(
+        buf.contains("Song1"),
+        "track column must show the track: {buf}"
+    );
 }
 
 #[test]
@@ -76,8 +85,14 @@ fn queue_view_lists_manual_queue_titles() {
     app.transport.manual_queue.push("t1".into());
     app.transport.manual_queue.push("t2".into());
     let buf = rendered(&mut app, 120, 30);
-    assert!(buf.contains("Song1"), "queue column must resolve t1 -> Song1: {buf}");
-    assert!(buf.contains("Ghost Rule"), "queue column must resolve t2 -> Ghost Rule: {buf}");
+    assert!(
+        buf.contains("Song1"),
+        "queue column must resolve t1 -> Song1: {buf}"
+    );
+    assert!(
+        buf.contains("Ghost Rule"),
+        "queue column must resolve t2 -> Ghost Rule: {buf}"
+    );
 }
 
 #[test]
@@ -86,7 +101,10 @@ fn now_playing_track_marked_with_glyph() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.play_in_context_ids(vec!["t1".into()], "t1");
     let buf = rendered(&mut app, 120, 30);
-    assert!(buf.contains('▶'), "now-playing track must be marked with the play glyph: {buf}");
+    assert!(
+        buf.contains('▶'),
+        "now-playing track must be marked with the play glyph: {buf}"
+    );
 }
 
 #[test]
@@ -95,15 +113,26 @@ fn youtube_view_renders_account_and_suggested_lists() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.view = jukebox::tui::app::View::Youtube;
     app.yt_lists = vec![
-        jukebox::tui::app::YtList { id: "PL1".into(), name: "Liked Songs".into(),
-            kind: jukebox::tui::app::YtListKind::Account, track_ids: vec![] },
-        jukebox::tui::app::YtList { id: "RD1".into(), name: "Focus Flow".into(),
-            kind: jukebox::tui::app::YtListKind::Suggested, track_ids: vec![] },
+        jukebox::tui::app::YtList {
+            id: "PL1".into(),
+            name: "Liked Songs".into(),
+            kind: jukebox::tui::app::YtListKind::Account,
+            track_ids: vec![],
+        },
+        jukebox::tui::app::YtList {
+            id: "RD1".into(),
+            name: "Focus Flow".into(),
+            kind: jukebox::tui::app::YtListKind::Suggested,
+            track_ids: vec![],
+        },
     ];
     let s = render(&app);
     assert!(s.contains("♫ Liked Songs"), "{s}");
     assert!(s.contains("✦ Focus Flow"), "{s}");
-    assert!(s.contains("Up Next") || s.contains("Suggested"), "missing up-next: {s}");
+    assert!(
+        s.contains("Up Next") || s.contains("Suggested"),
+        "missing up-next: {s}"
+    );
 }
 
 #[test]
@@ -112,7 +141,10 @@ fn youtube_view_shows_setup_hint_when_no_session() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.view = jukebox::tui::app::View::Youtube;
     let s = render(&app);
-    assert!(s.contains(":yt auth") || s.contains(":yt setup"), "missing setup hint: {s}");
+    assert!(
+        s.contains(":yt auth") || s.contains(":yt setup"),
+        "missing setup hint: {s}"
+    );
 }
 
 fn cat_albums_for_yt() -> (tempfile::TempDir, Catalog) {
@@ -125,7 +157,8 @@ fn cat_albums_for_yt() -> (tempfile::TempDir, Catalog) {
         "tracks":[{"id":"t1","artists":["A"],"primary_artist":"A","title":"S","album":"Al",
         "bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/A/01.flac",
         "symlinked_into_artists":["A"]}]
-    }).to_string();
+    })
+    .to_string();
     let p = d.path().join("catalog.json");
     std::fs::write(&p, json).unwrap();
     (d, Catalog::load(&p).unwrap())

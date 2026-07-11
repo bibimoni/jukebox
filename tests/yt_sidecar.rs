@@ -2,7 +2,10 @@ use jukebox::yt::proto::*;
 
 #[test]
 fn search_request_serializes_to_line() {
-    let r = Request::Search { q: "adele hello".into(), limit: 25 };
+    let r = Request::Search {
+        q: "adele hello".into(),
+        limit: 25,
+    };
     let line = r.to_line();
     assert!(line.contains("\"cmd\":\"search\""));
     assert!(line.contains("\"q\":\"adele hello\""));
@@ -49,11 +52,69 @@ fn response_error() {
 fn response_pong_and_auth() {
     let pong = Response::from_line(r#"{"ok":true,"data":{"pong":true}}"#).unwrap();
     assert!(matches!(pong, Response::Pong));
+    // Old sidecar without valid/expired/reason fields — must still parse
+    // (serde defaults: valid=false, expired=false, reason=None).
     let auth = Response::from_line(
         r#"{"ok":true,"data":{"auth":{"ok":true,"premium":true,"account":true}}}"#,
     )
     .unwrap();
-    assert!(matches!(auth, Response::Auth(a) if a.premium && a.account));
+    assert!(
+        matches!(auth, Response::Auth(a) if a.premium && a.account && !a.valid && !a.expired && a.reason.is_none())
+    );
+}
+
+#[test]
+fn response_auth_with_validity_fields() {
+    // New sidecar with valid=true (probe succeeded).
+    let auth = Response::from_line(
+        r#"{"ok":true,"data":{"auth":{"ok":true,"premium":true,"account":true,"valid":true,"expired":false,"reason":null}}}"#,
+    )
+    .unwrap();
+    match auth {
+        Response::Auth(a) => {
+            assert!(a.ok, "ok should be true (cookie present)");
+            assert!(a.valid, "valid should be true (probe succeeded)");
+            assert!(!a.expired, "expired should be false");
+            assert!(a.reason.is_none(), "reason should be null");
+        }
+        other => panic!("expected Auth, got {other:?}"),
+    }
+}
+
+#[test]
+fn response_auth_expired_cookie() {
+    // Cookie present (ok=true) but probe failed with auth error → expired.
+    let auth = Response::from_line(
+        r#"{"ok":true,"data":{"auth":{"ok":true,"premium":false,"account":false,"valid":false,"expired":true,"reason":"HTTP 401: Unauthorized"}}}"#,
+    )
+    .unwrap();
+    match auth {
+        Response::Auth(a) => {
+            assert!(a.ok, "ok should be true (cookie string exists)");
+            assert!(!a.valid, "valid should be false (probe failed)");
+            assert!(a.expired, "expired should be true (auth error)");
+            assert_eq!(a.reason.as_deref(), Some("HTTP 401: Unauthorized"));
+        }
+        other => panic!("expected Auth, got {other:?}"),
+    }
+}
+
+#[test]
+fn response_auth_no_cookie() {
+    // No cookie at all → ok=false, valid=false, expired=false.
+    let auth = Response::from_line(
+        r#"{"ok":true,"data":{"auth":{"ok":false,"premium":false,"account":false,"valid":false,"expired":false,"reason":null}}}"#,
+    )
+    .unwrap();
+    match auth {
+        Response::Auth(a) => {
+            assert!(!a.ok);
+            assert!(!a.valid);
+            assert!(!a.expired);
+            assert!(a.reason.is_none());
+        }
+        other => panic!("expected Auth, got {other:?}"),
+    }
 }
 
 #[test]
@@ -84,7 +145,11 @@ fn fake_script() -> std::path::PathBuf {
     writeln!(f, "for line in sys.stdin:").unwrap();
     writeln!(f, "    line=line.strip()").unwrap();
     writeln!(f, "    if not line: continue").unwrap();
-    writeln!(f, "    print(json.dumps({{'ok':True,'data':{{'pong':True}}}}), flush=True)").unwrap();
+    writeln!(
+        f,
+        "    print(json.dumps({{'ok':True,'data':{{'pong':True}}}}), flush=True)"
+    )
+    .unwrap();
     p
 }
 
@@ -112,7 +177,7 @@ fn sidecar_try_recv_none_when_idle() {
     let script = fake_script();
     let mut s = Sidecar::spawn(&python, &script, None, None, None).unwrap();
     // nothing sent yet — no response pending
-    assert!(matches!(s.try_recv().unwrap(), None));
+    assert!(s.try_recv().unwrap().is_none());
     let _ = std::fs::remove_file(&script);
 }
 

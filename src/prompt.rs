@@ -20,7 +20,9 @@ pub fn prompt_source_dir_with<R: BufRead>(r: &mut R, default: &Path) -> Result<P
         let _ = std::io::stderr().flush();
         let mut line = String::new();
         let n = r.read_line(&mut line)?;
-        if n == 0 { return Err(anyhow!("no input on stdin")); }
+        if n == 0 {
+            return Err(anyhow!("no input on stdin"));
+        }
         let raw = line.trim();
         let expanded = if let Some(rest) = raw.strip_prefix('~') {
             let rest = rest.strip_prefix('/').unwrap_or(rest);

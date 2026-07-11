@@ -14,6 +14,11 @@ use std::io::Write;
 /// Write a per-test fake sidecar script + its map file. The map *path* is
 /// baked into the script itself (no env var) so parallel tests can't race on
 /// a shared process env. Returns (script, map).
+// `write_literal`: the fake sidecar bodies are raw strings containing Python
+// with `{`/`}` (JSON dicts). Inlining them into the format string would
+// re-interpret those braces as format args and break, so the literals must
+// stay as args.
+#[allow(clippy::write_literal)]
 fn fake_sidecar(map_json: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -24,11 +29,14 @@ fn fake_sidecar(map_json: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let mut f = std::fs::File::create(&p).unwrap();
     // The map path is interpolated directly into the script — no env var, so
     // parallel `Session::spawn` calls can't race on a shared JK_FAKE_MAP.
-    writeln!(
+    write!(
         f,
-        "import sys, json\nm = json.load(open({map_path:?}))\n{body}",
+        "import sys, json\nm = json.load(open({map_path:?}))\n",
         map_path = map.display(),
-        body = r#"
+    )
+    .unwrap();
+    f.write_all(
+        r#"
 for line in sys.stdin:
     line = line.strip()
     if not line: continue
@@ -42,8 +50,10 @@ for line in sys.stdin:
     if key is not None:
         print(key, flush=True)
 "#
+        .as_bytes(),
     )
     .unwrap();
+    writeln!(f).unwrap();
     (p, map)
 }
 
@@ -79,7 +89,8 @@ fn local_cat() -> (tempfile::TempDir, jukebox::catalog::Catalog) {
         "tracks":[{"id":"t1","artists":["Adele"],"primary_artist":"Adele","title":"Hello",
         "album":"25","bit_depth":24,"sample_rate_hz":96000,"source_path":"lossless/Adele/01.flac",
         "symlinked_into_artists":["Adele"],"isrc":"GBBKS1500123"}]
-    }).to_string();
+    })
+    .to_string();
     let p = d.path().join("catalog.json");
     std::fs::write(&p, json).unwrap();
     (d, jukebox::catalog::Catalog::load(&p).unwrap())
@@ -88,7 +99,12 @@ fn local_cat() -> (tempfile::TempDir, jukebox::catalog::Catalog) {
 #[test]
 fn mixed_mode_matches_local_on_isrc_and_plays_local() {
     let (_d, cat) = local_cat();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, None);
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        None,
+    );
     app.source_mode = jukebox::mode::SourceMode::Mixed;
     app.play_in_context_ids(vec!["t1".into()], "t1");
     assert!(
@@ -101,18 +117,31 @@ fn mixed_mode_matches_local_on_isrc_and_plays_local() {
 #[test]
 fn cont_youtube_with_no_session_stops_cleanly_no_panic() {
     let (_d, cat) = local_cat();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, None);
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        None,
+    );
     app.source_mode = jukebox::mode::SourceMode::Youtube;
     app.transport.continue_mode = ContinueMode::YouTube;
     app.play_in_context_ids(vec!["t1".into()], "t1");
     app.next();
-    assert!(app.now_playing.is_none(), "no session → should stop, not panic");
+    assert!(
+        app.now_playing.is_none(),
+        "no session → should stop, not panic"
+    );
 }
 
 #[test]
 fn dead_remote_track_is_skipped_not_halt() {
     let (_d, cat) = local_cat();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, None);
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        None,
+    );
     app.source_mode = jukebox::mode::SourceMode::Youtube;
     app.play_in_context_ids(vec!["vidA".into(), "vidB".into()], "vidA");
     assert!(app.dead.contains("vidA") || app.now_playing.is_none());
@@ -148,7 +177,12 @@ fn cont_youtube_advances_via_radio_cursor() {
     let (script, map) = fake_sidecar(wp);
     let session = spawn_session(&script, &map);
     let (_d, cat) = local_cat();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
     app.source_mode = jukebox::mode::SourceMode::Youtube;
     app.transport.continue_mode = ContinueMode::YouTube;
     app.play_in_context_ids(vec!["yt1".into()], "yt1");
@@ -181,7 +215,12 @@ fn refresh_then_on_tick_populates_yt_lists_and_clears_loading() {
     std::env::set_var("JK_FAKE_MAP", &map_file);
     let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
     let (_d, cat) = local_cat();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
     app.view = jukebox::tui::app::View::Youtube;
     app.refresh_yt_lists();
     assert!(app.yt_lists_loading, "refresh should set loading");
@@ -195,10 +234,19 @@ fn refresh_then_on_tick_populates_yt_lists_and_clears_loading() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(populated, "on_tick should fold the fetched lists into yt_lists");
+    assert!(
+        populated,
+        "on_tick should fold the fetched lists into yt_lists"
+    );
     assert!(!app.yt_lists_loading, "on_tick should clear loading");
-    assert!(app.yt_lists.iter().any(|l| l.name == "Liked"), "account list missing");
-    assert!(app.yt_lists.iter().any(|l| l.name == "Focus"), "suggested list missing");
+    assert!(
+        app.yt_lists.iter().any(|l| l.name == "Liked"),
+        "account list missing"
+    );
+    assert!(
+        app.yt_lists.iter().any(|l| l.name == "Focus"),
+        "suggested list missing"
+    );
     let _ = std::fs::remove_file(&script);
     let _ = std::fs::remove_file(&map_file);
 }
@@ -214,7 +262,12 @@ fn focused_yt_list_lazy_loads_its_tracks_on_tick() {
     std::env::set_var("JK_FAKE_MAP", &map_file);
     let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
     let (_d, cat) = local_cat();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
     app.view = jukebox::tui::app::View::Youtube;
     app.refresh_yt_lists();
     // Wait for the lists to land.
@@ -226,7 +279,10 @@ fn focused_yt_list_lazy_loads_its_tracks_on_tick() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert_eq!(app.yt_lists.len(), 1);
-    assert!(app.yt_lists[0].track_ids.is_empty(), "list starts with no tracks");
+    assert!(
+        app.yt_lists[0].track_ids.is_empty(),
+        "list starts with no tracks"
+    );
     // The focused list (cursor 0 → PL1) has empty tracks: on_tick should
     // fire-and-forget get_playlist, then a later tick folds the tracks in.
     let mut loaded = false;
@@ -239,7 +295,10 @@ fn focused_yt_list_lazy_loads_its_tracks_on_tick() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(loaded, "on_tick should lazy-load the focused list's tracks");
-    assert_eq!(app.yt_lists[0].track_ids, vec!["v1".to_string(), "v2".to_string()]);
+    assert_eq!(
+        app.yt_lists[0].track_ids,
+        vec!["v1".to_string(), "v2".to_string()]
+    );
     assert!(app.loaded_yt_lists.contains("PL1"), "list marked loaded");
     let _ = std::fs::remove_file(&script);
     let _ = std::fs::remove_file(&map_file);
@@ -257,38 +316,61 @@ fn refresh_yt_lists_releases_playlist_inflight_so_a_refocus_can_refetch() {
     std::env::set_var("JK_FAKE_MAP", &map_file);
     let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
     let (_d, cat) = local_cat();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
     app.view = jukebox::tui::app::View::Youtube;
     app.refresh_yt_lists();
     // First load: PL1 tracks land.
     for _ in 0..100 {
         app.on_tick();
-        if !app.yt_lists.is_empty() && !app.yt_lists[0].track_ids.is_empty() { break; }
+        if !app.yt_lists.is_empty() && !app.yt_lists[0].track_ids.is_empty() {
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(!app.yt_lists.is_empty() && !app.yt_lists[0].track_ids.is_empty(), "first load");
+    assert!(
+        !app.yt_lists.is_empty() && !app.yt_lists[0].track_ids.is_empty(),
+        "first load"
+    );
     // The inflight guard MUST have cleared on success.
-    assert!(!app.yt_session.as_ref().unwrap().playlist_loading("PL1"),
-        "playlist_inflight must clear on a successful get_playlist");
+    assert!(
+        !app.yt_session.as_ref().unwrap().playlist_loading("PL1"),
+        "playlist_inflight must clear on a successful get_playlist"
+    );
     // Simulate a re-focus (Tab away and back, or re-entering Y view): refresh
     // replaces the lists + clears loaded_yt_lists.
     app.refresh_yt_lists();
     for _ in 0..100 {
         app.on_tick();
-        if !app.yt_lists.is_empty() && !app.yt_lists_loading { break; }
+        if !app.yt_lists.is_empty() && !app.yt_lists_loading {
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     app.loaded_yt_lists.clear(); // mirror the refresh's clear
-    assert!(app.yt_lists[0].track_ids.is_empty(), "refresh replaced the list (empty tracks)");
+    assert!(
+        app.yt_lists[0].track_ids.is_empty(),
+        "refresh replaced the list (empty tracks)"
+    );
     // Now on_tick must re-fetch PL1 — which requires playlist_inflight to be
     // clear. If the guard was wedged, this loop never loads.
     let mut reloaded = false;
     for _ in 0..100 {
         app.on_tick();
-        if !app.yt_lists[0].track_ids.is_empty() { reloaded = true; break; }
+        if !app.yt_lists[0].track_ids.is_empty() {
+            reloaded = true;
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(reloaded, "re-focus must re-fetch the list's tracks (inflight cleared on success)");
+    assert!(
+        reloaded,
+        "re-focus must re-fetch the list's tracks (inflight cleared on success)"
+    );
     let _ = std::fs::remove_file(&script);
     let _ = std::fs::remove_file(&map_file);
 }
@@ -305,7 +387,12 @@ fn yt_search_is_explicit_submit_and_lands_on_tick() {
     std::env::set_var("JK_FAKE_MAP", &map_file);
     let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
     let (_d, cat) = local_cat();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
     app.view = jukebox::tui::app::View::Youtube;
     // Open the search overlay in Youtube scope with a typed query. Crucially,
     // NO request has been sent yet (typing must not search).
@@ -320,11 +407,19 @@ fn yt_search_is_explicit_submit_and_lands_on_tick() {
     // Submit — this sends exactly one Request::Search and marks searching.
     app.submit_yt_search("adele".into());
     assert!(
-        app.yt_session.as_ref().and_then(|s| s.search_inflight()).is_some(),
+        app.yt_session
+            .as_ref()
+            .and_then(|s| s.search_inflight())
+            .is_some(),
         "submit should set the search in flight"
     );
     // Mirror the overlay state the key handler would set on Enter.
-    if let Some(Overlay::Search { submitted, searching, .. }) = app.overlay.as_mut() {
+    if let Some(Overlay::Search {
+        submitted,
+        searching,
+        ..
+    }) = app.overlay.as_mut()
+    {
         *submitted = Some("adele".into());
         *searching = true;
     }
@@ -332,7 +427,10 @@ fn yt_search_is_explicit_submit_and_lands_on_tick() {
     let mut landed = false;
     for _ in 0..100 {
         app.on_tick();
-        if let Some(Overlay::Search { results, searching, .. }) = &app.overlay {
+        if let Some(Overlay::Search {
+            results, searching, ..
+        }) = &app.overlay
+        {
             if !results.is_empty() && !*searching {
                 landed = true;
                 break;
@@ -340,8 +438,14 @@ fn yt_search_is_explicit_submit_and_lands_on_tick() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(landed, "on_tick should fold the search response into the overlay");
-    if let Some(Overlay::Search { results, searching, .. }) = &app.overlay {
+    assert!(
+        landed,
+        "on_tick should fold the search response into the overlay"
+    );
+    if let Some(Overlay::Search {
+        results, searching, ..
+    }) = &app.overlay
+    {
         assert_eq!(*results, vec!["v1".to_string(), "v2".to_string()]);
         assert!(!*searching, "searching should clear once results land");
     }
@@ -357,7 +461,7 @@ fn fake_sidecar_two_tier() -> (std::path::PathBuf, std::path::PathBuf) {
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
     let p = std::env::temp_dir().join(format!("e2e-2tier-{}-{}.py", std::process::id(), n));
     let mut f = std::fs::File::create(&p).unwrap();
-    writeln!(f, "{}", r#"
+    f.write_all(br#"
 import sys, json, time
 for line in sys.stdin:
     line = line.strip()
@@ -381,6 +485,7 @@ for line in sys.stdin:
             r = {"url": "https://fast/" + vid, "expires_at": None, "codec": "AAC", "abr": 129, "sample_rate": 48000, "container": "m4a", "premium": False}
         print(json.dumps({"ok": True, "data": {"resolve": r}}), flush=True); continue
 "#).unwrap();
+    writeln!(f).unwrap();
     (p.clone(), p) // second is unused; kept for symmetry with fake_sidecar
 }
 
@@ -396,17 +501,28 @@ fn two_tier_cache_holds_both_and_prefers_premium() {
     let fast = s.resolve_url("v", "fast").unwrap();
     assert_eq!(fast.abr, 129);
     assert!(!fast.premium);
-    assert_eq!(s.url_for("v").as_deref(), Some("https://fast/v"), "only fast cached → url_for returns fast");
+    assert_eq!(
+        s.url_for("v").as_deref(),
+        Some("https://fast/v"),
+        "only fast cached → url_for returns fast"
+    );
     assert!(s.url_for_premium("v").is_none());
     // Premium: caches https://pre/v WITHOUT evicting fast.
     let prem = s.resolve_url("v", "premium").unwrap();
     assert_eq!(prem.abr, 256);
     assert!(prem.premium);
-    assert_eq!(s.url_for("v").as_deref(), Some("https://pre/v"), "premium present → url_for prefers premium");
+    assert_eq!(
+        s.url_for("v").as_deref(),
+        Some("https://pre/v"),
+        "premium present → url_for prefers premium"
+    );
     assert_eq!(s.url_for_premium("v").as_deref(), Some("https://pre/v"));
     // The signal for App's progressive-upgrade swap was set on the premium land.
     // (resolve_url is a sync roundtrip; apply_pair ran and set the signal.)
-    let (vid, u) = s.pending_premium_url.take().expect("premium land signals pending_premium_url");
+    let (vid, u) = s
+        .pending_premium_url
+        .take()
+        .expect("premium land signals pending_premium_url");
     assert_eq!(vid, "v");
     assert!(u.premium);
     let _ = std::fs::remove_file(&script);
@@ -421,7 +537,12 @@ fn progressive_upgrade_swaps_player_to_premium_and_resumes() {
     let (script, _map) = fake_sidecar_two_tier();
     let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
     let (_d, cat) = local_cat();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
     app.view = jukebox::tui::app::View::Youtube;
     app.source_mode = jukebox::mode::SourceMode::Youtube;
     // Play a YT track via the fast tier. A cold miss lands on the next tick
@@ -438,7 +559,11 @@ fn progressive_upgrade_swaps_player_to_premium_and_resumes() {
     app.player.seek(12.0).ok();
     assert_eq!(app.player.position(), Some(12.0));
     // Fire-and-forget the premium resolve; pump on_tick until the swap lands.
-    app.yt_session.as_mut().unwrap().send_resolve_premium("v".into()).unwrap();
+    app.yt_session
+        .as_mut()
+        .unwrap()
+        .send_resolve_premium("v".into())
+        .unwrap();
     let mut swapped = false;
     for _ in 0..100 {
         app.on_tick();
@@ -451,9 +576,17 @@ fn progressive_upgrade_swaps_player_to_premium_and_resumes() {
     assert!(swapped, "premium land should swap the player up to 256k");
     assert!(app.playing_premium, "playing_premium set after swap");
     // The player resumed at the captured position (12s) via load_at (no replay).
-    assert_eq!(app.player.position(), Some(12.0), "swap must resume at the captured position");
+    assert_eq!(
+        app.player.position(),
+        Some(12.0),
+        "swap must resume at the captured position"
+    );
     // A second premium land must NOT re-swap (already premium guard).
-    app.yt_session.as_mut().unwrap().send_resolve_premium("v".into()).unwrap();
+    app.yt_session
+        .as_mut()
+        .unwrap()
+        .send_resolve_premium("v".into())
+        .unwrap();
     for _ in 0..20 {
         app.on_tick();
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -472,7 +605,7 @@ fn fake_sidecar_error_scope() -> std::path::PathBuf {
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
     let p = std::env::temp_dir().join(format!("e2e-errscope-{}-{}.py", std::process::id(), n));
     let mut f = std::fs::File::create(&p).unwrap();
-    writeln!(f, "{}", r#"
+    f.write_all(br#"
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -496,6 +629,7 @@ for line in sys.stdin:
             print(json.dumps({"ok": True, "data": {"resolve": {"url": "https://fast/" + v, "expires_at": None, "codec": "AAC", "abr": 129, "sample_rate": 48000, "container": "m4a", "premium": False}}}), flush=True)
         continue
 "#).unwrap();
+    writeln!(f).unwrap();
     p
 }
 
@@ -511,12 +645,21 @@ fn premium_preload_error_does_not_drop_an_in_flight_search() {
     let script = fake_sidecar_error_scope();
     let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
     let (_d, cat) = local_cat();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
     app.view = jukebox::tui::app::View::Youtube;
 
     // 1. A background premium preload fires (e.g. preload_next_url) — sent
     //    FIRST so its error response lands before the search's success.
-    app.yt_session.as_mut().unwrap().send_resolve_premium("nextVid".into()).unwrap();
+    app.yt_session
+        .as_mut()
+        .unwrap()
+        .send_resolve_premium("nextVid".into())
+        .unwrap();
 
     // 2. The user opens the search overlay in Youtube scope + submits a query.
     app.overlay = Some(Overlay::Search {
@@ -534,7 +677,10 @@ fn premium_preload_error_does_not_drop_an_in_flight_search() {
     let mut populated = false;
     for _ in 0..100 {
         app.on_tick();
-        if let Some(Overlay::Search { results, searching, .. }) = &app.overlay {
+        if let Some(Overlay::Search {
+            results, searching, ..
+        }) = &app.overlay
+        {
             if !results.is_empty() && !*searching {
                 populated = true;
                 break;
@@ -542,13 +688,19 @@ fn premium_preload_error_does_not_drop_an_in_flight_search() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(populated, "the premium-preload error must NOT drop the in-flight search's results");
+    assert!(
+        populated,
+        "the premium-preload error must NOT drop the in-flight search's results"
+    );
     if let Some(Overlay::Search { results, .. }) = &app.overlay {
         assert_eq!(*results, vec!["s1".to_string(), "s2".to_string()]);
     }
     // The premium error was still surfaced (footer), just without touching the
     // overlay — confirm the error message reached yt_error.
-    assert!(app.yt_error.is_some(), "premium error surfaced in the footer");
+    assert!(
+        app.yt_error.is_some(),
+        "premium error surfaced in the footer"
+    );
     let _ = std::fs::remove_file(&script);
 }
 
@@ -564,7 +716,12 @@ fn stale_search_response_does_not_drop_a_non_search_overlay() {
     std::env::set_var("JK_FAKE_MAP", &map_file);
     let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
     let (_d, cat) = local_cat();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
     app.view = jukebox::tui::app::View::Youtube;
 
     // Fire a search (in flight), then close it + open Help — simulating the
@@ -579,8 +736,14 @@ fn stale_search_response_does_not_drop_a_non_search_overlay() {
         app.on_tick();
         matches!(app.overlay, Some(Overlay::Help))
     });
-    assert!(help_survived, "a stale search response must NOT drop the Help overlay");
-    assert!(matches!(app.overlay, Some(Overlay::Help)), "Help still open after search lands");
+    assert!(
+        help_survived,
+        "a stale search response must NOT drop the Help overlay"
+    );
+    assert!(
+        matches!(app.overlay, Some(Overlay::Help)),
+        "Help still open after search lands"
+    );
     let _ = std::fs::remove_file(&script);
     let _ = std::fs::remove_file(&map_file);
 }
@@ -602,7 +765,9 @@ fn search_error_keeps_search_scope_when_other_error_drains_same_cycle() {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
     let p = std::env::temp_dir().join(format!("e2e-botherr-{}-{}.py", std::process::id(), n));
-    std::fs::write(&p, r#"
+    std::fs::write(
+        &p,
+        r#"
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -616,7 +781,9 @@ for line in sys.stdin:
         print(json.dumps({"ok": False, "error": "search failed"}), flush=True); continue
     if cmd == "resolve_url":
         print(json.dumps({"ok": False, "error": "premium failed"}), flush=True); continue
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let mut s = Session::spawn(std::path::Path::new("python3"), &p, None).unwrap();
     // Fire a search, then a premium resolve (FIFO: search error first, then
     // premium error). Both responses are read by the sidecar's reader thread;
@@ -625,16 +792,31 @@ for line in sys.stdin:
     // second/Other error used to overwrite the first/Search one).
     s.send_search("q".into()).unwrap();
     s.send_resolve_premium("v".into()).unwrap();
-    // Give the reader thread time to buffer both responses.
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    // Drain both in one cycle — apply_pair runs Search-err then Other-err.
-    s.drain_paired();
+    // Poll drain_paired until both errors are staged (or timeout). The reader
+    // thread buffers responses asynchronously; a fixed sleep is flaky under
+    // parallel test load (SYNC-3). Poll up to ~5s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut errs = Vec::new();
+    while std::time::Instant::now() < deadline {
+        s.drain_paired();
+        errs = std::mem::take(&mut s.pending_errors);
+        if errs
+            .iter()
+            .any(|(sc, _)| matches!(sc, ErrorScope::Search(_)))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     // The pending_errors (Vec) must contain the SEARCH-scoped error (not
     // dropped by the Other error; both staged). The Search one is what tells
     // on_tick to clear the overlay's searching flag.
-    let errs = std::mem::take(&mut s.pending_errors);
-    assert!(errs.iter().any(|(sc, _)| matches!(sc, ErrorScope::Search(_))),
-        "Search error staged (not clobbered/dropped by the Other error): {:?}", errs);
+    assert!(
+        errs.iter()
+            .any(|(sc, _)| matches!(sc, ErrorScope::Search(_))),
+        "Search error staged (not clobbered/dropped by the Other error): {:?}",
+        errs
+    );
     let _ = std::fs::remove_file(&p);
 }
 
@@ -652,7 +834,9 @@ fn second_search_does_not_steal_the_first_searchs_results() {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
     let p = std::env::temp_dir().join(format!("e2e-2search-{}-{}.py", std::process::id(), n));
-    std::fs::write(&p, r#"
+    std::fs::write(
+        &p,
+        r#"
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -669,22 +853,37 @@ for line in sys.stdin:
         print(json.dumps({"ok": True, "data": {"search": [
             {"video_id": "first:" + q, "title": q, "artist": "X"}
         ]}}), flush=True); continue
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let session = Session::spawn(std::path::Path::new("python3"), &p, None).unwrap();
     let (_d, cat) = local_cat();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
     app.view = jukebox::tui::app::View::Youtube;
 
     // Submit "adele", then — while it's still in flight — submit "adeles".
     app.overlay = Some(Overlay::Search {
-        input: "adele".into(), results: Vec::new(), cursor: 0,
-        scope: SearchScope::Youtube, submitted: Some("adele".into()), searching: true,
+        input: "adele".into(),
+        results: Vec::new(),
+        cursor: 0,
+        scope: SearchScope::Youtube,
+        submitted: Some("adele".into()),
+        searching: true,
     });
     app.submit_yt_search("adele".into());
     // Second search: change the query + submit.
     app.overlay = Some(Overlay::Search {
-        input: "adeles".into(), results: Vec::new(), cursor: 0,
-        scope: SearchScope::Youtube, submitted: Some("adeles".into()), searching: true,
+        input: "adeles".into(),
+        results: Vec::new(),
+        cursor: 0,
+        scope: SearchScope::Youtube,
+        submitted: Some("adeles".into()),
+        searching: true,
     });
     app.submit_yt_search("adeles".into());
 
@@ -703,11 +902,16 @@ for line in sys.stdin:
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(got_adeles, "the overlay (submitted=adeles) must get ADELES's results, not adele's");
+    assert!(
+        got_adeles,
+        "the overlay (submitted=adeles) must get ADELES's results, not adele's"
+    );
     // And adele's results must NOT be shown as adeles's (the bug's symptom).
     if let Some(Overlay::Search { results, .. }) = &app.overlay {
-        assert!(!results.iter().any(|r| r == "first:adele"),
-            "adele's results must not be mislabeled as adeles's");
+        assert!(
+            !results.iter().any(|r| r == "first:adele"),
+            "adele's results must not be mislabeled as adeles's"
+        );
     }
     let _ = std::fs::remove_file(&p);
 }
@@ -726,7 +930,9 @@ fn prior_querys_search_error_does_not_drop_current_querys_results() {
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
     let p = std::env::temp_dir().join(format!("e2e-errthenok-{}-{}.py", std::process::id(), n));
     // search for "adele" ERRORS; search for "adeles" SUCCEEDS with id "first:adeles".
-    std::fs::write(&p, r#"
+    std::fs::write(
+        &p,
+        r#"
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -745,22 +951,37 @@ for line in sys.stdin:
                 {"video_id": "first:" + q, "title": q, "artist": "X"}
             ]}}), flush=True)
         continue
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let session = Session::spawn(std::path::Path::new("python3"), &p, None).unwrap();
     let (_d, cat) = local_cat();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
     app.view = jukebox::tui::app::View::Youtube;
 
     // Submit "adele" (will error), then abandon it + submit "adeles" (will succeed).
     app.submit_yt_search("adele".into());
     app.overlay = Some(Overlay::Search {
-        input: "adele".into(), results: Vec::new(), cursor: 0,
-        scope: SearchScope::Youtube, submitted: Some("adele".into()), searching: true,
+        input: "adele".into(),
+        results: Vec::new(),
+        cursor: 0,
+        scope: SearchScope::Youtube,
+        submitted: Some("adele".into()),
+        searching: true,
     });
     app.submit_yt_search("adeles".into());
     app.overlay = Some(Overlay::Search {
-        input: "adeles".into(), results: Vec::new(), cursor: 0,
-        scope: SearchScope::Youtube, submitted: Some("adeles".into()), searching: true,
+        input: "adeles".into(),
+        results: Vec::new(),
+        cursor: 0,
+        scope: SearchScope::Youtube,
+        submitted: Some("adeles".into()),
+        searching: true,
     });
 
     // Pump on_tick. FIFO: adele's ERROR lands first (would clear searching with
@@ -771,11 +992,17 @@ for line in sys.stdin:
     for _ in 0..100 {
         app.on_tick();
         if let Some(Overlay::Search { results, .. }) = &app.overlay {
-            if results.iter().any(|r| r == "first:adeles") { got_adeles = true; break; }
+            if results.iter().any(|r| r == "first:adeles") {
+                got_adeles = true;
+                break;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(got_adeles, "adeles's results must show despite adele's stale error clearing searching");
+    assert!(
+        got_adeles,
+        "adeles's results must show despite adele's stale error clearing searching"
+    );
     let _ = std::fs::remove_file(&p);
 }
 
@@ -794,7 +1021,9 @@ fn both_queries_erroring_in_one_cycle_clears_the_current_querys_searching() {
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
     let p = std::env::temp_dir().join(format!("e2e-botherr2-{}-{}.py", std::process::id(), n));
     // BOTH searches error.
-    std::fs::write(&p, r#"
+    std::fs::write(
+        &p,
+        r#"
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -807,22 +1036,37 @@ for line in sys.stdin:
     if cmd == "search":
         q = req.get("q", "")
         print(json.dumps({"ok": False, "error": q + " rate-limited"}), flush=True); continue
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let session = Session::spawn(std::path::Path::new("python3"), &p, None).unwrap();
     let (_d, cat) = local_cat();
-    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
     app.view = jukebox::tui::app::View::Youtube;
 
     // Submit "adele", then abandon it + submit "adeles". Both will error.
     app.submit_yt_search("adele".into());
     app.overlay = Some(Overlay::Search {
-        input: "adele".into(), results: Vec::new(), cursor: 0,
-        scope: SearchScope::Youtube, submitted: Some("adele".into()), searching: true,
+        input: "adele".into(),
+        results: Vec::new(),
+        cursor: 0,
+        scope: SearchScope::Youtube,
+        submitted: Some("adele".into()),
+        searching: true,
     });
     app.submit_yt_search("adeles".into());
     app.overlay = Some(Overlay::Search {
-        input: "adeles".into(), results: Vec::new(), cursor: 0,
-        scope: SearchScope::Youtube, submitted: Some("adeles".into()), searching: true,
+        input: "adeles".into(),
+        results: Vec::new(),
+        cursor: 0,
+        scope: SearchScope::Youtube,
+        submitted: Some("adeles".into()),
+        searching: true,
     });
 
     // Pump on_tick until both errors land in one drain cycle (the reader thread
@@ -831,7 +1075,12 @@ for line in sys.stdin:
     let mut searching_cleared = false;
     for _ in 0..100 {
         app.on_tick();
-        if let Some(Overlay::Search { submitted, searching, .. }) = &app.overlay {
+        if let Some(Overlay::Search {
+            submitted,
+            searching,
+            ..
+        }) = &app.overlay
+        {
             if submitted.as_deref() == Some("adeles") && !*searching {
                 searching_cleared = true;
                 break;
@@ -839,9 +1088,17 @@ for line in sys.stdin:
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(searching_cleared, "the current query (adeles) error must clear searching, not wedge");
+    assert!(
+        searching_cleared,
+        "the current query (adeles) error must clear searching, not wedge"
+    );
     // And the footer must show ADELES's error (the relevant one), not adele's.
-    assert!(app.yt_error.as_deref().is_some_and(|e| e.contains("adeles")),
-        "footer shows adeles's error: {:?}", app.yt_error);
+    assert!(
+        app.yt_error
+            .as_deref()
+            .is_some_and(|e| e.contains("adeles")),
+        "footer shows adeles's error: {:?}",
+        app.yt_error
+    );
     let _ = std::fs::remove_file(&p);
 }

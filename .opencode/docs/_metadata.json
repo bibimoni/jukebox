@@ -1,0 +1,47 @@
+{
+  "documents": {
+    "ytmusicapi_readthedocs_io_en_stable_.md": {
+      "url": "https://ytmusicapi.readthedocs.io/en/stable/",
+      "title": "ytmusicapi: Unofficial API for YouTube Music &mdash; ytmusicapi 1.12.1 documentation",
+      "fetchedAt": "2026-07-11T19:16:09.375Z",
+      "expiresAt": "2026-07-12T19:16:09.375Z",
+      "size": 309
+    },
+    "ytmusicapi_readthedocs_io_en_latest_.md": {
+      "url": "https://ytmusicapi.readthedocs.io/en/latest/",
+      "title": "ytmusicapi: Unofficial API for YouTube Music &mdash; ytmusicapi 1.12.2.dev3+g9ba806fa5 documentation",
+      "fetchedAt": "2026-07-11T19:16:25.687Z",
+      "expiresAt": "2026-07-12T19:16:25.687Z",
+      "size": 325
+    },
+    "raw_githubusercontent_com_sigma67_ytmusicapi_main_ytmusicapi_mixins_libraryp.md": {
+      "url": "https://raw.githubusercontent.com/sigma67/ytmusicapi/main/ytmusicapi/mixins/library.py",
+      "title": "Plain Text",
+      "fetchedAt": "2026-07-11T19:19:55.293Z",
+      "expiresAt": "2026-07-12T19:19:55.293Z",
+      "size": 18836
+    },
+    "raw_githubusercontent_com_sigma67_ytmusicapi_main_ytmusicapi_ytmusicpy.md": {
+      "url": "https://raw.githubusercontent.com/sigma67/ytmusicapi/main/ytmusicapi/ytmusic.py",
+      "title": "Plain Text",
+      "fetchedAt": "2026-07-11T19:20:04.936Z",
+      "expiresAt": "2026-07-12T19:20:04.936Z",
+      "size": 12216
+    },
+    "raw_githubusercontent_com_sigma67_ytmusicapi_main_ytmusicapi_exceptionspy.md": {
+      "url": "https://raw.githubusercontent.com/sigma67/ytmusicapi/main/ytmusicapi/exceptions.py",
+      "title": "Plain Text",
+      "fetchedAt": "2026-07-11T19:21:15.825Z",
+      "expiresAt": "2026-07-12T19:21:15.825Z",
+      "size": 517
+    },
+    "docs_rs_ratatui_0302_ratatui_widgets_enumBorderTypehtml.md": {
+      "url": "https://docs.rs/ratatui/0.30.2/ratatui/widgets/enum.BorderType.html",
+      "title": "BorderType in ratatui::widgets - Rust",
+      "fetchedAt": "2026-07-11T19:49:33.471Z",
+      "expiresAt": "2026-07-12T19:49:33.471Z",
+      "size": 15185
+    }
+  },
+  "lastUpdated": "2026-07-11T19:49:33.472Z"
+}

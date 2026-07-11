@@ -1,4 +1,4 @@
-use jukebox::config::{config_path, Config, validate_source_dir};
+use jukebox::config::{config_path, validate_source_dir, Config};
 use std::fs;
 use std::sync::Mutex;
 use tempfile::tempdir;
@@ -14,8 +14,14 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 #[test]
 fn default_for_sets_filtered_sibling() {
     let cfg = Config::default_for("/Users/distiled/Music/lossless".into());
-    assert_eq!(cfg.source_dir, std::path::Path::new("/Users/distiled/Music/lossless"));
-    assert_eq!(cfg.filtered_dir, std::path::Path::new("/Users/distiled/Music/filtered_lossless"));
+    assert_eq!(
+        cfg.source_dir,
+        std::path::Path::new("/Users/distiled/Music/lossless")
+    );
+    assert_eq!(
+        cfg.filtered_dir,
+        std::path::Path::new("/Users/distiled/Music/filtered_lossless")
+    );
     assert_eq!(cfg.version, 1);
 }
 
@@ -46,7 +52,10 @@ fn save_then_load_roundtrip() {
     assert_eq!(loaded.source_dir, cfg.source_dir);
     assert_eq!(loaded.filtered_dir, cfg.filtered_dir);
     let p = config_path();
-    assert!(p.starts_with(tmp.path()), "config_path {p:?} should be under temp HOME");
+    assert!(
+        p.starts_with(tmp.path()),
+        "config_path {p:?} should be under temp HOME"
+    );
     let meta = fs::metadata(p).unwrap();
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(meta.permissions().mode() & 0o777, 0o700);

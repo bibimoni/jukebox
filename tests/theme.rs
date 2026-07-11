@@ -1,9 +1,9 @@
-use jukebox::tui::view::theme::{disp_width, pad_between, quality_color, no_color};
+use jukebox::tui::view::theme::{disp_width, no_color, pad_between, quality_color};
 
 #[test]
 fn disp_width_counts_cjk_as_two() {
     assert_eq!(disp_width("abc"), 3);
-    assert_eq!(disp_width("あいう"), 6);          // hiragana, 2 each
+    assert_eq!(disp_width("あいう"), 6); // hiragana, 2 each
     assert_eq!(disp_width("Ado"), 3);
 }
 

@@ -65,10 +65,13 @@ library by ISRC or normalized artist+title, else stream from YouTube).
   otherwise); `f` filters the focused column; `s` plays a random track; `S`
   opens a discover overlay.
 - **Auth (recommended):** run `:yt auth browser chrome` inside the TUI to read
-  cookies straight from your logged-in Chrome profile — **no cookie file is
-  written and no credentials are pasted anywhere**. `firefox`, `safari`,
-  `edge`, `brave`, `opera`, `chromium` are also supported. One command feeds
-  both the metadata sidecar (`ytmusicapi`) and the stream resolver (`yt-dlp`).
+  cookies straight from your logged-in Chrome profile — **no credentials are
+  pasted anywhere**, and the raw browser store is never modified. The decrypted
+  cookies are cached in a 0600 file (`yt-cookies.txt`) in your config dir so
+  subsequent launches don't re-prompt your Keychain/password.
+  `firefox`, `safari`, `edge`, `brave`, `opera`, `chromium` are also supported.
+  One command feeds both the metadata sidecar (`ytmusicapi`) and the stream
+  resolver (`yt-dlp`).
   Log into `youtube.com` in that browser first; **a Premium account is
   recommended** (ad-free 256k AAC streams + account rate limits).
 - **Auth (paste):** `:yt auth` opens a cookie-paste box for a Netscape
@@ -117,7 +120,7 @@ player: mpv          # mpv | afplay
 mpv_socket: /tmp/jukebox-mpv.sock
 ```
 
-`jukebox config` re-runs the first-run prompt.
+`jukebox config` shows the config file path.
 
 ## Commands
 
@@ -127,7 +130,7 @@ mpv_socket: /tmp/jukebox-mpv.sock
 | `jukebox sync` | run `scripts/standardize.sh` then rebuild the search index |
 | `jukebox index` | rebuild the Tantivy search index from `catalog.json` |
 | `jukebox search <query>` | one-shot CLI search (prints ranked results) |
-| `jukebox config` | show / re-run the config prompt |
+| `jukebox config` | print the config file path |
 
 ## Search
 
@@ -139,10 +142,14 @@ like `Freedon` still match `Freedom`.
 
 ## Keybindings (TUI)
 
-`Tab` cycle panes · `↑/↓` move cursor · `/` focus search · `space` enqueue
-artist (Artists pane) · `enter` enqueue result (Search) / play-now (Queue) ·
-`s`/`S` shuffle (S also jumps) · `r` remove · `c` clear queue · `n`/`p`
-next/prev · `←/→` seek ±5s · `q` quit (stops playback).
+`?` help · `h j k l` / arrows move (←→ columns, ↑↓ within) · `gg`/`G` top/bottom
+of column · `1 2 3 4` switch view (Artists / Playlists / Queue / YouTube) ·
+`Tab`/`Shift+Tab` cycle view · `Enter` play selected in context · `Space` play
+/pause · `>`/`<` next/prev · `,`/`.` seek ±5s · `+`/`-` volume · `m` mute · `z`/`Z`
+cycle shuffle / reshuffle · `r` cycle repeat · `c` cycle continue · `M` cycle
+source mode · `/` search (scoped to view) · `f` filter focused column · `s`
+instant random track · `S` discover overlay · `a` add to playlist · `:` command
+(`:yt auth`, `:yt auth browser <name>`, `:yt logout`, `:yt setup`) · `q` quit.
 
 If `mpv` isn't available, playback falls back to `afplay` (no seek).
 

@@ -2,7 +2,9 @@ name: release
 
 # Build release binaries and publish a GitHub Release on version tags (v*.*.*).
 # Each archive bundles the Rust `jukebox` binary plus `scripts/standardize.sh`
-# (the bash indexer invoked by `jukebox sync`).
+# (the bash indexer invoked by `jukebox sync`) and `scripts/yt/` (the Python
+# YouTube sidecar + its requirements.txt). A `test` job gates the build so a
+# failing test suite cannot be published.
 on:
   push:
     tags:
@@ -13,8 +15,36 @@ permissions:
   contents: write      # to create the release + upload assets
 
 jobs:
+  test:
+    name: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux audio deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-test-release-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: cargo-test-release-
+
+      - name: cargo test --release --all-features
+        run: cargo test --release --all-features --locked
+
   build:
     name: build (${{ matrix.target }})
+    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -65,9 +95,13 @@ jobs:
 
       - name: Stage artifact
         run: |
-          mkdir -p staging/scripts
+          mkdir -p staging/scripts/yt
           cp target/${{ matrix.target }}/release/jukebox staging/
           cp -R scripts/standardize.sh scripts/lib staging/scripts/
+          # YouTube sidecar (scripts/yt/) — without these, `:yt setup` and
+          # every YouTube command fail with "could not find scripts/yt/yt.py"
+          # for all binstall/binary-download users.
+          cp scripts/yt/yt.py scripts/yt/requirements.txt staging/scripts/yt/
           cp README.md LICENSE Cargo.toml staging/
           cd staging
           tar czf ../${{ matrix.artifact }}.tar.gz .
@@ -101,7 +135,7 @@ jobs:
             echo
             echo "Filtered-lossless jukebox: bash indexer + Rust TUI with multilingual search and mpv playback."
             echo
-            echo "Each archive contains the \`jukebox\` binary for its platform plus \`scripts/standardize.sh\` (the indexer invoked by \`jukebox sync\`)."
+            echo "Each archive contains the \`jukebox\` binary for its platform plus \`scripts/standardize.sh\` (the indexer invoked by \`jukebox sync\`) and \`scripts/yt/\` (the Python YouTube sidecar + requirements.txt)."
             echo
             echo "### Install"
             echo
@@ -124,6 +158,7 @@ jobs:
             echo "### Runtime prerequisites"
             echo "- \`metaflac\`, \`ffprobe\`, \`jq\`, \`yq\` (for \`jukebox sync\`)"
             echo "- \`mpv\` (for playback; falls back to \`afplay\` on macOS if unavailable)"
+            echo "- \`python3\` + \`ytmusicapi\` + \`yt-dlp\` + \`browser_cookie3\` (for YouTube; run \`jukebox\` then \`:yt setup\` to install into a private venv)"
           } > notes.md
           echo "path=notes.md" >> "$GITHUB_OUTPUT"
 

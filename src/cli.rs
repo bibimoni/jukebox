@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::config::{Config, config_path};
+use crate::config::{config_path, Config};
 
 #[derive(Parser, Debug)]
 #[command(name = "jukebox", version, about = "Filtered-lossless jukebox")]
@@ -47,7 +47,9 @@ pub fn ensure_config() -> Result<Config> {
 
 fn first_run() -> Result<()> {
     eprintln!("Welcome to jukebox. Let's configure your library.");
-    let default = dirs::home_dir().map(|h| h.join("Music/lossless")).unwrap_or_default();
+    let default = dirs::home_dir()
+        .map(|h| h.join("Music/lossless"))
+        .unwrap_or_default();
     let source = crate::prompt::prompt_source_dir(&default)?;
     let cfg = Config::default_for(source);
     cfg.save()?;

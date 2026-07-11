@@ -19,15 +19,35 @@ struct RecordingPlayer {
     muted: Option<bool>,
 }
 impl Player for RecordingPlayer {
-    fn load(&mut self, _: &Path) -> anyhow::Result<()> { Ok(()) }
-    fn play_pause(&mut self) -> anyhow::Result<()> { Ok(()) }
-    fn seek(&mut self, _: f64) -> anyhow::Result<()> { Ok(()) }
-    fn stop(&mut self) -> anyhow::Result<()> { Ok(()) }
-    fn position(&self) -> Option<f64> { None }
-    fn duration(&self) -> Option<f64> { None }
-    fn is_playing(&self) -> bool { true }
-    fn set_volume(&mut self, vol: u8) -> anyhow::Result<()> { self.volume = Some(vol); Ok(()) }
-    fn set_muted(&mut self, m: bool) -> anyhow::Result<()> { self.muted = Some(m); Ok(()) }
+    fn load(&mut self, _: &Path) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn play_pause(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn seek(&mut self, _: f64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn stop(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn position(&self) -> Option<f64> {
+        None
+    }
+    fn duration(&self) -> Option<f64> {
+        None
+    }
+    fn is_playing(&self) -> bool {
+        true
+    }
+    fn set_volume(&mut self, vol: u8) -> anyhow::Result<()> {
+        self.volume = Some(vol);
+        Ok(())
+    }
+    fn set_muted(&mut self, m: bool) -> anyhow::Result<()> {
+        self.muted = Some(m);
+        Ok(())
+    }
 }
 
 #[test]
@@ -49,10 +69,22 @@ fn app_volume_up_reaches_player() {
     app.volume = 50;
     app.volume_up();
     assert_eq!(app.volume, 55);
-    assert_eq!(rec_handle.borrow().volume, Some(55), "volume_up must push to player");
-    assert_eq!(rec_handle.borrow().muted, Some(false), "volume_up unmutes via player");
+    assert_eq!(
+        rec_handle.borrow().volume,
+        Some(55),
+        "volume_up must push to player"
+    );
+    assert_eq!(
+        rec_handle.borrow().muted,
+        Some(false),
+        "volume_up unmutes via player"
+    );
     app.toggle_mute();
-    assert_eq!(rec_handle.borrow().muted, Some(true), "toggle_mute must push to player");
+    assert_eq!(
+        rec_handle.borrow().muted,
+        Some(true),
+        "toggle_mute must push to player"
+    );
 }
 
 #[test]
@@ -76,8 +108,16 @@ fn app_set_volume_reaches_player() {
     app.volume = 100;
     app.set_volume(33);
     assert_eq!(app.volume, 33, "set_volume sets the absolute value");
-    assert_eq!(rec_handle.borrow().volume, Some(33), "set_volume must push to player");
-    assert_eq!(rec_handle.borrow().muted, Some(false), "set_volume unmutes via player");
+    assert_eq!(
+        rec_handle.borrow().volume,
+        Some(33),
+        "set_volume must push to player"
+    );
+    assert_eq!(
+        rec_handle.borrow().muted,
+        Some(false),
+        "set_volume unmutes via player"
+    );
     // Values >100 clamp to 100.
     app.set_volume(150);
     assert_eq!(app.volume, 100);
@@ -87,14 +127,31 @@ fn app_set_volume_reaches_player() {
 // Tiny proxy so we can share the recorder with App while App owns the Box.
 struct RecProxy(std::rc::Rc<std::cell::RefCell<RecordingPlayer>>);
 impl Player for RecProxy {
-    fn load(&mut self, p: &Path) -> anyhow::Result<()> { self.0.borrow_mut().load(p) }
-    fn play_pause(&mut self) -> anyhow::Result<()> { self.0.borrow_mut().play_pause() }
-    fn seek(&mut self, s: f64) -> anyhow::Result<()> { self.0.borrow_mut().seek(s) }
-    fn stop(&mut self) -> anyhow::Result<()> { self.0.borrow_mut().stop() }
-    fn position(&self) -> Option<f64> { self.0.borrow().position() }
-    fn duration(&self) -> Option<f64> { self.0.borrow().duration() }
-    fn is_playing(&self) -> bool { self.0.borrow().is_playing() }
-    fn set_volume(&mut self, v: u8) -> anyhow::Result<()> { self.0.borrow_mut().set_volume(v) }
-    fn set_muted(&mut self, m: bool) -> anyhow::Result<()> { self.0.borrow_mut().set_muted(m) }
+    fn load(&mut self, p: &Path) -> anyhow::Result<()> {
+        self.0.borrow_mut().load(p)
+    }
+    fn play_pause(&mut self) -> anyhow::Result<()> {
+        self.0.borrow_mut().play_pause()
+    }
+    fn seek(&mut self, s: f64) -> anyhow::Result<()> {
+        self.0.borrow_mut().seek(s)
+    }
+    fn stop(&mut self) -> anyhow::Result<()> {
+        self.0.borrow_mut().stop()
+    }
+    fn position(&self) -> Option<f64> {
+        self.0.borrow().position()
+    }
+    fn duration(&self) -> Option<f64> {
+        self.0.borrow().duration()
+    }
+    fn is_playing(&self) -> bool {
+        self.0.borrow().is_playing()
+    }
+    fn set_volume(&mut self, v: u8) -> anyhow::Result<()> {
+        self.0.borrow_mut().set_volume(v)
+    }
+    fn set_muted(&mut self, m: bool) -> anyhow::Result<()> {
+        self.0.borrow_mut().set_muted(m)
+    }
 }
-

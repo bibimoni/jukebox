@@ -11,7 +11,10 @@ fn main() -> anyhow::Result<()> {
         Cmd::Config { args } => {
             let _cfg = cli::ensure_config()?;
             if !args.is_empty() {
-                eprintln!("config edits are not yet supported; edit {}", config::config_path().display());
+                eprintln!(
+                    "config edits are not yet supported; edit {}",
+                    config::config_path().display()
+                );
             } else {
                 println!("config: {}", config::config_path().display());
             }
@@ -28,11 +31,15 @@ fn main() -> anyhow::Result<()> {
             // Resolve the YouTube sidecar script (mirrors standardize.sh
             // resolution): manifest dir in dev, sibling-of-binary when installed.
             let yt_script = {
-                let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/yt/yt.py");
+                let p =
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/yt/yt.py");
                 if p.exists() {
                     p
                 } else {
-                    std::env::current_exe()?.parent().unwrap().join("scripts/yt/yt.py")
+                    std::env::current_exe()?
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .join("scripts/yt/yt.py")
                 }
             };
             // Resolve a python that has the YT deps. Prefer, in order:
@@ -43,7 +50,11 @@ fn main() -> anyhow::Result<()> {
                 .map(std::path::PathBuf::from)
                 .or_else(|| {
                     let venv_py = jukebox::yt::session::venv_python();
-                    if venv_py.exists() { Some(venv_py) } else { None }
+                    if venv_py.exists() {
+                        Some(venv_py)
+                    } else {
+                        None
+                    }
                 })
                 .unwrap_or_else(|| std::path::PathBuf::from("python3"));
             // Spawn the sidecar best-effort. Auth preference is restored from
@@ -53,7 +64,8 @@ fn main() -> anyhow::Result<()> {
             // python3/script/cookies just means YT features degrade to clean
             // stops — local playback is unaffected.
             let cookies = jukebox::yt::session::load_cookies();
-            let yt_session = jukebox::yt::session::Session::spawn(&yt_python, &yt_script, cookies).ok();
+            let yt_session =
+                jukebox::yt::session::Session::spawn(&yt_python, &yt_script, cookies).ok();
 
             let mut app = tui::App::new(cat, player, searcher, yt_session);
             app.switch_sample_rate = cfg.switch_sample_rate;
@@ -95,7 +107,7 @@ fn main() -> anyhow::Result<()> {
                     "youtube" => View::Youtube,
                     _ => View::Artists,
                 };
-                app.source_mode = jukebox::mode::SourceMode::from_str(&layout.source_mode);
+                app.source_mode = jukebox::mode::SourceMode::parse_mode(&layout.source_mode);
                 // Restore the saved browser-auth preference. We do NOT re-spawn
                 // `spawn_browser` here (that re-reads Chrome's Keychain-encrypted
                 // cookie store → a password prompt every launch). Instead the
@@ -111,59 +123,85 @@ fn main() -> anyhow::Result<()> {
                     // No cached cookies yet — read from the browser now (prompt)
                     // and persist, so future launches are prompt-free.
                     if let Ok(s) = jukebox::yt::session::Session::spawn_browser(
-                        &app.yt_python, &app.yt_script, app.yt_browser.clone(),
+                        &app.yt_python,
+                        &app.yt_script,
+                        app.yt_browser.clone(),
                     ) {
                         app.yt_session = Some(s);
-                        app.yt_status = Some(format!("YT auth: connected via {}", app.yt_browser));
+                        // Authenticated but NOT synced — the credential hasn't
+                        // been verified by a data fetch yet. The old code set
+                        // yt_status = "connected via {browser}" here (yt-recon §8
+                        // location 1), which was false-ready. The probe below (or
+                        // refresh_yt_lists) must succeed to promote to Ready.
+                        app.yt_state = jukebox::yt::state::YtState::AuthenticatedNotSynced;
                     } else {
                         // Browser spawn failed (e.g. profile locked, deps
-                        // missing) — surface it; user can `:yt setup` / re-auth.
+                        // missing) — a hard failure, not retryable. The user
+                        // needs :yt setup or a re-auth, not R.
                         app.yt_error = Some(format!(
                             "could not read {} cookies — run :yt setup, or :yt auth browser {}",
                             app.yt_browser, app.yt_browser,
                         ));
                         app.yt_browser.clear();
+                        app.yt_state = jukebox::yt::state::YtState::Failed;
                     }
                 } else if !app.yt_browser.is_empty() && app.yt_session.is_some() {
-                    // Cached cookies loaded — already authed, no prompt.
-                    app.yt_status = Some(format!("YT auth: connected via {}", app.yt_browser));
+                    // Cached cookies loaded — the sidecar spawned with them, but
+                    // we have NOT verified the credential works yet. Set
+                    // AuthenticatedNotSynced (not "connected") until the probe
+                    // below confirms. This fixes yt-recon §8 location 2.
+                    app.yt_state = jukebox::yt::state::YtState::AuthenticatedNotSynced;
                 }
             }
             if let Ok(pls) = state::load_playlists() {
                 app.playlists = pls;
             }
+            // Restore persisted `:` command history (D4 — bounded, dedup-adjacent,
+            // persisted to state.db under 'command_history'). Best-effort: a
+            // missing/corrupt DB just falls back to empty.
+            if let Ok(hist) = state::load_command_history() {
+                app.command_history = hist;
+            }
 
-            // Probe the YT sidecar before entering the loop: fire a real
-            // library_playlists fetch (it needs network — unlike ping, which
-            // the sidecar answers even when ytmusicapi init failed). If it
-            // can't reach YouTube (network block, VPN, rate-limit), don't strand
-            // the user in the persisted Y view staring at an empty "loading…".
-            // Fall back to Artists and surface why in the footer.
+            // Load cached YT lists from state.db so a launch while offline
+            // shows cached playlists immediately. load_yt_lists_from_cache
+            // also marks the state ReadyStale when the sidecar couldn't start
+            // (offline — showing cached, press R to retry). The fire-and-forget
+            // refresh below overwrites the cached lists with fresh data and
+            // promotes to Ready when the network is up.
+            app.load_yt_lists_from_cache();
+
+            // Fire-and-forget YT refresh at launch. Replaces the old blocking
+            // library_playlists() probe, which (a) hung launch on a network
+            // timeout and (b) before the keep-session fix, discarded the session
+            // on any error — forcing a re-login every launch (yt-recon §3 root
+            // cause, the "repeatedly must log in" symptom). Now: if the sidecar
+            // is up, fire a refresh and let on_tick promote to Ready (or demote
+            // to ProviderError/AuthExpired) when the response lands. The Y view
+            // shows "loading…" meanwhile (yt_lists_loading), which is the correct
+            // UX — no need to fall back to Artists. If the sidecar never started
+            // (no python3 / missing script) and there are NO cached lists, that's
+            // a hard failure; fall back to Artists. When cached lists exist, the
+            // helper above already set ReadyStale so the user can browse them.
             if app.yt_session.is_some() {
-                let mut reachable = false;
-                if let Some(s) = app.yt_session.as_mut() {
-                    // Short deadline: the sidecar's ytmusicapi init prints a
-                    // network-flavored error and sets have=False, so this fetch
-                    // returns an error fast (not a hang).
-                    match s.library_playlists() {
-                        Ok(_) => reachable = true,
-                        Err(e) => {
-                            app.yt_session = None;
-                            app.yt_error = Some(format!(
-                                "YouTube unreachable: {e}. Likely a network block, \
-                                 VPN, or IP rate-limit — check your connection. \
-                                 (Not fixed by :yt setup.)",
-                            ));
-                        }
-                    }
-                }
-                if !reachable && app.view == View::Youtube {
+                // refresh_yt_lists sets Synchronizing + fires send_refresh; on_tick
+                // promotes to Ready on success or demotes on error. The session
+                // is NEVER discarded on a fetch failure — only the state label
+                // changes, so the user presses R (retry_yt_probe) instead of
+                // re-authenticating.
+                app.refresh_yt_lists();
+            } else if app.yt_lists.is_empty() {
+                // Spawn failed (no python3 / missing script) and no cached
+                // lists — a hard failure, not retryable. The user needs :yt
+                // setup or an environment fix, not :yt auth or R.
+                app.yt_state = jukebox::yt::state::YtState::Failed;
+                app.yt_error = Some("YT sidecar could not start — run :yt setup".into());
+                if app.view == View::Youtube {
                     app.view = View::Artists;
                 }
-            } else if app.view == View::Youtube {
-                // No session was ever created (no auth) — don't open on the Y view.
-                app.view = View::Artists;
             }
+            // else: session is None but cached lists exist — load_yt_lists_from_cache
+            // already set ReadyStale; leave the cached lists visible.
 
             // Apply the restored volume to the player backend so the persisted
             // level actually takes effect on launch (mpv defaults to 100%).
@@ -180,52 +218,58 @@ fn main() -> anyhow::Result<()> {
             // Persist final state on a clean exit. Best-effort: a failed save
             // (e.g. read-only config dir) must not turn a successful session
             // into an error.
-            let _ = state::save_layout(
-                app.focus_key(),
-                &app.column_widths,
-                app.volume,
-                app.transport.shuffle,
-                app.transport.repeat,
-                app.transport.continue_mode,
-                app.source_mode,
-                &app.yt_browser,
-            );
+            let _ = state::save_layout(&state::LayoutSave {
+                focus: app.focus_key(),
+                widths: &app.column_widths,
+                volume: app.volume,
+                shuffle: app.transport.shuffle,
+                repeat: app.transport.repeat,
+                continue_mode: app.transport.continue_mode,
+                source_mode: app.source_mode,
+                yt_browser: &app.yt_browser,
+            });
             let _ = state::save_playlists(&app.playlists);
+            let _ = state::save_command_history(&app.command_history);
         }
         Cmd::Sync => {
             let cfg = cli::ensure_config()?;
-            let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("scripts/standardize.sh");
+            let script =
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/standardize.sh");
             // Fall back to a sibling-of-binary location if running installed.
-            let script = if script.exists() { script } else {
-                std::env::current_exe()?.parent().unwrap().join("scripts/standardize.sh")
+            let script = if script.exists() {
+                script
+            } else {
+                std::env::current_exe()?
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("scripts/standardize.sh")
             };
             let status = std::process::Command::new(&script)
-                .args(["--source", &cfg.source_dir.display().to_string(),
-                       "--out", &cfg.filtered_dir.display().to_string()])
+                .args([
+                    "--source",
+                    &cfg.source_dir.display().to_string(),
+                    "--out",
+                    &cfg.filtered_dir.display().to_string(),
+                ])
                 .status()?;
-            if !status.success() { anyhow::bail!("standardize.sh failed"); }
+            if !status.success() {
+                anyhow::bail!("standardize.sh failed");
+            }
             let cat = catalog::Catalog::load(&cfg.filtered_dir.join("catalog.json"))?;
             search::build_index(&cat, &cfg.filtered_dir.join("search-index"))?;
             println!("synced: {} tracks", cat.tracks.len());
         }
         Cmd::Index => {
             let cfg = cli::ensure_config()?;
-            let cat = jukebox::catalog::Catalog::load(
-                &cfg.filtered_dir.join("catalog.json"),
-            )?;
+            let cat = jukebox::catalog::Catalog::load(&cfg.filtered_dir.join("catalog.json"))?;
             jukebox::search::build_index(&cat, &cfg.filtered_dir.join("search-index"))?;
             println!("indexed {} tracks", cat.tracks.len());
         }
         Cmd::Search { query } => {
             let cfg = cli::ensure_config()?;
-            let s = jukebox::search::Searcher::open(
-                &cfg.filtered_dir.join("search-index"),
-            )?;
+            let s = jukebox::search::Searcher::open(&cfg.filtered_dir.join("search-index"))?;
             let q = query.join(" ");
-            let cat = jukebox::catalog::Catalog::load(
-                &cfg.filtered_dir.join("catalog.json"),
-            )?;
+            let cat = jukebox::catalog::Catalog::load(&cfg.filtered_dir.join("catalog.json"))?;
             for hit in s.search(&q, 25)? {
                 if let Some(t) = cat.tracks.iter().find(|t| t.id == hit.track_id) {
                     println!(
@@ -233,9 +277,9 @@ fn main() -> anyhow::Result<()> {
                         // BM25 is unbounded; cap the displayed relevance at 100%
                         // so a strong match reads as 100% rather than e.g. 200%.
                         (hit.score * 100.0).clamp(0.0, 100.0),
-                        t.title,
-                        t.primary_artist,
-                        t.quality_label()
+                        jukebox::sanitize_for_terminal(&t.title),
+                        jukebox::sanitize_for_terminal(&t.primary_artist),
+                        jukebox::sanitize_for_terminal(&t.quality_label())
                     );
                 }
             }

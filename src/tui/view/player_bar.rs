@@ -29,15 +29,34 @@ use crate::tui::view::theme::{quality_color, Theme};
 /// CLI uses. Animated in `App::on_tick` while a YouTube resolve is in flight.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// ASCII spinner frames — a fallback for minimal terminals (often paired with
+/// `NO_COLOR`) where the braille dots may not render in the font. 4 frames
+/// cycled by `App::on_tick` (`spinner_frame` advances by 1 each tick).
+const SPINNER_ASCII: [&str; 4] = ["|", "/", "-", "\\"];
+
+/// Pick the current spinner glyph: ASCII under `NO_COLOR` (minimal terminals),
+/// braille otherwise. `spinner_frame` wraps modulo the active frame count.
+fn spinner_glyph(app: &App) -> &'static str {
+    let frames = if crate::tui::view::theme::no_color() {
+        &SPINNER_ASCII[..]
+    } else {
+        &SPINNER[..]
+    };
+    frames[app.spinner_frame as usize % frames.len()]
+}
+
 /// Compact 1-row player bar for the narrow (60–80 col) fallback: now-playing +
-/// quality + flags all on one line, no gauge (spec §5.6).
+/// quality + flags all on one line, no gauge (spec §5.6). At very narrow widths
+/// the least-important sections drop out so the now-playing text stays visible:
+/// below 70 cols the mode flags drop, below 60 cols the quality readout drops
+/// too (priority: now-playing > quality > flags).
 pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
     let theme = Theme::default();
     let dim = Style::default().fg(theme.dim);
     let text = Style::default().fg(theme.text);
     let resolving = app.is_resolving();
     let play_glyph = if resolving {
-        SPINNER[app.spinner_frame as usize % SPINNER.len()]
+        spinner_glyph(app)
     } else if app.player.is_playing() {
         "⏸"
     } else {
@@ -52,7 +71,14 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
     };
     let mut spans: Vec<Span<'static>> = vec![Span::styled(format!("{play_glyph} "), glyph_style)];
 
-    match app.now_playing_view() {
+    // Resolve the now-playing view ONCE per frame — `now_playing_view()` does
+    // an id→track lookup (and for remote tracks a `track_cache` probe). It was
+    // called twice here (title/artist + quality) and twice more in
+    // `build_info_line`; caching the result cuts 4 lookups/frame to 1 (PB7).
+    let np = app.now_playing_view();
+
+    // title — artist (always shown — highest priority)
+    match &np {
         Some(v) => {
             spans.push(Span::styled(v.title.clone(), text));
             spans.push(Span::styled(" — ", dim));
@@ -60,31 +86,47 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
         }
         None => spans.push(Span::styled("—", dim)),
     }
-    spans.push(Span::raw("  "));
-    // quality
-    match app.now_playing_view() {
-        Some(v) if v.source.is_remote() => {
-            let label = v.fmt.as_ref().map(|f| f.yt_label()).unwrap_or_else(|| "YT".to_string());
-            let color = if crate::tui::view::theme::no_color() { Color::Reset } else { Color::Yellow };
-            spans.push(Span::styled(label, Style::default().fg(color)));
+    // quality (drop below 60 cols)
+    if area.width >= 60 {
+        spans.push(Span::raw("  "));
+        match &np {
+            Some(v) if v.source.is_remote() => {
+                let label = v
+                    .fmt
+                    .as_ref()
+                    .map(|f| f.yt_label())
+                    .unwrap_or_else(|| "YT".to_string());
+                let color = if crate::tui::view::theme::no_color() {
+                    Color::Reset
+                } else {
+                    Color::Yellow
+                };
+                spans.push(Span::styled(label, Style::default().fg(color)));
+            }
+            Some(v) => {
+                let q_color = quality_color(v.bit_depth, v.sample_rate_hz);
+                spans.push(Span::styled(
+                    format!("{}bit/{}", v.bit_depth, khz(v.sample_rate_hz)),
+                    Style::default().fg(q_color),
+                ));
+            }
+            None => spans.push(Span::styled("--", dim)),
         }
-        Some(v) => {
-            let q_color = quality_color(v.bit_depth, v.sample_rate_hz);
-            spans.push(Span::styled(
-                format!("{}bit/{}", v.bit_depth, khz(v.sample_rate_hz)),
-                Style::default().fg(q_color),
-            ));
-        }
-        None => spans.push(Span::styled("--", dim)),
     }
-    spans.push(Span::raw("  "));
-    let cont = match app.transport.continue_mode {
-        ContinueMode::Off => "off",
-        ContinueMode::NextAlbum => "next",
-        ContinueMode::Radio => "radio",
-        ContinueMode::YouTube => "youtube",
-    };
-    spans.push(Span::styled(format!("CONT {cont} · MODE {}", app.source_mode.as_str()), dim));
+    // flags (drop below 70 cols — lowest priority)
+    if area.width >= 70 {
+        spans.push(Span::raw("  "));
+        let cont = match app.transport.continue_mode {
+            ContinueMode::Off => "off",
+            ContinueMode::NextAlbum => "next",
+            ContinueMode::Radio => "radio",
+            ContinueMode::YouTube => "youtube",
+        };
+        spans.push(Span::styled(
+            format!("CONT {cont} · MODE {}", app.source_mode.as_str()),
+            dim,
+        ));
+    }
     f.render_widget(
         Paragraph::new(Line::from(spans).alignment(Alignment::Left))
             .block(Block::default().borders(Borders::NONE)),
@@ -117,11 +159,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         // the gauge into a left sub-rect and the flags into a right sub-rect so
         // the flags stay flush against the right edge and the gauge never
         // overruns them.
-        let split = Layout::horizontal([
-            Constraint::Percentage(55),
-            Constraint::Min(1),
-        ])
-        .split(g);
+        let split = Layout::horizontal([Constraint::Percentage(55), Constraint::Min(1)]).split(g);
         let (pct, label) = progress(app);
         f.render_widget(
             Gauge::default()
@@ -151,7 +189,7 @@ fn build_info_line(app: &App, _width: usize) -> Line<'static> {
     let playing = app.player.is_playing();
     let resolving = app.is_resolving();
     let play_glyph = if resolving {
-        SPINNER[app.spinner_frame as usize % SPINNER.len()]
+        spinner_glyph(app)
     } else if playing {
         "⏸"
     } else {
@@ -167,8 +205,11 @@ fn build_info_line(app: &App, _width: usize) -> Line<'static> {
 
     spans.push(Span::styled(format!("{play_glyph} "), glyph_style));
 
+    // Resolve the now-playing view ONCE per frame (see `render_compact`).
+    let np = app.now_playing_view();
+
     // Now-playing: title — artist · album (or a dim placeholder).
-    match app.now_playing_view() {
+    match &np {
         Some(v) => {
             spans.push(Span::styled(v.title.clone(), text));
             spans.push(Span::styled(" — ", dim));
@@ -189,10 +230,18 @@ fn build_info_line(app: &App, _width: usize) -> Line<'static> {
 
     // Quality readout: local → `24-bit / 96 kHz` (+`· bit-perfect`);
     // remote → stream format label (`Opus 160k · YT` / `AAC 256k · YT Premium`).
-    match app.now_playing_view() {
+    match &np {
         Some(v) if v.source.is_remote() => {
-            let label = v.fmt.as_ref().map(|f| f.yt_label()).unwrap_or_else(|| "YT".to_string());
-            let color = if crate::tui::view::theme::no_color() { Color::Reset } else { Color::Yellow };
+            let label = v
+                .fmt
+                .as_ref()
+                .map(|f| f.yt_label())
+                .unwrap_or_else(|| "YT".to_string());
+            let color = if crate::tui::view::theme::no_color() {
+                Color::Reset
+            } else {
+                Color::Yellow
+            };
             spans.push(Span::styled(label, Style::default().fg(color)));
         }
         Some(v) => {
@@ -303,5 +352,5 @@ fn khz(sample_rate_hz: u32) -> String {
 #[allow(dead_code)]
 fn now_playing_track(app: &App) -> Option<&Track> {
     let id = app.now_playing.as_ref().map(|s| s.id())?;
-    app.catalog.tracks.iter().find(|t| t.id == id)
+    app.track_by_id_fast(id)
 }

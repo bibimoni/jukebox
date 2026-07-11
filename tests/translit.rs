@@ -4,7 +4,11 @@ use jukebox::translit::variants;
 fn katakana_yields_romaji_and_hiragana() {
     let v = variants("ブルーバード");
     assert!(v.iter().any(|s| s == "burubado"), "got romaji: {:?}", v);
-    assert!(v.iter().any(|s| s == "ぶるーばーど"), "got hiragana: {:?}", v);
+    assert!(
+        v.iter().any(|s| s == "ぶるーばーど"),
+        "got hiragana: {:?}",
+        v
+    );
 }
 
 #[test]

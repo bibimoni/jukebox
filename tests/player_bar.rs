@@ -83,7 +83,10 @@ fn bar_shows_volume_and_mode_flags() {
     let bar = rendered_bar(&app, 120, 3);
     assert!(bar.contains("vol"), "bar must show a volume label: {bar}");
     assert!(bar.contains("70"), "bar must show the volume pct: {bar}");
-    assert!(bar.contains("SHUF"), "bar must show the shuffle flag: {bar}");
+    assert!(
+        bar.contains("SHUF"),
+        "bar must show the shuffle flag: {bar}"
+    );
     assert!(bar.contains("RPT"), "bar must show the repeat flag: {bar}");
 }
 

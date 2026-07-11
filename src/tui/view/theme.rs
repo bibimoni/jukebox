@@ -10,13 +10,13 @@ pub fn no_color() -> bool {
 /// Semantic color tokens. [`Theme::default`] honors `NO_COLOR`: when set, every
 /// field collapses to [`Color::Reset`] so the TUI stays usable in monochrome.
 pub struct Theme {
-    pub accent: Color,     // focus + selection
-    pub dim: Color,        // chrome / borders unfocused
+    pub accent: Color, // focus + selection
+    pub dim: Color,    // chrome / borders unfocused
     pub text: Color,
     pub muted: Color,
-    pub hi_fg: Color,      // text on accent background
-    pub hires: Color,      // Hi-Res quality accent
-    pub cd: Color,         // CD-quality accent
+    pub hi_fg: Color, // text on accent background
+    pub hires: Color, // Hi-Res quality accent
+    pub cd: Color,    // CD-quality accent
 }
 
 impl Default for Theme {
@@ -62,9 +62,10 @@ pub fn quality_color(bit_depth: u32, sample_rate_hz: u32) -> Color {
 /// enough for terminal alignment of mixed JP/EN titles without pulling in the
 /// unicode-width crate.
 pub fn disp_width(s: &str) -> usize {
-    s.chars().map(|c| {
-        let cp = c as u32;
-        if (0x1100..=0x115F).contains(&cp)                    // Hangul Jamo
+    s.chars()
+        .map(|c| {
+            let cp = c as u32;
+            if (0x1100..=0x115F).contains(&cp)                    // Hangul Jamo
             || (0x2E80..=0xA4CF).contains(&cp) && cp != 0x303F // CJK radicals / Yi
             || (0xAC00..=0xD7A3).contains(&cp)                // Hangul syllables
             || (0xF900..=0xFAFF).contains(&cp)                // CJK compat ideographs
@@ -73,13 +74,15 @@ pub fn disp_width(s: &str) -> usize {
             || (0xFFE0..=0xFFE6).contains(&cp)                // fullwidth signs
             || (0x3000..=0x303F).contains(&cp)                // CJK symbols (incl. ・)
             || (0x3040..=0x30FF).contains(&cp)                // Hiragana + Katakana
-            || (0x4E00..=0x9FFF).contains(&cp)                // CJK Unified Ideographs
-        {
-            2
-        } else {
-            1
-        }
-    }).sum()
+            || (0x4E00..=0x9FFF).contains(&cp)
+            // CJK Unified Ideographs
+            {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
 }
 
 /// Right-pad `left` so that `right` sits flush against the pane's right edge.

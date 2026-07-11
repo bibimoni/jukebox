@@ -40,8 +40,8 @@ pub enum ContinueMode {
 
 pub struct Transport {
     pub context: Context,
-    pub order: Vec<usize>, // permutation over context.track_ids
-    pub cursor: usize,     // index into `order`
+    pub order: Vec<usize>,               // permutation over context.track_ids
+    pub cursor: usize,                   // index into `order`
     pub history: Vec<(String, Context)>, // (track_id, context_at_play_time)
     pub manual_queue: Vec<String>,
     pub shuffle: ShuffleMode,

@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use std::path::Path;
-use tantivy::directory::MmapDirectory;
 use tantivy::collector::TopDocs;
+use tantivy::directory::MmapDirectory;
 use tantivy::query::QueryParser;
 use tantivy::schema::{
-    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STRING, STORED,
+    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED, STRING,
 };
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
@@ -169,7 +169,11 @@ impl Searcher {
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
-        Ok(Searcher { reader, fields, index })
+        Ok(Searcher {
+            reader,
+            fields,
+            index,
+        })
     }
 
     /// Run a BM25 query against the index and return up to `limit` hits, best
@@ -185,13 +189,16 @@ impl Searcher {
     /// tolerated. The `id` field is `STORED`, so it is read back from the
     /// matched document to populate [`Hit::track_id`].
     pub fn search(&self, q: &str, limit: usize) -> Result<Vec<Hit>> {
-        let mut qp = QueryParser::for_index(&self.index, vec![
-            self.fields.title,
-            self.fields.title_variants,
-            self.fields.artists,
-            self.fields.artist_variants,
-            self.fields.album,
-        ]);
+        let mut qp = QueryParser::for_index(
+            &self.index,
+            vec![
+                self.fields.title,
+                self.fields.title_variants,
+                self.fields.artists,
+                self.fields.artist_variants,
+                self.fields.album,
+            ],
+        );
         // BM25 boosts: title x2, title_variants x1.5, others x1.
         qp.set_field_boost(self.fields.title, 2.0);
         qp.set_field_boost(self.fields.title_variants, 1.5);

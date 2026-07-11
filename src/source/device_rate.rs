@@ -32,7 +32,10 @@ pub fn desired_switch(
         return None;
     }
     match kind {
-        LoadKind::Local { sample_rate_hz, bit_depth } => {
+        LoadKind::Local {
+            sample_rate_hz,
+            bit_depth,
+        } => {
             state.in_yt_rate = false;
             if state.current_sr == sample_rate_hz && state.current_bd == bit_depth {
                 None

@@ -40,7 +40,7 @@ impl Sidecar {
     ///   sidecar read cookies from that browser's profile (yt-dlp's
     ///   `--cookies-from-browser` + browser_cookie3 for ytmusicapi). No cookie
     ///   file is written; values never leave the browser.
-    /// Both `None` → guest mode.
+    ///   Both `None` → guest mode.
     pub fn spawn(
         python: &Path,
         script: &Path,
@@ -59,12 +59,29 @@ impl Sidecar {
                 "JUKEBOX_YT_COOKIES_FILE",
                 cookies_file.clone().unwrap_or_default(),
             );
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawning sidecar {} {}", python.display(), script.display()))?;
-        let stdin = child.stdin.take().expect("stdin piped");
-        let stdout = child.stdout.take().expect("stdout piped");
-        let (tx, rx) = mpsc::channel::<String>();
+        let mut child = cmd.spawn().with_context(|| {
+            format!("spawning sidecar {} {}", python.display(), script.display())
+        })?;
+        // Take stdin/stdout; if either is missing (fd exhaustion under tight
+        // ulimits), kill the child and return an error instead of panicking —
+        // the caller can degrade to guest mode.
+        let stdin = match child.stdin.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("sidecar stdin pipe unavailable (fd exhaustion?)"));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("sidecar stdout pipe unavailable (fd exhaustion?)"));
+            }
+        };
+        let (tx, rx) = mpsc::sync_channel::<String>(64);
         let reader = std::thread::spawn(move || {
             let mut r = BufReader::new(stdout);
             let mut line = String::new();
@@ -74,10 +91,8 @@ impl Sidecar {
                     Ok(0) => break, // EOF — child closed stdout
                     Ok(_) => {
                         let l = line.trim().to_string();
-                        if !l.is_empty() {
-                            if tx.send(l).is_err() {
-                                break; // receiver dropped
-                            }
+                        if !l.is_empty() && tx.send(l).is_err() {
+                            break; // receiver dropped
                         }
                     }
                     Err(_) => break,
@@ -126,7 +141,13 @@ impl Sidecar {
     pub fn respawn(&mut self) -> Result<()> {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let new = Sidecar::spawn(&self.python, &self.script, self.cookies.clone(), self.browser.clone(), self.cookies_file.clone())?;
+        let new = Sidecar::spawn(
+            &self.python,
+            &self.script,
+            self.cookies.clone(),
+            self.browser.clone(),
+            self.cookies_file.clone(),
+        )?;
         *self = new;
         Ok(())
     }
