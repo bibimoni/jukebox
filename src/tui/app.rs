@@ -660,9 +660,19 @@ impl App {
         if n_tracks > 0 && self.cursors.track >= n_tracks {
             self.cursors.track = n_tracks - 1;
         }
-        let n_playlists = self.playlists.len();
-        if n_playlists > 0 && self.cursors.playlist >= n_playlists {
-            self.cursors.playlist = n_playlists - 1;
+        // `cursors.playlist` is shared between View::Playlists (local
+        // playlists) and View::Youtube (yt_lists), which generally have
+        // different lengths. Clamping against the wrong list yanks the
+        // cursor back on every render (layout.rs calls this each frame) and
+        // the user can't move between YouTube playlists when they have fewer
+        // local playlists than YouTube lists. Clamp against the list that
+        // belongs to the active view.
+        let n_playlist_col = match self.view {
+            View::Youtube => self.yt_lists.len(),
+            _ => self.playlists.len(),
+        };
+        if n_playlist_col > 0 && self.cursors.playlist >= n_playlist_col {
+            self.cursors.playlist = n_playlist_col - 1;
         }
     }
 

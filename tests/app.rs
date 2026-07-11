@@ -1,6 +1,6 @@
 use jukebox::catalog::Catalog;
 use jukebox::player::StubPlayer;
-use jukebox::tui::app::{App, View};
+use jukebox::tui::app::{App, View, YtList, YtListKind};
 use jukebox::tui::queue::{ContinueMode, RepeatMode, ShuffleMode};
 
 fn cat_album() -> (tempfile::TempDir, Catalog, std::path::PathBuf) {
@@ -428,4 +428,106 @@ fn s_discover_lists_local_albums_in_local_mode() {
         }
         _ => panic!("expected Discover"),
     }
+}
+
+// --- YouTube view navigation: the shared `cursors.playlist` clamp bug -------
+//
+// `cursors.playlist` is shared between `View::Playlists` (local playlists)
+// and `View::Youtube` (yt_lists). `clamp_cursors` used to clamp it against
+// `playlists.len()` unconditionally — so in the YouTube view, with fewer
+// local playlists than YouTube lists, every render yanked the cursor back
+// down to `playlists.len()-1` and the user could not move between YouTube
+// playlists. The clamp must be view-aware.
+
+fn three_yt_lists() -> Vec<YtList> {
+    (0..3)
+        .map(|i| YtList {
+            id: format!("PL{i}"),
+            name: format!("List {i}"),
+            kind: YtListKind::Account,
+            track_ids: Vec::new(),
+        })
+        .collect()
+}
+
+#[test]
+fn clamp_cursors_in_youtube_view_uses_yt_lists_len() {
+    // 1 local playlist, 3 YouTube lists, YouTube view, cursor on list 2.
+    // Before the fix: clamp_cursors clamped against playlists.len()=1, yanking
+    // the cursor back to 0. After: it must clamp against yt_lists.len()=3 and
+    // leave the cursor at 2.
+    let (_d, cat, _l) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.playlists = vec![jukebox::tui::app::Playlist {
+        name: "local".into(),
+        track_ids: vec![],
+    }];
+    app.yt_lists = three_yt_lists();
+    app.view = View::Youtube;
+    app.cursors.playlist = 2;
+    app.clamp_cursors();
+    assert_eq!(
+        app.cursors.playlist, 2,
+        "YouTube view must clamp against yt_lists.len(), not playlists.len()"
+    );
+}
+
+#[test]
+fn yt_view_navigation_not_blocked_by_local_playlists() {
+    // End-to-end reproduction: 1 local playlist, 3 YouTube lists, YouTube view.
+    // Simulate the render loop (handle_key then clamp_cursors, as layout.rs
+    // does on every frame). Before the fix, pressing `j` twice left the
+    // cursor stuck at 0 (clamped back from 1→0 each frame because
+    // playlists.len()=1). After the fix, the cursor must reach 2.
+    let (_d, cat, _l) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.playlists = vec![jukebox::tui::app::Playlist {
+        name: "local".into(),
+        track_ids: vec![],
+    }];
+    app.yt_lists = three_yt_lists();
+    app.view = View::Youtube;
+    app.focus_col = 0;
+    app.cursors.playlist = 0;
+
+    // Press j (down) — simulating the real loop: handle_key then the render's
+    // clamp_cursors. Two presses should reach list index 2.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use jukebox::tui::input::handle_key;
+    let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+    for _ in 0..2 {
+        handle_key(&mut app, j);
+        app.clamp_cursors(); // what layout.rs:53 does every frame
+    }
+    assert_eq!(
+        app.cursors.playlist, 2,
+        "must be able to move down to the third YouTube playlist"
+    );
+
+    // Press k (up) once — should go back to 1, not get stuck.
+    let k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+    handle_key(&mut app, k);
+    app.clamp_cursors();
+    assert_eq!(app.cursors.playlist, 1, "k must move up one");
+}
+
+#[test]
+fn clamp_cursors_in_playlists_view_uses_playlists_len() {
+    // Symmetric guard: in the Playlists view, the clamp must still use the
+    // local playlists list (not yt_lists), so a stale yt_lists-heavy cursor
+    // is pulled back into the local playlists' range.
+    let (_d, cat, _l) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.playlists = vec![jukebox::tui::app::Playlist {
+        name: "local".into(),
+        track_ids: vec![],
+    }];
+    app.yt_lists = three_yt_lists();
+    app.view = View::Playlists;
+    app.cursors.playlist = 2; // valid for yt_lists (3) but out of range for playlists (1)
+    app.clamp_cursors();
+    assert_eq!(
+        app.cursors.playlist, 0,
+        "Playlists view must clamp against playlists.len()"
+    );
 }
