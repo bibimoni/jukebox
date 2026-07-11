@@ -20,7 +20,16 @@ pub enum Request {
     GetPlaylist { id: String },
     HomeSuggestions,
     GetWatchPlaylist { video_id: String },
-    ResolveUrl { video_id: String },
+    /// Resolve a playable stream URL. `quality` selects the yt-dlp client tier:
+    /// `"fast"` (default) → `tv_embedded`, ~1.3s, caps at AAC 129k (itag 140);
+    /// `"premium"` → `tv`/`web` + the deno EJS nsig solver, ~10-15s, reaches
+    /// AAC 256k (itag 141) for Premium users. `#[serde(default)]` so an old
+    /// sidecar/client that omits it still parses (defaults to "" → "fast").
+    ResolveUrl {
+        video_id: String,
+        #[serde(default)]
+        quality: String,
+    },
     Ping,
     AuthStatus,
 }

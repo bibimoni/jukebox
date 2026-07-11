@@ -81,6 +81,25 @@ impl Default for ColumnWidths {
     }
 }
 
+/// Which index the `/` search overlay queries. `Local` is the on-disk BM25 index
+/// (instant, live-as-you-type). `Youtube` is ytmusicapi search over the sidecar
+/// (slow, so it's explicit-submit on Enter, not per keystroke). `Tab` cycles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SearchScope {
+    #[default]
+    Local,
+    Youtube,
+}
+
+impl SearchScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchScope::Local => "local",
+            SearchScope::Youtube => "youtube",
+        }
+    }
+}
+
 /// Modal overlays drawn on top of the browse layout. Defined minimally here so
 /// `App.overlay: Option<Overlay>` compiles; Task 11 fills in the full surface.
 #[derive(Clone)]
@@ -89,6 +108,20 @@ pub enum Overlay {
         input: String,
         results: Vec<String>,
         cursor: usize,
+        /// Which index the query runs against. Defaults from the active view on
+        /// open (Youtube in the Y view, Local elsewhere); `Tab` toggles so the
+        /// user can search the local catalog from the Y view or YouTube from a
+        /// local view.
+        scope: SearchScope,
+        /// The query that produced `results` (None = never submitted). For
+        /// Local scope this tracks `input` live; for Youtube it's set on
+        /// Enter-submit, so a second Enter on fresh results picks the track
+        /// instead of re-searching.
+        submitted: Option<String>,
+        /// True while a Youtube search request is in flight (set on Enter,
+        /// cleared when the response lands in `on_tick`). Drives the
+        /// "searching…" indicator.
+        searching: bool,
     },
     Help,
     PlaylistPicker,
@@ -154,6 +187,9 @@ pub struct App {
     /// Empty until `refresh_yt_lists` populates them.
     pub yt_lists: Vec<YtList>,
     pub yt_lists_loading: bool,
+    /// Playlist ids whose tracks have been fetched (even if empty), so a
+    /// genuinely-empty list isn't re-fetched every tick while focused.
+    pub loaded_yt_lists: HashSet<String>,
     pub yt_error: Option<String>,
     /// Transient status message (e.g. "YT auth: connected via chrome"), shown
     /// in the footer until overwritten/cleared. Success counterpart to
@@ -164,8 +200,31 @@ pub struct App {
     /// `python3` + the manifest-dir script (works in dev).
     pub yt_python: std::path::PathBuf,
     pub yt_script: std::path::PathBuf,
+    /// The browser profile the sidecar reads YouTube cookies from ("chrome",
+    /// etc.), or empty for guest / pasted-cookies. Source of truth for auth:
+    /// set by `:yt auth browser <name>`, cleared by `:yt logout`/`:yt auth`,
+    /// restored at startup from `LayoutState.yt_browser`, and saved on exit so
+    /// you don't re-auth every launch.
+    pub yt_browser: String,
     /// Active inline filter (`f`) on the focused column, or `None`.
     pub filter: Option<FilterState>,
+    /// Vertical scroll offset for the `?` Help overlay. The keymap is taller
+    /// than a typical popup, so the overlay scrolls with j/k/↑/↓/PgUp/PgDn/g/G.
+    pub help_scroll: u16,
+    /// Braille spinner frame index (0..10) for the "a resolve is in flight"
+    /// indicator in the player bar. Advanced in `on_tick` only while resolving,
+    /// reset to 0 otherwise so the glyph returns to play/pause.
+    pub spinner_frame: u8,
+    /// True when the currently-playing remote stream is the premium (256k) URL,
+    /// false while it's the fast (129k) one. Gates the progressive upgrade: a
+    /// premium URL landing mid-play swaps the stream up to 256k only once.
+    pub playing_premium: bool,
+    /// The video_id of a cold-miss YouTube pick whose URL hasn't landed yet.
+    /// Set by `start_playback`/`load_track` on a `Resolved::Pending`; `on_tick`
+    /// swaps the player in (and clears this) the moment `url_for` returns it,
+    /// or clears it if the fast resolve finishes without a URL. Single slot:
+    /// a new pick replaces it. The old track keeps playing until the swap.
+    pub pending_play: Option<String>,
 }
 
 /// Inline filter state for the `f` filter-on-focused-column (spec §5.4).
@@ -186,6 +245,15 @@ enum Resolved {
     Remote {
         url: String,
         fmt: crate::source::StreamFormat,
+        video_id: String,
+    },
+    /// A YouTube id whose stream URL isn't cached yet (cold miss). The resolve
+    /// is fire-and-forget; `on_tick` swaps the player in once the URL lands.
+    /// The old track keeps playing (or nothing plays, on a cold start) and the
+    /// spinner signals the pending swap — the UI never blocks on the ~1.3s
+    /// resolve. `App::pending_play` carries the id between this call and the
+    /// `on_tick` swap.
+    Pending {
         video_id: String,
     },
 }
@@ -303,6 +371,12 @@ impl App {
             yt_python: std::path::PathBuf::from("python3"),
             yt_script: std::path::PathBuf::from("scripts/yt/yt.py"),
             filter: None,
+            help_scroll: 0,
+            spinner_frame: 0,
+            playing_premium: false,
+            pending_play: None,
+            loaded_yt_lists: HashSet::new(),
+            yt_browser: String::new(),
         }
     }
 
@@ -313,6 +387,17 @@ impl App {
     /// A display view of the now-playing track, local or remote, for the
     /// player bar. `None` when nothing is playing or the metadata isn't
     /// available yet (a remote track whose `RemoteTrack` isn't cached).
+    /// True while a YouTube resolve is in flight (fast or premium). Drives the
+    /// braille spinner in the player bar — a global "the code is working"
+    /// signal, so it spins during the CONT-radio premium preload of the next
+    /// track and the progressive-upgrade resolve, not just the current track.
+    pub fn is_resolving(&self) -> bool {
+        self.yt_session
+            .as_ref()
+            .map(|s| s.resolve_busy() || s.premium_resolve_busy())
+            .unwrap_or(false)
+    }
+
     pub fn now_playing_view(&self) -> Option<NowPlayingView> {
         let ts = self.now_playing.as_ref()?;
         match ts {
@@ -469,6 +554,9 @@ impl App {
     /// and resolving each id through [`resolve_source`] (Local / YouTube /
     /// Mixed policy). Remote ids that fail to resolve are treated as dead.
     fn start_playback(&mut self) {
+        // A fresh play intent owns the pending slot: clear any stale cold-miss
+        // swap from a prior pick. (A Pending arm below may set it again.)
+        self.pending_play = None;
         let n = self.transport.order.len();
         if n == 0 {
             return;
@@ -513,23 +601,23 @@ impl App {
                     return;
                 }
                 Some(Resolved::Remote { url, fmt, video_id }) => {
-                    if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
-                        &mut self.device_rate,
-                        crate::source::device_rate::LoadKind::Remote { sample_rate: fmt.sample_rate },
-                        self.switch_sample_rate,
-                    ) {
-                        let _ = crate::audio::set_output_format(sr, bd);
-                    }
-                    // mpv loadfile accepts an https URL via the same path —
-                    // PathBuf carries the URL string verbatim.
-                    let p = std::path::PathBuf::from(&url);
-                    let _ = self.player.load(&p);
-                    self.now_playing = Some(crate::source::TrackSource::Remote { video_id });
-                    self.preload_next_url();
+                    // Cached URL (fast or premium) → swap in immediately.
+                    self.load_remote(url, fmt, video_id);
+                    return;
+                }
+                Some(Resolved::Pending { video_id }) => {
+                    // Cold miss: the URL isn't cached yet. Don't block — keep
+                    // the old track playing (or nothing, on a cold start), set
+                    // the pending slot, and let on_tick swap the player in the
+                    // moment the URL lands. resolve_source already armed both
+                    // resolve tiers fire-and-forget.
+                    self.pending_play = Some(video_id);
                     return;
                 }
                 None => {
-                    // Unresolvable (unknown id, or remote resolve failed) → dead.
+                    // Genuinely unresolvable (unknown local id) → dead. Remote
+                    // cold misses return Pending (handled above), NOT None, so
+                    // they aren't dead-marked.
                     self.dead.insert(id.clone());
                     let r = ClonedResolver { playlists: &self.playlists, manual_queue: self.transport.manual_queue.clone(), yt_lists: &self.yt_lists };
                     let _ = self.transport.next(&r, &self.catalog);
@@ -560,14 +648,24 @@ impl App {
                 });
             }
         }
-        // Remote (YouTube / Mixed-no-local-hit). Needs a live session. Prefer
-        // a pre-resolved (cached) URL — instant, no block — so gapless handoff
-        // lands the next track without a resolve roundtrip gap.
+        // Remote (YouTube / Mixed-no-local-hit). Two paths:
+        //   - cached (url_for prefers premium → fast): instant, no block.
+        //   - cache miss: fire-and-forget BOTH tiers (fast ~1.3s + premium
+        //     ~10-15s) and return Pending. on_tick swaps the player in the
+        //     moment the fast URL lands, then the progressive-upgrade path
+        //     swaps up to 256k once the premium URL lands. This is fully
+        //     non-blocking — the old track keeps playing and the spinner
+        //     signals the swap, so a cold miss never freezes the UI.
         let session = self.yt_session.as_mut()?;
         if let Some(url) = session.url_for(id) {
+            // The url_cache entry's own fmt is the tier source of truth (premium
+            // wins when present). track_cache's fmt can lag — a track cached by
+            // search BEFORE its premium resolve lands has fmt=None there even
+            // though url_for returned the premium URL — so prefer the cache
+            // entry's fmt and only fall back to track_cache's.
             let fmt = session
-                .track_for(id)
-                .and_then(|t| t.fmt.clone())
+                .cache_fmt_for(id)
+                .or_else(|| session.track_for(id).and_then(|t| t.fmt.clone()))
                 .unwrap_or_else(|| crate::source::StreamFormat {
                     codec: "AAC".into(),
                     abr: 0,
@@ -577,22 +675,12 @@ impl App {
                 });
             return Some(Resolved::Remote { url, fmt, video_id: id.to_string() });
         }
-        // Cache miss → synchronous resolve (bounded ~8s). Pre-resolve via
-        // `preload_next_url` usually prevents this on the hot path.
-        match session.resolve_url(id) {
-            Ok(u) => Some(Resolved::Remote {
-                url: u.url,
-                fmt: crate::source::StreamFormat {
-                    codec: u.codec,
-                    abr: u.abr,
-                    sample_rate: u.sample_rate,
-                    container: u.container,
-                    premium: u.premium,
-                },
-                video_id: id.to_string(),
-            }),
-            Err(_) => None, // expired/unavailable/rate-limited → dead path
-        }
+        // Cache miss → arm both tiers fire-and-forget and defer the swap to
+        // on_tick (Pending). Guards in send_resolve/send_resolve_premium make
+        // re-arming a no-op if a tier is already in flight or cached.
+        let _ = session.send_resolve(id.to_string());
+        let _ = session.send_resolve_premium(id.to_string());
+        Some(Resolved::Pending { video_id: id.to_string() })
     }
 
     /// Pre-resolve the next track's stream URL (fire-and-forget) so gapless
@@ -615,10 +703,16 @@ impl App {
             return;
         }
         let Some(session) = self.yt_session.as_mut() else { return };
-        if session.resolve_busy() {
+        // Pre-resolve the PREMIUM (256k) URL ahead of time — it's slow (~10-15s
+        // cold, with the EJS nsig solver) but happens during the current track,
+        // so the next track starts instantly at Premium quality (gapless). The
+        // fast (129k) URL is only fetched at play time on a cache miss, as the
+        // instant-start fallback. Guard on the premium inflight, not the fast
+        // one, so a concurrent fast sync doesn't suppress the premium preload.
+        if session.premium_resolve_busy() {
             return;
         }
-        let _ = session.send_resolve(id);
+        let _ = session.send_resolve_premium(id);
     }
 
     /// Load `id` into the player (switching the output device's sample rate
@@ -634,6 +728,8 @@ impl App {
         if self.dead.contains(id) {
             return;
         }
+        // A fresh explicit load (next/prev) owns the pending slot.
+        self.pending_play = None;
         match self.resolve_source(id) {
             Some(Resolved::Local { path, sample_rate_hz, bit_depth }) => {
                 if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
@@ -647,22 +743,45 @@ impl App {
                 self.now_playing = Some(crate::source::TrackSource::Local { track_id: id.to_string() });
             }
             Some(Resolved::Remote { url, fmt, video_id }) => {
-                if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
-                    &mut self.device_rate,
-                    crate::source::device_rate::LoadKind::Remote { sample_rate: fmt.sample_rate },
-                    self.switch_sample_rate,
-                ) {
-                    let _ = crate::audio::set_output_format(sr, bd);
-                }
-                let p = std::path::PathBuf::from(&url);
-                let _ = self.player.load(&p);
-                self.now_playing = Some(crate::source::TrackSource::Remote { video_id });
-                self.preload_next_url();
+                // Cached URL → swap in immediately.
+                self.load_remote(url, fmt, video_id);
+            }
+            Some(Resolved::Pending { video_id }) => {
+                // Cold miss: keep the previous track playing (load_track is a
+                // single next/prev load, no loop-advance) and let on_tick swap
+                // once the URL lands. resolve_source already armed both tiers.
+                self.pending_play = Some(video_id);
             }
             None => {
+                // Genuinely unresolvable (unknown local id). Remote cold misses
+                // return Pending (handled above), not None.
                 self.dead.insert(id.to_string());
             }
         }
+    }
+
+    /// Swap the player to a cached YouTube stream URL (device-rate switch →
+    /// load → set now_playing + playing_premium → preload the next track's
+    /// premium URL). Shared by the cached `Resolved::Remote` path in
+    /// `start_playback`/`load_track` and the `on_tick` cold-miss swap. mpv
+    /// loadfile accepts an https URL via the same path — PathBuf carries the
+    /// URL string verbatim.
+    fn load_remote(&mut self, url: String, fmt: crate::source::StreamFormat, video_id: String) {
+        if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
+            &mut self.device_rate,
+            crate::source::device_rate::LoadKind::Remote { sample_rate: fmt.sample_rate },
+            self.switch_sample_rate,
+        ) {
+            let _ = crate::audio::set_output_format(sr, bd);
+        }
+        let p = std::path::PathBuf::from(&url);
+        let _ = self.player.load(&p);
+        self.now_playing = Some(crate::source::TrackSource::Remote { video_id });
+        // Record whether we started at premium (256k) so a later premium URL
+        // landing mid-play swaps only if we're not already premium
+        // (progressive upgrade guard).
+        self.playing_premium = fmt.premium;
+        self.preload_next_url();
     }
 
     /// Play the track under the track-column cursor in the current view.
@@ -848,6 +967,10 @@ impl App {
     /// them. Best-effort: on failure sets `yt_error` so the Y view surfaces it.
     pub fn apply_yt_auth(&mut self, cookies: String) {
         self.yt_error = None;
+        // Pasted cookies are a distinct auth path from the browser profile;
+        // clear the saved browser so the next launch doesn't try to read a
+        // browser profile the user abandoned.
+        self.yt_browser.clear();
         if self.yt_session.is_none() {
             match crate::yt::session::Session::spawn(&self.yt_python, &self.yt_script, Some(cookies.clone())) {
                 Ok(s) => self.yt_session = Some(s),
@@ -871,6 +994,9 @@ impl App {
     /// credentials ever enter the conversation or a paste buffer.
     pub fn apply_yt_browser(&mut self, browser: String) {
         self.yt_error = None;
+        // Remember the choice so the next launch auto-connects from the same
+        // browser profile (no re-auth). Saved to state.db on clean exit.
+        self.yt_browser = browser.clone();
         if self.yt_session.is_none() {
             match crate::yt::session::Session::spawn_browser(&self.yt_python, &self.yt_script, browser.clone()) {
                 Ok(s) => self.yt_session = Some(s),
@@ -939,7 +1065,15 @@ impl App {
                 // respawned every tick into a tight loop.
                 session.note_respawn();
                 let attempts = session.respawn_attempts;
-                let browser = session.browser.clone();
+                // `yt_browser` is the source of truth (set by `:yt auth browser`,
+                // restored at startup). Fall back to the session's in-memory
+                // browser if the field was unset (e.g. session created before
+                // the field existed), then to pasted cookies, then guest.
+                let browser = if !self.yt_browser.is_empty() {
+                    Some(self.yt_browser.clone())
+                } else {
+                    session.browser.clone()
+                };
                 let respawned = match browser {
                     Some(b) => crate::yt::session::Session::spawn_browser(
                         &self.yt_python, &self.yt_script, b,
@@ -970,7 +1104,19 @@ impl App {
         }
 
         // Drain + apply async responses. Session::apply_pair already cached
-        // tracks/URLs; here we also fold the fetched lists into yt_lists.
+        // tracks/URLs; here we also fold the fetched lists into yt_lists. Take
+        // the premium-swap signal out of the session here too — it's processed
+        // AFTER the session borrow ends (it needs &mut self for the player).
+        let mut premium_swap: Option<(String, crate::yt::proto::ResolvedUrl)> = None;
+        // A cold-miss pick whose URL just landed. Staged here (needs &mut self
+        // for the player) and swapped in below, after the session borrow ends.
+        // (video_id, url, fmt).
+        let mut pending_swap: Option<(String, String, crate::source::StreamFormat)> = None;
+        // True if the pending fast resolve finished WITHOUT a URL (error / no
+        // audio) → give up the cold-miss swap (the error already surfaced via
+        // pending_errors). Don't wait the ~10s for the premium tier on a "play
+        // now" miss.
+        let mut pending_give_up = false;
         if let Some(session) = self.yt_session.as_mut() {
             session.drain_paired();
             // Pull any lists the session buffered for us.
@@ -997,17 +1143,248 @@ impl App {
                 }
                 self.yt_lists = lists;
                 self.yt_lists_loading = false;
+                // Lists were replaced; forget which had been expanded so a
+                // re-focused list re-fetches its tracks.
+                self.loaded_yt_lists.clear();
+            }
+
+            // Fold a fetched playlist's tracks into the matching YtList. The
+            // session paired the response with the list id we requested.
+            if let Some((id, vids)) = session.pending_tracks.take() {
+                // Re-arming the inflight guard lets a re-focus re-fetch only
+                // if the list genuinely changed (not every tick on an empty
+                // result). Mark the list loaded either way.
+                for l in self.yt_lists.iter_mut() {
+                    if l.id == id {
+                        l.track_ids = vids.clone();
+                    }
+                }
+                self.loaded_yt_lists.insert(id);
+            }
+
+            // Fold a completed YouTube search into the open search overlay.
+            // Only applies if the overlay is still a Youtube-scope Search whose
+            // submitted query matches — a stale response (user typed more /
+            // closed the overlay) is dropped (the tracks are still cached).
+            if let Some((q, vids)) = session.pending_search.take() {
+                // Only touch the overlay if it's actually a Search — a stale
+                // search response landing while a non-Search overlay (Help /
+                // PlaylistPicker / Command / YtAuth / Discover) is open must
+                // NOT drop that overlay. Clone + match (don't `take`) so a
+                // non-Search overlay is left untouched; a Search that isn't
+                // ours (different query / not searching / local scope) is also
+                // left as-is (the tracks are still cached in track_cache).
+                if let Some(Overlay::Search {
+                    input,
+                    results: _,
+                    cursor,
+                    scope,
+                    submitted,
+                    searching,
+                }) = self.overlay.clone()
+                {
+                    if scope == crate::tui::app::SearchScope::Youtube
+                        && submitted.as_deref() == Some(q.as_str())
+                        && searching
+                    {
+                        let results = vids;
+                        let mut cursor = cursor;
+                        if !results.is_empty() && cursor >= results.len() {
+                            cursor = results.len().saturating_sub(1);
+                        }
+                        self.overlay = Some(Overlay::Search {
+                            input, results, cursor, scope, submitted, searching: false,
+                        });
+                    }
+                    // else: not ours — leave the overlay exactly as it was.
+                }
+            }
+
+            // A sidecar error frees any "searching…/loading…" overlay state and
+            // surfaces the message in the footer (the sidecar's stderr is
+            // null'd, so this is the only error path). Without this a failed
+            // search wedged: the inflight guard never cleared, so every later
+            // Enter no-oped and the overlay stayed on "searching…" forever.
+            // Drain ALL staged errors (a Vec, so none is dropped even when two
+            // Search errors for different queries land in one cycle). For the
+            // search overlay: clear its `searching` flag ONLY when a Search
+            // error's query matches the overlay's `submitted` query (so an
+            // error for an abandoned prior query doesn't drop the current
+            // query's results, and the current query's own error DOES clear
+            // it so the overlay exits "searching…"). Surface the most relevant
+            // message in the footer: prefer the Search error matching the
+            // overlay's query, else the last error.
+            let errors = std::mem::take(&mut session.pending_errors);
+            if !errors.is_empty() {
+                let overlay_q = match &self.overlay {
+                    Some(Overlay::Search { submitted, .. }) => submitted.clone(),
+                    _ => None,
+                };
+                // Find the Search error matching the overlay's query (if any),
+                // and the last error overall (for the footer fallback).
+                let mut matching_search: Option<&(crate::yt::session::ErrorScope, String)> = None;
+                let mut last: Option<&(crate::yt::session::ErrorScope, String)> = None;
+                for er in &errors {
+                    if let (Some(q), crate::yt::session::ErrorScope::Search(err_q)) =
+                        (overlay_q.as_deref(), &er.0)
+                    {
+                        if q == err_q.as_str() {
+                            matching_search = Some(er);
+                        }
+                    }
+                    last = Some(er);
+                }
+                // Clear the overlay's searching flag if the matching Search
+                // error was found (clone + match, never take, so a non-Search
+                // overlay or a Search for a different query is left untouched).
+                if let Some((crate::yt::session::ErrorScope::Search(_), _)) = matching_search {
+                    if let Some(Overlay::Search {
+                        input,
+                        results,
+                        cursor,
+                        scope,
+                        submitted,
+                        searching: _,
+                    }) = self.overlay.clone()
+                    {
+                        self.overlay = Some(Overlay::Search {
+                            input, results, cursor, scope, submitted, searching: false,
+                        });
+                    }
+                }
+                // Footer: prefer the matching Search error's message (most
+                // relevant to what the user searched), else the last error.
+                let footer = matching_search.or(last).map(|(_, e)| e.clone());
+                if let Some(e) = footer {
+                    self.yt_error = Some(e);
+                }
+            }
+
+            // A premium (256k) URL landed for a fire-and-forget premium
+            // resolve. Take it out of the session here (we need &mut self for
+            // the player to swap) and process it below, after this block.
+            premium_swap = session.pending_premium_url.take();
+
+            // Cold-miss swap: if a pick is pending and its URL just landed,
+            // stage it for the player swap below. If the fast resolve finished
+            // with no URL (error), give up so the user isn't stuck on the
+            // spinner waiting for the slow premium tier. url_for prefers
+            // premium→fast, so a premium URL landing first also satisfies this.
+            if let Some(id) = self.pending_play.clone() {
+                if let Some(url) = session.url_for(&id) {
+                    let fmt = session
+                        .cache_fmt_for(&id)
+                        .or_else(|| session.track_for(&id).and_then(|t| t.fmt.clone()))
+                        .unwrap_or_else(|| crate::source::StreamFormat {
+                            codec: "AAC".into(),
+                            abr: 0,
+                            sample_rate: 48000,
+                            container: "m4a".into(),
+                            premium: false,
+                        });
+                    pending_swap = Some((id, url, fmt));
+                } else if !session.resolve_busy() {
+                    // Fast resolve done, no URL of either tier yet → it failed.
+                    pending_give_up = true;
+                }
             }
         }
 
-        // Keep pre-resolving the next track so gapless handoff stays warm.
+        // Progressive upgrade: a premium URL landed while we're playing the
+        // FAST (129k) stream of the SAME track. Swap the player up to 256k +
+        // resume at the current position. Guards:
+        //   - same track (premium vid == now_playing vid; else the user moved
+        //     on and the URL just caches for later),
+        //   - not near end (swapping in the last few seconds is pointless and
+        //     can race the natural end-of-track advance),
+        //   - not already premium (avoid a redundant reload that restarts
+        //     audio).
+        // Sample rate: 129k and 256k AAC are the same rate (44100/48000), so
+        // desired_switch returns None (no CoreAudio re-clock) — the
+        // once-per-session re-clock invariant is preserved. We still route
+        // through desired_switch rather than calling set_output_format
+        // directly, so a hypothetical rate change is handled safely.
+        if let Some((vid, u)) = premium_swap {
+            let same_track = matches!(
+                &self.now_playing,
+                Some(crate::source::TrackSource::Remote { video_id }) if video_id == &vid
+            );
+            if same_track && !self.playing_premium {
+                let pos = self.player.position().unwrap_or(0.0);
+                let dur = self.player.duration().unwrap_or(f64::MAX);
+                let near_end = dur.is_finite() && dur - pos < 5.0;
+                if !near_end {
+                    if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
+                        &mut self.device_rate,
+                        crate::source::device_rate::LoadKind::Remote { sample_rate: u.sample_rate },
+                        self.switch_sample_rate,
+                    ) {
+                        let _ = crate::audio::set_output_format(sr, bd);
+                    }
+                    let p = std::path::PathBuf::from(&u.url);
+                    // Resume at the captured position via mpv's `start` option
+                    // (load_at) so the premium stream begins at `pos` directly —
+                    // no from-0 replay before a seek lands.
+                    let _ = self.player.load_at(&p, pos);
+                    self.playing_premium = true;
+                    self.yt_status = Some("upgraded to AAC 256k · YT Premium".into());
+                }
+            }
+        }
+
+        // Cold-miss swap: the URL for a pending pick just landed — swap the
+        // player from the old track to it. (If the old track was still playing,
+        // this is where it stops; that's the intended "play this now" switch.)
+        if let Some((id, url, fmt)) = pending_swap {
+            self.pending_play = None;
+            self.load_remote(url, fmt, id);
+        } else if pending_give_up {
+            // Fast resolve finished without a URL — drop the pending intent.
+            // The error already surfaced to yt_error via pending_errors above;
+            // the old track either kept playing or advanced on its own.
+            self.pending_play = None;
+        }
+
+        // Lazy-load the focused YT list's tracks: the Y view's col2 + Enter/s
+        // need them, but they're only fetched on demand (spec §5.3). Skip
+        // lists already loaded (even if empty) and any fetch in flight.
+        if self.view == View::Youtube {
+            if let Some(l) = self.yt_lists.get(self.cursors.playlist).cloned() {
+                let id = l.id.clone();
+                let empty = l.track_ids.is_empty();
+                let loaded = self.loaded_yt_lists.contains(&id);
+                let inflight = self
+                    .yt_session
+                    .as_ref()
+                    .map(|s| s.playlist_loading(&id))
+                    .unwrap_or(false);
+                if empty && !loaded && !inflight {
+                    if let Some(session) = self.yt_session.as_mut() {
+                        let _ = session.send_get_playlist(id);
+                    }
+                }
+            }
+        }
+
+        // Keep pre-resolving the next track's PREMIUM url so gapless handoff
+        // stays warm (the slow 256k resolve happens during the current track).
         self.preload_next_url();
+
+        // Braille spinner: advance one frame per tick while a resolve is in
+        // flight, else freeze at 0 (returns the glyph to play/pause). ~150ms
+        // per tick (event loop POLL_TIMEOUT) ≈ 6.7fps — smooth for 10 frames.
+        if self.is_resolving() {
+            self.spinner_frame = (self.spinner_frame + 1) % 10;
+        } else {
+            self.spinner_frame = 0;
+        }
     }
 
-    /// Logout: clear cookies + respawn the sidecar guest.
+    /// Logout: clear cookies + browser choice + respawn the sidecar guest.
     pub fn yt_logout(&mut self) {
         let p = crate::yt::session::cookies_file();
         let _ = std::fs::remove_file(&p);
+        self.yt_browser.clear();
         if let Some(session) = self.yt_session.as_mut() {
             let _ = session.clear_cookies(&self.yt_python, &self.yt_script);
         }
@@ -1032,9 +1409,41 @@ impl App {
             self.play_in_context_ids(ids, &start);
             return;
         }
+        // Youtube mode (or empty local catalog): pick from the first list that
+        // has tracks loaded. `s` on a fresh Y view kicks off a load of the
+        // focused list, so a second `s` plays once it lands.
         if let Some(l) = self.yt_lists.iter().find(|l| !l.track_ids.is_empty()).cloned() {
             if let Some(id) = l.track_ids.first().cloned() {
                 self.play_in_context_ids(l.track_ids.clone(), &id);
+                return;
+            }
+        }
+        // Nothing to play yet — tell the user why instead of silently no-op'ing.
+        if self.source_mode == crate::mode::SourceMode::Youtube || self.catalog.tracks.is_empty() {
+            if self.yt_session.is_none() {
+                self.yt_error = Some("s: YouTube not configured — run :yt auth browser <chrome>".into());
+            } else if self.yt_lists.is_empty() {
+                self.yt_status = Some("s: no YouTube lists loaded yet (open the Y view with 4)".into());
+            } else {
+                // Lists present but none expanded: nudge the focused one to load.
+                if self.view != View::Youtube {
+                    self.view = View::Youtube;
+                }
+                if let Some(l) = self.yt_lists.get(self.cursors.playlist).cloned() {
+                    let id = l.id.clone();
+                    let loaded = self.loaded_yt_lists.contains(&id);
+                    let inflight = self
+                        .yt_session
+                        .as_ref()
+                        .map(|s| s.playlist_loading(&id))
+                        .unwrap_or(false);
+                    if !loaded && !inflight {
+                        if let Some(session) = self.yt_session.as_mut() {
+                            let _ = session.send_get_playlist(id);
+                        }
+                    }
+                }
+                self.yt_status = Some("s: loading the focused list — press s again in a moment".into());
             }
         }
     }
@@ -1094,8 +1503,22 @@ impl App {
     }
 
     fn simple_rand(&mut self) -> usize {
+        // Seed the counter with the wall-clock time on FIRST use so each launch
+        // starts at a different point — otherwise `s` (instant random) would
+        // pick the same opening track every launch (the counter used to start
+        // at a fixed constant). The seed is computed once and reused; the
+        // counter still advances across calls so successive `s` presses differ.
+        use std::sync::OnceLock;
+        static SEED: OnceLock<u64> = OnceLock::new();
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x9E3779B97F4A7C15);
+        let seed = *SEED.get_or_init(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E3779B97F4A7C15)
+        });
         let mut x = COUNTER.fetch_add(0x632BE59BD9B4C0A1, std::sync::atomic::Ordering::Relaxed);
+        x = x.wrapping_add(seed);
         x ^= x >> 12;
         x ^= x << 25;
         x ^= x >> 27;
@@ -1241,6 +1664,14 @@ impl App {
             self.yt_lists_loading = false;
             self.yt_error = Some(format!("refresh: {e}"));
         }
+        // Pre-warm the PREMIUM tier on the first refresh: the deno EJS nsig
+        // solver downloads once (~10s cold) and caches, and the macOS Keychain
+        // read + cookie-file write happen once here too. Warming with the
+        // premium client (not fast) means the solver download is absorbed on
+        // Y-view open — otherwise the first PREMIUM preload (next-track) would
+        // eat it during the first track. Fire-and-forget, so it never blocks;
+        // the result (for a harmless well-known video) is just discarded.
+        let _ = session.send_resolve_premium("jNQXAC9IVRw".into()); // "Me at the zoo"
     }
 
     /// Auto-continue to the next album by the same artist. Pushes the current
@@ -1333,29 +1764,11 @@ impl App {
         self.player.stop().ok();
     }
 
-    /// Run a catalog search for `q` against `self.searcher` and return the
-    /// track ids (in BM25 order, up to 50) that resolve to extant tracks in
-    /// `self.catalog.tracks`. Returns an empty `Vec` if no index is present.
-    ///
-    /// This is the single source of truth for the search overlay's `results`
-    /// field: every mutation of the overlay's `input` should be followed by a
-    /// call to [`App::update_search_results`] (which calls this internally).
-    pub fn run_search(&mut self, q: &str) -> Vec<String> {
-        // The `/` search is scoped to the active view: YouTube in the Y view,
-        // the local BM25 index otherwise (spec §5.8). The overlay form is the
-        // same either way.
-        if self.view == View::Youtube {
-            let Some(session) = self.yt_session.as_mut() else {
-                return Vec::new();
-            };
-            return session
-                .search(q, 25)
-                .ok()
-                .into_iter()
-                .flatten()
-                .map(|t| t.video_id)
-                .collect();
-        }
+    /// Run a LOCAL catalog search for `q` against `self.searcher` (BM25, up to
+    /// 50 hits) and return the track ids that resolve to extant catalog tracks.
+    /// Empty if no index is present. This is the instant, live-as-you-type path
+    /// for the search overlay's `Local` scope.
+    pub fn run_search_local(&self, q: &str) -> Vec<String> {
         let Some(searcher) = self.searcher.as_ref() else {
             return Vec::new();
         };
@@ -1371,6 +1784,21 @@ impl App {
             .collect()
     }
 
+    /// Fire-and-forget a YouTube search for `q` (the `Youtube` scope's
+    /// explicit-submit path). Non-blocking: sends one `Request::Search` and
+    /// returns immediately; `on_tick` folds the response into the open search
+    /// overlay. No-op (and surfaces a hint via `yt_error`) when there's no
+    /// session — typing locally without a configured sidecar.
+    pub fn submit_yt_search(&mut self, q: String) {
+        let Some(session) = self.yt_session.as_mut() else {
+            self.yt_error = Some("search: YouTube not configured — run :yt auth browser <chrome>".into());
+            return;
+        };
+        if let Err(e) = session.send_search(q) {
+            self.yt_error = Some(format!("search: {e}"));
+        }
+    }
+
     /// The current browse view as a stable string key, for state persistence.
     /// Keep these strings stable — `state::load_layout` parses them back into a
     /// [`View`] on the next launch, so renaming one would orphan previously-
@@ -1382,28 +1810,6 @@ impl App {
             View::Queue => "queue",
             View::Youtube => "youtube",
         }
-    }
-
-    /// If the active overlay is `Search`, re-run the search against its current
-    /// `input` and replace `results` with the fresh id list, clamping `cursor`
-    /// to the new result count. No-op for non-search overlays.
-    pub fn update_search_results(&mut self) {
-        let Some(overlay) = self.overlay.take() else {
-            return;
-        };
-        let overlay = match overlay {
-            Overlay::Search { input, results: _, mut cursor } => {
-                let ids = self.run_search(&input);
-                let results = ids;
-                if cursor >= results.len() {
-                    cursor = results.len().saturating_sub(1);
-                }
-                Overlay::Search { input, results, cursor }
-
-            }
-            other => other,
-        };
-        self.overlay = Some(overlay);
     }
 }
 

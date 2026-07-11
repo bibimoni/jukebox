@@ -24,6 +24,10 @@ pub struct Sidecar {
     _reader: Option<std::thread::JoinHandle<()>>,
     cookies: Option<String>,
     browser: Option<String>,
+    /// Persistent path the sidecar writes the decrypted browser cookies to
+    /// (via JUKEBOX_YT_COOKIES_FILE env), so the next launch can load them
+    /// without re-reading the Keychain. None for the pasted/guest path.
+    cookies_file: Option<String>,
     python: std::path::PathBuf,
     script: std::path::PathBuf,
 }
@@ -42,6 +46,7 @@ impl Sidecar {
         script: &Path,
         cookies: Option<String>,
         browser: Option<String>,
+        cookies_file: Option<String>,
     ) -> Result<Self> {
         let mut cmd = Command::new(python);
         cmd.arg(script)
@@ -49,7 +54,11 @@ impl Sidecar {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .env("JUKEBOX_YT_COOKIES", cookies.clone().unwrap_or_default())
-            .env("JUKEBOX_YT_BROWSER", browser.clone().unwrap_or_default());
+            .env("JUKEBOX_YT_BROWSER", browser.clone().unwrap_or_default())
+            .env(
+                "JUKEBOX_YT_COOKIES_FILE",
+                cookies_file.clone().unwrap_or_default(),
+            );
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning sidecar {} {}", python.display(), script.display()))?;
@@ -82,6 +91,7 @@ impl Sidecar {
             _reader: Some(reader),
             cookies,
             browser,
+            cookies_file,
             python: python.to_path_buf(),
             script: script.to_path_buf(),
         })
@@ -116,7 +126,7 @@ impl Sidecar {
     pub fn respawn(&mut self) -> Result<()> {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let new = Sidecar::spawn(&self.python, &self.script, self.cookies.clone(), self.browser.clone())?;
+        let new = Sidecar::spawn(&self.python, &self.script, self.cookies.clone(), self.browser.clone(), self.cookies_file.clone())?;
         *self = new;
         Ok(())
     }

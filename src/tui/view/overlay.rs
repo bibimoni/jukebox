@@ -34,10 +34,10 @@ use crate::tui::view::theme::Theme;
 pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(overlay) = app.overlay.clone() else { return };
     match overlay {
-        Overlay::Search { input, results, cursor } => {
-            render_search(f, area, app, &input, &results, cursor);
+        Overlay::Search { input, results, cursor, scope, submitted, searching } => {
+            render_search(f, area, app, &input, &results, cursor, scope, &submitted, searching);
         }
-        Overlay::Help => render_help(f, area),
+        Overlay::Help => render_help(f, area, app.help_scroll),
         Overlay::PlaylistPicker => render_playlist_picker(f, area, app),
         Overlay::Command { input } => render_command(f, area, &input),
         Overlay::YtAuth { input } => render_yt_auth(f, area, &input),
@@ -164,6 +164,9 @@ fn render_search(
     input: &str,
     results: &[String],
     cursor: usize,
+    scope: crate::tui::app::SearchScope,
+    submitted: &Option<String>,
+    searching: bool,
 ) {
     let theme = Theme::default();
     let popup = centered(area, 60, 60);
@@ -171,15 +174,24 @@ fn render_search(
     // Clear the popup region so browse chrome doesn't bleed through.
     f.render_widget(Clear, popup);
 
+    let title = format!(" search · {} ", scope.as_str());
     let inner = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))
-        .title(Span::styled(" search ", Style::default().fg(theme.accent)));
+        .title(Span::styled(title, Style::default().fg(theme.accent)));
     let inner_area = inner.inner(popup);
     f.render_widget(inner, popup);
 
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)])
-        .split(inner_area);
+    // Row 0: query input. Row 1: a one-line status/hint (Youtube scope only).
+    // Row 2: the results list. The status row is reserved for Youtube scope so
+    // the results list doesn't jump when the query state changes; for Local
+    // scope (instant) row 1 is blank and results fill from row 2.
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .split(inner_area);
 
     // Input line: `/ query` with a block cursor on the trailing cell.
     let input_line = Line::from(vec![
@@ -188,6 +200,40 @@ fn render_search(
         Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
     ]);
     f.render_widget(input_line, rows[0]);
+
+    // Status/hint line (Youtube scope). Local scope has no roundtrip, so it
+    // needs no "searching…" indicator — leave the row blank for stable layout.
+    let dim = Style::default().fg(theme.dim);
+    let status: Line = match scope {
+        crate::tui::app::SearchScope::Local => Line::from(Span::styled(
+            "Tab → youtube   ·   Enter plays selection",
+            dim,
+        )),
+        crate::tui::app::SearchScope::Youtube => {
+            if searching {
+                Line::from(Span::styled("searching…   (Tab → local · Esc cancel)", dim))
+            } else if input.trim().is_empty() {
+                Line::from(Span::styled(
+                    "type a query, then Enter to search   ·   Tab → local",
+                    dim,
+                ))
+            } else if results.is_empty() && submitted.as_deref() == Some(input) {
+                // A search ran and returned nothing.
+                Line::from(Span::styled("no results — edit the query or Tab → local", dim))
+            } else if submitted.as_deref() == Some(input) && !results.is_empty() {
+                Line::from(Span::styled(
+                    "↑↓ select   ·   Enter plays   ·   Tab → local",
+                    dim,
+                ))
+            } else {
+                Line::from(Span::styled(
+                    "Enter to search YouTube   ·   Tab → local",
+                    dim,
+                ))
+            }
+        }
+    };
+    f.render_widget(status, rows[1]);
 
     // Results list.
     let items: Vec<ListItem> = results
@@ -199,7 +245,7 @@ fn render_search(
     f.render_stateful_widget(
         List::new(items)
             .highlight_style(Style::default().fg(theme.hi_fg).bg(theme.accent)),
-        rows[1],
+        rows[2],
         &mut state,
     );
 }
@@ -253,16 +299,22 @@ fn help_lines<'a>() -> Vec<Line<'a>> {
     ]
 }
 
-fn render_help(f: &mut Frame, area: Rect) {
+fn render_help(f: &mut Frame, area: Rect, scroll: u16) {
     let theme = Theme::default();
-    let popup = centered(area, 64, 70);
+    let popup = centered(area, 64, 86);
     f.render_widget(Clear, popup);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))
-        .title(Span::styled(" help — press Esc to close ", Style::default().fg(theme.accent)));
-    f.render_widget(Paragraph::new(help_lines()).block(block), popup);
+        .title(Span::styled(
+            " help — j/k scroll · Esc to close ",
+            Style::default().fg(theme.accent),
+        ));
+    f.render_widget(
+        Paragraph::new(help_lines()).scroll((scroll, 0)).block(block),
+        popup,
+    );
 }
 
 // ---------------------------------------------------------------------------

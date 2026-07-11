@@ -31,6 +31,7 @@ fn layout_round_trips() {
         RepeatMode::One,
         ContinueMode::Radio,
         jukebox::mode::SourceMode::Mixed,
+        "chrome",
     )
     .unwrap();
     let loaded = load_layout_at(&path).unwrap();
@@ -41,6 +42,7 @@ fn layout_round_trips() {
     assert_eq!(loaded.repeat, "one");
     assert_eq!(loaded.continue_mode, "radio");
     assert_eq!(loaded.source_mode, "mixed");
+    assert_eq!(loaded.yt_browser, "chrome");
 }
 
 #[test]

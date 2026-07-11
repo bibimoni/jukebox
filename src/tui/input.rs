@@ -114,15 +114,27 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 
         // --- Overlays -------------------------------------------------------
         (KeyCode::Char('/'), _) => {
+            // Default the search scope to the active view: YouTube search in
+            // the Y view (explicit-submit — ytmusicapi is slow), local BM25
+            // elsewhere (instant, live). `Tab` inside the overlay toggles.
+            let scope = if app.view == crate::tui::app::View::Youtube {
+                crate::tui::app::SearchScope::Youtube
+            } else {
+                crate::tui::app::SearchScope::Local
+            };
             app.overlay = Some(Overlay::Search {
                 input: String::new(),
                 results: Vec::new(),
                 cursor: 0,
+                scope,
+                submitted: None,
+                searching: false,
             });
         }
         // `f` inline filter on the focused column (spec §5.4).
         (KeyCode::Char('f'), _) => app.toggle_filter(),
         (KeyCode::Char('?'), _) => {
+            app.help_scroll = 0;
             app.overlay = Some(Overlay::Help);
         }
         (KeyCode::Char('a'), _) => {
@@ -150,16 +162,71 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
     }
 
     match app.overlay.take() {
-        Some(Overlay::Search { mut input, mut results, mut cursor }) => {
-            // Track whether the query changed so we only re-search on mutation.
-            let mut changed = false;
+        Some(Overlay::Search {
+            mut input,
+            mut results,
+            mut cursor,
+            mut scope,
+            mut submitted,
+            mut searching,
+        }) => {
+            // Two search models, by scope:
+            //   Local  — instant: typing re-runs the BM25 index live.
+            //   Youtube — explicit-submit: typing only accumulates the query;
+            //     Enter sends ONE async request (no per-keystroke network, which
+            //     would stall the UI for ~3s/char). A second Enter on fresh
+            //     results picks the track instead of re-searching.
             match key.code {
-                // Enter picks the result under the cursor (play in context).
+                // Tab toggles scope (local ↔ youtube) so the user can search the
+                // local catalog from the Y view, or YouTube from a local view.
+                // Results are scope-specific, so clear them on toggle.
+                KeyCode::Tab => {
+                    scope = match scope {
+                        crate::tui::app::SearchScope::Local => crate::tui::app::SearchScope::Youtube,
+                        crate::tui::app::SearchScope::Youtube => crate::tui::app::SearchScope::Local,
+                    };
+                    results.clear();
+                    cursor = 0;
+                    submitted = None;
+                    searching = false;
+                    // Local is instant: run the (now-local) query immediately.
+                    if scope == crate::tui::app::SearchScope::Local && !input.is_empty() {
+                        results = app.run_search_local(&input);
+                        submitted = Some(input.clone());
+                        if cursor >= results.len() {
+                            cursor = results.len().saturating_sub(1);
+                        }
+                    }
+                }
+                // Enter: submit (Youtube dirty) or pick (results fresh) or pick
+                // (Local, where results are always live).
                 KeyCode::Enter => {
-                    if let Some(id) = results.get(cursor).cloned() {
-                        let ids = std::mem::take(&mut results);
-                        app.play_in_context_ids(ids, &id);
-                        return;
+                    if searching {
+                        // A request is already in flight; ignore.
+                    } else if scope == crate::tui::app::SearchScope::Local {
+                        if let Some(id) = results.get(cursor).cloned() {
+                            let ids = std::mem::take(&mut results);
+                            app.play_in_context_ids(ids, &id);
+                            return;
+                        }
+                    } else {
+                        // Youtube scope.
+                        let fresh = submitted.as_deref() == Some(input.as_str()) && !results.is_empty();
+                        if fresh {
+                            // Results match the current query → pick.
+                            if let Some(id) = results.get(cursor).cloned() {
+                                let ids = std::mem::take(&mut results);
+                                app.play_in_context_ids(ids, &id);
+                                return;
+                            }
+                        } else if !input.trim().is_empty() {
+                            // Dirty / never submitted → fire-and-forget search.
+                            app.submit_yt_search(input.clone());
+                            submitted = Some(input.clone());
+                            searching = true;
+                            results.clear();
+                            cursor = 0;
+                        }
                     }
                 }
                 // Arrow keys are the ONLY result navigators in the search
@@ -180,18 +247,38 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
                 {
                     input.push(c);
-                    changed = true;
+                    if scope == crate::tui::app::SearchScope::Local {
+                        // Local is instant: live-search on every keystroke.
+                        results = app.run_search_local(&input);
+                        submitted = Some(input.clone());
+                        if cursor >= results.len() {
+                            cursor = results.len().saturating_sub(1);
+                        }
+                    } else {
+                        // Youtube: typing marks the query dirty (a later
+                        // Enter re-submits). Don't touch results here — leave
+                        // the stale list visible until the user submits.
+                        searching = false;
+                        // submitted no longer matches input → next Enter submits.
+                    }
                 }
                 KeyCode::Backspace => {
                     input.pop();
-                    changed = true;
+                    if scope == crate::tui::app::SearchScope::Local {
+                        results = app.run_search_local(&input);
+                        submitted = Some(input.clone());
+                        if cursor >= results.len() {
+                            cursor = results.len().saturating_sub(1);
+                        }
+                    } else {
+                        searching = false;
+                    }
                 }
                 _ => {}
             }
-            app.overlay = Some(Overlay::Search { input, results, cursor });
-            if changed {
-                app.update_search_results();
-            }
+            app.overlay = Some(Overlay::Search {
+                input, results, cursor, scope, submitted, searching,
+            });
         }
         Some(Overlay::Command { mut input }) => {
             match key.code {
@@ -232,6 +319,33 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 _ => {}
             }
             app.overlay = Some(Overlay::YtAuth { input });
+        }
+        // Help overlay: scroll the keymap (it's taller than the popup). Esc
+        // (handled above) closes; j/k/↑/↓ scroll a line, PgUp/PgDn half a page,
+        // g/G jump to top/bottom. Any other key is a no-op.
+        Some(Overlay::Help) => {
+            // Upper bound is the content length; over-scrolling just shows
+            // blank space, so a generous constant is safe and avoids needing
+            // the rendered height here.
+            const HELP_LINES: u16 = 31;
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.help_scroll = app.help_scroll.saturating_add(1).min(HELP_LINES);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.help_scroll = app.help_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    app.help_scroll = app.help_scroll.saturating_add(10).min(HELP_LINES);
+                }
+                KeyCode::PageUp => {
+                    app.help_scroll = app.help_scroll.saturating_sub(10);
+                }
+                KeyCode::Char('g') => app.help_scroll = 0,
+                KeyCode::Char('G') => app.help_scroll = HELP_LINES,
+                _ => {}
+            }
+            app.overlay = Some(Overlay::Help);
         }
         // Help / PlaylistPicker: any non-Esc key is a no-op (overlay stays open
         // until Esc). PlaylistPicker selection routing is wired up in a later

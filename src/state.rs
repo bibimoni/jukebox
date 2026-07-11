@@ -126,6 +126,11 @@ pub struct LayoutState {
     pub continue_mode: String,
     #[serde(default = "default_local")]
     pub source_mode: String,
+    /// The browser profile to read YouTube cookies from at startup (e.g.
+    /// "chrome"), set by `:yt auth browser <name>`. Empty/guest when unset —
+    /// the sidecar then falls back to persisted pasted cookies, else guest.
+    #[serde(default)]
+    pub yt_browser: String,
 }
 
 fn default_focus() -> String {
@@ -154,6 +159,7 @@ impl Default for LayoutState {
             repeat: "off".to_string(),
             continue_mode: "off".to_string(),
             source_mode: "local".to_string(),
+            yt_browser: String::new(),
         }
     }
 }
@@ -207,6 +213,7 @@ pub fn save_layout_at(
     repeat: crate::tui::queue::RepeatMode,
     continue_mode: crate::tui::queue::ContinueMode,
     source_mode: crate::mode::SourceMode,
+    yt_browser: &str,
 ) -> Result<()> {
     let conn = open_at(path)?;
     let v = serde_json::to_string(&LayoutState {
@@ -238,6 +245,7 @@ pub fn save_layout_at(
         }
         .to_string(),
         source_mode: source_mode.as_str().to_string(),
+        yt_browser: yt_browser.to_string(),
     })?;
     conn.execute(
         "INSERT INTO state (key, value) VALUES ('layout', ?1)
@@ -302,8 +310,9 @@ pub fn save_layout(
     repeat: crate::tui::queue::RepeatMode,
     continue_mode: crate::tui::queue::ContinueMode,
     source_mode: crate::mode::SourceMode,
+    yt_browser: &str,
 ) -> Result<()> {
-    save_layout_at(&db_path(), focus, widths, volume, shuffle, repeat, continue_mode, source_mode)
+    save_layout_at(&db_path(), focus, widths, volume, shuffle, repeat, continue_mode, source_mode, yt_browser)
 }
 
 /// Load the layout from the default DB path.

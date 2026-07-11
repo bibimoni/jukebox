@@ -46,8 +46,11 @@ fn main() -> anyhow::Result<()> {
                     if venv_py.exists() { Some(venv_py) } else { None }
                 })
                 .unwrap_or_else(|| std::path::PathBuf::from("python3"));
-            // Spawn the sidecar best-effort with persisted cookies. A missing
-            // python3 / script / cookies just means YT features degrade to clean
+            // Spawn the sidecar best-effort. Auth preference is restored from
+            // state.db below (after `app` exists so we can set the field), so
+            // the initial spawn here is guest/pasted-cookies only; if a browser
+            // was saved we re-spawn with it once the layout is loaded. A missing
+            // python3/script/cookies just means YT features degrade to clean
             // stops — local playback is unaffected.
             let cookies = jukebox::yt::session::load_cookies();
             let yt_session = jukebox::yt::session::Session::spawn(&yt_python, &yt_script, cookies).ok();
@@ -93,9 +96,73 @@ fn main() -> anyhow::Result<()> {
                     _ => View::Artists,
                 };
                 app.source_mode = jukebox::mode::SourceMode::from_str(&layout.source_mode);
+                // Restore the saved browser-auth preference. We do NOT re-spawn
+                // `spawn_browser` here (that re-reads Chrome's Keychain-encrypted
+                // cookie store → a password prompt every launch). Instead the
+                // launch spawn above used `load_cookies()`, which reads the
+                // decrypted cookies `:yt auth browser` persisted to our config
+                // `cookies_file()` (0600) — no Keychain, no prompt. Only re-read
+                // the browser when that cache is missing/empty (first launch
+                // after choosing the browser, or cookies expired): then the one
+                // Keychain prompt is expected, and it re-persists the cache.
+                app.yt_browser = layout.yt_browser.clone();
+                let cached_cookies = jukebox::yt::session::load_cookies();
+                if !app.yt_browser.is_empty() && cached_cookies.is_none() {
+                    // No cached cookies yet — read from the browser now (prompt)
+                    // and persist, so future launches are prompt-free.
+                    if let Ok(s) = jukebox::yt::session::Session::spawn_browser(
+                        &app.yt_python, &app.yt_script, app.yt_browser.clone(),
+                    ) {
+                        app.yt_session = Some(s);
+                        app.yt_status = Some(format!("YT auth: connected via {}", app.yt_browser));
+                    } else {
+                        // Browser spawn failed (e.g. profile locked, deps
+                        // missing) — surface it; user can `:yt setup` / re-auth.
+                        app.yt_error = Some(format!(
+                            "could not read {} cookies — run :yt setup, or :yt auth browser {}",
+                            app.yt_browser, app.yt_browser,
+                        ));
+                        app.yt_browser.clear();
+                    }
+                } else if !app.yt_browser.is_empty() && app.yt_session.is_some() {
+                    // Cached cookies loaded — already authed, no prompt.
+                    app.yt_status = Some(format!("YT auth: connected via {}", app.yt_browser));
+                }
             }
             if let Ok(pls) = state::load_playlists() {
                 app.playlists = pls;
+            }
+
+            // Probe the YT sidecar before entering the loop: fire a real
+            // library_playlists fetch (it needs network — unlike ping, which
+            // the sidecar answers even when ytmusicapi init failed). If it
+            // can't reach YouTube (network block, VPN, rate-limit), don't strand
+            // the user in the persisted Y view staring at an empty "loading…".
+            // Fall back to Artists and surface why in the footer.
+            if app.yt_session.is_some() {
+                let mut reachable = false;
+                if let Some(s) = app.yt_session.as_mut() {
+                    // Short deadline: the sidecar's ytmusicapi init prints a
+                    // network-flavored error and sets have=False, so this fetch
+                    // returns an error fast (not a hang).
+                    match s.library_playlists() {
+                        Ok(_) => reachable = true,
+                        Err(e) => {
+                            app.yt_session = None;
+                            app.yt_error = Some(format!(
+                                "YouTube unreachable: {e}. Likely a network block, \
+                                 VPN, or IP rate-limit — check your connection. \
+                                 (Not fixed by :yt setup.)",
+                            ));
+                        }
+                    }
+                }
+                if !reachable && app.view == View::Youtube {
+                    app.view = View::Artists;
+                }
+            } else if app.view == View::Youtube {
+                // No session was ever created (no auth) — don't open on the Y view.
+                app.view = View::Artists;
             }
 
             // Apply the restored volume to the player backend so the persisted
@@ -121,6 +188,7 @@ fn main() -> anyhow::Result<()> {
                 app.transport.repeat,
                 app.transport.continue_mode,
                 app.source_mode,
+                &app.yt_browser,
             );
             let _ = state::save_playlists(&app.playlists);
         }

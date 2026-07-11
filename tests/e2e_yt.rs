@@ -51,6 +51,24 @@ fn spawn_session(script: &std::path::Path, _map: &std::path::Path) -> Session {
     Session::spawn(std::path::Path::new("python3"), script, None).unwrap()
 }
 
+/// Pump `on_tick` (with small sleeps for the sidecar reader thread to deliver
+/// responses) until `cond(app)` is true, up to `max` iterations. Returns true
+/// on success. A cold-miss pick no longer sets `now_playing` synchronously —
+/// the URL lands on the next tick — so tests pump until it does.
+fn tick_until<F>(app: &mut App, max: usize, cond: F) -> bool
+where
+    F: Fn(&App) -> bool,
+{
+    for _ in 0..max {
+        app.on_tick();
+        if cond(&*app) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
 fn local_cat() -> (tempfile::TempDir, jukebox::catalog::Catalog) {
     let d = tempfile::tempdir().unwrap();
     let lossless = d.path().join("lossless");
@@ -116,7 +134,7 @@ fn sidecar_spawn_and_search_round_trip() {
 fn sidecar_resolve_url_round_trip() {
     let (script, map) = fake_sidecar("{}");
     let mut s = spawn_session(&script, &map);
-    let u = s.resolve_url("vidZ").unwrap();
+    let u = s.resolve_url("vidZ", "fast").unwrap();
     assert_eq!(u.url, "https://x/vidZ");
     assert_eq!(u.abr, 256);
     assert!(u.premium);
@@ -134,12 +152,20 @@ fn cont_youtube_advances_via_radio_cursor() {
     app.source_mode = jukebox::mode::SourceMode::Youtube;
     app.transport.continue_mode = ContinueMode::YouTube;
     app.play_in_context_ids(vec!["yt1".into()], "yt1");
-    assert!(app.now_playing.is_some(), "yt1 should resolve+play via the fake sidecar");
-    app.next();
-    let after = app.now_playing.clone();
     assert!(
-        matches!(after, Some(TrackSource::Remote { ref video_id }) if video_id == "yt2"),
-        "CONT=YouTube should advance to yt2, got {after:?}"
+        tick_until(&mut app, 100, |a| a.now_playing.is_some()),
+        "yt1 should resolve+play via the fake sidecar (cold miss lands on tick)"
+    );
+    app.next();
+    // next() arms a cold-miss swap to yt2 (now_playing stays on yt1 until the
+    // URL lands); pump until it swaps.
+    assert!(
+        tick_until(&mut app, 100, |a| matches!(
+            a.now_playing,
+            Some(TrackSource::Remote { ref video_id }) if video_id == "yt2"
+        )),
+        "CONT=YouTube should advance to yt2, got {:?}",
+        app.now_playing
     );
     let _ = std::fs::remove_file(&script);
     let _ = std::fs::remove_file(&map);
@@ -175,4 +201,647 @@ fn refresh_then_on_tick_populates_yt_lists_and_clears_loading() {
     assert!(app.yt_lists.iter().any(|l| l.name == "Focus"), "suggested list missing");
     let _ = std::fs::remove_file(&script);
     let _ = std::fs::remove_file(&map_file);
+}
+
+#[test]
+fn focused_yt_list_lazy_loads_its_tracks_on_tick() {
+    // Regression: focusing a YT list never fetched its tracks — col2 stayed on
+    // "select a list to load its tracks", and `s`/Enter no-oped. on_tick now
+    // fire-and-forget sends get_playlist for the focused list with empty
+    // track_ids, then folds the response into the list.
+    let map = r#"{"library_playlists":"{\"ok\":true,\"data\":{\"playlists\":[{\"id\":\"PL1\",\"name\":\"Liked\",\"count\":2}]}}","home_suggestions":"{\"ok\":true,\"data\":{\"suggestions\":[]}}","get_playlist":"{\"ok\":true,\"data\":{\"tracks\":[{\"video_id\":\"v1\",\"title\":\"Song\",\"artist\":\"A\"},{\"video_id\":\"v2\",\"title\":\"Other\",\"artist\":\"B\"}]}}"}"#;
+    let (script, map_file) = fake_sidecar(map);
+    std::env::set_var("JK_FAKE_MAP", &map_file);
+    let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    app.view = jukebox::tui::app::View::Youtube;
+    app.refresh_yt_lists();
+    // Wait for the lists to land.
+    for _ in 0..100 {
+        app.on_tick();
+        if !app.yt_lists.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(app.yt_lists.len(), 1);
+    assert!(app.yt_lists[0].track_ids.is_empty(), "list starts with no tracks");
+    // The focused list (cursor 0 → PL1) has empty tracks: on_tick should
+    // fire-and-forget get_playlist, then a later tick folds the tracks in.
+    let mut loaded = false;
+    for _ in 0..100 {
+        app.on_tick();
+        if !app.yt_lists[0].track_ids.is_empty() {
+            loaded = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(loaded, "on_tick should lazy-load the focused list's tracks");
+    assert_eq!(app.yt_lists[0].track_ids, vec!["v1".to_string(), "v2".to_string()]);
+    assert!(app.loaded_yt_lists.contains("PL1"), "list marked loaded");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&map_file);
+}
+
+#[test]
+fn refresh_yt_lists_releases_playlist_inflight_so_a_refocus_can_refetch() {
+    // Regression: a successful get_playlist cleared pending_tracks but NOT
+    // playlist_inflight (only the error arm cleared it). So after a refresh
+    // replaced yt_lists + cleared loaded_yt_lists, re-focusing a list hit the
+    // `!inflight` guard as false forever → col2 wedged on "select a list…"
+    // for the rest of the session.
+    let map = r#"{"library_playlists":"{\"ok\":true,\"data\":{\"playlists\":[{\"id\":\"PL1\",\"name\":\"Liked\",\"count\":2}]}}","home_suggestions":"{\"ok\":true,\"data\":{\"suggestions\":[]}}","get_playlist":"{\"ok\":true,\"data\":{\"tracks\":[{\"video_id\":\"v1\",\"title\":\"Song\",\"artist\":\"A\"}]}}"}"#;
+    let (script, map_file) = fake_sidecar(map);
+    std::env::set_var("JK_FAKE_MAP", &map_file);
+    let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    app.view = jukebox::tui::app::View::Youtube;
+    app.refresh_yt_lists();
+    // First load: PL1 tracks land.
+    for _ in 0..100 {
+        app.on_tick();
+        if !app.yt_lists.is_empty() && !app.yt_lists[0].track_ids.is_empty() { break; }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!app.yt_lists.is_empty() && !app.yt_lists[0].track_ids.is_empty(), "first load");
+    // The inflight guard MUST have cleared on success.
+    assert!(!app.yt_session.as_ref().unwrap().playlist_loading("PL1"),
+        "playlist_inflight must clear on a successful get_playlist");
+    // Simulate a re-focus (Tab away and back, or re-entering Y view): refresh
+    // replaces the lists + clears loaded_yt_lists.
+    app.refresh_yt_lists();
+    for _ in 0..100 {
+        app.on_tick();
+        if !app.yt_lists.is_empty() && !app.yt_lists_loading { break; }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    app.loaded_yt_lists.clear(); // mirror the refresh's clear
+    assert!(app.yt_lists[0].track_ids.is_empty(), "refresh replaced the list (empty tracks)");
+    // Now on_tick must re-fetch PL1 — which requires playlist_inflight to be
+    // clear. If the guard was wedged, this loop never loads.
+    let mut reloaded = false;
+    for _ in 0..100 {
+        app.on_tick();
+        if !app.yt_lists[0].track_ids.is_empty() { reloaded = true; break; }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(reloaded, "re-focus must re-fetch the list's tracks (inflight cleared on success)");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&map_file);
+}
+
+#[test]
+fn yt_search_is_explicit_submit_and_lands_on_tick() {
+    // Regression: the `/` overlay re-ran the YouTube search on every keystroke,
+    // stalling the UI ~3s/char. Now Youtube scope is explicit-submit: typing
+    // never sends, Enter fires one async request, on_tick folds the response
+    // into the overlay. This test drives the submit + drain path directly.
+    use jukebox::tui::app::{Overlay, SearchScope};
+    let map = r#"{"search":"{\"ok\":true,\"data\":{\"search\":[{\"video_id\":\"v1\",\"title\":\"A\",\"artist\":\"X\"},{\"video_id\":\"v2\",\"title\":\"B\",\"artist\":\"Y\"}]}}"}"#;
+    let (script, map_file) = fake_sidecar(map);
+    std::env::set_var("JK_FAKE_MAP", &map_file);
+    let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    app.view = jukebox::tui::app::View::Youtube;
+    // Open the search overlay in Youtube scope with a typed query. Crucially,
+    // NO request has been sent yet (typing must not search).
+    app.overlay = Some(Overlay::Search {
+        input: "adele".into(),
+        results: Vec::new(),
+        cursor: 0,
+        scope: SearchScope::Youtube,
+        submitted: None,
+        searching: false,
+    });
+    // Submit — this sends exactly one Request::Search and marks searching.
+    app.submit_yt_search("adele".into());
+    assert!(
+        app.yt_session.as_ref().and_then(|s| s.search_inflight()).is_some(),
+        "submit should set the search in flight"
+    );
+    // Mirror the overlay state the key handler would set on Enter.
+    if let Some(Overlay::Search { submitted, searching, .. }) = app.overlay.as_mut() {
+        *submitted = Some("adele".into());
+        *searching = true;
+    }
+    // Pump on_tick until the response lands and populates the overlay.
+    let mut landed = false;
+    for _ in 0..100 {
+        app.on_tick();
+        if let Some(Overlay::Search { results, searching, .. }) = &app.overlay {
+            if !results.is_empty() && !*searching {
+                landed = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(landed, "on_tick should fold the search response into the overlay");
+    if let Some(Overlay::Search { results, searching, .. }) = &app.overlay {
+        assert_eq!(*results, vec!["v1".to_string(), "v2".to_string()]);
+        assert!(!*searching, "searching should clear once results land");
+    }
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&map_file);
+}
+
+/// A fake sidecar that BRANCHES resolve_url on `quality`: fast → AAC 129k
+/// premium=false, premium → AAC 256k premium=true. Used by the two-tier tests.
+fn fake_sidecar_two_tier() -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let p = std::env::temp_dir().join(format!("e2e-2tier-{}-{}.py", std::process::id(), n));
+    let mut f = std::fs::File::create(&p).unwrap();
+    writeln!(f, "{}", r#"
+import sys, json, time
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: req = json.loads(line)
+    except Exception: continue
+    cmd = req.get("cmd")
+    if cmd == "ping":
+        print(json.dumps({"ok": True, "data": {"pong": True}}), flush=True); continue
+    if cmd == "resolve_url":
+        vid = req.get("video_id", "")
+        q = (req.get("quality") or "fast")
+        if q == "premium":
+            # Model real timing: the premium (tv/web + nsig solver) resolve is
+            # ~10-15s, well after the ~1.3s fast tier. A short delay lets the
+            # fast URL land first so a cold-miss swap starts on the fast tier
+            # and the premium land later drives the progressive upgrade.
+            time.sleep(0.5)
+            r = {"url": "https://pre/" + vid, "expires_at": None, "codec": "AAC", "abr": 256, "sample_rate": 48000, "container": "m4a", "premium": True}
+        else:
+            r = {"url": "https://fast/" + vid, "expires_at": None, "codec": "AAC", "abr": 129, "sample_rate": 48000, "container": "m4a", "premium": False}
+        print(json.dumps({"ok": True, "data": {"resolve": r}}), flush=True); continue
+"#).unwrap();
+    (p.clone(), p) // second is unused; kept for symmetry with fake_sidecar
+}
+
+#[test]
+fn two_tier_cache_holds_both_and_prefers_premium() {
+    // Regression: the url_cache used to be Vec<(vid,url,exp)> with retain-by-vid,
+    // so a premium resolve EVICTED the fast URL. Now it holds both tiers per vid
+    // and url_for prefers premium. send_resolve_premium also signals
+    // pending_premium_url so App can swap the live stream up to 256k.
+    let (script, _map) = fake_sidecar_two_tier();
+    let mut s = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    // Fast first: caches https://fast/v, premium not yet present.
+    let fast = s.resolve_url("v", "fast").unwrap();
+    assert_eq!(fast.abr, 129);
+    assert!(!fast.premium);
+    assert_eq!(s.url_for("v").as_deref(), Some("https://fast/v"), "only fast cached → url_for returns fast");
+    assert!(s.url_for_premium("v").is_none());
+    // Premium: caches https://pre/v WITHOUT evicting fast.
+    let prem = s.resolve_url("v", "premium").unwrap();
+    assert_eq!(prem.abr, 256);
+    assert!(prem.premium);
+    assert_eq!(s.url_for("v").as_deref(), Some("https://pre/v"), "premium present → url_for prefers premium");
+    assert_eq!(s.url_for_premium("v").as_deref(), Some("https://pre/v"));
+    // The signal for App's progressive-upgrade swap was set on the premium land.
+    // (resolve_url is a sync roundtrip; apply_pair ran and set the signal.)
+    let (vid, u) = s.pending_premium_url.take().expect("premium land signals pending_premium_url");
+    assert_eq!(vid, "v");
+    assert!(u.premium);
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+fn progressive_upgrade_swaps_player_to_premium_and_resumes() {
+    // App plays the fast URL, then a premium URL lands mid-play → on_tick swaps
+    // the player to the premium URL + resumes at the captured position via
+    // load_at (mpv `start`), guarded by same-track / not-near-end /
+    // not-already-premium. No from-0 replay.
+    let (script, _map) = fake_sidecar_two_tier();
+    let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    app.view = jukebox::tui::app::View::Youtube;
+    app.source_mode = jukebox::mode::SourceMode::Youtube;
+    // Play a YT track via the fast tier. A cold miss lands on the next tick
+    // (resolve_source arms both tiers fire-and-forget + returns Pending).
+    app.play_in_context_ids(vec!["v".to_string()], "v");
+    // The StubPlayer loads the fast URL and starts at pos 0, dur 180.
+    assert!(
+        tick_until(&mut app, 100, |a| a.now_playing.is_some()),
+        "track should be playing (cold miss lands on tick)"
+    );
+    assert!(!app.playing_premium, "started on the fast (129k) tier");
+    // Advance the stub's position a little (simulate playback) so the swap has a
+    // non-zero resume point and isn't near the end.
+    app.player.seek(12.0).ok();
+    assert_eq!(app.player.position(), Some(12.0));
+    // Fire-and-forget the premium resolve; pump on_tick until the swap lands.
+    app.yt_session.as_mut().unwrap().send_resolve_premium("v".into()).unwrap();
+    let mut swapped = false;
+    for _ in 0..100 {
+        app.on_tick();
+        if app.playing_premium {
+            swapped = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(swapped, "premium land should swap the player up to 256k");
+    assert!(app.playing_premium, "playing_premium set after swap");
+    // The player resumed at the captured position (12s) via load_at (no replay).
+    assert_eq!(app.player.position(), Some(12.0), "swap must resume at the captured position");
+    // A second premium land must NOT re-swap (already premium guard).
+    app.yt_session.as_mut().unwrap().send_resolve_premium("v".into()).unwrap();
+    for _ in 0..20 {
+        app.on_tick();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Still premium, still at 12s (no redundant reload that restarts audio).
+    assert!(app.playing_premium);
+    let _ = std::fs::remove_file(&script);
+}
+
+/// A fake sidecar where `search` succeeds, `resolve_url` premium ERRORS, fast
+/// succeeds. Used to prove a background premium-preload error does NOT clear
+/// an in-flight search overlay's `searching` flag (the error-scope tag fix).
+fn fake_sidecar_error_scope() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let p = std::env::temp_dir().join(format!("e2e-errscope-{}-{}.py", std::process::id(), n));
+    let mut f = std::fs::File::create(&p).unwrap();
+    writeln!(f, "{}", r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: req = json.loads(line)
+    except Exception: continue
+    cmd = req.get("cmd")
+    if cmd == "ping":
+        print(json.dumps({"ok": True, "data": {"pong": True}}), flush=True); continue
+    if cmd == "search":
+        print(json.dumps({"ok": True, "data": {"search": [
+            {"video_id": "s1", "title": "A", "artist": "X"},
+            {"video_id": "s2", "title": "B", "artist": "Y"}
+        ]}}), flush=True); continue
+    if cmd == "resolve_url":
+        q = (req.get("quality") or "fast")
+        if q == "premium":
+            print(json.dumps({"ok": False, "error": "premium resolve rate-limited"}), flush=True)
+        else:
+            v = req.get("video_id", "")
+            print(json.dumps({"ok": True, "data": {"resolve": {"url": "https://fast/" + v, "expires_at": None, "codec": "AAC", "abr": 129, "sample_rate": 48000, "container": "m4a", "premium": False}}}), flush=True)
+        continue
+"#).unwrap();
+    p
+}
+
+#[test]
+fn premium_preload_error_does_not_drop_an_in_flight_search() {
+    // Regression: pending_error was a single Option<String> with no kind tag,
+    // and on_tick's error handler assumed every error belonged to the open
+    // search overlay. So a background premium-preload error (rate-limit) while
+    // a real search was in flight cleared the overlay's `searching` flag → the
+    // search response, when it landed, was silently dropped (searching=false
+    // meant the search-fold branch didn't populate results).
+    use jukebox::tui::app::{Overlay, SearchScope};
+    let script = fake_sidecar_error_scope();
+    let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    app.view = jukebox::tui::app::View::Youtube;
+
+    // 1. A background premium preload fires (e.g. preload_next_url) — sent
+    //    FIRST so its error response lands before the search's success.
+    app.yt_session.as_mut().unwrap().send_resolve_premium("nextVid".into()).unwrap();
+
+    // 2. The user opens the search overlay in Youtube scope + submits a query.
+    app.overlay = Some(Overlay::Search {
+        input: "adele".into(),
+        results: Vec::new(),
+        cursor: 0,
+        scope: SearchScope::Youtube,
+        submitted: Some("adele".into()),
+        searching: true,
+    });
+    app.submit_yt_search("adele".into());
+
+    // 3. Pump on_tick. The premium ERROR lands first; with the bug it would
+    //    clear the overlay's `searching` flag. Then the search success lands.
+    let mut populated = false;
+    for _ in 0..100 {
+        app.on_tick();
+        if let Some(Overlay::Search { results, searching, .. }) = &app.overlay {
+            if !results.is_empty() && !*searching {
+                populated = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(populated, "the premium-preload error must NOT drop the in-flight search's results");
+    if let Some(Overlay::Search { results, .. }) = &app.overlay {
+        assert_eq!(*results, vec!["s1".to_string(), "s2".to_string()]);
+    }
+    // The premium error was still surfaced (footer), just without touching the
+    // overlay — confirm the error message reached yt_error.
+    assert!(app.yt_error.is_some(), "premium error surfaced in the footer");
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+fn stale_search_response_does_not_drop_a_non_search_overlay() {
+    // Regression: on_tick's search-fold used self.overlay.take(), so a stale
+    // search response landing while a non-Search overlay (Help/PlaylistPicker/
+    // Command/YtAuth/Discover) was open would destruct it and never restore.
+    // Now it clones + matches, leaving a non-Search overlay untouched.
+    use jukebox::tui::app::Overlay;
+    let map = r#"{"search":"{\"ok\":true,\"data\":{\"search\":[{\"video_id\":\"s1\",\"title\":\"A\",\"artist\":\"X\"}]}}"}"#;
+    let (script, map_file) = fake_sidecar(map);
+    std::env::set_var("JK_FAKE_MAP", &map_file);
+    let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    app.view = jukebox::tui::app::View::Youtube;
+
+    // Fire a search (in flight), then close it + open Help — simulating the
+    // user hitting Esc then `?` while the search response is still pending.
+    app.submit_yt_search("adele".into());
+    app.overlay = None; // Esc
+    app.overlay = Some(Overlay::Help); // user opens help
+
+    // Pump on_tick until the search response lands (it would, with the bug,
+    // drop the Help overlay). The Help overlay must survive.
+    let help_survived = (0..100).all(|_| {
+        app.on_tick();
+        matches!(app.overlay, Some(Overlay::Help))
+    });
+    assert!(help_survived, "a stale search response must NOT drop the Help overlay");
+    assert!(matches!(app.overlay, Some(Overlay::Help)), "Help still open after search lands");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&map_file);
+}
+
+#[test]
+fn search_error_keeps_search_scope_when_other_error_drains_same_cycle() {
+    // Regression: pending_error was a single slot; a Search error drained
+    // before an Other error in one drain_paired cycle was overwritten, losing
+    // the Search scope tag → the search overlay's `searching` flag wouldn't
+    // clear on a Search failure. Now set_error keeps a pending Search error.
+    use jukebox::yt::session::ErrorScope;
+    let script = fake_sidecar_error_scope();
+    let s = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    // This fake's search SUCCEEDS; for this test we want two ERRORS, so use a
+    // fake that errors on BOTH search and premium resolve (below).
+    drop(s);
+    // Use a fake whose search AND premium both error.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let p = std::env::temp_dir().join(format!("e2e-botherr-{}-{}.py", std::process::id(), n));
+    std::fs::write(&p, r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: req = json.loads(line)
+    except Exception: continue
+    cmd = req.get("cmd")
+    if cmd == "ping":
+        print(json.dumps({"ok": True, "data": {"pong": True}}), flush=True); continue
+    if cmd == "search":
+        print(json.dumps({"ok": False, "error": "search failed"}), flush=True); continue
+    if cmd == "resolve_url":
+        print(json.dumps({"ok": False, "error": "premium failed"}), flush=True); continue
+"#).unwrap();
+    let mut s = Session::spawn(std::path::Path::new("python3"), &p, None).unwrap();
+    // Fire a search, then a premium resolve (FIFO: search error first, then
+    // premium error). Both responses are read by the sidecar's reader thread;
+    // we wait until BOTH have landed, then drain them in ONE drain_paired
+    // cycle (the bug only manifests when both apply in the same cycle: the
+    // second/Other error used to overwrite the first/Search one).
+    s.send_search("q".into()).unwrap();
+    s.send_resolve_premium("v".into()).unwrap();
+    // Give the reader thread time to buffer both responses.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Drain both in one cycle — apply_pair runs Search-err then Other-err.
+    s.drain_paired();
+    // The pending_errors (Vec) must contain the SEARCH-scoped error (not
+    // dropped by the Other error; both staged). The Search one is what tells
+    // on_tick to clear the overlay's searching flag.
+    let errs = std::mem::take(&mut s.pending_errors);
+    assert!(errs.iter().any(|(sc, _)| matches!(sc, ErrorScope::Search(_))),
+        "Search error staged (not clobbered/dropped by the Other error): {:?}", errs);
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn second_search_does_not_steal_the_first_searchs_results() {
+    // Regression: search_inflight was a single slot, so a second search's
+    // query overwrote the first's tag. apply_pair tagged the FIRST response
+    // with the LATEST query → the user searched "adeles" but got "adele"'s
+    // results, and "adeles"'s real results were silently dropped. Now the
+    // query rides in Pending::Search(q), so each response is tagged correctly.
+    use jukebox::tui::app::{Overlay, SearchScope};
+    // Fake sidecar: search returns results keyed on the query so we can tell
+    // which query's results landed.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let p = std::env::temp_dir().join(format!("e2e-2search-{}-{}.py", std::process::id(), n));
+    std::fs::write(&p, r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: req = json.loads(line)
+    except Exception: continue
+    cmd = req.get("cmd")
+    if cmd == "ping":
+        print(json.dumps({"ok": True, "data": {"pong": True}}), flush=True); continue
+    if cmd == "search":
+        q = req.get("q", "")
+        # Echo the query into the first result's id so the test can tell which
+        # query's results these are.
+        print(json.dumps({"ok": True, "data": {"search": [
+            {"video_id": "first:" + q, "title": q, "artist": "X"}
+        ]}}), flush=True); continue
+"#).unwrap();
+    let session = Session::spawn(std::path::Path::new("python3"), &p, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    app.view = jukebox::tui::app::View::Youtube;
+
+    // Submit "adele", then — while it's still in flight — submit "adeles".
+    app.overlay = Some(Overlay::Search {
+        input: "adele".into(), results: Vec::new(), cursor: 0,
+        scope: SearchScope::Youtube, submitted: Some("adele".into()), searching: true,
+    });
+    app.submit_yt_search("adele".into());
+    // Second search: change the query + submit.
+    app.overlay = Some(Overlay::Search {
+        input: "adeles".into(), results: Vec::new(), cursor: 0,
+        scope: SearchScope::Youtube, submitted: Some("adeles".into()), searching: true,
+    });
+    app.submit_yt_search("adeles".into());
+
+    // Pump on_tick. Both responses land (FIFO: adele first, then adeles). With
+    // the bug, adele's response would be tagged "adeles" and adeles's response
+    // dropped (search_inflight taken by adele). Now each is tagged correctly:
+    // the overlay (submitted="adeles") gets ADELES's results.
+    let mut got_adeles = false;
+    for _ in 0..100 {
+        app.on_tick();
+        if let Some(Overlay::Search { results, .. }) = &app.overlay {
+            if results.iter().any(|r| r == "first:adeles") {
+                got_adeles = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(got_adeles, "the overlay (submitted=adeles) must get ADELES's results, not adele's");
+    // And adele's results must NOT be shown as adeles's (the bug's symptom).
+    if let Some(Overlay::Search { results, .. }) = &app.overlay {
+        assert!(!results.iter().any(|r| r == "first:adele"),
+            "adele's results must not be mislabeled as adeles's");
+    }
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn prior_querys_search_error_does_not_drop_current_querys_results() {
+    // Regression: a Search error carried no query tag, so on_tick cleared the
+    // overlay's `searching` flag for ANY Search error. If the error was for an
+    // ABANDONED prior query ("adele") while "adeles" was still in flight, the
+    // flag was cleared → "adeles"'s success landed into searching=false and
+    // was dropped. Now the error carries its query and on_tick only clears the
+    // flag when it matches the overlay's `submitted` query.
+    use jukebox::tui::app::{Overlay, SearchScope};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let p = std::env::temp_dir().join(format!("e2e-errthenok-{}-{}.py", std::process::id(), n));
+    // search for "adele" ERRORS; search for "adeles" SUCCEEDS with id "first:adeles".
+    std::fs::write(&p, r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: req = json.loads(line)
+    except Exception: continue
+    cmd = req.get("cmd")
+    if cmd == "ping":
+        print(json.dumps({"ok": True, "data": {"pong": True}}), flush=True); continue
+    if cmd == "search":
+        q = req.get("q", "")
+        if q == "adele":
+            print(json.dumps({"ok": False, "error": "adele rate-limited"}), flush=True)
+        else:
+            print(json.dumps({"ok": True, "data": {"search": [
+                {"video_id": "first:" + q, "title": q, "artist": "X"}
+            ]}}), flush=True)
+        continue
+"#).unwrap();
+    let session = Session::spawn(std::path::Path::new("python3"), &p, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    app.view = jukebox::tui::app::View::Youtube;
+
+    // Submit "adele" (will error), then abandon it + submit "adeles" (will succeed).
+    app.submit_yt_search("adele".into());
+    app.overlay = Some(Overlay::Search {
+        input: "adele".into(), results: Vec::new(), cursor: 0,
+        scope: SearchScope::Youtube, submitted: Some("adele".into()), searching: true,
+    });
+    app.submit_yt_search("adeles".into());
+    app.overlay = Some(Overlay::Search {
+        input: "adeles".into(), results: Vec::new(), cursor: 0,
+        scope: SearchScope::Youtube, submitted: Some("adeles".into()), searching: true,
+    });
+
+    // Pump on_tick. FIFO: adele's ERROR lands first (would clear searching with
+    // the bug), then adeles's SUCCESS. With the fix, the error (query="adele")
+    // does NOT match submitted="adeles", so searching stays true and adeles's
+    // results populate.
+    let mut got_adeles = false;
+    for _ in 0..100 {
+        app.on_tick();
+        if let Some(Overlay::Search { results, .. }) = &app.overlay {
+            if results.iter().any(|r| r == "first:adeles") { got_adeles = true; break; }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(got_adeles, "adeles's results must show despite adele's stale error clearing searching");
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn both_queries_erroring_in_one_cycle_clears_the_current_querys_searching() {
+    // Regression: pending_error was a single slot and set_error kept the FIRST
+    // Search error, dropping the second. So if BOTH "adele" and "adeles"
+    // errored in one drain cycle, the second (adeles — the overlay's current
+    // query) was dropped at staging time → on_tick never saw it → searching
+    // stayed true forever (wedge) AND the footer showed adele's error while the
+    // user searched adeles. Now pending_errors is a Vec (nothing dropped);
+    // on_tick matches the overlay's submitted query and clears searching for it.
+    use jukebox::tui::app::{Overlay, SearchScope};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let p = std::env::temp_dir().join(format!("e2e-botherr2-{}-{}.py", std::process::id(), n));
+    // BOTH searches error.
+    std::fs::write(&p, r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: req = json.loads(line)
+    except Exception: continue
+    cmd = req.get("cmd")
+    if cmd == "ping":
+        print(json.dumps({"ok": True, "data": {"pong": True}}), flush=True); continue
+    if cmd == "search":
+        q = req.get("q", "")
+        print(json.dumps({"ok": False, "error": q + " rate-limited"}), flush=True); continue
+"#).unwrap();
+    let session = Session::spawn(std::path::Path::new("python3"), &p, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(cat, Box::new(jukebox::player::StubPlayer::default()), None, Some(session));
+    app.view = jukebox::tui::app::View::Youtube;
+
+    // Submit "adele", then abandon it + submit "adeles". Both will error.
+    app.submit_yt_search("adele".into());
+    app.overlay = Some(Overlay::Search {
+        input: "adele".into(), results: Vec::new(), cursor: 0,
+        scope: SearchScope::Youtube, submitted: Some("adele".into()), searching: true,
+    });
+    app.submit_yt_search("adeles".into());
+    app.overlay = Some(Overlay::Search {
+        input: "adeles".into(), results: Vec::new(), cursor: 0,
+        scope: SearchScope::Youtube, submitted: Some("adeles".into()), searching: true,
+    });
+
+    // Pump on_tick until both errors land in one drain cycle (the reader thread
+    // buffers both). With the bug, searching would stay true forever (the
+    // adeles error was dropped). Now it must clear (adeles's error matches).
+    let mut searching_cleared = false;
+    for _ in 0..100 {
+        app.on_tick();
+        if let Some(Overlay::Search { submitted, searching, .. }) = &app.overlay {
+            if submitted.as_deref() == Some("adeles") && !*searching {
+                searching_cleared = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(searching_cleared, "the current query (adeles) error must clear searching, not wedge");
+    // And the footer must show ADELES's error (the relevant one), not adele's.
+    assert!(app.yt_error.as_deref().is_some_and(|e| e.contains("adeles")),
+        "footer shows adeles's error: {:?}", app.yt_error);
+    let _ = std::fs::remove_file(&p);
 }

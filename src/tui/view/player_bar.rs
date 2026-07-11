@@ -25,14 +25,32 @@ use crate::tui::app::App;
 use crate::tui::queue::{ContinueMode, RepeatMode, ShuffleMode};
 use crate::tui::view::theme::{quality_color, Theme};
 
+/// Braille spinner frames (U+2800–28FF, width 1) — the same set Claude Code's
+/// CLI uses. Animated in `App::on_tick` while a YouTube resolve is in flight.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 /// Compact 1-row player bar for the narrow (60–80 col) fallback: now-playing +
 /// quality + flags all on one line, no gauge (spec §5.6).
 pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
     let theme = Theme::default();
     let dim = Style::default().fg(theme.dim);
     let text = Style::default().fg(theme.text);
-    let play_glyph = if app.player.is_playing() { "⏸" } else { "▶" };
-    let mut spans: Vec<Span<'static>> = vec![Span::styled(format!("{play_glyph} "), text)];
+    let resolving = app.is_resolving();
+    let play_glyph = if resolving {
+        SPINNER[app.spinner_frame as usize % SPINNER.len()]
+    } else if app.player.is_playing() {
+        "⏸"
+    } else {
+        "▶"
+    };
+    // Accent (Cyan) while resolving — an attention/progress signal — else the
+    // normal text color. Both auto-degrade to Reset under NO_COLOR (theme).
+    let glyph_style = if resolving {
+        Style::default().fg(theme.accent)
+    } else {
+        text
+    };
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(format!("{play_glyph} "), glyph_style)];
 
     match app.now_playing_view() {
         Some(v) => {
@@ -131,11 +149,23 @@ fn build_info_line(app: &App, _width: usize) -> Line<'static> {
     let text = Style::default().fg(theme.text);
 
     let playing = app.player.is_playing();
-    let play_glyph = if playing { "⏸" } else { "▶" };
+    let resolving = app.is_resolving();
+    let play_glyph = if resolving {
+        SPINNER[app.spinner_frame as usize % SPINNER.len()]
+    } else if playing {
+        "⏸"
+    } else {
+        "▶"
+    };
+    let glyph_style = if resolving {
+        Style::default().fg(theme.accent)
+    } else {
+        text
+    };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
 
-    spans.push(Span::styled(format!("{play_glyph} "), text));
+    spans.push(Span::styled(format!("{play_glyph} "), glyph_style));
 
     // Now-playing: title — artist · album (or a dim placeholder).
     match app.now_playing_view() {
