@@ -15,6 +15,33 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 
+/// Open a `Stdio` for the sidecar's stderr that captures it to a bounded log
+/// file (`~/.cache/jukebox/sidecar.log`) instead of discarding it. The log is
+/// truncated at 1 MiB before each spawn so it can't grow unbounded across
+/// sessions (one-level rotation like `jukebox.log`). Falls back to
+/// `Stdio::null()` if the cache dir isn't available or the file can't be
+/// opened — never blocks spawn. AC-M5.3.1.
+fn sidecar_stderr() -> Result<Stdio> {
+    let Some(cache) = dirs::cache_dir() else {
+        return Ok(Stdio::null());
+    };
+    let log_dir = cache.join("jukebox");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let path = log_dir.join("sidecar.log");
+    // Bounded: truncate if the previous session left a >1 MiB file.
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 1024 * 1024 {
+            let _ = std::fs::write(&path, b"");
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| anyhow!("opening sidecar log {path:?}: {e}"))?;
+    Ok(Stdio::from(file))
+}
+
 pub struct Sidecar {
     child: Child,
     stdin: std::process::ChildStdin,
@@ -52,7 +79,7 @@ impl Sidecar {
         cmd.arg(script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(sidecar_stderr()?)
             .env("JUKEBOX_YT_COOKIES", cookies.clone().unwrap_or_default())
             .env("JUKEBOX_YT_BROWSER", browser.clone().unwrap_or_default())
             .env(

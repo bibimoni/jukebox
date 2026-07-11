@@ -164,6 +164,12 @@ pub enum Overlay {
         /// result if `App::lyrics_gen` has advanced past it.
         gen: u64,
     },
+    /// Diagnostics overlay (`:diag` or `D`): a scrollable list of recent
+    /// diagnostic messages (provider errors, respawn notices) captured by
+    /// [`crate::diagnostics::Diagnostics`]. Unit variant — the buffer lives
+    /// on `App::diagnostics`; this just signals "show it". Esc closes (handled
+    /// generically at the top of the key handler).
+    Diagnostics,
 }
 
 /// The lifecycle state of the lyrics overlay. Distinct from `Overlay::Lyrics`
@@ -349,6 +355,15 @@ pub struct App {
     /// the `RadioCursor` + start playback. Non-blocking auto-advance: the old
     /// track stays current until the next track's id lands.
     pub pending_radio_seed: Option<String>,
+
+    /// Pending background audio format switch (non-blocking). Set by
+    /// `start_playback`/`load_track`/`load_remote` when a device-rate
+    /// switch is needed; the blocking CoreAudio call runs on a detached
+    /// thread so the input loop never freezes. `on_tick` polls
+    /// `is_finished()` for best-effort cleanup. The player loads
+    /// immediately (fire-and-forget) — the device re-clocks when the
+    /// format lands (AC-M9.2.4).
+    audio_switch_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Inline filter state for the `f` filter-on-focused-column (spec §5.4).
@@ -545,6 +560,7 @@ impl App {
             discover_loading: false,
             pending_discover_play: None,
             pending_radio_seed: None,
+            audio_switch_handle: None,
         }
     }
 
@@ -791,7 +807,8 @@ impl App {
                         },
                         self.switch_sample_rate,
                     ) {
-                        let _ = crate::audio::set_output_format(sr, bd);
+                        self.audio_switch_handle =
+                            Some(crate::audio::set_output_format_async(sr, bd));
                     }
                     let _ = self.player.load(&path);
                     self.now_playing = Some(crate::source::TrackSource::Local { track_id: id });
@@ -954,7 +971,7 @@ impl App {
                     },
                     self.switch_sample_rate,
                 ) {
-                    let _ = crate::audio::set_output_format(sr, bd);
+                    self.audio_switch_handle = Some(crate::audio::set_output_format_async(sr, bd));
                 }
                 let _ = self.player.load(&path);
                 self.now_playing = Some(crate::source::TrackSource::Local {
@@ -993,7 +1010,7 @@ impl App {
             },
             self.switch_sample_rate,
         ) {
-            let _ = crate::audio::set_output_format(sr, bd);
+            self.audio_switch_handle = Some(crate::audio::set_output_format_async(sr, bd));
         }
         let p = std::path::PathBuf::from(&url);
         let _ = self.player.load(&p);
@@ -1353,6 +1370,17 @@ impl App {
     /// - apply drained async responses (refresh lists → yt_lists, pre-resolve
     ///   → url_cache; Search/Tracks caching happens in Session::apply_pair).
     pub fn on_tick(&mut self) {
+        // Drain a completed background audio format switch (best-effort
+        // cleanup — the thread already did the blocking CoreAudio work; we
+        // just join + drop the handle so it doesn't leak). If the thread
+        // is still running, put the handle back (it'll be joined on a
+        // later tick). Non-blocking: `is_finished()` never blocks
+        // (AC-M9.2.4).
+        if let Some(handle) = self.audio_switch_handle.take() {
+            if !handle.is_finished() {
+                self.audio_switch_handle = Some(handle);
+            }
+        }
         // Notification TTL (Slice 7): clear a stale transient `yt_status` after
         // 5s so the footer returns to the hint bar / state label instead of
         // lingering on a one-shot message (e.g. "upgraded to AAC 256k",
@@ -1850,7 +1878,8 @@ impl App {
                         },
                         self.switch_sample_rate,
                     ) {
-                        let _ = crate::audio::set_output_format(sr, bd);
+                        self.audio_switch_handle =
+                            Some(crate::audio::set_output_format_async(sr, bd));
                     }
                     let p = std::path::PathBuf::from(&u.url);
                     // Resume at the captured position via mpv's `start` option
@@ -2036,6 +2065,9 @@ impl App {
         self.discover_loading = false;
         self.pending_discover_play = None;
         self.pending_radio_seed = None;
+        // Drop a pending audio format switch handle (the thread detaches
+        // and completes on its own — best-effort, no blocking).
+        self.audio_switch_handle = None;
         // Also clear the disk cache so the next launch doesn't show the
         // logged-out account's playlists.
         crate::yt::cache::clear_yt_lists();

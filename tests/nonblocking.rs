@@ -297,3 +297,29 @@ fn cont_youtube_auto_advance_non_blocking() {
     let _ = std::fs::remove_file(&script);
     let _ = std::fs::remove_file(&map_file);
 }
+
+/// Audio format switch doesn't block the input loop ≥100ms (AC-M9.2.4).
+/// `set_output_format_async` spawns a background thread and returns
+/// immediately, so a device-rate switch never freezes the TUI. The
+/// synchronous `set_output_format` can take ~310ms (format-verify
+/// polling + settle sleep); the async wrapper should return in <1ms
+/// (thread spawn overhead only).
+#[test]
+fn audio_switch_does_not_block_input() {
+    // The async variant returns immediately (the blocking work runs on
+    // a spawned thread). Time the call — it must be well under 100ms.
+    let start = std::time::Instant::now();
+    let handle = jukebox::audio::set_output_format_async(96000, 24);
+    let elapsed = start.elapsed();
+
+    // Spawning a thread + returning should take <100ms (typically <1ms).
+    // The actual format switch (up to 310ms on macOS) runs on the thread.
+    assert!(
+        elapsed < std::time::Duration::from_millis(100),
+        "set_output_format_async took {elapsed:?} — should return immediately (<100ms)"
+    );
+
+    // Wait for the background thread to finish (clean up — don't leave
+    // orphaned threads that could interfere with other tests).
+    let _ = handle.join();
+}

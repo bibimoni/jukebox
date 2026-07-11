@@ -178,6 +178,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // Shows loading → available (synced/plain) / not found / error, with
         // synced-line highlighting by player.position(). `L` again (or Esc) closes.
         (KeyCode::Char('L'), _) => app.toggle_lyrics(),
+        // `D` opens the diagnostics overlay (recent provider errors, respawn
+        // notices, sidecar failures). Esc closes. Also reachable via `:diag`.
+        (KeyCode::Char('D'), _) => {
+            app.overlay = Some(Overlay::Diagnostics);
+        }
 
         // --- Quit -----------------------------------------------------------
         (KeyCode::Char('q'), _) => app.quit(),
@@ -651,6 +656,15 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 gen,
             });
         }
+        Some(Overlay::Diagnostics) => {
+            // Esc closes the diagnostics overlay; all other keys are
+            // swallowed (no interaction while the diag list is open).
+            if key.code == KeyCode::Esc {
+                app.overlay = None;
+                return;
+            }
+            app.overlay = Some(Overlay::Diagnostics);
+        }
         None => {}
     }
 }
@@ -717,6 +731,11 @@ fn execute_command(app: &mut App, cmd: &str) {
         "queue clear" => {
             app.transport.clear_queue();
             app.yt_status = Some("queue cleared".into());
+        }
+        // `:diag` — open the diagnostics overlay (recent provider errors,
+        // respawn notices, sidecar failures). Esc closes (generic handler).
+        "diag" => {
+            app.overlay = Some(Overlay::Diagnostics);
         }
         // `:q` / `:quit` — quit the app (same as the `q` keybinding).
         "q" | "quit" => {

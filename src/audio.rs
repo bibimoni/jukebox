@@ -39,6 +39,26 @@ mod inner {
         Ok(())
     }
 
+    /// Fire-and-forget format switch: spawns a background thread to call
+    /// [`set_output_format`] so the caller (the TUI input loop) never blocks.
+    /// The synchronous `set_output_format` can take up to ~310ms (format
+    /// verify polling + settle sleep); this wrapper returns immediately
+    /// (typically <1ms) and the blocking work runs on a detached thread.
+    ///
+    /// Returns a [`JoinHandle<()>`] the caller may poll on `on_tick` for
+    /// best-effort cleanup. The handle can also be dropped (fire-and-forget)
+    /// — the thread runs to completion independently either way. Errors
+    /// are swallowed by the thread (best-effort switch; a failed switch
+    /// doesn't crash the TUI) (AC-M9.2.4).
+    pub fn set_output_format_async(
+        sample_rate_hz: u32,
+        bit_depth: u32,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let _ = set_output_format(sample_rate_hz, bit_depth);
+        })
+    }
+
     /// Snapshot of the default output device's stream + its current physical
     /// format, captured up-front so jukebox can restore it on exit (or after a
     /// crash) and leave the user's device the way it found it. Best-effort:
@@ -438,6 +458,17 @@ mod inner {
         Ok(())
     }
 
+    /// Non-macOS: the sync version is already a no-op, so the async wrapper
+    /// just spawns a thread that returns immediately. This keeps the API
+    /// uniform across platforms (tests on Linux CI exercise the same code
+    /// path as macOS).
+    pub fn set_output_format_async(
+        _sample_rate_hz: u32,
+        _bit_depth: u32,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(|| {})
+    }
+
     /// No-op capture on non-macOS: there's nothing to restore, so `None`.
     pub struct CapturedFormat;
     pub fn capture_default_format() -> Option<CapturedFormat> {
@@ -446,4 +477,7 @@ mod inner {
     pub fn restore_output_format(_fmt: Option<CapturedFormat>) {}
 }
 
-pub use inner::{capture_default_format, restore_output_format, set_output_format, CapturedFormat};
+pub use inner::{
+    capture_default_format, restore_output_format, set_output_format, set_output_format_async,
+    CapturedFormat,
+};

@@ -398,3 +398,44 @@ Result: 8 compile errors (E0532 ×2, E0124 ×1, E0062 ×2, E0308 ×3) — all in
 - No security issues (no hardcoded secrets; no debug logging)
 - S3.1 yt.py pagination approach is sound (delegating to ytmusicapi limit=None is the idiomatic path; comments explain the fallback for the intermittent singleColumnBrowseResultsRenderer parser failure)
 - The premature [x] marks violated the rule that ONLY Reviewer marks [x] — Commander should reinforce this with Workers
+
+## Reviewer Verification — Slice 7 Unit Review (2026-07-12T03:05)
+**Scope:** Slice 7 (M5 Feedback, logging, diagnostics) unit verification — ses_s7
+**Verdict:** CONDITIONAL FAIL — 5 of 7 leaf tasks PASS (S7.1, S7.3, S7.5, S7.6, S7.7); 2 DEFECT (S7.2 diagnostics overlay not wired, S7.4 sidecar stderr still nulled); S7.R FAIL. todo.md [x] marks REVERTED for S7.2/S7.4/S7.R. Slice 7 status changed from completed→in_progress. No prior Reviewer verification existed for Slice 7 (the [x] marks were placed by the Worker).
+
+### Gate Evidence (all PASS)
+| Gate | Command | Result |
+|------|---------|--------|
+| fmt | cargo fmt --check | ✅ PASS (exit 0) |
+| clippy | cargo clippy --all-targets --all-features -- -D warnings | ✅ PASS (exit 0) |
+| test (full) | cargo test --all-features | ✅ PASS — 358 passed, 0 failed |
+| test (feedback) | cargo test --test feedback | ✅ PASS — 5/5 (status_auto_clears, status_within_ttl_is_kept, status_dedup_does_not_refresh_ttl, no_secret_in_logs, diagnostics_capture) |
+| test (diagnostics lib) | cargo test --lib diagnostics | ✅ PASS — 3/3 (push_and_read_back, evicts_oldest_when_full, default_is_empty) |
+| bats | bats scripts/test/*.bats | ✅ PASS — 30/30 |
+| build --release | cargo build --release | ✅ PASS (exit 0) |
+
+### Sub-task Evidence
+| Task | File(s) | Check | Result |
+|------|---------|-------|--------|
+| S7.1 | cli.rs L28-50, main.rs L12+L79 | Verbosity enum + from_flags + -v/-q wired | ✅ PASS — AC-M5.1.1 MET |
+| S7.2 | diagnostics.rs, view/diagnostics.rs, input.rs:704-748, app.rs:107-166 | :diag view accessible | ❌ DEFECT — buffer+render exist BUT `:diag` NOT wired: no handler in execute_command, no Overlay::Diagnostics variant, render() never called from layout, no D key; user CANNOT access overlay; AC-M5.1.2 NOT MET |
+| S7.3 | app.rs L328,L332,L1362-1381 | notification TTL + dedup | ✅ PASS — 5s TTL clear + dedup via last_notification; 3 tests PASS; AC-M5.2.1+M5.2.2 MET |
+| S7.4 | sidecar.rs L55 | stderr to bounded log | ❌ DEFECT — still `Stdio::null()`; file NOT modified (not in git diff); AC-M5.3.1 NOT MET |
+| S7.5 | event.rs L103-177 | redact + log_to_file + rotation | ✅ PASS (with deviation) — DEVIATION: src/redact.rs NOT created (redact in event.rs); redact() handles 4 markers; 1 MiB rotation; wired in event loop L341-346; no_secret_in_logs PASS; AC-M5.3.2 MET; AC-M5.3.3 NOT MET (no rotation test) |
+| S7.6 | proto.rs L228-232 | sanitize unrecognized response | ✅ PASS — truncates to 200 chars to prevent cookie leakage |
+| S7.7 | tests/feedback.rs (171 lines) | 5 feedback tests | ✅ PASS — all 5 PASS; NB: missing log_rotation_bounded (AC-M5.3.3) |
+| S7.R | — | named tests pass | ❌ FAIL — 5/7 leaf PASS; 2 DEFECT; named tests DO pass but S7.2+S7.4 defects block |
+
+### Defects → SYNC-20, SYNC-21, SYNC-22
+1. SYNC-20 (HIGH): Diagnostics overlay NOT wired — `:diag` command, Overlay::Diagnostics, layout render, D key ALL missing
+2. SYNC-21 (MED): sidecar.rs stderr still `Stdio::null()` — never modified, AC-M5.3.1 NOT MET
+3. SYNC-22 (LOW): No log_rotation_bounded test (AC-M5.3.3) + no "see :diag" in error strings (AC-M5.4.1)
+
+### False-Claim Alert
+The Worker marked ALL 8 Slice 7 items as [x] in todo.md, but NO prior Reviewer verification existed. Reviewer REVERTED [x] → [ ] for S7.2 (overlay not wired), S7.4 (sidecar stderr not modified), S7.R (defects block). S7.1, S7.3, S7.5, S7.6, S7.7 remain [x] (independently verified with evidence). Slice 7 status changed from "completed"→"in_progress".
+
+### Code Quality (PASS)
+- Architecture: diagnostics.rs follows existing patterns (bounded buffer, doc comments, inline tests)
+- Security: redact() is byte-level char-boundary-safe, handles 4 secret markers; no hardcoded secrets
+- Modularity: diagnostics buffer separate from rendering (good layer separation)
+- Deviation: src/redact.rs not created as separate file (redact in event.rs) — functionally equivalent

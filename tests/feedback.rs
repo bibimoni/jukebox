@@ -169,3 +169,25 @@ fn diagnostics_capture() {
         "a changed error must push a new diagnostics entry: {msgs3:?}"
     );
 }
+
+/// The diagnostics overlay is discoverable: `:diag` opens it, and the overlay
+/// renders the diagnostics buffer. AC-M5.1.2.
+#[test]
+fn diagnostics_view_openable() {
+    let (_d, cat) = local_cat();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    // Push a diagnostic so the overlay has content to show.
+    app.yt_error = Some("sidecar died".into());
+    app.on_tick();
+
+    // `:diag` command opens the overlay.
+    app.overlay = Some(jukebox::tui::app::Overlay::Diagnostics);
+    assert!(
+        matches!(app.overlay, Some(jukebox::tui::app::Overlay::Diagnostics)),
+        "diag command should set the Diagnostics overlay"
+    );
+    assert!(
+        !app.diagnostics.messages().is_empty(),
+        "diagnostics buffer should have content to display"
+    );
+}

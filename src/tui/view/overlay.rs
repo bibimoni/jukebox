@@ -61,6 +61,9 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
             scroll,
             ..
         } => render_lyrics_overlay(f, area, app, content.as_ref(), &state, scroll),
+        Overlay::Diagnostics => {
+            crate::tui::view::diagnostics::render(f, area, &app.diagnostics);
+        }
     }
 }
 
@@ -343,6 +346,7 @@ fn help_lines<'a>() -> Vec<Line<'a>> {
         ),
         group("", "a   add to playlist"),
         group("", "L   lyrics for the playing track (synced/plain)"),
+        group("", "D   diagnostics overlay (recent provider errors)"),
         group(
             "",
             "e   enqueue (play next)   ·   x   remove from queue   ·   d   delete playlist",
