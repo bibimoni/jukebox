@@ -810,9 +810,17 @@ impl App {
                         self.audio_switch_handle =
                             Some(crate::audio::set_output_format_async(sr, bd));
                     }
-                    let _ = self.player.load(&path);
-                    self.now_playing = Some(crate::source::TrackSource::Local { track_id: id });
-                    self.preload_next_url();
+                    match self.player.load(&path) {
+                        Ok(()) => {
+                            self.now_playing =
+                                Some(crate::source::TrackSource::Local { track_id: id });
+                            self.preload_next_url();
+                        }
+                        Err(e) => {
+                            self.yt_error = Some(format!("playback failed: {e}"));
+                            self.dead.insert(id.clone());
+                        }
+                    }
                     return;
                 }
                 Some(Resolved::Remote { url, fmt, video_id }) => {
@@ -973,10 +981,17 @@ impl App {
                 ) {
                     self.audio_switch_handle = Some(crate::audio::set_output_format_async(sr, bd));
                 }
-                let _ = self.player.load(&path);
-                self.now_playing = Some(crate::source::TrackSource::Local {
-                    track_id: id.to_string(),
-                });
+                match self.player.load(&path) {
+                    Ok(()) => {
+                        self.now_playing = Some(crate::source::TrackSource::Local {
+                            track_id: id.to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        self.yt_error = Some(format!("playback failed: {e}"));
+                        self.dead.insert(id.to_string());
+                    }
+                }
             }
             Some(Resolved::Remote { url, fmt, video_id }) => {
                 // Cached URL → swap in immediately.
@@ -1013,13 +1028,21 @@ impl App {
             self.audio_switch_handle = Some(crate::audio::set_output_format_async(sr, bd));
         }
         let p = std::path::PathBuf::from(&url);
-        let _ = self.player.load(&p);
-        self.now_playing = Some(crate::source::TrackSource::Remote { video_id });
-        // Record whether we started at premium (256k) so a later premium URL
-        // landing mid-play swaps only if we're not already premium
-        // (progressive upgrade guard).
-        self.playing_premium = fmt.premium;
-        self.preload_next_url();
+        match self.player.load(&p) {
+            Ok(()) => {
+                self.now_playing = Some(crate::source::TrackSource::Remote { video_id });
+                // Record whether we started at premium (256k) so a later premium URL
+                // landing mid-play swaps only if we're not already premium
+                // (progressive upgrade guard).
+                self.playing_premium = fmt.premium;
+                self.preload_next_url();
+            }
+            Err(e) => {
+                self.yt_error = Some(format!("stream load failed: {e}"));
+                // Don't set now_playing — keep the prior state (old track or
+                // nothing) so the UI doesn't show a track that isn't playing.
+            }
+        }
     }
 
     /// Play the track under the track-column cursor in the current view.
@@ -1885,9 +1908,18 @@ impl App {
                     // Resume at the captured position via mpv's `start` option
                     // (load_at) so the premium stream begins at `pos` directly —
                     // no from-0 replay before a seek lands.
-                    let _ = self.player.load_at(&p, pos);
-                    self.playing_premium = true;
-                    self.yt_status = Some("upgraded to AAC 256k · YT Premium".into());
+                    match self.player.load_at(&p, pos) {
+                        Ok(()) => {
+                            self.playing_premium = true;
+                            self.yt_status = Some("upgraded to AAC 256k · YT Premium".into());
+                        }
+                        Err(e) => {
+                            // Premium upgrade failed — keep the fast stream
+                            // playing. Don't change now_playing (it's already
+                            // set to this track from the initial load).
+                            self.yt_error = Some(format!("premium upgrade failed: {e}"));
+                        }
+                    }
                 }
             }
         }

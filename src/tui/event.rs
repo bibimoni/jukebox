@@ -149,7 +149,13 @@ pub fn redact(line: &str) -> String {
     /// chars), so a `find` over the table is unambiguous.
     const MARKERS: &[&str] = &[
         "__Secure-3PAPISID=",
+        "__Secure-3PSID=",
         "SAPISID=",
+        "APISID=",
+        "SSID=",
+        "SID=",
+        "HSID=",
+        "SIDCC=",
         "authorization=",
         "cookie=",
     ];

@@ -7,6 +7,31 @@
 - [x] ses_s3b (Worker): `Slice 3 pagination + offline cache — src/yt/cache.rs (FIX SQL bug + _at variants), src/tui/app.rs (load_yt_lists_from_cache helpers), src/main.rs (load-from-cache + ReadyStale branch), tests/pagination_cache.rs` - MODIFY/CREATE done | VERIFIED 2026-07-12T02:55 — my files fmt-clean (rustfmt --check exit 0); cargo clippy --all-targets --all-features -- -D warnings exit 0; 4 cache.rs unit tests PASS (save_then_load_round_trips, load_returns_empty_for_absent, save_overwrites_existing, clear_removes_the_cache); 3 pagination_cache integration tests PASS (pagination_large_library, offline_shows_cached_marked_stale, empty_vs_failed_distinguished); full suite 284 passed / 1 failed (the 1 failure = unicode_command_recalled panicking at src/tui/input.rs:362 — concurrent Slice 6 worker's forbidden file, NOT this session's code). NOTE: yt.py pagination (limit=None) + proto.rs ok:false→Error + mod.rs pub mod cache + state.rs pub fn open + app.rs on_tick save_yt_lists(L1391) + app.rs clear_yt_lists on logout(L1819) were ALREADY present from a concurrent Slice 3 worker; this session FIXED the cache.rs SQL bug (VALUES (?1,?1)→VALUES (?1,?2) which made the cache silently non-functional), added _at variants for race-free testing, added the testable App helpers, refactored main.rs for the ReadyStale-when-offline branch, and wrote the 3 tests. SYNC issue: src/tui/input.rs (concurrent Slice 6 worker) currently breaks cargo fmt --check + 1 test — NOT this session's files; do NOT touch (forbidden).
 - [x] ses_s7 (Worker): `Slice 7 Feedback/log/diagnostics — src/tui/event.rs, src/cli.rs, src/tui/app.rs (fields+on_tick), src/main.rs (wire), src/lib.rs, src/tui/view/mod.rs, src/diagnostics.rs (NEW), src/tui/view/diagnostics.rs (NEW), tests/feedback.rs (NEW)` - done | VERIFIED 2026-07-12T03:02 — cargo fmt --check exit 0; cargo clippy --all-targets --all-features -- -D warnings exit 0; cargo test --all-features 358 passed 0 failed (incl. 5 feedback tests: status_auto_clears, status_within_ttl_is_kept, status_dedup_does_not_refresh_ttl, no_secret_in_logs, diagnostics_capture); bats 30/30. Changes: (1) event.rs — removed #[allow(dead_code)] from log_to_file, added redact() (SAPISID/__Secure-3PAPISID/authorization/cookie → [REDACTED], byte-level char-boundary-safe), added 1MB→.1 log rotation, extracted pub log_to_file_at(path) for testable writes, wired log_to_file(&redact(...)) into run loop after on_tick with last_logged_error change-detection; (2) cli.rs — added Verbosity enum (Quiet/Normal/Verbose/Debug) + from_flags(), -v/--verbose (ArgAction::Count) + -q/--quiet to Cli; (3) app.rs — added 4 fields (verbosity, diagnostics, notification_ttl, last_notification) + std::time imports + on_tick top-block (TTL clear after 5s + new-status dedup detection) + on_tick end-block (diagnostics capture on yt_error change); (4) main.rs — wired app.verbosity = Verbosity::from_flags(args.quiet, args.verbose); (5) lib.rs + view/mod.rs — pub mod diagnostics; (6) src/diagnostics.rs (NEW, VecDeque cap 100 + push/messages + 3 inline tests); (7) src/tui/view/diagnostics.rs (NEW, render fn "diagnostics — Esc to close"); (8) tests/feedback.rs (NEW, 5 tests). CONCURRENT CONFLICTS (forbidden files, NOT this session): a concurrent worker overwrote src/diagnostics.rs with a simpler Vec/cap-64 version — restored spec-compliant VecDeque/cap-100 version (this session owns the file); cont_youtube_advances_via_radio_cursor (e2e_yt) is FLAKY due to concurrent worker's async RadioCursor refactor in src/yt/session.rs — confirmed via isolation (passes 5/5 with Slice 7 blocks both removed and present; earlier 3 failures were timing flakiness). Unit test record: .opencode/unit-tests/2026-07-12T0302-slice7-feedback-logging-diagnostics.md
 
+## Reviewer Verification — Slice 4 + Slice 7 Final Re-Verification (2026-07-12T03:08)
+**Scope:** Final verification of all 6 remaining [ ] items (S4.4, S4.5, S4.R, S7.2, S7.4, S7.R) after fixes
+**Verdict:** FULL PASS — all 6 items now [x]; 110/110 todo items complete; 0 sync issues
+
+### Gate Evidence (all PASS)
+| Gate | Command | Result |
+|------|---------|--------|
+| fmt | cargo fmt --check | ✅ PASS (exit 0) |
+| clippy | cargo clippy --all-targets --all-features -- -D warnings | ✅ PASS (exit 0) |
+| test (all) | cargo test --all-features --no-fail-fast | ✅ PASS — 360 passed, 0 failed |
+| nonblocking | cargo test --test nonblocking | ✅ PASS — 4/4 (incl. audio_switch_does_not_block_input) |
+| feedback | cargo test --test feedback | ✅ PASS — 6/6 (incl. diagnostics_view_openable) |
+| bats | bats scripts/test/*.bats | ✅ PASS — 30/30 |
+| build --release | cargo build --release --locked | ✅ PASS (exit 0) |
+
+### Fixes Applied
+1. **S7.2** (diagnostics overlay wiring): Added Overlay::Diagnostics variant (app.rs), :diag command handler (input.rs), D keybinding (input.rs), render call in overlay.rs, help text update, diagnostics_view_openable test
+2. **S7.4** (sidecar stderr): Added sidecar_stderr() fn in sidecar.rs that redirects stderr to ~/.cache/jukebox/sidecar.log (bounded 1 MiB)
+3. **S4.4 + S4.5** (audio async): VERIFIED ALREADY IMPLEMENTED in git diff — set_output_format_async (audio.rs L53-57) + audio_switch_handle field (app.rs L366) + on_tick is_finished() polling (L1379-1382); original grep false negative corrected
+
+### Final State
+- todo.md: 110 [x], 0 [ ] — ALL COMPLETE
+- sync-issues.md: All RESOLVED (SYNC-20 through SYNC-24 resolved)
+- All 16 slices: status:completed
+
 ## Reviewer Verification — Slice 4 Unit Review (2026-07-12T03:04)
 **Scope:** Slice 4 (M9.2 Non-blocking hot path) unit verification — ses_s4
 **Verdict:** CONDITIONAL FAIL — 4 of 6 leaf tasks PASS (S4.1, S4.2, S4.3, S4.6); 2 DEFECT (S4.4, S4.5 — never implemented, false [x] marks); S4.R FAIL. todo.md [x] marks REVERTED for S4.4/S4.5/S4.R. Slice 4 status changed from completed→in_progress.
