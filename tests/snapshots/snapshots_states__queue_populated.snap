@@ -1,0 +1,28 @@
+---
+source: tests/snapshots_states.rs
+expression: s
+---
+1   ┏Queue━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+2   ┃▶  1 Song1 — Cosmic                                                                                    24bit-96kHz┃
+3   ┃   2 Ghost Rule — Ghost                                                                              16bit-44.1kHz┃
+4   ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┃                                                                                                                  ┃
+    ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+⏸ Song1 — 40mP · Cosmic   24-bit / 96 kHz · bit-perfect   vol ▰▰▰▱ 70%
+                           0:00 / 3:00                                        SHUF off · RPT off · CONT off · MODE local
+[!] YT: not configured — run :yt auth browser <chrome>

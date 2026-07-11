@@ -2,6 +2,7 @@ pub mod audio;
 pub mod catalog;
 pub mod cli;
 pub mod config;
+pub mod diagnostics;
 pub mod lyrics;
 pub mod mode;
 pub mod player;

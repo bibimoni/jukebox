@@ -1,4 +1,5 @@
 pub mod columns;
+pub mod diagnostics;
 pub mod footer;
 pub mod layout;
 pub mod overlay;

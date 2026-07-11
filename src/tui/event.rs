@@ -89,11 +89,17 @@ fn cleanup_audio() {
     }
 }
 
-/// Append a single log line to `~/.cache/jukebox/jukebox.log` (or the platform
-/// cache dir). Best-effort: a failed write is silently dropped (we're often in
-/// the alt screen, where `eprintln!` would corrupt the UI anyway). This is the
-/// `eprintln!` replacement for paths that originate in the event loop.
-#[allow(dead_code)]
+/// Append a single (redacted) log line to `~/.cache/jukebox/jukebox.log` (or
+/// the platform cache dir). Best-effort: a failed write is silently dropped
+/// (we're often in the alt screen, where `eprintln!` would corrupt the UI
+/// anyway). This is the `eprintln!` replacement for paths that originate in
+/// the event loop.
+///
+/// **Rotation:** before writing, if the log exceeds 1 MiB it's rolled to
+/// `jukebox.log.1` (overwriting any prior `.1`) and a fresh log is started —
+/// a one-level rotation that keeps the log bounded without losing the most
+/// recent history. Callers should pass the line through [`redact`] first so
+/// cookie/token secrets never reach disk.
 fn log_to_file(line: &str) {
     let Some(cache) = dirs::cache_dir() else {
         return;
@@ -101,13 +107,82 @@ fn log_to_file(line: &str) {
     let log_dir = cache.join("jukebox");
     let _ = std::fs::create_dir_all(&log_dir);
     let path = log_dir.join("jukebox.log");
+    // One-level rotation: keep the log from growing without bound. A >1 MiB
+    // log rolls to `.1` (clobbering the previous roll) so the active log
+    // always holds the most recent ~1 MiB of lines.
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 1024 * 1024 {
+            let _ = std::fs::rename(&path, log_dir.join("jukebox.log.1"));
+        }
+    }
+    log_to_file_at(&path, line);
+}
+
+/// Append `line` to `path` (best-effort: a failed write is silently dropped).
+/// Public so tests can write to a temp path instead of the real cache dir.
+/// Creates the parent directory if missing. No rotation: rotation is a
+/// property of the default cache log (see [`log_to_file`]).
+pub fn log_to_file_at(path: &std::path::Path, line: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
     {
         let _ = writeln!(f, "{line}");
     }
+}
+
+/// Redact cookie/token secrets from a log line before it's written to disk.
+/// Replaces any `<marker><value>` substring with `[REDACTED]`, where `<marker>`
+/// is one of `SAPISID=`, `__Secure-3PAPISID=`, `authorization=`, `cookie=`
+/// (case-insensitive) and `<value>` is the run of `[A-Za-z0-9_.-]` that
+/// follows. The marker itself is consumed so the secret name doesn't leak
+/// either; other text (including the surrounding context) is preserved so
+/// the log stays readable. Public so the run loop can call it before
+/// [`log_to_file`] and so tests can verify the redaction directly.
+pub fn redact(line: &str) -> String {
+    /// Markers whose following value is a secret. Order doesn't matter: at a
+    /// given position only one marker can match (they have distinct first
+    /// chars), so a `find` over the table is unambiguous.
+    const MARKERS: &[&str] = &[
+        "__Secure-3PAPISID=",
+        "SAPISID=",
+        "authorization=",
+        "cookie=",
+    ];
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0usize;
+    while i < line.len() {
+        let rest = &line[i..];
+        let rest_bytes = rest.as_bytes();
+        // Byte-level prefix match: markers are ASCII, so comparing the leading
+        // bytes is char-boundary-safe (a str slice `rest[..m.len()]` would
+        // panic if `m.len()` landed inside a multi-byte char like '—').
+        let hit = MARKERS.iter().copied().find(|m| {
+            rest_bytes.len() >= m.len() && rest_bytes[..m.len()].eq_ignore_ascii_case(m.as_bytes())
+        });
+        if let Some(m) = hit {
+            out.push_str("[REDACTED]");
+            i += m.len();
+            // Consume the secret value: alnum + `_`, `-`, `.`. Stop at the
+            // first non-token char (whitespace, `;`, `]`, …) so the next
+            // marker in the same line can still be caught.
+            let tail = &line[i..];
+            let consume = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'))
+                .unwrap_or(tail.len());
+            i += consume;
+        } else {
+            // Advance by one char (UTF-8 safe): copy the whole codepoint.
+            let ch = line[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
 }
 
 /// Install the crash-safe panic hook.
@@ -226,6 +301,11 @@ pub fn run(app: &mut App, captured: Option<CapturedFormat>) -> Result<()> {
     // Force an initial draw so the screen isn't blank for the first poll tick.
     terminal.draw(|f| view::layout::draw(f, app))?;
 
+    // Last yt_error value we logged, so the loop only writes a log line when
+    // the error CHANGES (not every tick). Lives across iterations; reset to
+    // None would re-log a persistent error ~6.7×/s.
+    let mut last_logged_error: Option<String> = None;
+
     while !app.should_quit {
         // Drain the SIGCONT redraw flag.
         if NEED_REDRAW.swap(false, Ordering::SeqCst) {
@@ -253,6 +333,17 @@ pub fn run(app: &mut App, captured: Option<CapturedFormat>) -> Result<()> {
         // this, fire-and-forget fetches never land and the Y view stays on
         // "loading…" forever (spec §3.1/§3.5).
         app.on_tick();
+
+        // File logging (Slice 7): when `on_tick` surfaces a NEW yt_error, write
+        // a redacted line to the log so post-mortem debugging doesn't require a
+        // replay. Only logs on CHANGE (compared against `last_logged_error`)
+        // so a persistent error doesn't spam one line per tick (~6.7/s).
+        if let Some(e) = &app.yt_error {
+            if last_logged_error.as_deref() != Some(e.as_str()) {
+                log_to_file(&redact(&format!("yt_error: {e}")));
+                last_logged_error = Some(e.clone());
+            }
+        }
 
         terminal.draw(|f| view::layout::draw(f, app))?;
 

@@ -89,7 +89,7 @@ fn run_command(app: &mut App, text: &str) {
 /// Extract the current command overlay input (panics if the overlay isn't open).
 fn command_input(app: &App) -> String {
     match &app.overlay {
-        Some(Overlay::Command { input }) => input.clone(),
+        Some(Overlay::Command { input, .. }) => input.clone(),
         _ => panic!("expected Command overlay to be open"),
     }
 }

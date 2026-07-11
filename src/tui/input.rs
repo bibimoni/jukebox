@@ -171,6 +171,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyCode::Char(':'), _) => {
             app.overlay = Some(Overlay::Command {
                 input: String::new(),
+                cursor: 0,
             });
         }
         // `L` toggles the lyrics overlay for the currently-playing track.
@@ -327,17 +328,133 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 searching,
             });
         }
-        Some(Overlay::Command { mut input }) => {
+        Some(Overlay::Command {
+            mut input,
+            mut cursor,
+        }) => {
+            // Word-boundary helpers (byte-level — input is `:` commands, ASCII).
+            fn word_start_left(s: &str, pos: usize) -> usize {
+                let b = s.as_bytes();
+                let mut i = pos.min(b.len());
+                while i > 0 && (b[i - 1] as char).is_whitespace() {
+                    i -= 1;
+                }
+                while i > 0 && !(b[i - 1] as char).is_whitespace() {
+                    i -= 1;
+                }
+                i
+            }
+            fn word_start_right(s: &str, pos: usize) -> usize {
+                let b = s.as_bytes();
+                let mut i = pos.min(b.len());
+                while i < b.len() && (b[i] as char).is_whitespace() {
+                    i += 1;
+                }
+                while i < b.len() && !(b[i] as char).is_whitespace() {
+                    i += 1;
+                }
+                i
+            }
             match key.code {
                 // Accept Char regardless of SHIFT — see the Search arm note.
                 KeyCode::Char(c)
                     if !key.modifiers.contains(KeyModifiers::CONTROL)
                         && !key.modifiers.contains(KeyModifiers::ALT) =>
                 {
-                    input.push(c)
+                    cursor = cursor.min(input.len());
+                    input.insert(cursor, c);
+                    cursor += c.len_utf8();
+                }
+                KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl-Backspace: delete the word before the cursor.
+                    cursor = cursor.min(input.len());
+                    let start = word_start_left(&input, cursor);
+                    input.drain(start..cursor);
+                    cursor = start;
                 }
                 KeyCode::Backspace => {
-                    input.pop();
+                    cursor = cursor.min(input.len());
+                    if cursor > 0 {
+                        // Move to the previous char boundary (UTF-8 safe).
+                        let mut prev = cursor - 1;
+                        while prev > 0 && !input.is_char_boundary(prev) {
+                            prev -= 1;
+                        }
+                        input.drain(prev..cursor);
+                        cursor = prev;
+                    }
+                }
+                KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl-Delete: delete the word after the cursor.
+                    cursor = cursor.min(input.len());
+                    let end = word_start_right(&input, cursor);
+                    input.drain(cursor..end);
+                }
+                KeyCode::Home => {
+                    cursor = 0;
+                }
+                KeyCode::End => {
+                    cursor = input.len();
+                }
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    cursor = cursor.min(input.len());
+                    cursor = word_start_left(&input, cursor);
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    cursor = cursor.min(input.len());
+                    cursor = word_start_right(&input, cursor);
+                }
+                KeyCode::Left => {
+                    cursor = cursor.min(input.len());
+                    if cursor > 0 {
+                        // Move to the previous char boundary (UTF-8 safe).
+                        let mut prev = cursor - 1;
+                        while prev > 0 && !input.is_char_boundary(prev) {
+                            prev -= 1;
+                        }
+                        cursor = prev;
+                    }
+                }
+                KeyCode::Right => {
+                    cursor = cursor.min(input.len());
+                    if cursor < input.len() {
+                        // Move to the next char boundary (UTF-8 safe).
+                        let mut next = cursor + 1;
+                        while next < input.len() && !input.is_char_boundary(next) {
+                            next += 1;
+                        }
+                        cursor = next;
+                    }
+                }
+                KeyCode::Tab => {
+                    // Tab completion: complete known command prefix.
+                    let known = ["queue", "yt", "lyrics", "diag", "help", "quit", "q"];
+                    let prefix = input.trim_start_matches(':');
+                    let matches: Vec<&str> = known
+                        .iter()
+                        .copied()
+                        .filter(|c| c.starts_with(prefix))
+                        .collect();
+                    if matches.len() == 1 {
+                        input = format!(":{}", matches[0]);
+                        cursor = input.len();
+                    } else if matches.len() > 1 {
+                        // Complete the common prefix.
+                        let common = matches
+                            .iter()
+                            .map(|s| s.as_bytes())
+                            .fold(None::<Vec<u8>>, |acc, s| match acc {
+                                None => Some(s.to_vec()),
+                                Some(a) => {
+                                    let len =
+                                        a.iter().zip(s.iter()).take_while(|(x, y)| x == y).count();
+                                    Some(a[..len].to_vec())
+                                }
+                            })
+                            .unwrap_or_default();
+                        input = format!(":{}", String::from_utf8_lossy(&common));
+                        cursor = input.len();
+                    }
                 }
                 KeyCode::Up if !app.command_history.is_empty() => {
                     // Traverse command history backwards (most recent first).
@@ -352,6 +469,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     }
                     if let Some(i) = app.command_history_cursor {
                         input = app.command_history[i].clone();
+                        cursor = input.len();
                     }
                 }
                 KeyCode::Down => {
@@ -361,9 +479,11 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                             // Past the end → restore the draft.
                             app.command_history_cursor = None;
                             input = app.command_draft.clone();
+                            cursor = input.len();
                         } else {
                             app.command_history_cursor = Some(i - 1);
                             input = app.command_history[i - 1].clone();
+                            cursor = input.len();
                         }
                     }
                 }
@@ -385,7 +505,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 }
                 _ => {}
             }
-            app.overlay = Some(Overlay::Command { input });
+            app.overlay = Some(Overlay::Command { input, cursor });
         }
         Some(Overlay::YtAuth { mut input }) => {
             // The auth overlay's own keymap: typing accumulates the pasted

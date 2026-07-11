@@ -7,6 +7,9 @@ use jukebox::{catalog, player, search, state, tui};
 
 fn main() -> anyhow::Result<()> {
     let args = cli::Cli::parse();
+    // Resolve verbosity once from the parsed flags; `quiet` wins over
+    // `verbose`. `Cmd::Play` applies it to the App after construction.
+    let verbosity = cli::Verbosity::from_flags(args.quiet, args.verbose);
     match args.cmd.unwrap_or(Cmd::Play) {
         Cmd::Config { args } => {
             let _cfg = cli::ensure_config()?;
@@ -71,6 +74,9 @@ fn main() -> anyhow::Result<()> {
             app.switch_sample_rate = cfg.switch_sample_rate;
             app.yt_python = yt_python;
             app.yt_script = yt_script;
+            // Apply the resolved verbosity (from --verbose / --quiet) so the
+            // footer / view layer can render the right amount of chrome.
+            app.verbosity = verbosity;
 
             // Restore persisted layout + transport modes. Best-effort: a missing
             // or corrupt DB just falls back to defaults. At startup the transport

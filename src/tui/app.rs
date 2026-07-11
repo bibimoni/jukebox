@@ -9,6 +9,7 @@
 //! separate fields, this split-borrow works).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::catalog::{Catalog, Track};
 use crate::player::Player;
@@ -132,6 +133,9 @@ pub enum Overlay {
     },
     Command {
         input: String,
+        /// Byte offset of the cursor within `input` (0 to `input.len()`).
+        /// Insertion/deletion happen at this position, not at the end.
+        cursor: usize,
     },
     /// YouTube cookie-paste overlay (spec §5.7). `input` accumulates the pasted
     /// Netscape cookies.txt content; `Enter` saves, `Esc` cancels.
@@ -304,6 +308,47 @@ pub struct App {
     /// user moved to a different track). Guarantees stale lyrics can't
     /// overwrite a newer track's lyrics overlay.
     pub lyrics_gen: u64,
+    /// Verbosity resolved from the `--verbose`/`--quiet` CLI flags. The footer
+    /// / view layer consults this to decide how much chrome to render: `Quiet`
+    /// shows only errors, `Normal` is the default hint bar, `Verbose` shows
+    /// the YT provider label even when Ready, `Debug` adds a per-tick
+    /// diagnostic counter. Defaults to `Normal`; wired by `main.rs`.
+    pub verbosity: crate::cli::Verbosity,
+    /// Bounded ring buffer of recent diagnostic messages (provider errors,
+    /// respawn notices, sidecar failures) rendered by
+    /// [`crate::tui::view::diagnostics`]. `on_tick` pushes a line whenever
+    /// `yt_error` changes, so the user can review what happened without
+    /// scraping the log file.
+    pub diagnostics: crate::diagnostics::Diagnostics,
+    /// When the current transient `yt_status` should expire. Set (via
+    /// `on_tick` change-detection) when a key handler / respawn assigns a new
+    /// `yt_status`; cleared by `on_tick` once `Duration::from_secs(5)` elapses
+    /// so the footer returns to the hint bar / state label instead of
+    /// lingering indefinitely.
+    pub notification_ttl: Option<Instant>,
+    /// The last `yt_status` we "accepted" (for dedup). `on_tick` only
+    /// (re)starts the TTL window when the new `yt_status` differs from this,
+    /// so a repeat of the same message doesn't keep refreshing its 5s lease.
+    pub last_notification: Option<String>,
+    /// True while a discover (`S` overlay) home-suggestions fetch is in flight.
+    /// Set by `yt_discover_items` (fire-and-forget `send_home_suggestions`);
+    /// cleared by `on_tick` when `pending_discover` lands (or on error). The
+    /// overlay opens instantly with a "loading…" state and populates when the
+    /// response lands — `S` no longer blocks the UI for the ~3s roundtrip.
+    pub discover_loading: bool,
+    /// A YouTube playlist id whose tracks were requested by a discover
+    /// selection (Enter on a `DiscoverItem::Playlist`). `play_discover_selection`
+    /// fires-and-forgets `send_get_playlist(id)` + stores the id here; `on_tick`
+    /// starts playback of the playlist's tracks when `pending_tracks` lands
+    /// with a matching id (the blocking `get_playlist` call is gone, so Enter
+    /// no longer freezes the UI for the ~4s roundtrip).
+    pub pending_discover_play: Option<String>,
+    /// The seed video_id for an in-flight CONT=YouTube radio refill
+    /// (`send_watch_playlist`). `next()` stores it when the radio queue is
+    /// exhausted; `on_tick` consumes it when `pending_watch` lands to refill
+    /// the `RadioCursor` + start playback. Non-blocking auto-advance: the old
+    /// track stays current until the next track's id lands.
+    pub pending_radio_seed: Option<String>,
 }
 
 /// Inline filter state for the `f` filter-on-focused-column (spec §5.4).
@@ -493,6 +538,13 @@ impl App {
             command_history_cursor: None,
             command_draft: String::new(),
             lyrics_gen: 0,
+            verbosity: crate::cli::Verbosity::default(),
+            diagnostics: crate::diagnostics::Diagnostics::new(),
+            notification_ttl: None,
+            last_notification: None,
+            discover_loading: false,
+            pending_discover_play: None,
+            pending_radio_seed: None,
         }
     }
 
@@ -1047,39 +1099,57 @@ impl App {
                     self.start_playback();
                 }
                 ContinueMode::YouTube => {
-                    // Drive YouTube autoplay via RadioCursor (spec §3.4). Ask
-                    // for the next video id seeded by the just-finished track;
-                    // switch context to a fresh radio Search + load it.
+                    // Drive YouTube autoplay via RadioCursor (spec §3.4). The
+                    // old `radio.advance(session, seed)` made a BLOCKING
+                    // `get_watch_playlist` roundtrip (~4s) every time the queue
+                    // was exhausted, freezing the UI on each auto-advance. Now
+                    // we advance locally when the queue still has entries (no
+                    // sidecar call), and fire-and-forget a radio refill when
+                    // exhausted — `on_tick` refills the cursor + starts
+                    // playback when `pending_watch` lands (non-blocking).
                     let seed_id = self.now_playing.clone().map(|s| s.id().to_string());
-                    if let Some(session) = self.yt_session.as_mut() {
-                        match self
-                            .radio
-                            .advance(session as &mut dyn crate::yt::session::YtClient, seed_id)
-                        {
-                            Some(vid) => {
-                                if let Some(np) = self.now_playing.clone() {
-                                    self.transport.history.push((
-                                        np.id().to_string(),
-                                        self.transport.context.clone(),
-                                    ));
-                                }
-                                let ctx = Context::Search {
-                                    query: "youtube radio".into(),
-                                    track_ids: vec![vid.clone()],
-                                };
-                                let r = ClonedResolver {
-                                    playlists: &self.playlists,
-                                    manual_queue: self.transport.manual_queue.clone(),
-                                    yt_lists: &self.yt_lists,
-                                };
-                                self.transport
-                                    .switch_context(ctx, Some(&vid), &r, &self.catalog);
-                                self.start_playback();
+                    if let Some(vid) = self.radio.next_local() {
+                        // Fast path: the queue still has entries — switch
+                        // context + start playback immediately (same as the
+                        // old `radio.advance` Some(vid) arm).
+                        if let Some(np) = self.now_playing.clone() {
+                            self.transport
+                                .history
+                                .push((np.id().to_string(), self.transport.context.clone()));
+                        }
+                        let ctx = Context::Search {
+                            query: "youtube radio".into(),
+                            track_ids: vec![vid.clone()],
+                        };
+                        let r = ClonedResolver {
+                            playlists: &self.playlists,
+                            manual_queue: self.transport.manual_queue.clone(),
+                            yt_lists: &self.yt_lists,
+                        };
+                        self.transport
+                            .switch_context(ctx, Some(&vid), &r, &self.catalog);
+                        self.start_playback();
+                    } else if let Some(session) = self.yt_session.as_mut() {
+                        // Queue exhausted — fire-and-forget a radio refill
+                        // seeded by the just-finished track. Non-blocking: the
+                        // old track stays current until `on_tick` drains
+                        // `pending_watch` and starts the next. No-op if a
+                        // refill is already in flight so a burst of `next`/
+                        // end-of-track events doesn't flood the sidecar.
+                        if let Some(seed) = seed_id {
+                            if !session.watch_loading()
+                                && session.send_watch_playlist(seed.clone()).is_ok()
+                            {
+                                self.pending_radio_seed = Some(seed);
                             }
-                            None => {
-                                self.player.stop().ok();
-                                self.now_playing = None;
-                            }
+                            // Leave now_playing on the ended track; on_tick
+                            // will push it to history + switch when the
+                            // response lands. Don't stop here — clearing
+                            // now_playing would lose the history-push target.
+                        } else {
+                            // No seed (nothing was playing) — stop cleanly.
+                            self.player.stop().ok();
+                            self.now_playing = None;
                         }
                     } else {
                         // No session — stop cleanly (degrade, spec §3.5).
@@ -1283,6 +1353,33 @@ impl App {
     /// - apply drained async responses (refresh lists → yt_lists, pre-resolve
     ///   → url_cache; Search/Tracks caching happens in Session::apply_pair).
     pub fn on_tick(&mut self) {
+        // Notification TTL (Slice 7): clear a stale transient `yt_status` after
+        // 5s so the footer returns to the hint bar / state label instead of
+        // lingering on a one-shot message (e.g. "upgraded to AAC 256k",
+        // "queue cleared"). The TTL is (re)started below when a NEW status is
+        // detected; an identical repeat does NOT refresh the window (dedup via
+        // `last_notification`).
+        if let Some(t) = self.notification_ttl {
+            if t.elapsed() > Duration::from_secs(5) && self.yt_status.is_some() {
+                self.yt_status = None;
+                self.notification_ttl = None;
+                // Reset dedup so a later re-assertion of the same message
+                // counts as a fresh notification (gets a new 5s window).
+                self.last_notification = None;
+            }
+        }
+        // Detect a NEW yt_status (set since the last tick by a key handler /
+        // respawn / on_tick premium-swap) and (re)start its TTL window. Dedup:
+        // an identical repeat (== last_notification) keeps the original
+        // window — it doesn't refresh, so repeated identical messages clear on
+        // the original schedule.
+        if let Some(msg) = &self.yt_status {
+            if self.last_notification.as_deref() != Some(msg.as_str()) {
+                self.notification_ttl = Some(Instant::now());
+                self.last_notification = Some(msg.clone());
+            }
+        }
+
         // Auto-respawn a dead sidecar (best-effort, once per tick). Preserves
         // the browser/pasted auth; local playback is unaffected either way.
         if let Some(session) = self.yt_session.as_mut() {
@@ -1356,6 +1453,14 @@ impl App {
         // pending_errors). Don't wait the ~10s for the premium tier on a "play
         // now" miss.
         let mut pending_give_up = false;
+        // A discover selection (Enter on a YT playlist) whose tracks just
+        // landed. Staged here (needs &mut self for `play_in_context_ids`) and
+        // started below, after the session borrow ends. `(video_ids, start_id)`.
+        let mut pending_discover_start: Option<(Vec<String>, String)> = None;
+        // A CONT=YouTube radio refill whose watch_playlist just landed. Staged
+        // here (needs &mut self for transport + `start_playback`) and started
+        // below, after the session borrow ends. The video_id to play next.
+        let mut pending_radio_start: Option<String> = None;
         if let Some(session) = self.yt_session.as_mut() {
             session.drain_paired();
             // Pull any lists the session buffered for us.
@@ -1405,7 +1510,72 @@ impl App {
                         l.track_ids = vids.clone();
                     }
                 }
-                self.loaded_yt_lists.insert(id);
+                self.loaded_yt_lists.insert(id.clone());
+                // Discover selection: if this is the list a discover Enter
+                // asked for, stage the playback start (after the session
+                // borrow ends — `play_in_context_ids` needs &mut self). Works
+                // even for playlists not in yt_lists (uses the vids directly).
+                // A different list's tracks landing does NOT consume the
+                // pending selection — it stays for the right response.
+                if let Some(want) = self.pending_discover_play.take() {
+                    if want == id {
+                        if let Some(start) = vids.first().cloned() {
+                            pending_discover_start = Some((vids, start));
+                        }
+                    } else {
+                        self.pending_discover_play = Some(want);
+                    }
+                }
+            }
+
+            // CONT=YouTube radio refill: a watch_playlist response landed.
+            // Advance the RadioCursor with the fresh video_ids + stage the
+            // playback start (after the session borrow ends). The seed (the
+            // just-finished track) is dropped if it's the queue's leading
+            // entry (YouTube "Up Next" excludes the just-played track). A
+            // non-blocking auto-advance: the old track stayed current until
+            // this tick; now we switch.
+            if let Some(vids) = session.pending_watch.take() {
+                let seed = self.pending_radio_seed.take();
+                if let Some(vid) = self.radio.advance_with_vids(vids, seed) {
+                    pending_radio_start = Some(vid);
+                }
+            }
+
+            // Discover overlay: home-suggestions landed. Populate the open
+            // Discover overlay's items (replace prior YT playlists; preserve
+            // local albums + cursor) and clear the loading flag. A stale
+            // response (overlay closed/changed) is dropped — items just don't
+            // show. This is the non-blocking completion of `yt_discover_items`
+            // (which fired-and-forgot the request + opened the overlay empty).
+            if let Some(s) = session.pending_discover.take() {
+                self.discover_loading = false;
+                let new_pl: Vec<DiscoverItem> = s
+                    .into_iter()
+                    .map(|p| DiscoverItem::Playlist {
+                        id: p.id,
+                        name: p.name,
+                    })
+                    .take(5)
+                    .collect();
+                // Only touch the overlay if it's still a Discover — a stale
+                // response landing after the user closed/replaced the overlay
+                // must NOT drop the current overlay. Clone + match (don't
+                // `take`) so a non-Discover overlay is left untouched.
+                if let Some(Overlay::Discover { items, cursor }) = self.overlay.clone() {
+                    // Preserve Album items (local smart-albums in Mixed mode);
+                    // replace prior Playlist items with the fresh batch so a
+                    // re-drain doesn't stack duplicates.
+                    let mut combined: Vec<DiscoverItem> = items
+                        .into_iter()
+                        .filter(|d| !matches!(d, DiscoverItem::Playlist { .. }))
+                        .collect();
+                    combined.extend(new_pl);
+                    self.overlay = Some(Overlay::Discover {
+                        items: combined,
+                        cursor,
+                    });
+                }
             }
 
             // Fold a completed YouTube search into the open search overlay.
@@ -1706,6 +1876,40 @@ impl App {
             self.pending_play = None;
         }
 
+        // Discover selection playback: a YT playlist's tracks landed (the
+        // fire-and-forget completion of `play_discover_selection`'s Playlist
+        // arm). Start the playlist, mirroring the old blocking path's
+        // `play_in_context_ids(ids, start)`.
+        if let Some((ids, start)) = pending_discover_start {
+            self.play_in_context_ids(ids, &start);
+        }
+
+        // CONT=YouTube radio auto-advance: the watch_playlist response
+        // landed (the fire-and-forget completion of `next()`'s exhausted-
+        // queue path). Push the old track to history, switch context to a
+        // fresh radio Search, and start playback — mirroring the old
+        // blocking `radio.advance` Some(vid) arm. Non-blocking: this runs on
+        // the tick after the response lands, not in the input handler.
+        if let Some(vid) = pending_radio_start {
+            if let Some(np) = self.now_playing.clone() {
+                self.transport
+                    .history
+                    .push((np.id().to_string(), self.transport.context.clone()));
+            }
+            let ctx = Context::Search {
+                query: "youtube radio".into(),
+                track_ids: vec![vid.clone()],
+            };
+            let r = ClonedResolver {
+                playlists: &self.playlists,
+                manual_queue: self.transport.manual_queue.clone(),
+                yt_lists: &self.yt_lists,
+            };
+            self.transport
+                .switch_context(ctx, Some(&vid), &r, &self.catalog);
+            self.start_playback();
+        }
+
         // Lazy-load the focused YT list's tracks: the Y view's col2 + Enter/s
         // need them, but they're only fetched on demand (spec §5.3). Skip
         // lists already loaded (even if empty) and any fetch in flight.
@@ -1754,6 +1958,19 @@ impl App {
             self.spinner_frame = (self.spinner_frame + 1) % 10;
         } else {
             self.spinner_frame = 0;
+        }
+
+        // Diagnostics capture (Slice 7): when `yt_error` changes, push a line
+        // into the diagnostics buffer so the user can review what happened via
+        // the diagnostics overlay (the footer only shows the latest error).
+        // Change-detection against the last captured line avoids flooding
+        // the buffer with one entry per tick while the error stays the same.
+        if let Some(e) = &self.yt_error {
+            let line = format!("yt_error: {e}");
+            let last = self.diagnostics.messages().last().map(|s| s.as_str());
+            if last != Some(line.as_str()) {
+                self.diagnostics.push(line);
+            }
         }
     }
 
@@ -1814,6 +2031,11 @@ impl App {
         self.yt_lists.clear();
         self.loaded_yt_lists.clear();
         self.yt_lists_loading = false;
+        // Clear the fire-and-forget hot-path intents so a response that lands
+        // after logout doesn't start playback / populate a stale overlay.
+        self.discover_loading = false;
+        self.pending_discover_play = None;
+        self.pending_radio_seed = None;
         // Also clear the disk cache so the next launch doesn't show the
         // logged-out account's playlists.
         crate::yt::cache::clear_yt_lists();
@@ -2005,21 +2227,28 @@ impl App {
         scored.into_iter().take(5).map(|(_, d)| d).collect()
     }
 
+    /// Fire-and-forget the YouTube home-suggestions fetch for the `S` discover
+    /// overlay (non-blocking — the old `home_suggestions()` roundtrip blocked
+    /// the UI ~3s every time `S` was pressed). Returns an empty list now; the
+    /// overlay opens instantly with a "loading…" state (`discover_loading` =
+    /// true) and `on_tick` populates its items when `pending_discover` lands.
+    /// A fetch already in flight is a no-op (`discover_inflight`), so repeated
+    /// `S` presses don't flood the sidecar.
     fn yt_discover_items(&mut self) -> Vec<DiscoverItem> {
         let Some(session) = self.yt_session.as_mut() else {
             return Vec::new();
         };
-        match session.home_suggestions() {
-            Ok(s) => s
-                .into_iter()
-                .map(|p| DiscoverItem::Playlist {
-                    id: p.id,
-                    name: p.name,
-                })
-                .take(5)
-                .collect(),
-            Err(_) => Vec::new(),
+        // Fire-and-forget: send + return immediately. The response lands in
+        // `session.pending_discover` and `on_tick` folds it into the open
+        // Discover overlay. `discover_inflight` makes a re-press a no-op.
+        if session.send_home_suggestions().is_err() {
+            // Send failed (sidecar dead etc.) — leave discover_loading false so
+            // the overlay doesn't hang on "loading…" forever; the error will
+            // surface via pending_errors on the next tick.
+            return Vec::new();
         }
+        self.discover_loading = true;
+        Vec::new()
     }
 
     fn simple_rand(&mut self) -> usize {
@@ -2162,14 +2391,19 @@ impl App {
                 }
             }
             DiscoverItem::Playlist { id, .. } => {
-                let tracks = self
-                    .yt_session
-                    .as_mut()
-                    .and_then(|s| s.get_playlist(&id).ok())
-                    .unwrap_or_default();
-                let ids: Vec<String> = tracks.into_iter().map(|t| t.video_id).collect();
-                if let Some(start) = ids.first().cloned() {
-                    self.play_in_context_ids(ids, &start);
+                // Fire-and-forget: the old blocking `get_playlist(&id)` froze
+                // the UI ~4s on every Enter. Now we ask the sidecar
+                // (non-blocking) and defer the playback start to `on_tick`,
+                // which starts the playlist when `pending_tracks` lands with
+                // a matching id (see `pending_discover_play`). A cold cache
+                // hit isn't possible here (discover lists never have
+                // pre-fetched tracks), so we always go through the async
+                // path. If there's no session, fall back to a clean no-op.
+                if let Some(session) = self.yt_session.as_mut() {
+                    // `send_get_playlist` is a no-op if this exact id is
+                    // already in flight, so a double-Enter doesn't flood.
+                    let _ = session.send_get_playlist(id.clone());
+                    self.pending_discover_play = Some(id);
                 }
             }
         }

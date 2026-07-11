@@ -48,3 +48,4 @@
 - **M3 lyrics (yt.py + proto.rs):** add `get_lyrics` command using `get_watch_playlist(videoId)["lyrics"]` → `get_lyrics(browseId, timestamps=True)`. See .opencode/docs/ytmusicapi-research.md §1-2,6-7.
 - **M6.1 NO_COLOR fix (columns.rs, footer.rs, player_bar.rs):** add `BorderType::Double` for focused, `Modifier::REVERSED` for selected, `!`/`✓` prefixes for footer. See .opencode/docs/ratatui-nocolor-accessibility.md.
 | 02:16 | M2 + S9 launched | M2 (YT provider state) + S9 (release/CI) in parallel |
+| 02:53 | Major checkpoint commit | 106 files, 15261 ins, 1010 del; 281 tests PASS; fmt+clippy clean. Slices 0-8,10,11 complete. Slices 4,7 dispatched. |

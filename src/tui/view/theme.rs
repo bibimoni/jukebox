@@ -58,22 +58,34 @@ pub fn quality_color(bit_depth: u32, sample_rate_hz: u32) -> Color {
     }
 }
 
-/// Approximate display width: ASCII = 1, CJK + kana + fullwidth = 2. Good
-/// enough for terminal alignment of mixed JP/EN titles without pulling in the
-/// unicode-width crate.
+/// Approximate display width: ASCII = 1, CJK + kana + fullwidth = 2,
+/// zero-width/combining = 0. Good enough for terminal alignment of mixed
+/// JP/EN titles without pulling in the unicode-width crate.
+///
+/// Zero-width chars (U+200B–200F, U+FEFF) and combining diacritical marks
+/// (U+0300–036F) count as 0 so they don't inflate alignment calculations
+/// (AC-M6.4.1). Without this, a title like "A\u{0301}do" (Ádo with combining
+/// acute) would measure as width 4 instead of 3, breaking right-alignment.
 pub fn disp_width(s: &str) -> usize {
     s.chars()
         .map(|c| {
             let cp = c as u32;
-            if (0x1100..=0x115F).contains(&cp)                    // Hangul Jamo
+            // Zero-width / combining: display width 0
+            if (0x0300..=0x036F).contains(&cp) // combining diacritical marks
+            || (0x200B..=0x200F).contains(&cp) // zero-width space, non-joiner, etc.
+            || cp == 0xFEFF
+            // zero-width no-break space (BOM)
+            {
+                0
+            } else if (0x1100..=0x115F).contains(&cp)                    // Hangul Jamo
             || (0x2E80..=0xA4CF).contains(&cp) && cp != 0x303F // CJK radicals / Yi
             || (0xAC00..=0xD7A3).contains(&cp)                // Hangul syllables
             || (0xF900..=0xFAFF).contains(&cp)                // CJK compat ideographs
             || (0xFE30..=0xFE4F).contains(&cp)                // CJK compat forms
-            || (0xFF00..=0xFF60).contains(&cp)                // fullwidth forms
-            || (0xFFE0..=0xFFE6).contains(&cp)                // fullwidth signs
-            || (0x3000..=0x303F).contains(&cp)                // CJK symbols (incl. ・)
-            || (0x3040..=0x30FF).contains(&cp)                // Hiragana + Katakana
+            || (0xFF00..=0xFF60).contains(&cp)                 // fullwidth forms
+            || (0xFFE0..=0xFFE6).contains(&cp)                 // fullwidth signs
+            || (0x3000..=0x303F).contains(&cp)                 // CJK symbols (incl. ・)
+            || (0x3040..=0x30FF).contains(&cp)                 // Hiragana + Katakana
             || (0x4E00..=0x9FFF).contains(&cp)
             // CJK Unified Ideographs
             {

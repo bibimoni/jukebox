@@ -221,6 +221,14 @@ enum Pending {
     /// discard stale lyrics for a different track.
     Lyrics(String),
     Watch,
+    /// A discover (`S` overlay) home-suggestions fetch outstanding. Distinct
+    /// from `Suggestions(gen)` (the refresh flow) so a discover response
+    /// routes to `pending_discover` WITHOUT disturbing the generation-guarded
+    /// refresh tracking (`refresh_gen` / `refresh_remaining`). The wire
+    /// request is the same `Request::HomeSuggestions`; only the pending tag
+    /// differs, and FIFO pairing (responses in send order) keeps each
+    /// `HomeSuggestions` response paired with the kind that asked for it.
+    Discover,
     Auth,
     Pong,
 }
@@ -309,6 +317,22 @@ pub struct Session {
     /// The video_id whose lyrics are currently being fetched (guards against
     /// re-sending every tick while the fetch is in flight).
     lyrics_inflight: Option<String>,
+    /// `(video_ids)` from a fire-and-forget `send_home_suggestions`, picked up
+    /// by `App::on_tick` to populate the `S` discover overlay. Distinct from
+    /// `pending_suggestions` (the refresh flow) so opening discover doesn't
+    /// disturb the Y-view account+suggested lists.
+    pub pending_discover: Option<Vec<crate::yt::proto::PlaylistSummary>>,
+    /// True while a discover fetch is in flight (guards against re-sending
+    /// every tick while the fetch is in flight).
+    discover_inflight: bool,
+    /// `video_ids` from a fire-and-forget `send_watch_playlist` (CONT=YouTube
+    /// auto-advance), picked up by `App::on_tick` to refill the `RadioCursor`
+    /// and start playback of the next track. Non-blocking so a natural
+    /// end-of-track doesn't freeze the UI for the ~4s ytmusicapi roundtrip.
+    pub pending_watch: Option<Vec<String>>,
+    /// True while a watch_playlist fetch is in flight (guards against
+    /// re-sending every tick while the fetch is in flight).
+    watch_inflight: bool,
     /// The most recent sidecar error from an inflight-tracked request
     /// (search/get_playlist/resolve/watch), surfaced to `App::yt_error` by
     /// `on_tick`. Lets the UI exit a "searching…/loading…" state on failure
@@ -338,7 +362,8 @@ const URL_CACHE_CAP: usize = 2;
 /// the cap the oldest entry is evicted. Entries whose stream URL is still
 /// held in the 2-entry `url_cache` (the playing / next-preload track) are
 /// never evicted, so the player bar keeps its now-playing metadata mid-play.
-const TRACK_CACHE_CAP: usize = 256;
+/// `pub` so `tests/perf.rs` can assert the cap value.
+pub const TRACK_CACHE_CAP: usize = 256;
 
 impl Session {
     /// Spawn with pasted `cookies` (Netscape) OR `browser` (profile name) —
@@ -368,6 +393,10 @@ impl Session {
             refresh_remaining: 0,
             pending_lyrics: None,
             lyrics_inflight: None,
+            pending_discover: None,
+            discover_inflight: false,
+            pending_watch: None,
+            watch_inflight: false,
             pending_errors: Vec::new(),
             respawn_attempts: 0,
             last_respawn: None,
@@ -410,6 +439,10 @@ impl Session {
             refresh_remaining: 0,
             pending_lyrics: None,
             lyrics_inflight: None,
+            pending_discover: None,
+            discover_inflight: false,
+            pending_watch: None,
+            watch_inflight: false,
             pending_errors: Vec::new(),
             respawn_attempts: 0,
             last_respawn: None,
@@ -555,12 +588,16 @@ impl Session {
         self.pending_search = None;
         self.pending_premium_url = None;
         self.pending_lyrics = None;
+        self.pending_discover = None;
+        self.pending_watch = None;
         self.pending_errors.clear();
         self.playlist_inflight = None;
         self.search_inflight = None;
         self.resolve_inflight = None;
         self.premium_resolve_inflight = None;
         self.lyrics_inflight = None;
+        self.discover_inflight = false;
+        self.watch_inflight = false;
         self.refresh_inflight = false;
         self.refresh_remaining = 0;
         // Bump the gen so any in-flight response (carrying the old gen) is
@@ -643,6 +680,22 @@ impl Session {
                 for t in v {
                     self.cache_track(t);
                 }
+                // Surface the radio queue's video_ids so `App::on_tick` can
+                // refill the `RadioCursor` + start playback (non-blocking
+                // auto-advance). Clear the inflight guard on success so a
+                // later auto-advance can fire a fresh fetch.
+                let vids: Vec<String> = v.iter().map(|t| t.video_id.clone()).collect();
+                self.pending_watch = Some(vids);
+                self.watch_inflight = false;
+            }
+            // Discover (`S` overlay) home-suggestions: route to
+            // `pending_discover` (NOT `pending_suggestions`, which is the
+            // gen-guarded refresh flow). Distinct Pending variant → FIFO
+            // pairing keeps a discover response away from a refresh's
+            // Suggestions(gen) slot.
+            (Response::Suggestions(v), Pending::Discover) => {
+                self.pending_discover = Some(v.clone());
+                self.discover_inflight = false;
             }
             (Response::Resolve(u), Pending::Resolve(vid)) => {
                 // FAST tier: fill the fast slot WITHOUT evicting a premium slot
@@ -794,6 +847,20 @@ impl Session {
                 }
                 self.set_error(ErrorScope::Other, e.clone());
             }
+            (Response::Error(e), Pending::Discover) => {
+                // Free the discover inflight guard so a later `S` press can
+                // re-fetch, and surface the error so `App::on_tick` can clear
+                // the discover overlay's "loading…" state.
+                self.discover_inflight = false;
+                self.set_error(ErrorScope::Other, e.clone());
+            }
+            (Response::Error(e), Pending::Watch) => {
+                // Free the watch inflight guard so a later auto-advance can
+                // fire a fresh radio refill. Surface the error so `App::on_tick`
+                // can stop cleanly instead of hanging on a wedged inflight.
+                self.watch_inflight = false;
+                self.set_error(ErrorScope::Other, e.clone());
+            }
             (Response::Error(e), _) => {
                 self.set_error(ErrorScope::Other, e.clone());
             }
@@ -827,6 +894,19 @@ impl Session {
             self.track_cache_order.push_back(t.video_id.clone());
             self.evict_track_cache();
         }
+    }
+
+    /// Public test helper: cache a track summary (wraps the private
+    /// `cache_track`). Used by `tests/perf.rs` to verify the LRU cap + dedup.
+    pub fn cache_track_pub(&mut self, t: &RemoteTrackSummary) {
+        self.cache_track(t);
+    }
+
+    /// Public test helper: the number of entries in the FIFO eviction order
+    /// deque. Used by `tests/perf.rs` to verify dedup (should equal
+    /// `track_cache.len()`).
+    pub fn track_cache_order_len(&self) -> usize {
+        self.track_cache_order.len()
     }
 
     /// Evict the oldest `track_cache` entries while over [`TRACK_CACHE_CAP`].
@@ -1089,6 +1169,54 @@ impl Session {
         self.lyrics_inflight.as_deref() == Some(video_id)
     }
 
+    /// Fire-and-forget: fetch home suggestions for the `S` discover overlay.
+    /// Results land in `pending_discover` (picked up by `App::on_tick` to
+    /// populate the overlay). Non-blocking — opening discover never blocks on
+    /// the ~3s ytmusicapi roundtrip (the overlay opens instantly with a
+    /// "loading…" state, items appear when the response lands). Only one
+    /// discover fetch at a time (`discover_inflight`); re-sending while in
+    /// flight is a no-op so repeated `S` presses don't flood the sidecar.
+    /// Distinct from `send_refresh`'s `Pending::Suggestions(gen)` so a discover
+    /// response routes to `pending_discover` without disturbing the
+    /// generation-guarded refresh tracking.
+    pub fn send_home_suggestions(&mut self) -> Result<()> {
+        if self.discover_inflight {
+            return Ok(());
+        }
+        self.discover_inflight = true;
+        self.pending.push_back(Pending::Discover);
+        self.sidecar.send(&Request::HomeSuggestions)?;
+        Ok(())
+    }
+
+    /// True if a discover (home-suggestions) fetch is currently in flight.
+    pub fn discover_loading(&self) -> bool {
+        self.discover_inflight
+    }
+
+    /// Fire-and-forget: fetch a watch_playlist (radio queue) seeded by
+    /// `video_id` for CONT=YouTube auto-advance. Results land in
+    /// `pending_watch` (picked up by `App::on_tick` to refill the
+    /// `RadioCursor` + start playback). Non-blocking — a natural end-of-track
+    /// no longer freezes the UI for the ~4s ytmusicapi roundtrip; the old
+    /// track simply stays current until the next track's id lands, then
+    /// `on_tick` switches. Only one watch fetch at a time (`watch_inflight`);
+    /// re-sending while in flight is a no-op.
+    pub fn send_watch_playlist(&mut self, video_id: String) -> Result<()> {
+        if self.watch_inflight {
+            return Ok(());
+        }
+        self.watch_inflight = true;
+        self.pending.push_back(Pending::Watch);
+        self.sidecar.send(&Request::GetWatchPlaylist { video_id })?;
+        Ok(())
+    }
+
+    /// True if a watch_playlist (radio refill) fetch is currently in flight.
+    pub fn watch_loading(&self) -> bool {
+        self.watch_inflight
+    }
+
     /// Drain any pending responses without pairing (legacy). Returns parsed
     /// responses in arrival order.
     pub fn drain(&mut self) -> Vec<Response> {
@@ -1255,6 +1383,45 @@ impl RadioCursor {
             }
         }
         None
+    }
+
+    /// Return the next queued video id WITHOUT refilling (no sidecar call).
+    /// Returns `None` when the queue is exhausted — the caller then decides to
+    /// fire-and-forget a refill via [`Session::send_watch_playlist`] and, on
+    /// the response landing, [`RadioCursor::advance_with_vids`]. This splits
+    /// the old blocking [`RadioCursor::advance`] into a non-blocking local
+    /// advance + an async refill so a natural end-of-track never freezes the
+    /// UI for the ~4s ytmusicapi roundtrip.
+    pub fn next_local(&mut self) -> Option<String> {
+        if self.pos < self.queue.len() {
+            let id = self.queue[self.pos].clone();
+            self.pos += 1;
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    /// Refill the queue from pre-fetched `vids` (the fire-and-forget path: the
+    /// sidecar call already happened via `send_watch_playlist`, this just
+    /// advances the cursor over the result). `seed` is dropped if it's the
+    /// leading entry (matches YouTube's "Up Next" excludes the just-played
+    /// track). Returns the first video id to play, or `None` when `vids` is
+    /// empty after dropping the seed. Mirrors the refill half of
+    /// [`RadioCursor::advance`] but without the sidecar roundtrip.
+    pub fn advance_with_vids(&mut self, vids: Vec<String>, seed: Option<String>) -> Option<String> {
+        let mut next = vids;
+        if let Some(seed) = seed {
+            if next.first().map(|s| s == &seed).unwrap_or(false) {
+                next.remove(0);
+            }
+        }
+        if next.is_empty() {
+            return None;
+        }
+        self.queue = next;
+        self.pos = 1;
+        self.queue.first().cloned()
     }
 }
 

@@ -52,7 +52,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
         Overlay::PlaylistPicker { track_id, cursor } => {
             render_playlist_picker(f, area, app, &track_id, cursor)
         }
-        Overlay::Command { input } => render_command(f, area, &input),
+        Overlay::Command { input, cursor } => render_command(f, area, &input, cursor),
         Overlay::YtAuth { input } => render_yt_auth(f, area, &input),
         Overlay::Discover { items, cursor } => render_discover(f, area, &items, cursor),
         Overlay::Lyrics {
@@ -430,7 +430,7 @@ fn render_playlist_picker(f: &mut Frame, area: Rect, app: &App, track_id: &str, 
 // Command line
 // ---------------------------------------------------------------------------
 
-fn render_command(f: &mut Frame, area: Rect, input: &str) {
+fn render_command(f: &mut Frame, area: Rect, input: &str, cursor: usize) {
     let theme = Theme::default();
     // One-line strip at the very bottom of the screen.
     let strip = Rect {
@@ -441,10 +441,16 @@ fn render_command(f: &mut Frame, area: Rect, input: &str) {
     };
     f.render_widget(Clear, strip);
 
+    // Show the input with the block cursor `▏` at the cursor position.
+    let cursor = cursor.min(input.len());
+    let before = &input[..cursor];
+    let after = &input[cursor..];
+
     let line = Line::from(vec![
         Span::styled(":", Style::default().fg(theme.accent)),
-        Span::styled(input.to_string(), Style::default().fg(theme.text)),
+        Span::styled(before.to_string(), Style::default().fg(theme.text)),
         Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        Span::styled(after.to_string(), Style::default().fg(theme.text)),
     ])
     .alignment(Alignment::Left);
     f.render_widget(Paragraph::new(line), strip);

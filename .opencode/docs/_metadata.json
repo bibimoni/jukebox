@@ -41,7 +41,14 @@
       "fetchedAt": "2026-07-11T19:49:33.471Z",
       "expiresAt": "2026-07-12T19:49:33.471Z",
       "size": 15185
+    },
+    "docs_rs_clap_460_clap__derive__tutorial_indexhtml.md": {
+      "url": "https://docs.rs/clap/4.6.0/clap/_derive/_tutorial/index.html",
+      "title": "clap::_derive::_tutorial - Rust",
+      "fetchedAt": "2026-07-11T19:54:31.015Z",
+      "expiresAt": "2026-07-12T19:54:31.015Z",
+      "size": 15172
     }
   },
-  "lastUpdated": "2026-07-11T19:49:33.472Z"
+  "lastUpdated": "2026-07-11T19:54:31.016Z"
 }
