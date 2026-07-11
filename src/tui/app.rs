@@ -1285,6 +1285,30 @@ impl App {
         // clear the saved browser so the next launch doesn't try to read a
         // browser profile the user abandoned.
         self.yt_browser.clear();
+
+        // Auto-setup: same as apply_yt_browser — if the venv doesn't exist,
+        // run setup automatically so `:yt auth` is self-contained.
+        let venv_py = crate::yt::session::venv_python();
+        if !venv_py.exists() {
+            self.yt_status = Some("YT setup: installing deps (one-time)…".into());
+            let reqs = self.yt_script.parent().map(|p| p.join("requirements.txt"));
+            if let Some(reqs) = reqs {
+                match crate::yt::session::run_setup(&reqs) {
+                    Ok(_) => {
+                        self.yt_python = crate::yt::session::venv_python();
+                        self.yt_status = Some("YT setup complete — authenticating…".into());
+                    }
+                    Err(e) => {
+                        self.yt_error = Some(format!(
+                            "setup failed: {e} — run :yt setup manually, then :yt auth"
+                        ));
+                        self.yt_state = crate::yt::state::YtState::Failed;
+                        return;
+                    }
+                }
+            }
+        }
+
         if self.yt_session.is_none() {
             match crate::yt::session::Session::spawn(
                 &self.yt_python,
@@ -1321,6 +1345,34 @@ impl App {
         // Remember the choice so the next launch auto-connects from the same
         // browser profile (no re-auth). Saved to state.db on clean exit.
         self.yt_browser = browser.clone();
+
+        // Auto-setup: if the venv doesn't exist yet (first-time user), run
+        // :yt setup automatically before spawning the sidecar. This lets a
+        // new user do everything in ONE command (`:yt auth browser chrome`)
+        // instead of two (`:yt setup` + `:yt auth browser chrome`). The venv
+        // install is ~30s one-time; subsequent `:yt auth browser` calls skip
+        // this because the venv already exists.
+        let venv_py = crate::yt::session::venv_python();
+        if !venv_py.exists() {
+            self.yt_status = Some("YT setup: installing deps (one-time)…".into());
+            let reqs = self.yt_script.parent().map(|p| p.join("requirements.txt"));
+            if let Some(reqs) = reqs {
+                match crate::yt::session::run_setup(&reqs) {
+                    Ok(_) => {
+                        self.yt_python = crate::yt::session::venv_python();
+                        self.yt_status = Some("YT setup complete — authenticating…".into());
+                    }
+                    Err(e) => {
+                        self.yt_error = Some(format!(
+                            "setup failed: {e} — run :yt setup manually, then :yt auth browser {browser}"
+                        ));
+                        self.yt_state = crate::yt::state::YtState::Failed;
+                        return;
+                    }
+                }
+            }
+        }
+
         if self.yt_session.is_none() {
             match crate::yt::session::Session::spawn_browser(
                 &self.yt_python,
