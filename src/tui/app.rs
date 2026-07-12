@@ -2502,6 +2502,11 @@ impl App {
     pub fn open_discover(&mut self) {
         let items = match self.source_mode {
             crate::mode::SourceMode::Youtube => self.yt_discover_items(),
+            crate::mode::SourceMode::Mixed => {
+                let mut albums = self.local_smart_albums();
+                albums.extend(self.yt_discover_items());
+                albums
+            }
             _ => {
                 let mut albums = self.local_smart_albums();
                 if albums.is_empty() {
