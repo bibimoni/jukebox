@@ -1372,6 +1372,15 @@ impl Session {
         self.discover_inflight
     }
 
+    /// Reset the discover inflight flag so a new `send_home_suggestions` can
+    /// be issued. Called when the user reopens the discover overlay (`S`) —
+    /// if the previous response never arrived (sidecar timeout, network
+    /// drop), the flag would stay `true` forever and block all future
+    /// discover fetches.
+    pub fn reset_discover_inflight(&mut self) {
+        self.discover_inflight = false;
+    }
+
     /// Fire-and-forget: fetch a watch_playlist (radio queue) seeded by
     /// `video_id` for CONT=YouTube auto-advance. Results land in
     /// `pending_watch` (picked up by `App::on_tick` to refill the

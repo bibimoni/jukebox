@@ -2565,6 +2565,11 @@ impl App {
         let Some(session) = self.yt_session.as_mut() else {
             return Vec::new();
         };
+        // Reset the inflight flag in case a previous request's response
+        // never arrived (sidecar timeout, network drop). Without this,
+        // `discover_inflight` stays true forever and blocks all future
+        // discover fetches — the user presses S and gets only local albums.
+        session.reset_discover_inflight();
         // Fire-and-forget: send + return immediately. The response lands in
         // `session.pending_discover` and `on_tick` folds it into the open
         // Discover overlay. `discover_inflight` makes a re-press a no-op.
