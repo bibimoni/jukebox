@@ -229,6 +229,24 @@ enum Pending {
     /// differs, and FIFO pairing (responses in send order) keeps each
     /// `HomeSuggestions` response paired with the kind that asked for it.
     Discover,
+    /// A create-playlist request outstanding. Carries the title so the
+    /// response can be correlated with the request.
+    #[allow(dead_code)]
+    CreatePlaylist(String),
+    /// An add-playlist-items request outstanding. Carries the playlist id.
+    #[allow(dead_code)]
+    AddPlaylistItems(String),
+    /// A get-liked-songs request outstanding.
+    LikedSongs,
+    /// A get-artist request outstanding. Carries the channel id.
+    #[allow(dead_code)]
+    Artist(String),
+    /// A get-song-related request outstanding. Carries the browse id.
+    #[allow(dead_code)]
+    Related(String),
+    /// A get-album request outstanding. Carries the browse id.
+    #[allow(dead_code)]
+    Album(String),
     Auth,
     Pong,
 }
@@ -300,6 +318,11 @@ pub struct Session {
     /// sidecar, and the user's currently-focused playlist sat at the back of
     /// the queue behind redundant fetches → "Loading…" forever.
     playlist_inflight: std::collections::HashSet<String>,
+    /// SYNC-49 fix: queue of playlist ids visited while a fetch was in flight.
+    /// When the current fetch completes, on_tick checks this queue and fires
+    /// the next one. This ensures rapid A→B→C→D→E switching loads ALL
+    /// playlists, not just the first and last.
+    pending_playlist_queue: std::collections::VecDeque<String>,
     /// `(query, video_ids)` from a fire-and-forget `send_search`, picked up by
     /// `App::on_tick` to populate the search overlay's results. Carries the
     /// query so App only applies it to the overlay that asked for it.
@@ -345,6 +368,13 @@ pub struct Session {
     /// True while a watch_playlist fetch is in flight (guards against
     /// re-sending every tick while the fetch is in flight).
     watch_inflight: bool,
+    /// The result of the last fire-and-forget publication operation
+    /// (create_playlist or add_playlist_items), picked up by `App::on_tick`
+    /// to surface the outcome to the user. Carries the playlist id on success,
+    /// the list of failed video ids on partial success, or the error message
+    /// on failure. Truthful reporting — never a blanket "done" when some
+    /// tracks silently failed.
+    pub pending_publication: Option<crate::yt::publication::PublicationResult>,
     /// The most recent sidecar error from an inflight-tracked request
     /// (search/get_playlist/resolve/watch), surfaced to `App::yt_error` by
     /// `on_tick`. Lets the UI exit a "searching…/loading…" state on failure
@@ -409,6 +439,7 @@ impl Session {
             pending_suggestions: None,
             pending_tracks: Vec::new(),
             playlist_inflight: std::collections::HashSet::new(),
+            pending_playlist_queue: std::collections::VecDeque::new(),
             pending_search: None,
             search_inflight: None,
             refresh_inflight: false,
@@ -420,6 +451,7 @@ impl Session {
             discover_inflight: false,
             pending_watch: None,
             watch_inflight: false,
+            pending_publication: None,
             pending_errors: Vec::new(),
             respawn_attempts: 0,
             last_respawn: None,
@@ -456,6 +488,7 @@ impl Session {
             pending_suggestions: None,
             pending_tracks: Vec::new(),
             playlist_inflight: std::collections::HashSet::new(),
+            pending_playlist_queue: std::collections::VecDeque::new(),
             pending_search: None,
             search_inflight: None,
             refresh_inflight: false,
@@ -467,6 +500,7 @@ impl Session {
             discover_inflight: false,
             pending_watch: None,
             watch_inflight: false,
+            pending_publication: None,
             pending_errors: Vec::new(),
             respawn_attempts: 0,
             last_respawn: None,
@@ -594,6 +628,9 @@ impl Session {
     pub fn clear_cookies(&mut self, python: &Path, script: &Path) -> Result<()> {
         self.cookies = None;
         self.browser = None;
+        // SYNC-48 fix: clear inflight state before respawn so stale requests
+        // from the killed sidecar don't block future fetches.
+        self.clear_all_caches();
         self.sidecar = Sidecar::spawn(python, script, None, None, None)?;
         Ok(())
     }
@@ -616,8 +653,10 @@ impl Session {
         self.pending_lyrics = None;
         self.pending_discover = None;
         self.pending_watch = None;
+        self.pending_publication = None;
         self.pending_errors.clear();
         self.playlist_inflight.clear();
+        self.pending_playlist_queue.clear();
         self.search_inflight = None;
         self.resolve_inflight = None;
         self.premium_resolve_inflight = None;
@@ -646,6 +685,8 @@ impl Session {
         let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
         self.cookies = Some(cookies);
         self.browser = None;
+        // SYNC-48 fix: clear inflight state before respawn.
+        self.clear_all_caches();
         self.sidecar = Sidecar::spawn(python, script, self.cookies.clone(), None, None)?;
         Ok(())
     }
@@ -657,6 +698,8 @@ impl Session {
     pub fn set_browser(&mut self, browser: String, python: &Path, script: &Path) -> Result<()> {
         self.browser = Some(browser.clone());
         self.cookies = None;
+        // SYNC-48 fix: clear inflight state before respawn.
+        self.clear_all_caches();
         // Same pattern as spawn_browser: pass empty string when no safe config
         // dir (refusing /tmp/.config for cookie secrets).
         let cf = cookies_file_opt()
@@ -822,6 +865,28 @@ impl Session {
                 // back to the same id) isn't wedged.
                 if self.lyrics_inflight.as_deref() == Some(vid.as_str()) {
                     self.lyrics_inflight = None;
+                }
+            }
+            // Publication responses: stage the result for App::on_tick to
+            // surface to the user. CreatedPlaylist carries the new playlist
+            // id (Success). AddedItems carries a ytmusicapi status + count;
+            // STATUS_SUCCEEDED = Success, anything else = Failed (truthful
+            // reporting — never a blanket "done" when some tracks failed).
+            (Response::CreatedPlaylist { id, .. }, Pending::CreatePlaylist(_)) => {
+                self.pending_publication = Some(
+                    crate::yt::publication::PublicationResult::Success(id.clone()),
+                );
+            }
+            (Response::AddedItems { status, count: _ }, Pending::AddPlaylistItems(_)) => {
+                if status == "STATUS_SUCCEEDED" {
+                    self.pending_publication = Some(
+                        crate::yt::publication::PublicationResult::Success(String::new()),
+                    );
+                } else {
+                    self.pending_publication =
+                        Some(crate::yt::publication::PublicationResult::Failed(format!(
+                            "add_playlist_items returned status: {status}"
+                        )));
                 }
             }
             // An error response frees the inflight guard for its request kind so
@@ -1004,6 +1069,14 @@ impl Session {
             }
             Request::AuthStatus => Pending::Auth,
             Request::GetLyrics { video_id } => Pending::Lyrics(video_id.clone()),
+            Request::CreatePlaylist { title, .. } => Pending::CreatePlaylist(title.clone()),
+            Request::AddPlaylistItems { playlist_id, .. } => {
+                Pending::AddPlaylistItems(playlist_id.clone())
+            }
+            Request::GetLikedSongs { .. } => Pending::LikedSongs,
+            Request::GetArtist { channel_id } => Pending::Artist(channel_id.clone()),
+            Request::GetSongRelated { browse_id } => Pending::Related(browse_id.clone()),
+            Request::GetAlbum { browse_id } => Pending::Album(browse_id.clone()),
             Request::Ping => Pending::Pong,
         }
     }
@@ -1180,23 +1253,45 @@ impl Session {
     /// Fire-and-forget: fetch the tracks of one playlist so the Y view can
     /// populate the focused list's col2. Results land in `pending_tracks`
     /// (picked up by `App::on_tick`). **Only ONE playlist fetch is allowed
-    /// in flight at a time** — if any fetch is in progress, this is a no-op.
-    /// The sidecar is single-threaded/sequential; allowing multiple
-    /// concurrent fetches (one per switched-to playlist) queues them all,
-    /// and the user's CURRENTLY focused playlist's request sits at the back
-    /// behind 5-10 others (1-2s each → 10-20s "long loading time"). By
-    /// serializing: switch A→B while A loads → B waits → A completes → next
-    /// tick fires B → B loads in 1-2s. No queue buildup.
+    /// in flight at a time** — if a fetch is in progress, the id is QUEUED
+    /// (SYNC-49 fix) rather than dropped, so rapid A→B→C→D→E switching
+    /// eventually loads ALL playlists. When the current fetch completes,
+    /// `drain_playlist_queue()` fires the next one.
     pub fn send_get_playlist(&mut self, id: String) -> Result<()> {
+        // Don't re-fetch if already loaded or in flight.
+        if self.playlist_inflight.contains(&id) {
+            return Ok(());
+        }
         if !self.playlist_inflight.is_empty() {
-            // Any fetch in flight → block. The focused playlist's fetch will
-            // fire on a later tick once the current one completes.
+            // A fetch is in flight → queue this id (don't drop it).
+            // Dedup: don't queue the same id twice.
+            if !self.pending_playlist_queue.contains(&id) {
+                self.pending_playlist_queue.push_back(id);
+            }
             return Ok(());
         }
         self.playlist_inflight.insert(id.clone());
         self.pending.push_back(Pending::Tracks(id.clone()));
         self.sidecar.send(&Request::GetPlaylist { id })?;
         Ok(())
+    }
+
+    /// SYNC-49 fix: fire the next queued playlist fetch (if any). Called by
+    /// `App::on_tick` after a Tracks response lands and clears the inflight
+    /// set. Returns the id that was fired, if any.
+    pub fn drain_playlist_queue(&mut self) -> Option<String> {
+        if self.playlist_inflight.is_empty() {
+            if let Some(id) = self.pending_playlist_queue.pop_front() {
+                // Skip if already loaded while waiting in the queue.
+                if !self.playlist_inflight.contains(&id) {
+                    self.playlist_inflight.insert(id.clone());
+                    self.pending.push_back(Pending::Tracks(id.clone()));
+                    let _ = self.sidecar.send(&Request::GetPlaylist { id: id.clone() });
+                    return Some(id);
+                }
+            }
+        }
+        None
     }
 
     /// True if a get_playlist for `id` is currently in flight.
@@ -1298,6 +1393,82 @@ impl Session {
     /// True if a watch_playlist (radio refill) fetch is currently in flight.
     pub fn watch_loading(&self) -> bool {
         self.watch_inflight
+    }
+
+    /// Fire-and-forget: create a new YouTube playlist with the given title,
+    /// description, privacy, and optional seed video_ids. The response
+    /// (CreatedPlaylist with the new playlist id) is drained by `on_tick`.
+    /// Non-blocking — publication never freezes the UI. The caller MUST show
+    /// a confirmation flow before calling this (safe publication: the user
+    /// must explicitly confirm the title, privacy, and track list).
+    pub fn send_create_playlist(
+        &mut self,
+        title: String,
+        description: String,
+        privacy: String,
+        video_ids: Vec<String>,
+    ) -> Result<()> {
+        self.pending
+            .push_back(Pending::CreatePlaylist(title.clone()));
+        self.sidecar.send(&Request::CreatePlaylist {
+            title,
+            description,
+            privacy,
+            video_ids,
+        })?;
+        Ok(())
+    }
+
+    /// Fire-and-forget: add tracks to an existing playlist. `duplicates=true`
+    /// makes the call idempotent (ytmusicapi skips already-present items), so
+    /// retry-on-failure won't double-add. The caller MUST have already shown
+    /// the track list and gotten explicit confirmation (safe publication).
+    pub fn send_add_playlist_items(
+        &mut self,
+        playlist_id: String,
+        video_ids: Vec<String>,
+    ) -> Result<()> {
+        self.pending
+            .push_back(Pending::AddPlaylistItems(playlist_id.clone()));
+        self.sidecar.send(&Request::AddPlaylistItems {
+            playlist_id,
+            video_ids,
+            duplicates: true,
+        })?;
+        Ok(())
+    }
+
+    /// Fire-and-forget: fetch the user's liked-songs playlist. Results land in
+    /// the response queue and are drained by `on_tick`. Non-blocking.
+    pub fn send_get_liked_songs(&mut self) -> Result<()> {
+        self.pending.push_back(Pending::LikedSongs);
+        self.sidecar.send(&Request::GetLikedSongs { limit: 100 })?;
+        Ok(())
+    }
+
+    /// Fire-and-forget: fetch artist info (name, radio/shuffle ids, top songs,
+    /// related artists). Results land in the response queue. Non-blocking.
+    pub fn send_get_artist(&mut self, channel_id: String) -> Result<()> {
+        self.pending.push_back(Pending::Artist(channel_id.clone()));
+        self.sidecar.send(&Request::GetArtist { channel_id })?;
+        Ok(())
+    }
+
+    /// Fire-and-forget: fetch related content for a song ("you might also
+    /// like", recommended playlists, similar artists). Results land in the
+    /// response queue. Non-blocking.
+    pub fn send_get_song_related(&mut self, browse_id: String) -> Result<()> {
+        self.pending.push_back(Pending::Related(browse_id.clone()));
+        self.sidecar.send(&Request::GetSongRelated { browse_id })?;
+        Ok(())
+    }
+
+    /// Fire-and-forget: fetch album info (title, artists, year, tracks).
+    /// Results land in the response queue. Non-blocking.
+    pub fn send_get_album(&mut self, browse_id: String) -> Result<()> {
+        self.pending.push_back(Pending::Album(browse_id.clone()));
+        self.sidecar.send(&Request::GetAlbum { browse_id })?;
+        Ok(())
     }
 
     /// Drain any pending responses without pairing (legacy). Returns parsed

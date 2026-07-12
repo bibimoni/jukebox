@@ -1,7 +1,13 @@
 pub mod columns;
 pub mod diagnostics;
+pub mod explanation;
 pub mod footer;
+pub mod generator;
+pub mod home;
+pub mod icons;
 pub mod layout;
 pub mod overlay;
 pub mod player_bar;
+pub mod publication;
+pub mod radio;
 pub mod theme;

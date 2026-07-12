@@ -35,7 +35,12 @@ pub fn db_path() -> PathBuf {
 /// Increment when the schema or stored JSON format changes incompatibly.
 /// `open_at` auto-migrates older DBs by wiping + recreating (state is
 /// ephemeral UI prefs, not user data — losing it is acceptable).
-const SCHEMA_VERSION: u32 = 2;
+///
+/// Version history:
+/// - 1: initial (focus pane)
+/// - 2: layout + playlists + command history
+/// - 3: events table for the recommendation engine (listening history)
+const SCHEMA_VERSION: u32 = 3;
 
 /// Open (creating if missing) the state DB at `path` and ensure the schema
 /// exists. Checks the stored schema version; if it's older than current,
@@ -74,6 +79,21 @@ fn open_and_init(path: &Path) -> Result<Connection> {
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );",
+    )?;
+    // Events table for the recommendation engine (schema v3). Created here
+    // (outside the need_wipe block) so it survives a v2→v3 migration: the
+    // state table gets wiped (UI prefs are ephemeral), but listening history
+    // is user data we want to preserve across migrations. If the table already
+    // exists (re-open), `CREATE TABLE IF NOT EXISTS` is a no-op.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS events (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_json TEXT NOT NULL,
+            timestamp  INTEGER NOT NULL,
+            event_type TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);",
     )?;
     // Check schema version; wipe if older (migration = fresh start for UI prefs).
     let stored: Option<String> = conn
@@ -417,6 +437,122 @@ pub fn save_command_history(history: &[String]) -> Result<()> {
 /// Load command history from the default DB path.
 pub fn load_command_history() -> Result<Vec<String>> {
     load_command_history_at(&db_path())
+}
+
+// --- Events (recommendation engine listening history) ---
+
+/// Save a single listening event to `path`. Delegates to
+/// `reco::events::EventStore::save_at` after opening the connection.
+pub fn save_event_at(path: &Path, event: &crate::reco::events::ListenEvent) -> Result<()> {
+    let conn = open_at(path)?;
+    crate::reco::events::EventStore::save_at(event, &conn)
+}
+
+/// Load the `limit` most recent events from `path` (chronological order).
+pub fn load_events_at(path: &Path, limit: usize) -> Result<Vec<crate::reco::events::ListenEvent>> {
+    let conn = open_at(path)?;
+    crate::reco::events::EventStore::load_at(&conn, limit)
+}
+
+/// Load all events since `since` from `path` (chronological order).
+pub fn load_events_since_at(
+    path: &Path,
+    since: u64,
+) -> Result<Vec<crate::reco::events::ListenEvent>> {
+    let conn = open_at(path)?;
+    crate::reco::events::EventStore::load_since_at(&conn, since)
+}
+
+/// Clear all listening events from `path`.
+pub fn clear_events_at(path: &Path) -> Result<()> {
+    let conn = open_at(path)?;
+    crate::reco::events::EventStore::clear_at(&conn)
+}
+
+/// Count the total number of listening events at `path`.
+pub fn count_events_at(path: &Path) -> Result<u64> {
+    let conn = open_at(path)?;
+    crate::reco::events::EventStore::count_at(&conn)
+}
+
+/// Prune events older than `before` at `path` (retention enforcement).
+/// Returns the number of deleted rows.
+pub fn prune_events_before_at(path: &Path, before: u64) -> Result<u64> {
+    let conn = open_at(path)?;
+    crate::reco::events::EventStore::prune_before_at(&conn, before)
+}
+
+/// Save a single listening event to the default DB path.
+pub fn save_event(event: &crate::reco::events::ListenEvent) -> Result<()> {
+    save_event_at(&db_path(), event)
+}
+
+/// Load the `limit` most recent events from the default DB path.
+pub fn load_events(limit: usize) -> Result<Vec<crate::reco::events::ListenEvent>> {
+    load_events_at(&db_path(), limit)
+}
+
+/// Clear all listening events from the default DB path.
+pub fn clear_events() -> Result<()> {
+    clear_events_at(&db_path())
+}
+
+/// Count the total number of listening events at the default DB path.
+pub fn count_events() -> Result<u64> {
+    count_events_at(&db_path())
+}
+
+// --- Profile (recommendation engine user profile) ---
+
+/// Save the user profile to `path` as JSON under the `'profile'` key. UPSERT
+/// so the row is created on first save and updated thereafter.
+pub fn save_profile_at(path: &Path, profile: &crate::reco::profile::UserProfile) -> Result<()> {
+    let conn = open_at(path)?;
+    let v = serde_json::to_string(profile)?;
+    conn.execute(
+        "INSERT INTO state (key, value) VALUES ('profile', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [v],
+    )?;
+    Ok(())
+}
+
+/// Load the saved user profile from `path`. Returns `UserProfile::default()`
+/// (empty) when no `'profile'` row exists yet (first launch, or after reset).
+pub fn load_profile_at(path: &Path) -> Result<crate::reco::profile::UserProfile> {
+    let conn = open_at(path)?;
+    match conn.query_row("SELECT value FROM state WHERE key = 'profile'", [], |r| {
+        r.get::<_, String>(0)
+    }) {
+        Ok(s) => Ok(serde_json::from_str(&s)?),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            Ok(crate::reco::profile::UserProfile::default())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Clear the saved user profile at `path` (privacy: user requests profile
+/// reset). The next `load_profile` will return an empty profile.
+pub fn clear_profile_at(path: &Path) -> Result<()> {
+    let conn = open_at(path)?;
+    conn.execute("DELETE FROM state WHERE key = 'profile'", [])?;
+    Ok(())
+}
+
+/// Save the user profile to the default DB path.
+pub fn save_profile(profile: &crate::reco::profile::UserProfile) -> Result<()> {
+    save_profile_at(&db_path(), profile)
+}
+
+/// Load the user profile from the default DB path. Empty on first launch.
+pub fn load_profile() -> Result<crate::reco::profile::UserProfile> {
+    load_profile_at(&db_path())
+}
+
+/// Clear the user profile at the default DB path (privacy reset).
+pub fn clear_profile() -> Result<()> {
+    clear_profile_at(&db_path())
 }
 
 #[cfg(test)]

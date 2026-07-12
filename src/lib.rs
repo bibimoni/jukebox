@@ -7,6 +7,7 @@ pub mod lyrics;
 pub mod mode;
 pub mod player;
 pub mod prompt;
+pub mod reco;
 pub mod search;
 pub mod source;
 pub mod state;

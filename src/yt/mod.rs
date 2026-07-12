@@ -9,6 +9,7 @@
 
 pub mod cache;
 pub mod proto;
+pub mod publication;
 pub mod session;
 pub mod sidecar;
 pub mod state;

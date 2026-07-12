@@ -442,7 +442,9 @@ fn rapid_switch_then_settle_each_playlist_correct() {
 //   2. Stale `pending` FIFO entries cause wrong-track pairing
 //
 // This test demonstrates bug #1: after clear_cookies (logout), the stale
-// inflight guard from a previous get_playlist blocks all future fetches.
+// SYNC-48 FIX VERIFIED: clear_cookies now calls clear_all_caches() before
+// respawn, so stale inflight guards are cleared. After respawn, new
+// get_playlist calls work normally.
 
 #[test]
 fn stale_inflight_guard_after_respawn_blocks_all_fetches() {
@@ -457,9 +459,8 @@ fn stale_inflight_guard_after_respawn_blocks_all_fetches() {
         "PL1 should be inflight after first on_tick"
     );
 
-    // Simulate logout: clear_cookies respawns the sidecar but does NOT clear
-    // playlist_inflight (the bug). The old sidecar's in-flight response won't
-    // arrive (old process killed), so the guard is never cleared by apply_pair.
+    // Simulate logout: clear_cookies respawns the sidecar AND clears
+    // playlist_inflight via clear_all_caches() (the SYNC-48 fix).
     let script_path = std::path::PathBuf::from(&script);
     let _ = app
         .yt_session
@@ -467,35 +468,20 @@ fn stale_inflight_guard_after_respawn_blocks_all_fetches() {
         .unwrap()
         .clear_cookies(std::path::Path::new("python3"), &script_path);
 
-    // The stale guard is STILL SET — this is the bug.
+    // The stale guard should be CLEARED by the fix.
     assert!(
-        app.yt_session.as_ref().unwrap().playlist_loading("PL1"),
-        "BUG: PL1 inflight guard should have been cleared on respawn but is STILL SET \
-         — this blocks ALL future get_playlist calls (stuck on syncing forever)"
+        !app.yt_session.as_ref().unwrap().playlist_loading("PL1"),
+        "FIX VERIFIED: PL1 inflight guard was cleared on respawn \
+         (clear_all_caches called before respawn)"
     );
 
-    // Try to fetch PL2 — should be blocked by the stale guard.
+    // Try to fetch PL2 — should NOT be blocked by stale guard.
     app.cursors.playlist = 1;
     app.on_tick();
     assert!(
-        !app.yt_session.as_ref().unwrap().playlist_loading("PL2"),
-        "BUG: PL2 fetch was blocked by stale PL1 guard — send_get_playlist is a no-op \
-         because `!playlist_inflight.is_empty()` is true (PL1's stale guard)"
-    );
-
-    // Pump on_tick for 5s — PL2 should NEVER load (stale guard blocks it).
-    let pl2_loaded = tick_until(&mut app, 100, |app| {
-        app.yt_lists
-            .get(1)
-            .map(|l| !l.track_ids.is_empty())
-            .unwrap_or(false)
-    });
-
-    assert!(
-        !pl2_loaded,
-        "BUG CONFIRMED: PL2 never loads because stale PL1 inflight guard blocks \
-         ALL get_playlist calls after sidecar respawn. This is the 'stuck on \
-         syncing' / 'long loading time' root cause after re-auth/logout."
+        app.yt_session.as_ref().unwrap().playlist_loading("PL2"),
+        "FIX VERIFIED: PL2 fetch was NOT blocked — send_get_playlist works \
+         after respawn because clear_all_caches cleared the stale guard"
     );
 
     let _ = std::fs::remove_file(&script);

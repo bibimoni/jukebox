@@ -651,6 +651,100 @@ def handle(cmd, arg, ytm):
             text_lines = str(raw).split("\n")
         lines = [{"time": None, "text": t} for t in text_lines]
         return {"lyrics": {"lines": lines, "synced": False}}
+    if cmd == "create_playlist":
+        # Create a new YouTube playlist. ytmusicapi.create_playlist returns the
+        # new playlist id. `privacy` defaults to PRIVATE (the safest option;
+        # ytmusicapi's own default). `video_ids` is optional — pass a list to
+        # seed the playlist at creation, or None for an empty playlist. On
+        # failure the exception propagates to main() which returns
+        # {"ok": false, "error": "..."}.
+        title = arg.get("title", "")
+        description = arg.get("description", "")
+        privacy = arg.get("privacy", "PRIVATE")
+        video_ids = arg.get("video_ids", None)
+        playlist_id = ytm.create_playlist(
+            title, description, privacy_status=privacy, video_ids=video_ids
+        )
+        return {"created_playlist": {"id": playlist_id, "title": title, "privacy": privacy}}
+    if cmd == "add_playlist_items":
+        # Add tracks to an existing playlist. `duplicates=True` makes the call
+        # idempotent (ytmusicapi skips already-present items instead of erroring),
+        # so retry-on-failure won't double-add. ytmusicapi returns a dict with a
+        # "status" field ("STATUS_SUCCEEDED" on success). On failure the
+        # exception propagates.
+        playlist_id = arg.get("playlist_id", "")
+        video_ids = arg.get("video_ids", [])
+        duplicates = arg.get("duplicates", True)
+        result = ytm.add_playlist_items(playlist_id, video_ids, duplicates=duplicates)
+        return {"added_items": {"status": result.get("status", ""), "count": len(video_ids)}}
+    if cmd == "get_liked_songs":
+        # The user's liked-songs playlist (ytmusicapi.get_liked_songs). `limit`
+        # caps the fetch (default 100) so a huge liked-songs library doesn't
+        # block the single-threaded sidecar. Returns tracks via the shared
+        # `_track` mapper.
+        limit = arg.get("limit", 100)
+        result = ytm.get_liked_songs(limit)
+        return {"liked_songs": [_track(t) for t in result.get("tracks", [])]}
+    if cmd == "get_artist":
+        # Artist info: name, channel id, shuffleId/radioId (for radio seeding),
+        # subscriber counts, description, top songs, and related artists.
+        # ytmusicapi.get_artist returns a nested dict; we extract the fields the
+        # Rust side needs and flatten songs/related into our wire types. Wire
+        # keys are snake_case (matching _track's `video_id` convention) so the
+        # Rust serde structs deserialize without rename attributes.
+        channel_id = arg.get("channel_id", "")
+        artist = ytm.get_artist(channel_id)
+        return {"artist_info": {
+            "name": artist.get("name", ""),
+            "channel_id": artist.get("channelId", ""),
+            "shuffle_id": artist.get("shuffleId", ""),
+            "radio_id": artist.get("radioId", ""),
+            "subscribers": artist.get("subscribers", ""),
+            "description": artist.get("description", ""),
+            "songs_browse_id": artist.get("songs", {}).get("browseId", ""),
+            "songs": [_track(t) for t in artist.get("songs", {}).get("results", [])],
+            "related": [
+                {"name": r.get("title", ""), "browse_id": r.get("browseId", "")}
+                for r in artist.get("related", {}).get("results", [])
+            ],
+        }}
+    if cmd == "get_song_related":
+        # Related content for a song (ytmusicapi.get_song_related). The response
+        # is a list of sections, each with "contents" — items with a "videoId"
+        # are tracks, items with a "playlistId" are playlists. We flatten both
+        # into separate lists so the Rust side gets a clean tracks/playlists split.
+        browse_id = arg.get("browse_id", "")
+        related = ytm.get_song_related(browse_id)
+        tracks = []
+        playlists = []
+        for section in related:
+            for item in section.get("contents", []):
+                if "videoId" in item:
+                    tracks.append(_track(item))
+                elif "playlistId" in item:
+                    playlists.append({
+                        "id": item["playlistId"],
+                        "name": item.get("title", ""),
+                        "count": 0,
+                    })
+        return {"related_content": {"tracks": tracks, "playlists": playlists}}
+    if cmd == "get_album":
+        # Album info: title, artists, year, and tracks. ytmusicapi.get_album
+        # returns a dict with "artists" (list of {name, id}) and "tracks" (list
+        # of track dicts). We map through `_track` for consistent track shape.
+        # The artist `id` field is a browse/channel id, so we name it
+        # `browse_id` on the wire to match the Rust `RelatedArtist` struct.
+        browse_id = arg.get("browse_id", "")
+        album = ytm.get_album(browse_id)
+        return {"album_info": {
+            "title": album.get("title", ""),
+            "artists": [
+                {"name": a.get("name", ""), "browse_id": a.get("id", "")}
+                for a in album.get("artists", [])
+            ],
+            "year": album.get("year", ""),
+            "tracks": [_track(t) for t in album.get("tracks", [])],
+        }}
     raise ValueError(f"unknown cmd {cmd}")
 
 

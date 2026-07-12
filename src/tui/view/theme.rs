@@ -45,6 +45,8 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::tui::view::icons::{FontMode, Icon};
+
 /// True when NO_COLOR is set (no-color.org). Colors must not be the only signal.
 pub fn no_color() -> bool {
     std::env::var_os("NO_COLOR").is_some()
@@ -81,6 +83,10 @@ pub struct Theme {
     pub source_local: Color, // local source badge
     pub source_yt: Color,    // YouTube source badge
     pub surface: Color,      // panel background accent
+    /// The font mode for icon rendering (NerdFont / Unicode / Ascii).
+    /// Auto-detected at startup; can be changed at runtime via
+    /// `set_font_mode`. Used by `icon()` to render glyphs.
+    pub font_mode: FontMode,
 }
 
 impl Default for Theme {
@@ -115,6 +121,7 @@ impl Default for Theme {
                 source_local: Color::Reset,
                 source_yt: Color::Reset,
                 surface: Color::Black, // subtle zebra background
+                font_mode: FontMode::auto_detect(),
             }
         } else {
             Theme {
@@ -138,6 +145,7 @@ impl Default for Theme {
                 // was only ~2.1:1 vs Gray text — below WCAG. See columns.rs
                 // zebra_bg usage.
                 surface: Color::Indexed(236),
+                font_mode: FontMode::auto_detect(),
             }
         }
     }
@@ -169,7 +177,25 @@ impl Theme {
             source_local: Color::White,
             source_yt: Color::White,
             surface: Color::Black,
+            font_mode: FontMode::auto_detect(),
         }
+    }
+
+    /// Get the glyph for an icon using the theme's font mode. Essential
+    /// meaning never depends only on the glyph — callers always pair it
+    /// with a text label for accessibility.
+    pub fn icon(&self, icon: Icon) -> &'static str {
+        icon.glyph(self.font_mode)
+    }
+
+    /// Set the font mode at runtime (e.g. when the user cycles modes).
+    pub fn set_font_mode(&mut self, mode: FontMode) {
+        self.font_mode = mode;
+    }
+
+    /// Get the current font mode.
+    pub fn font_mode(&self) -> FontMode {
+        self.font_mode
     }
 
     /// Selection style as a method (method-form entry point for callers that
