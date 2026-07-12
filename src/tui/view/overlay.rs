@@ -62,9 +62,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
         }
         Overlay::Command { input, cursor } => render_command(f, area, &input, cursor),
         Overlay::YtAuth { input } => render_yt_auth(f, area, &input),
-        Overlay::Discover { items, cursor } => {
-            render_discover(f, area, &items, cursor, app.discover_loading)
-        }
+        Overlay::Discover { items, cursor } => render_discover(
+            f,
+            area,
+            &items,
+            cursor,
+            app.discover_loading,
+            app.discover_loading_ticks,
+        ),
         Overlay::Lyrics {
             content,
             state,
@@ -114,6 +119,7 @@ fn render_discover(
     items: &[crate::tui::app::DiscoverItem],
     cursor: usize,
     loading: bool,
+    loading_ticks: u32,
 ) {
     let theme = Theme::default();
     let ascii = is_ascii();
@@ -172,10 +178,15 @@ fn render_discover(
 
     // Show a loading indicator when waiting for YouTube suggestions.
     if loading {
-        let spinner = if ascii { "..." } else { "⠋" };
+        let frames: &[&str] = if ascii {
+            &["|", "/", "-", "\\"]
+        } else {
+            &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        };
+        let frame = frames[(loading_ticks as usize) % frames.len()];
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!("{spinner} Loading YouTube suggestions..."),
+            format!("{frame} Loading YouTube suggestions..."),
             Style::default().fg(theme.hi_fg),
         )));
     }
