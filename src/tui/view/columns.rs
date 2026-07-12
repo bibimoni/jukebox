@@ -1055,7 +1055,21 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
                 };
                 (left, yt_quality, true)
             };
-            let line = pad_between(&left, &quality, width);
+            // MOD-3: ensure at least 1 space between the track info (left) and
+            // the quality tag (right). `pad_between` produces 0 padding when
+            // `left + right >= width`, which concatenates them without a
+            // separator ("Album16bit…"). Fall back to a manual join with a
+            // space so the quality tag — if visible at all — is always
+            // separated from the album name.
+            let line = {
+                let lw = disp_width(&left);
+                let rw = disp_width(&quality);
+                if lw + rw + 1 > width {
+                    format!("{left} {quality}")
+                } else {
+                    pad_between(&left, &quality, width)
+                }
+            };
             let line = truncate_ellipsis(&line, width);
             // Zebra striping: consistent on ALL non-selected rows. Playing
             // rows get zebra under their playing_style (which only sets fg,
@@ -1160,7 +1174,21 @@ fn yt_track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<
             } else {
                 format!("{badge}{glyph} {num} {title} {dash} {artist} {album_s}")
             };
-            let line = pad_between(&left, &quality, width);
+            // MOD-3: ensure at least 1 space between the track info (left) and
+            // the quality tag (right). `pad_between` produces 0 padding when
+            // `left + right >= width`, which concatenates them without a
+            // separator ("Album16bit…"). Fall back to a manual join with a
+            // space so the quality tag — if visible at all — is always
+            // separated from the album name.
+            let line = {
+                let lw = disp_width(&left);
+                let rw = disp_width(&quality);
+                if lw + rw + 1 > width {
+                    format!("{left} {quality}")
+                } else {
+                    pad_between(&left, &quality, width)
+                }
+            };
             let line = truncate_ellipsis(&line, width);
             // Zebra striping: consistent on ALL non-selected rows. Playing
             // rows get zebra under their playing_style (which only sets fg,

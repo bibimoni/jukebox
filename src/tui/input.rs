@@ -728,6 +728,10 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                         crate::tui::app::ConfirmAction::YtLogout => {
                             app.yt_logout();
                         }
+                        crate::tui::app::ConfirmAction::ClearQueue => {
+                            app.transport.clear_queue();
+                            app.yt_status = Some("queue cleared".into());
+                        }
                     }
                     app.overlay = None;
                     return;
@@ -896,8 +900,19 @@ fn execute_command(app: &mut App, cmd: &str) {
             app.yt_setup();
         }
         "queue clear" => {
-            app.transport.clear_queue();
-            app.yt_status = Some("queue cleared".into());
+            // MOD-4: confirm before clearing a non-empty queue (mirrors the
+            // `d` delete-playlist and `:yt logout` confirmation pattern from
+            // DEF-001 / DEF-015). When the queue is already empty, `:queue
+            // clear` is a no-op without confirmation — there's nothing to
+            // destroy.
+            if app.transport.manual_queue.is_empty() {
+                app.yt_status = Some("queue is empty".into());
+            } else {
+                app.overlay = Some(Overlay::Confirm {
+                    message: "Clear the play-next queue?  y/n".to_string(),
+                    action: crate::tui::app::ConfirmAction::ClearQueue,
+                });
+            }
         }
         // `:diag` — open the diagnostics overlay (recent provider errors,
         // respawn notices, sidecar failures). Esc closes (generic handler).

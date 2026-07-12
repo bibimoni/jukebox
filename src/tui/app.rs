@@ -195,6 +195,9 @@ pub enum ConfirmAction {
     DeletePlaylist,
     /// Clear YouTube credentials and log out.
     YtLogout,
+    /// Clear the play-next queue (MOD-4: confirm before clearing a non-empty
+    /// queue, mirroring the `d` / `:yt logout` confirmation pattern).
+    ClearQueue,
 }
 
 /// Actions that can be triggered via [`Overlay::TextInput`].

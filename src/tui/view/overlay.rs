@@ -77,6 +77,16 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
 
 /// The discover overlay (`S`): a centered list of suggested albums / YT
 /// playlists. `Enter` plays the selection (wired in input.rs).
+///
+/// **MOD-1:** in ASCII font mode (`JUKEBOX_FONT_MODE=ascii`), the border uses
+/// `+`, `-`, `|` (via [`ASCII_BORDER_SET`]) and the glyphs / em-dash are
+/// replaced with ASCII equivalents (`#` for `♫`, `*` for `✦`, `--` for `—`)
+/// so the overlay is fully ASCII — mirroring the help overlay fix (DEF-025).
+///
+/// **MOD-2:** the full screen `area` is cleared before the popup so the
+/// browse chrome (columns / player bar text) doesn't bleed through on either
+/// side of the popup at small terminals (80×24). Only the popup region was
+/// cleared before, leaving the Miller columns visible around the overlay.
 fn render_discover(
     f: &mut Frame,
     area: Rect,
@@ -84,15 +94,34 @@ fn render_discover(
     cursor: usize,
 ) {
     let theme = Theme::default();
+    let ascii = is_ascii();
+    let dash = em_dash();
+
+    // MOD-2: clear the full screen area first so the browse chrome (artists /
+    // albums / tracks columns, player bar) doesn't bleed through around the
+    // popup. Then clear the popup region too (redundant but harmless — matches
+    // the help overlay pattern).
+    f.render_widget(Clear, area);
+
     let popup = centered(area, 55, 45);
     f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .title(Span::styled(
-            " discover — press Enter to play ",
-            Style::default().fg(theme.accent),
-        ));
+
+    // MOD-1: in ASCII font mode, use ASCII border characters (+, -, |) instead
+    // of Unicode box-drawing (┌─┐│└┘). The title's em-dash is replaced via
+    // `em_dash()` so it reads `--` in ASCII mode.
+    let title = format!(" discover {dash} press Enter to play ");
+    let block = if ascii {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(ASCII_BORDER_SET)
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(title, Style::default().fg(theme.accent)))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(title, Style::default().fg(theme.accent)))
+    };
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -102,9 +131,15 @@ fn render_discover(
         .map(|(i, d)| {
             let (glyph, text) = match d {
                 crate::tui::app::DiscoverItem::Album { artist, album } => {
-                    ("♫", format!("{artist} — {album}"))
+                    // MOD-1: `♫` (music note) → `#` in ASCII mode.
+                    let g = if ascii { "#" } else { "♫" };
+                    (g, format!("{artist} {dash} {album}"))
                 }
-                crate::tui::app::DiscoverItem::Playlist { name, .. } => ("✦", name.clone()),
+                crate::tui::app::DiscoverItem::Playlist { name, .. } => {
+                    // MOD-1: `✦` (star) → `*` in ASCII mode.
+                    let g = if ascii { "*" } else { "✦" };
+                    (g, name.clone())
+                }
             };
             let style = if i == cursor {
                 // MOD-5: use selected_style() (REVERSED|BOLD under NO_COLOR,

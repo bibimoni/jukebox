@@ -207,6 +207,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     force_space_redraw(f);
 }
 
+/// Maximum number of cells `force_space_redraw` will mark as `AlwaysUpdate`
+/// per frame. At small terminal sizes (80×24, 100×30) the cap is never
+/// reached, so all eligible spaces are marked (DEF-002 stays fixed). At
+/// large sizes (120×40, 160×50) the cap prevents the ~2100-cell flood of
+/// erase/update commands that corrupts the display (MAJ-2).
+const MAX_MARKED_CELLS: usize = 500;
+
 /// Work around ratatui's `Cell::eq` treating `symbol: None` (empty) as equal to
 /// `symbol: Some(" ")` (space). When text uses `Color::Reset` (the default
 /// `theme.text`), styled spaces are indistinguishable from empty buffer cells.
@@ -216,19 +223,33 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 /// previous frame's content shows through at every space position, making
 /// words run together ("WorkoutEnergy" instead of "Workout Energy").
 ///
-/// Fix: after all rendering, mark every default-styled space cell that is
+/// Fix: after all rendering, mark default-styled space cells that are
 /// **adjacent to a non-space cell** as `CellDiffOption::AlwaysUpdate` so the
-/// diff always emits it. This limits the extra writes to spaces that are
+/// diff always emits them. This limits the extra writes to spaces that are
 /// actually between words (or between a word and the border), not the vast
 /// empty background. A space in the middle of nowhere doesn't need a forced
 /// write — nothing visually abuts it, so stale content there is harmless.
+///
+/// MAJ-2: At large terminal sizes (120×40, 160×50) the old code marked every
+/// space adjacent to text (~2100 cells), flooding the terminal with erase
+/// commands that corrupt the status bar and hint line. Now we prioritize
+/// inter-word spaces (both neighbours non-space — the DEF-002 critical case
+/// where words run together) and cap the total at [`MAX_MARKED_CELLS`].
+/// Trailing/leading spaces (one neighbour) are filled in only if the cap
+/// hasn't been reached. At small sizes (80×24, 100×30) the cap is never hit,
+/// so DEF-002 stays fully fixed; at large sizes the flood is bounded.
 fn force_space_redraw(f: &mut Frame) {
     let area = f.area();
     let buf = f.buffer_mut();
-    // First pass: identify default-styled space cells adjacent to non-space
-    // content. We check 4-neighbourhood (left, right, up, down) — a space
-    // between two words has non-space neighbours on at least one side.
-    let mut to_mark: Vec<(u16, u16)> = Vec::new();
+    // Collect candidates in two priority tiers:
+    // 1. Inter-word spaces: both left AND right neighbours are non-space.
+    //    These are the DEF-002 critical case — without them, words run
+    //    together ("WorkoutEnergy" instead of "Workout Energy").
+    // 2. One-neighbour spaces: only one side has a non-space neighbour
+    //    (trailing/leading spaces at text boundaries). Less visually
+    //    critical but still needed to clear stale content at text edges.
+    let mut inter_word: Vec<(u16, u16)> = Vec::new();
+    let mut one_neighbour: Vec<(u16, u16)> = Vec::new();
     for y in area.y..area.bottom() {
         for x in area.x..area.right() {
             let is_default_space = match buf.cell((x, y)) {
@@ -244,26 +265,46 @@ fn force_space_redraw(f: &mut Frame) {
             if !is_default_space {
                 continue;
             }
-            // Check if any horizontal neighbour has a non-space symbol (i.e.
-            // a visible character like a letter, glyph, or border char).
-            // `symbol()` returns " " for both empty and space cells, so
-            // this only fires next to actual text/border content.
-            let has_text_neighbour =
-                [(x.wrapping_sub(1), y), (x.wrapping_add(1), y)]
-                    .iter()
-                    .any(|&(nx, ny)| match buf.cell((nx, ny)) {
-                        Some(n) => n.symbol() != " " && !n.symbol().is_empty(),
-                        None => false,
-                    });
-            if has_text_neighbour {
-                to_mark.push((x, y));
+            // Check horizontal neighbours — `symbol()` returns " " for both
+            // empty and space cells, so this only fires next to actual
+            // text/border content.
+            let left = buf
+                .cell((x.wrapping_sub(1), y))
+                .map(|c| c.symbol() != " " && !c.symbol().is_empty())
+                .unwrap_or(false);
+            let right = buf
+                .cell((x.wrapping_add(1), y))
+                .map(|c| c.symbol() != " " && !c.symbol().is_empty())
+                .unwrap_or(false);
+            if left && right {
+                inter_word.push((x, y));
+            } else if left || right {
+                one_neighbour.push((x, y));
             }
         }
     }
-    for (x, y) in to_mark {
+    // Mark inter-word spaces first (highest priority), then one-neighbour
+    // spaces, up to the cap. This ensures the most visible DEF-002 cases
+    // are always covered while bounding the total terminal output per
+    // frame (MAJ-2).
+    let mut marked = 0;
+    for &(x, y) in &inter_word {
+        if marked >= MAX_MARKED_CELLS {
+            break;
+        }
         if let Some(cell) = buf.cell_mut((x, y)) {
             cell.set_diff_option(CellDiffOption::AlwaysUpdate);
         }
+        marked += 1;
+    }
+    for &(x, y) in &one_neighbour {
+        if marked >= MAX_MARKED_CELLS {
+            break;
+        }
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+        }
+        marked += 1;
     }
 }
 
@@ -682,5 +723,35 @@ mod tests {
     #[test]
     fn min_width_is_100() {
         assert_eq!(MIN_WIDTH, 100);
+    }
+
+    /// MAJ-2: At large terminal sizes (160×50), `force_space_redraw` must not
+    /// mark more than `MAX_MARKED_CELLS` cells as `AlwaysUpdate`. Without the
+    /// cap, ~2100 cells are marked at 120×40, flooding the terminal with erase
+    /// commands that corrupt the status bar and hint line.
+    #[test]
+    fn force_space_redraw_caps_marked_cells_at_large_sizes() {
+        let backend = TestBackend::new(160, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                // Render many short words with spaces on every line to create
+                // a large number of eligible default-styled space cells.
+                for y in 0..50u16 {
+                    let text = "word ".repeat(32); // 160 chars, lots of spaces
+                    f.render_widget(Paragraph::new(text), Rect::new(0, y, 160, 1));
+                }
+                force_space_redraw(f);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let count = (0..50u16)
+            .flat_map(|y| (0..160u16).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].diff_option == CellDiffOption::AlwaysUpdate)
+            .count();
+        assert!(
+            count <= MAX_MARKED_CELLS,
+            "MAJ-2: too many cells marked at 160×50: {count} > {MAX_MARKED_CELLS}"
+        );
     }
 }

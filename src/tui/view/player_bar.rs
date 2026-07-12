@@ -117,9 +117,21 @@ fn spinner_glyph(app: &App) -> &'static str {
 /// up-next preview doesn't push the info line under the transport controls
 /// (MOD-1). When `max_title` is 0 the title is empty (but "▸ Next: " still
 /// shows if there IS a next track — the slot is never blank while playing).
+///
+/// MAJ-1: The old implementation called `app.up_next_title()` which only
+/// checked `transport.manual_queue.first()` + `track_by_id_fast()`. This
+/// missed two cases: (a) context continuation (playing track 1 of 3, no
+/// manual queue → showed "(end)" instead of track 2), and (b) YouTube
+/// tracks in the manual queue (`track_by_id_fast` fails on remote ids →
+/// returned None → showed "(end)"). Now we use `transport.peek_next()`
+/// which mirrors the actual next-track logic (context → manual queue →
+/// repeat), then resolve the title via the local catalog or the YouTube
+/// session's track cache, falling back to "Loading…" for uncached remote
+/// tracks.
 fn up_next_preview(app: &App, max_title: usize) -> Option<String> {
-    match app.up_next_title() {
-        Some(title) => {
+    match app.transport.peek_next(app, &app.catalog) {
+        Some(id) => {
+            let title = resolve_next_track_title(app, &id);
             let trimmed = truncate_title(&title, max_title);
             Some(format!("{} Next: {trimmed}", marker_glyph()))
         }
@@ -131,6 +143,19 @@ fn up_next_preview(app: &App, max_title: usize) -> Option<String> {
             }
         }
     }
+}
+
+/// Resolve the display title for a track id — local catalog first, then the
+/// YouTube session's track cache. Returns a "Loading…" placeholder when the
+/// track is a YouTube video whose metadata hasn't been fetched yet (MAJ-1).
+fn resolve_next_track_title(app: &App, id: &str) -> String {
+    if let Some(t) = app.track_by_id_fast(id) {
+        return t.title.clone();
+    }
+    if let Some(rt) = app.yt_session.as_ref().and_then(|s| s.track_for(id)) {
+        return rt.title.clone();
+    }
+    format!("Loading{}", ellipsis())
 }
 
 /// Truncate `title` to `max` display columns, appending an ellipsis when it
@@ -1120,6 +1145,59 @@ mod mod_tests {
         assert!(
             bar.contains("YT"),
             "MOD-3: YT auth indicator must be visible at 80x24 compact bar: {bar}"
+        );
+    }
+
+    /// MAJ-1: When playing track 1 of 2 with no manual queue, the bar should
+    /// show "Next: {track 2 title}" (context continuation), not "Next: (end)".
+    /// The old `up_next_title()` only checked `manual_queue.first()`, missing
+    /// context continuation entirely — so a user playing the first track of an
+    /// album saw "(end)" even though track 2 was queued up next.
+    #[test]
+    fn maj1_up_next_shows_context_continuation_not_end() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        // Play track 1 of 2 — context has two tracks, no manual queue.
+        app.play_in_context_ids(vec!["t1".into(), "t2".into()], "t1");
+        let bar = rendered_bar(&app, 120, 2);
+        assert!(
+            !bar.contains("Next: (end)"),
+            "MAJ-1: should show context continuation, not (end): {bar}"
+        );
+        assert!(
+            bar.contains("Next:"),
+            "MAJ-1: should show Next: preview: {bar}"
+        );
+        // Track 2's title (or a truncation of it) should appear in the bar.
+        let has_track2 = bar.contains("A Very Long") || bar.contains("Track Title");
+        assert!(
+            has_track2,
+            "MAJ-1: should show next track title (t2): {bar}"
+        );
+    }
+
+    /// MAJ-1: When a track is in the manual queue but can't be found in the
+    /// local catalog (e.g., a YouTube video id), the bar must NOT show "(end)".
+    /// It should show "Loading…" (or the title from the YouTube cache) since
+    /// there IS a track queued. The old `up_next_title()` returned None when
+    /// `track_by_id_fast` failed for non-catalog ids, causing "(end)".
+    #[test]
+    fn maj1_up_next_shows_loading_for_unknown_queued_track() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        // Play t1 as the last (and only) context track.
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        // Enqueue a track id not in the local catalog (simulates a YouTube
+        // track whose metadata hasn't been fetched yet).
+        app.transport.manual_queue.push("yt_video_abc".into());
+        let bar = rendered_bar(&app, 120, 2);
+        assert!(
+            !bar.contains("Next: (end)"),
+            "MAJ-1: should not show (end) when manual queue has a track: {bar}"
+        );
+        assert!(
+            bar.contains("Loading"),
+            "MAJ-1: should show Loading for unresolvable queued track: {bar}"
         );
     }
 }

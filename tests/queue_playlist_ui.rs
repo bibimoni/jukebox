@@ -188,6 +188,13 @@ fn queue_clear_command_empties_manual_queue() {
     app.transport.enqueue("t2".into());
     assert_eq!(app.transport.manual_queue.len(), 2);
     open_command(&mut app, "queue clear");
+    // MOD-4: `:queue clear` on a non-empty queue opens a confirmation dialog.
+    // Confirm with 'y' to actually clear.
+    assert!(
+        matches!(app.overlay, Some(Overlay::Confirm { .. })),
+        "queue clear on non-empty queue should open confirm dialog"
+    );
+    handle_key(&mut app, key('y'));
     assert!(app.transport.manual_queue.is_empty());
 }
 
@@ -198,7 +205,24 @@ fn queue_clear_sets_status_message() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.transport.enqueue("t1".into());
     open_command(&mut app, "queue clear");
+    // MOD-4: confirm the clear — the status is set only after confirming.
+    handle_key(&mut app, key('y'));
     assert_eq!(app.yt_status.as_deref(), Some("queue cleared"));
+}
+
+#[test]
+fn queue_clear_empty_queue_no_confirmation() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    assert!(app.transport.manual_queue.is_empty());
+    open_command(&mut app, "queue clear");
+    // MOD-4: clearing an already-empty queue is a no-op — no confirmation.
+    assert!(
+        app.overlay.is_none(),
+        "queue clear on empty queue should not open a dialog"
+    );
+    assert!(app.transport.manual_queue.is_empty());
 }
 
 // ---------------------------------------------------------------------------
