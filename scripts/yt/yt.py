@@ -354,7 +354,7 @@ def _extract_with_retry(ydl_opts, url, attempts=2):
     next client_set won't (a network-level error isn't client-specific).
     Reduced from 3 to 2 attempts so a DRM-protected video doesn't block
     the sidecar for 30+ seconds (each yt-dlp call takes 5-10s)."""
-    opts = {**ydl_opts, "socket_timeout": 5}
+    opts = {**ydl_opts, "socket_timeout": 3}
     last = None
     for attempt in range(attempts):
         try:
@@ -454,8 +454,9 @@ def handle(cmd, arg, ytm):
             out = []
             for sec in ytm.get_home():
                 for it in sec.get("contents", []):
-                    if "playlistId" in it:
-                        out.append({"id": it["playlistId"], "name": it.get("title", ""), "count": 0})
+                    pid = it.get("playlistId")
+                    if pid:  # skip None/empty ids — they can't be fetched
+                        out.append({"id": pid, "name": it.get("title", "") or "", "count": 0})
             return {"suggestions": out}
         except TimeoutError:
             return {"suggestions": []}
@@ -489,10 +490,14 @@ def handle(cmd, arg, ytm):
                 {"player_client": ["tv_embedded", "mweb"], "remote_components": ["ejs:github"]},
             ]
         else:
+            # Fast tier: only try ONE client set. The old code tried 3 sets
+            # (tv_embedded, web_embedded, mweb) which meant a DRM-protected
+            # video blocked the sidecar for 3×5=15s. One set is enough for
+            # pre-resolve (cache warming); if it fails, the play path will
+            # retry. This keeps home_suggestions and other quick requests
+            # from waiting behind a stuck resolve.
             client_sets = [
                 {"player_client": ["tv_embedded", "mweb"]},
-                {"player_client": ["web_embedded", "mweb"]},
-                {"player_client": ["mweb"]},
             ]
         authed = False
         cookiefile = None
@@ -793,6 +798,8 @@ def main():
             print(json.dumps({"ok": False, "error": f"bad json: {e}"}), flush=True)
             continue
         cmd = req.get("cmd")
+        _t0 = time.time()
+        print(f"[sidecar] {cmd} start at {_t0:.3f}", file=sys.stderr, flush=True)
         # ping + auth_status need no ytmusicapi/yt-dlp — serve them even when
         # the deps are missing, so Rust can probe liveness and auth state.
         if cmd == "ping":
@@ -860,21 +867,23 @@ def main():
                         error_box[0] = e
                 t = threading.Thread(target=_run, daemon=True)
                 t.start()
-                t.join(timeout=8)
+                t.join(timeout=5)
                 if t.is_alive():
-                    print(json.dumps({"ok": False, "error": "request timed out (8s) — the video may be DRM-protected or YouTube is rate-limiting; try another track"}), flush=True)
+                    print(json.dumps({"ok": False, "error": "request timed out (5s) — the video may be DRM-protected or YouTube is rate-limiting; try another track"}), flush=True)
                     continue
                 if error_box[0] is not None:
                     raise error_box[0]
                 print(json.dumps({"ok": True, "data": result_box[0]}), flush=True)
             except Exception as e:  # noqa: BLE001
                 print(json.dumps({"ok": False, "error": str(e)}), flush=True)
+            print(f"[sidecar] {cmd} done in {time.time()-_t0:.2f}s at {time.time():.3f}", file=sys.stderr, flush=True)
         else:
             try:
                 data = handle(cmd, req, ytm)
                 print(json.dumps({"ok": True, "data": data}), flush=True)
             except Exception as e:  # noqa: BLE001
                 print(json.dumps({"ok": False, "error": str(e)}), flush=True)
+            print(f"[sidecar] {cmd} done in {time.time()-_t0:.2f}s at {time.time():.3f}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

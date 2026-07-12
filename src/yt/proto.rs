@@ -117,7 +117,9 @@ pub struct RemoteTrackSummary {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct PlaylistSummary {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub count: u32,

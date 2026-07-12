@@ -1137,13 +1137,21 @@ impl Session {
     /// any extra mapping. Non-blocking.
     pub fn drain_paired(&mut self) -> Vec<Response> {
         let mut out = Vec::new();
-        while let Ok(Some(resp)) = self.sidecar.try_recv() {
-            let kind = self.pending.pop_front();
-            if let Some(k) = kind {
-                let target = k.clone();
-                self.apply_pair(k, resp.clone(), &target);
+        loop {
+            match self.sidecar.try_recv() {
+                Ok(Some(resp)) => {
+                    let kind = self.pending.pop_front();
+                    if let Some(k) = kind {
+                        let target = k.clone();
+                        self.apply_pair(k, resp.clone(), &target);
+                    }
+                    out.push(resp);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    break;
+                }
             }
-            out.push(resp);
         }
         out
     }
