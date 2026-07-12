@@ -1,5 +1,23 @@
 # UI Revamp Issues
 
+## Design constraint: NO ICONS
+
+The UI must NOT use icons (Nerd Font glyphs, Unicode symbols, emoji, or pictographic characters) for any UI element. All information must be conveyed through **text labels** and **layout** alone. This includes:
+
+- No `♫`, `✦`, `◆`, `◎`, `▶`, `■`, `▰`, `▱`, `⠋`, `┏`, `┃`, `┗`, `━` or any other Unicode pictographs
+- No Nerd Font PUA glyphs
+- No emoji
+- No box-drawing characters for borders — use plain ASCII (`+`, `-`, `|`) or CSS-style spacing
+- No spinner animations with braille dots (`⠋⠙⠹`) — use text like `[loading]` or `[...]`
+- No `▸` or `▶` markers — use `>` or `->` in plain ASCII
+- No progress bar blocks (`▰▱`) — use text like `[|||||---]` or percentage text
+
+**Rationale:** Icons are font-dependent, break in ASCII-only terminals, cause width-calculation bugs, and add visual noise without information. Text labels are universal, accessible, and testable. The existing `icons.rs` module and `FontMode` system should be removed entirely.
+
+**Affected files:** `src/tui/view/icons.rs` (delete), `src/tui/view/theme.rs` (remove icon helpers), all view files that call `IconRenderer`, `icons.glyph()`, or use Unicode box-drawing characters.
+
+---
+
 ## Issue 1: Too many features hidden behind command mode
 
 **Problem:** New features (Home, Radio, Generator, Publication, Discover) are primarily accessed via command-mode commands (`:home`, `:gen`, `:radio`, `:publish`). The command bar is an alternative input method, not the primary one. Features should be discoverable through visible UI elements — buttons, panels, menu items — with commands as a keyboard shortcut for power users.
