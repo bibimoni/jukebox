@@ -20,6 +20,7 @@
 
 use jukebox::tui::app::{App, View, YtList, YtListKind};
 use jukebox::yt::cache;
+use jukebox::yt::proto::PlaylistSummary;
 use jukebox::yt::session::Session;
 use jukebox::yt::state::YtState;
 use std::io::Write;
@@ -352,4 +353,157 @@ fn r_key_can_retry_from_rate_limited() {
     // Compare with Ready (not retryable — already working).
     let ready = YtState::Ready;
     assert!(!ready.can_retry(), "Ready state should not need retry");
+}
+
+// ---------------------------------------------------------------------------
+// 7. Bug A: refresh_yt_lists while a refresh is in flight preserves pending
+//    data (the clearing moved into send_refresh, after the inflight guard).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refresh_yt_lists_preserves_pending_when_inflight() {
+    // Bug A: refresh_yt_lists() used to clear session.pending_playlists and
+    // session.pending_suggestions BEFORE calling send_refresh(). But
+    // send_refresh() has an inflight guard — if refresh_inflight is true, it
+    // returns Ok(()) without sending. Result: the pending data was cleared
+    // but no new request fired → on_tick never merged → yt_lists stayed empty.
+    //
+    // Fix: the clearing moved INTO send_refresh, AFTER the inflight guard. If
+    // the guard blocks, the pending data is preserved.
+    //
+    // This test simulates: (1) first refresh_yt_lists sends requests and sets
+    // inflight, (2) responses arrive via apply_pair setting pending, (3) a
+    // second refresh_yt_lists (view switch) is called while inflight is true
+    // — the clearing inside send_refresh must NOT fire (guard blocks).
+    let _xdg = isolate_xdg();
+    // A fake sidecar that responds to resolve_url (premium preload) but NOT
+    // to library_playlists/home_suggestions — so refresh_inflight stays true
+    // (the refresh responses never arrive from the sidecar).
+    let map = r#"{}"#;
+    let (script, map_file) = fake_sidecar(map);
+    let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
+    app.view = View::Youtube;
+
+    // First refresh: sends library_playlists + home_suggestions, sets
+    // refresh_inflight=true. The sidecar won't respond (not in the map), so
+    // inflight stays true.
+    app.refresh_yt_lists();
+
+    // Simulate the first response arriving via apply_pair: manually set
+    // pending_playlists and pending_suggestions as if the sidecar responded.
+    // (We can't use on_tick here because drain_paired would also fire the
+    // merge, consuming the pending data immediately.)
+    if let Some(s) = app.yt_session.as_mut() {
+        s.pending_playlists = Some(vec![PlaylistSummary {
+            id: "PL_TEST".into(),
+            name: "Test Playlist".into(),
+            count: 0,
+        }]);
+        s.pending_suggestions = Some(vec![PlaylistSummary {
+            id: "RD_TEST".into(),
+            name: "Test Suggestion".into(),
+            count: 0,
+        }]);
+    }
+
+    // Second refresh (simulating a view switch while the first is in flight).
+    // With the OLD code: this cleared pending_playlists/pending_suggestions
+    // BEFORE calling send_refresh, and send_refresh was a no-op (inflight) —
+    // the pending data was lost. With the FIX: send_refresh is a no-op and
+    // the clearing (inside send_refresh, after the guard) doesn't fire.
+    app.refresh_yt_lists();
+
+    // The pending data must be preserved — the inflight guard blocked
+    // send_refresh, so the clearing must not have fired.
+    if let Some(s) = app.yt_session.as_ref() {
+        assert!(
+            s.pending_playlists.is_some(),
+            "pending_playlists must be preserved when refresh is in flight \
+             (the clearing must be after the inflight guard, not before it)"
+        );
+        assert!(
+            s.pending_suggestions.is_some(),
+            "pending_suggestions must be preserved when refresh is in flight \
+             (the clearing must be after the inflight guard, not before it)"
+        );
+    } else {
+        panic!("session must exist");
+    }
+
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&map_file);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Bug C: load_yt_lists_from_cache clears track_ids so the lazy-load
+//    re-fetches metadata (disk cache stores video IDs, not titles).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn load_yt_lists_from_cache_clears_track_ids() {
+    // Bug C: the disk cache stores track_ids (video IDs) but NOT track
+    // metadata. On launch, load_yt_lists_from_cache restored track_ids
+    // (non-empty). The lazy-load at on_tick checks track_ids.is_empty() —
+    // since they're NOT empty, send_get_playlist never fired. track_for(id)
+    // returned None → yt_track_rows showed the raw video ID as the title
+    // ("random characters" bug).
+    //
+    // Fix: clear track_ids when loading from cache so the lazy-load
+    // re-fetches them with metadata. The playlist NAMES are still visible
+    // from cache.
+    let db = tmp_db();
+    let cached = vec![
+        YtList {
+            id: "PL1".into(),
+            name: "Liked Songs".into(),
+            kind: YtListKind::Account,
+            track_ids: vec!["v1".into(), "v2".into(), "v3".into()],
+        },
+        YtList {
+            id: "RD1".into(),
+            name: "Focus Mix".into(),
+            kind: YtListKind::Suggested,
+            track_ids: vec!["v4".into()],
+        },
+    ];
+    cache::save_yt_lists_at(&db, &cached).unwrap();
+
+    // Verify the cache round-trip preserves track_ids (before the App load).
+    let reloaded = cache::load_yt_lists_at(&db).unwrap();
+    assert_eq!(
+        reloaded[0].track_ids.len(),
+        3,
+        "cache round-trip must preserve track_ids"
+    );
+
+    let (_d, cat) = local_cat();
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        None, // no session → offline
+    );
+    app.load_yt_lists_from_cache_at(&db);
+
+    // After loading from cache, track_ids must be cleared so the lazy-load
+    // re-fetches them with metadata. The playlist names are still visible.
+    assert_eq!(app.yt_lists.len(), 2, "cached lists should be loaded");
+    assert_eq!(app.yt_lists[0].name, "Liked Songs", "playlist name visible");
+    assert_eq!(app.yt_lists[1].name, "Focus Mix", "playlist name visible");
+    assert!(
+        app.yt_lists[0].track_ids.is_empty(),
+        "track_ids must be cleared on cache load so the lazy-load re-fetches \
+         metadata (otherwise raw video IDs show as titles)"
+    );
+    assert!(
+        app.yt_lists[1].track_ids.is_empty(),
+        "track_ids must be cleared on cache load for all lists"
+    );
 }

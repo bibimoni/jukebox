@@ -627,6 +627,24 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             track_id,
             gen,
         }) => {
+            if matches!(key.code, KeyCode::Char('R'))
+                && matches!(
+                    state,
+                    crate::tui::app::LyricsState::NotFound
+                        | crate::tui::app::LyricsState::Offline
+                        | crate::tui::app::LyricsState::Error(_)
+                )
+            {
+                app.overlay = Some(Overlay::Lyrics {
+                    content,
+                    state,
+                    scroll,
+                    track_id: track_id.clone(),
+                    gen,
+                });
+                app.request_lyrics(&track_id);
+                return;
+            }
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     scroll = scroll.saturating_add(1);
@@ -940,6 +958,14 @@ fn set_focused_cursor(app: &mut App, v: usize) {
 fn switch_view(app: &mut App, view: View) {
     app.view = view;
     app.focus_col = 0;
+    // Clamp cursors for the target view so a stale cursor from the previous
+    // view (e.g. `cursors.playlist` pointing into `yt_lists` while switching
+    // to Artists/Playlists, or vice-versa) doesn't leave a column empty on
+    // the first render. `layout::draw` also clamps each frame, but doing it
+    // here too means the very first frame after the switch is already
+    // correct — no 1-frame flicker where the Tracks pane reads "no album
+    // selected" because the album cursor was past the end.
+    app.clamp_cursors();
     // Entering the Y view fetches the account + suggested lists (bounded
     // synchronous roundtrip at the view-enter boundary; spec §5.3).
     if view == View::Youtube {
@@ -982,6 +1008,12 @@ fn cycle_view(app: &mut App, fwd: bool) {
 /// approximate by design — pixel-perfect hit-testing belongs to the view layer
 /// in a future refactor.
 pub fn handle_mouse(app: &mut App, m: MouseEvent) {
+    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    handle_mouse_in_area(app, m, ratatui::layout::Rect::new(0, 0, width, height));
+}
+
+/// Deterministic mouse dispatcher for a known frame area.
+pub fn handle_mouse_in_area(app: &mut App, m: MouseEvent, area: ratatui::layout::Rect) {
     match m.kind {
         MouseEventKind::ScrollUp => move_up(app),
         MouseEventKind::ScrollDown => move_down(app),
@@ -990,14 +1022,10 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent) {
             // browse columns. Drag is deliberately NOT routed: a held-drag used
             // to scrub volume on every mouse-move, which jumped the level
             // erratically. Volume is keyboard-only (+/-/m) now.
-            let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-            // Player bar is 2 rows above the 1-row footer hint bar, so its top
-            // is at h-3; the footer (row h-1) is intentionally not clickable.
-            let bar_top = h.saturating_sub(3);
-            let footer_row = h.saturating_sub(1);
-            if m.row >= bar_top && m.row < footer_row {
-                handle_player_bar_click(app, m.column, m.row - bar_top);
-            } else if m.row < bar_top {
+            let bar = crate::tui::view::layout::player_bar_area(area);
+            if let Some(bar) = bar.filter(|bar| rect_contains(*bar, m.column, m.row)) {
+                handle_player_bar_click(app, m.column, m.row, bar);
+            } else if bar.is_none_or(|bar| m.row < bar.y) {
                 handle_browse_click(app, m.column, m.row);
             }
             // clicks on the footer row are ignored
@@ -1012,14 +1040,15 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent) {
 /// now-playing text and volume meter are intentionally not clickable, because
 /// coarse hit-testing there made a stray click jump volume to an arbitrary
 /// value.
-fn handle_player_bar_click(app: &mut App, col: u16, row_in_bar: u16) {
-    let width = crossterm::terminal::size()
-        .map(|(w, _)| w)
-        .unwrap_or(80)
-        .max(1);
-    if row_in_bar == 1 {
-        // Progress gauge row: click-to-seek, proportional to column / width.
-        let pct = (col as f64 / width as f64).clamp(0.0, 1.0);
+fn rect_contains(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.right() && row >= rect.y && row < rect.bottom()
+}
+
+fn handle_player_bar_click(app: &mut App, col: u16, row: u16, area: ratatui::layout::Rect) {
+    let geo = crate::tui::view::player_bar::geometry(area);
+    if rect_contains(geo.progress, col, row) {
+        let pct = (col.saturating_sub(geo.progress.x) as f64 / geo.progress.width.max(1) as f64)
+            .clamp(0.0, 1.0);
         if let Some(dur) = app.player.duration() {
             if dur > 0.0 {
                 let _ = app
@@ -1029,16 +1058,12 @@ fn handle_player_bar_click(app: &mut App, col: u16, row_in_bar: u16) {
         }
         return;
     }
-    // Row 0: only the transport glyphs (◀◀ ▶ ▶▶, roughly cols 18..32) are
-    // clickable. Anything else (now-playing text, volume, flags) is ignored.
-    if (18..=32).contains(&col) {
-        match col {
-            18..=21 => app.prev(),
-            22..=27 => {
-                let _ = app.player.play_pause();
-            }
-            _ => app.next(),
-        }
+    if rect_contains(geo.previous, col, row) {
+        app.prev();
+    } else if rect_contains(geo.play_pause, col, row) {
+        let _ = app.player.play_pause();
+    } else if rect_contains(geo.next, col, row) {
+        app.next();
     }
 }
 

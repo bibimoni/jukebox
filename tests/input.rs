@@ -4,13 +4,15 @@
 //! backed by a [`StubPlayer`], asserting on observable state changes. No
 //! terminal, no crossterm event source — just the controller.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use jukebox::catalog::Catalog;
 use jukebox::player::StubPlayer;
 use jukebox::search::Searcher;
 use jukebox::tui::app::{App, Overlay, View};
-use jukebox::tui::input::handle_key;
+use jukebox::tui::input::{handle_key, handle_mouse_in_area};
 use jukebox::tui::queue::{RepeatMode, ShuffleMode};
+use jukebox::tui::view::{layout::player_bar_area, player_bar::geometry};
+use ratatui::layout::Rect;
 
 /// A 3-track catalog under one artist/album, with real on-disk source files
 /// (so `play_selected`'s `std::fs::metadata` check passes and playback starts).
@@ -401,4 +403,42 @@ fn s_opens_discover_overlay() {
     app.source_mode = jukebox::mode::SourceMode::Local;
     handle_key(&mut app, key('S'));
     assert!(matches!(app.overlay, Some(Overlay::Discover { .. })));
+}
+
+fn click(column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+#[test]
+fn mouse_uses_rendered_player_bar_geometry() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    focus_track_col(&mut app);
+    handle_key(&mut app, key_code(KeyCode::Enter));
+    let screen = Rect::new(0, 0, 120, 25);
+    let bar = player_bar_area(screen).expect("wide layout has a player bar");
+    let geo = geometry(bar);
+
+    handle_mouse_in_area(&mut app, click(geo.next.x, geo.next.y), screen);
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t2"));
+
+    let before = app.player.position();
+    handle_mouse_in_area(
+        &mut app,
+        click(geo.progress.right() + 2, geo.progress.y),
+        screen,
+    );
+    assert_eq!(app.player.position(), before, "outside gauge must not seek");
+
+    handle_mouse_in_area(
+        &mut app,
+        click(geo.progress.x + geo.progress.width / 2, geo.progress.y),
+        screen,
+    );
+    assert_eq!(app.player.position(), Some(90.0));
 }

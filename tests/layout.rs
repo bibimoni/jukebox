@@ -6,9 +6,9 @@
 use insta::assert_snapshot;
 use jukebox::catalog::Catalog;
 use jukebox::player::StubPlayer;
-use jukebox::tui::app::App;
+use jukebox::tui::app::{App, LyricsState, Overlay, Playlist, View, YtList};
 use jukebox::tui::view::layout::draw;
-use ratatui::{backend::TestBackend, Terminal};
+use ratatui::{backend::TestBackend, style::Modifier, Terminal};
 
 /// Build a fixed 2-artist catalog: "40mP" (album "Cosmic", track "Song1") and
 /// "DECO*27" (album "Ghost", track "Ghost Rule"). Each track points at a real
@@ -112,5 +112,125 @@ fn layout_too_small() {
     assert!(
         s.contains("terminal too small"),
         "too-small render must contain the resize message: {s}"
+    );
+}
+
+#[test]
+fn lyrics_overlay_preserves_responsive_player_and_footer_chrome() {
+    for height in [24, 25] {
+        let backend = TestBackend::new(120, height);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = build_app();
+        app.overlay = Some(Overlay::Lyrics {
+            content: None,
+            state: LyricsState::NotFound,
+            scroll: 0,
+            track_id: "t1".into(),
+            gen: app.lyrics_gen,
+        });
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered = buffer_string(&term, 120, height);
+        assert!(
+            rendered.contains("Song1"),
+            "player chrome lost at {height}: {rendered}"
+        );
+        assert!(
+            rendered.contains("VIEW:"),
+            "footer chrome lost at {height}: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn youtube_breadcrumb_uses_playlist_cursor() {
+    let backend = TestBackend::new(120, 25);
+    let mut term = Terminal::new(backend).unwrap();
+    let mut app = build_app();
+    app.view = View::Youtube;
+    app.focus_col = 1;
+    app.yt_lists = vec![
+        YtList {
+            id: "a".into(),
+            name: "Wrong artist cursor".into(),
+            kind: Default::default(),
+            track_ids: vec![],
+        },
+        YtList {
+            id: "b".into(),
+            name: "Selected playlist".into(),
+            kind: Default::default(),
+            track_ids: vec![],
+        },
+    ];
+    app.cursors.artist = 0;
+    app.cursors.playlist = 1;
+    term.draw(|f| draw(f, &mut app)).unwrap();
+    let rendered = buffer_string(&term, 120, 25);
+    assert!(
+        rendered.contains("YouTube › Selected playlist"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("YouTube › Wrong artist cursor"),
+        "{rendered}"
+    );
+}
+
+fn render_app(app: &mut App, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|frame| draw(frame, app)).unwrap();
+    buffer_string(&term, width, height)
+}
+
+#[test]
+fn breadcrumbs_cover_all_views_and_artist_depths() {
+    let mut app = build_app();
+    app.view = View::Artists;
+    app.focus_col = 0;
+    assert!(render_app(&mut app, 120, 25).contains("Artists"));
+    app.focus_col = 1;
+    assert!(render_app(&mut app, 120, 25).contains("Artists › 40mP"));
+    app.focus_col = 2;
+    assert!(render_app(&mut app, 120, 25).contains("Artists › 40mP › Cosmic"));
+
+    app.view = View::Playlists;
+    app.playlists = vec![Playlist {
+        name: "Roadtrip".into(),
+        track_ids: vec![],
+    }];
+    assert!(render_app(&mut app, 120, 25).contains("Playlists › Roadtrip"));
+
+    app.view = View::Queue;
+    assert!(render_app(&mut app, 120, 25).contains("Queue"));
+
+    app.view = View::Youtube;
+    app.yt_lists = vec![YtList {
+        id: "yt".into(),
+        name: "Mix".into(),
+        kind: Default::default(),
+        track_ids: vec![],
+    }];
+    app.cursors.playlist = 0;
+    assert!(render_app(&mut app, 120, 25).contains("YouTube › Mix"));
+}
+
+#[test]
+fn active_tab_and_separator_are_rendered_across_full_width() {
+    let mut app = build_app();
+    app.view = View::Queue;
+    let width = 120;
+    let backend = TestBackend::new(width, 25);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|frame| draw(frame, &mut app)).unwrap();
+    let rendered = buffer_string(&term, width, 25);
+    let active = term.backend().buffer()[(26, 0)].modifier;
+    assert!(active.contains(Modifier::BOLD), "{rendered}");
+    assert!(active.contains(Modifier::REVERSED), "{rendered}");
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line.chars().filter(|&c| c == '─').count() >= 100),
+        "{rendered}"
     );
 }

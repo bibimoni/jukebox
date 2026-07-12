@@ -189,6 +189,9 @@ pub enum LyricsState {
     /// returned empty). Truthful "unavailable" — never fabricated text
     /// (AC-M3.5.1).
     NotFound,
+    /// The provider is unreachable while cached provider data remains usable.
+    /// Distinct from `NotFound`: absence has not been established offline.
+    Offline,
     /// The provider failed (network/parse error). Carries the message so the
     /// overlay can show it (the sidecar's stderr is null'd, so this is the
     /// only error path).
@@ -589,6 +592,14 @@ impl App {
             .as_ref()
             .map(|s| s.resolve_busy() || s.premium_resolve_busy())
             .unwrap_or(false)
+    }
+
+    /// Title of the next track in the manual queue (for up-next preview).
+    /// Returns None if queue empty.
+    pub fn up_next_title(&self) -> Option<String> {
+        let id = self.transport.manual_queue.first()?;
+        let t = self.track_by_id_fast(id)?;
+        Some(t.title.clone())
     }
 
     pub fn now_playing_view(&self) -> Option<NowPlayingView> {
@@ -2542,10 +2553,22 @@ impl App {
     /// empty Y view. Best-effort: a missing/corrupt cache is silently ignored
     /// (the fire-and-forget refresh, when the session is up, repopulates
     /// fresh lists and promotes to `Ready`).
+    ///
+    /// `track_ids` are cleared on load: the disk cache stores video IDs but
+    /// NOT track metadata (title/artist/album). The in-memory `track_cache`
+    /// starts empty on launch. If we kept the cached `track_ids`, the
+    /// lazy-load at `on_tick` (which checks `track_ids.is_empty()`) wouldn't
+    /// fire, and `yt_track_rows` would show raw video IDs as titles
+    /// ("random characters" bug). Clearing forces a re-fetch with metadata
+    /// when the user focuses each playlist. The playlist NAMES are still
+    /// visible from cache.
     pub fn load_yt_lists_from_cache(&mut self) {
-        let cached = crate::yt::cache::load_yt_lists();
+        let mut cached = crate::yt::cache::load_yt_lists();
         if cached.is_empty() {
             return;
+        }
+        for l in cached.iter_mut() {
+            l.track_ids.clear();
         }
         self.yt_lists = cached;
         if self.yt_session.is_none() {
@@ -2557,12 +2580,17 @@ impl App {
     /// default state DB. For tests: avoids the process-global `XDG_CONFIG_HOME`
     /// env race by using an explicit temp DB path.
     pub fn load_yt_lists_from_cache_at(&mut self, path: &std::path::Path) {
-        let cached = match crate::yt::cache::load_yt_lists_at(path) {
+        let mut cached = match crate::yt::cache::load_yt_lists_at(path) {
             Ok(v) => v,
             Err(_) => return,
         };
         if cached.is_empty() {
             return;
+        }
+        // Clear track_ids: the disk cache stores video IDs but NOT track
+        // metadata. See `load_yt_lists_from_cache` for the full rationale.
+        for l in cached.iter_mut() {
+            l.track_ids.clear();
         }
         self.yt_lists = cached;
         if self.yt_session.is_none() {
@@ -2575,6 +2603,12 @@ impl App {
     /// "loading…" until `on_tick` folds the results into `yt_lists`. No-op
     /// (and clears the lists) when there's no session — the view then shows
     /// the setup hint. A refresh already in flight is not re-sent.
+    ///
+    /// The stale-pending clearing lives in `Session::send_refresh`, AFTER its
+    /// inflight guard — NOT here. Clearing here (before the guard) lost the
+    /// pending data when a refresh was already in flight: the guard made
+    /// `send_refresh` a no-op, the cleared `pending_playlists`/`pending_suggestions`
+    /// stayed None, and `on_tick` never merged → `yt_lists` stayed empty.
     pub fn refresh_yt_lists(&mut self) {
         let Some(session) = self.yt_session.as_mut() else {
             self.yt_lists.clear();
@@ -2585,9 +2619,6 @@ impl App {
         // Transition to Synchronizing — a data fetch is in flight. on_tick will
         // promote to Ready when playlists land, or ProviderError on error.
         self.yt_state = crate::yt::state::YtState::Synchronizing;
-        // Drop a stale partial fetch so on_tick merges the fresh pair together.
-        session.pending_playlists = None;
-        session.pending_suggestions = None;
         if let Err(e) = session.send_refresh() {
             self.yt_lists_loading = false;
             self.yt_error = Some(format!("refresh: {e}"));
@@ -2833,9 +2864,13 @@ impl App {
             if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
                 self.overlay = Some(Overlay::Lyrics {
                     content: None,
-                    state: LyricsState::Error(
-                        "YouTube not configured — run :yt auth browser <chrome>".into(),
-                    ),
+                    state: if self.yt_state == crate::yt::state::YtState::ReadyStale {
+                        LyricsState::Offline
+                    } else {
+                        LyricsState::Error(
+                            "YouTube not configured — run :yt auth browser <chrome>".into(),
+                        )
+                    },
                     scroll,
                     track_id: track_id.to_string(),
                     gen,
@@ -2847,7 +2882,11 @@ impl App {
             if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
                 self.overlay = Some(Overlay::Lyrics {
                     content: None,
-                    state: LyricsState::Error(format!("lyrics: {e}")),
+                    state: if self.yt_state == crate::yt::state::YtState::ReadyStale {
+                        LyricsState::Offline
+                    } else {
+                        LyricsState::Error(format!("lyrics: {e}"))
+                    },
                     scroll,
                     track_id: track_id.to_string(),
                     gen,

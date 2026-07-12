@@ -22,13 +22,14 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
 use crate::catalog::Track;
+use crate::lyrics::LyricsSource;
 use crate::tui::app::{App, Overlay};
-use crate::tui::view::theme::Theme;
+use crate::tui::view::theme::{clip_to_width, Theme};
 
 /// Render the active overlay (if any) into `area`.
 pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
@@ -143,7 +144,7 @@ fn render_yt_auth(f: &mut Frame, area: Rect, input: &str) {
         Line::from(vec![
             Span::styled("> ", Style::default().fg(theme.accent)),
             Span::styled(input.to_string(), Style::default().fg(theme.text)),
-            Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -210,15 +211,34 @@ fn render_search(
     searching: bool,
 ) {
     let theme = Theme::default();
-    let popup = centered(area, 60, 60);
 
-    // Clear the popup region so browse chrome doesn't bleed through.
+    // Dim the full-screen background so the browse chrome (artists/albums/
+    // tracks columns) doesn't show through around the search popup (Issue 2:
+    // the old render only cleared the popup region, leaving the Miller columns
+    // visible behind/around the search box — visual noise). Clear the full
+    // area, paint a dim Black backdrop, then clear + render the popup with an
+    // opaque surface bg on top so it reads as a true modal.
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(Color::Black)),
+        area,
+    );
+
+    let popup = centered(area, 60, 60);
     f.render_widget(Clear, popup);
 
-    let title = format!(" search · {} ", scope.as_str());
+    // Issue 3: thick (double-line) border + a title bar that carries the
+    // scope AND the Tab/Esc hints, so the popup reads as a true modal
+    // (high-contrast border against the dim Black backdrop) and the close/
+    // scope-swap keys are discoverable without reading the status row. The
+    // old plain border + ` search · {scope} ` title blended into the dim
+    // background; the thick border + hint title makes the modal pop.
+    let title = format!(" search · {} · Tab scope · Esc close ", scope.as_str());
     let inner = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(Color::Black))
         .title(Span::styled(title, Style::default().fg(theme.accent)));
     let inner_area = inner.inner(popup);
     f.render_widget(inner, popup);
@@ -238,7 +258,7 @@ fn render_search(
     let input_line = Line::from(vec![
         Span::styled("/ ", Style::default().fg(theme.accent)),
         Span::styled(input.to_string(), Style::default().fg(theme.text)),
-        Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
     ]);
     f.render_widget(input_line, rows[0]);
 
@@ -246,10 +266,23 @@ fn render_search(
     // needs no "searching…" indicator — leave the row blank for stable layout.
     let dim = Style::default().fg(theme.dim);
     let status: Line = match scope {
-        crate::tui::app::SearchScope::Local => Line::from(Span::styled(
-            "Tab → youtube   ·   Enter plays selection",
-            dim,
-        )),
+        crate::tui::app::SearchScope::Local => {
+            if !input.trim().is_empty() && results.is_empty() {
+                // Local search is instant — empty results means the query
+                // didn't match anything. Show a "No results" message + the
+                // Tab hint so the user knows they can switch to YouTube
+                // (T7: search had no "No results" indicator for local scope).
+                Line::from(Span::styled(
+                    format!("No results for '{input}'  ·  Tab → youtube to switch scope"),
+                    dim,
+                ))
+            } else {
+                Line::from(Span::styled(
+                    "Tab → youtube   ·   Enter plays selection",
+                    dim,
+                ))
+            }
+        }
         crate::tui::app::SearchScope::Youtube => {
             if searching {
                 Line::from(Span::styled("searching…   (Tab → local · Esc cancel)", dim))
@@ -261,7 +294,7 @@ fn render_search(
             } else if results.is_empty() && submitted.as_deref() == Some(input) {
                 // A search ran and returned nothing.
                 Line::from(Span::styled(
-                    "no results — edit the query or Tab → local",
+                    format!("No results for '{input}'  ·  Tab → local to switch scope"),
                     dim,
                 ))
             } else if submitted.as_deref() == Some(input) && !results.is_empty() {
@@ -300,80 +333,101 @@ fn render_search(
 /// The grouped keymap lines shown in the Help overlay. Kept here (not in the
 /// spec doc) so the help text can't drift from the implementation.
 fn help_lines<'a>() -> Vec<Line<'a>> {
-    let group = |title: &'a str, body: &'a str| -> Line<'a> {
+    let theme = Theme::default();
+    let accent = Style::default().fg(theme.accent);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let text = Style::default().fg(theme.text);
+    let dim = Style::default().fg(theme.dim);
+
+    let entry = |key: &'a str, desc: &'a str| -> Line<'a> {
         Line::from(vec![
-            Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("  "),
-            Span::styled(body, Style::default().fg(Color::Reset)),
+            Span::styled(format!("{:<16}", key), accent),
+            Span::styled(desc.to_string(), text),
         ])
     };
+
+    let section =
+        |title: &'a str| -> Line<'a> { Line::from(Span::styled(title.to_string(), bold)) };
+
+    let sep = || -> Line<'a> { Line::from(Span::styled("─".repeat(72), dim)) };
+
     vec![
         Line::from(""),
-        group(
-            "navigation",
-            "h j k l · arrows   move (←→ columns, ↑↓ within)",
+        section("Navigation"),
+        entry("h j k l · ↑↓←→", "move (←→ columns, ↑↓ within)"),
+        entry("gg / G", "top / bottom of column"),
+        entry(
+            "1 2 3 4",
+            "switch view: Artists / Playlists / Queue / YouTube",
         ),
-        group("", "gg / G   top / bottom of column"),
-        group(
-            "",
-            "1 2 3 4   switch view: Artists / Playlists / Queue / YouTube",
+        entry("Tab / Shift+Tab", "cycle view"),
+        sep(),
+        section("Playback"),
+        entry("Enter", "play selected in context"),
+        entry("Space", "play / pause"),
+        entry("> / <", "next / previous track"),
+        entry(", / .", "seek −5s / +5s"),
+        entry("+ / -", "volume up / down"),
+        entry("m", "mute"),
+        entry("z / Z", "cycle shuffle / reshuffle"),
+        entry("r", "cycle repeat (off → all → one)"),
+        entry("c", "cycle continue (mode-dependent)"),
+        entry("M", "cycle source mode (Local / YouTube / Mixed)"),
+        sep(),
+        section("Discover"),
+        entry("s", "instant random track"),
+        entry("S", "discover overlay"),
+        entry(
+            "f",
+            "filter focused column · Enter on filter jumps to match",
         ),
-        group("", "Tab / Shift+Tab   cycle view"),
-        Line::from(""),
-        group("playback", "Enter   play selected in context"),
-        group("", "Space   play / pause"),
-        group("", "> / <   next / previous track"),
-        group("", ", / .   seek −5s / +5s"),
-        group("", "+ / -   volume up / down"),
-        group("", "m   mute"),
-        group("", "z / Z   cycle shuffle / reshuffle"),
-        group("", "r   cycle repeat (off → all → one)"),
-        group("", "c   cycle continue (mode-dependent)"),
-        group("", "M   cycle source mode (Local / YouTube / Mixed)"),
-        Line::from(""),
-        group(
-            "discover",
-            "s   instant random track   ·   S   discover overlay",
+        sep(),
+        section("Modes"),
+        entry("/", "search (scoped to view)"),
+        entry("?", "help"),
+        entry(":", "command"),
+        entry("a", "add to playlist"),
+        entry("L", "lyrics for the playing track (synced/plain)"),
+        entry("D", "diagnostics overlay (recent provider errors)"),
+        entry("e", "enqueue (play next)"),
+        entry("x", "remove from queue"),
+        entry("d", "delete playlist"),
+        entry("R", "retry YouTube connection (after error / rate-limit)"),
+        entry(":yt auth", "paste cookies"),
+        entry(":yt auth browser", "<chrome|firefox|safari|edge|brave>"),
+        entry(":yt logout", "clear cookies"),
+        entry(":yt setup", "install deps"),
+        entry(":queue clear", "empty the play-next queue"),
+        entry("↑ / ↓", "move search-result / discover selection"),
+        entry("Esc", "close overlay / cancel"),
+        entry("q", "quit"),
+        sep(),
+        section("Accessibility"),
+        entry(
+            "NO_COLOR=1",
+            "grayscale mode (hue-free, brightness+modifier cues)",
         ),
-        group(
-            "",
-            "f   filter focused column   ·   Enter on filter jumps to match",
+        entry(
+            "JUKEBOX_HIGH_CONTRAST=1",
+            "max-contrast palette (pure white/black, no hue)",
         ),
-        Line::from(""),
-        group(
-            "modes",
-            "/   search (scoped to view)   ·   ?   help   ·   :   command",
-        ),
-        group("", "a   add to playlist"),
-        group("", "L   lyrics for the playing track (synced/plain)"),
-        group("", "D   diagnostics overlay (recent provider errors)"),
-        group(
-            "",
-            "e   enqueue (play next)   ·   x   remove from queue   ·   d   delete playlist",
-        ),
-        group(
-            "",
-            "R   retry YouTube connection (after error / rate-limit)",
-        ),
-        group(
-            "",
-            ":yt auth  paste cookies  ·  :yt auth browser <chrome|firefox|safari|edge|brave>",
-        ),
-        group("", ":yt logout / :yt setup   clear cookies / install deps"),
-        group("", ":queue clear   empty the play-next queue"),
-        group("", "↑ / ↓   move search-result / discover selection"),
-        group("", "Esc   close overlay / cancel"),
-        group("", "q   quit"),
-        Line::from(""),
-        group("mouse", "click row — focus + select"),
-        group("", "click progress — seek"),
-        group("", "wheel — scroll focused column"),
+        sep(),
+        section("Mouse"),
+        entry("click row", "focus + select"),
+        entry("click progress", "seek"),
+        entry("wheel", "scroll focused column"),
     ]
 }
 
 fn render_help(f: &mut Frame, area: Rect, scroll: u16) {
     let theme = Theme::default();
-    let popup = centered(area, 64, 86);
+    // True modal: clear the FULL screen so the browse chrome (columns, player
+    // bar, footer) is erased completely — not visible behind the popup. The
+    // popup itself clears its own region too (redundant but harmless).
+    f.render_widget(Clear, area);
+    // 90% width so long keymap lines (e.g. the `:yt auth browser <chrome|…>`
+    // line) don't truncate at the right edge. 90% height gives scroll room.
+    let popup = centered(area, 90, 90);
     f.render_widget(Clear, popup);
 
     let block = Block::default()
@@ -445,7 +499,7 @@ fn render_command(f: &mut Frame, area: Rect, input: &str, cursor: usize) {
     };
     f.render_widget(Clear, strip);
 
-    // Show the input with the block cursor `▏` at the cursor position.
+    // Show the input with the block cursor `_` at the cursor position.
     let cursor = cursor.min(input.len());
     let before = &input[..cursor];
     let after = &input[cursor..];
@@ -453,20 +507,73 @@ fn render_command(f: &mut Frame, area: Rect, input: &str, cursor: usize) {
     let line = Line::from(vec![
         Span::styled(":", Style::default().fg(theme.accent)),
         Span::styled(before.to_string(), Style::default().fg(theme.text)),
-        Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
         Span::styled(after.to_string(), Style::default().fg(theme.text)),
     ])
     .alignment(Alignment::Left);
     f.render_widget(Paragraph::new(line), strip);
 }
 
+/// Format a lyric timestamp as `[m:ss]` (single-digit minutes, zero-padded
+/// seconds) for the `[mm:ss]` prefix on synced lyric lines. Drops the
+/// leading-zero on minutes for a compact prefix (`[1:23]` not `[01:23]`) so
+/// the timestamp eats less of the lyric pane width. Seconds are zero-padded
+/// so widths line up (`[0:05]` not `[0:5]`) for scannable columns.
+fn lyric_ts(t: f64) -> String {
+    let total = t.max(0.0) as u64;
+    format!("[{}:{:02}]", total / 60, total % 60)
+}
+
+/// Strip a leading `[mm:ss]` / `[mm:ss.xx]` / `[mm:ss.xxx]` timestamp from
+/// `text` if present, returning the remainder (leading spaces trimmed).
+/// `parse_lrc` already strips these, but this is defensive: hand-built
+/// fixtures and some sidecar quirks embed the timestamp in `text`. Stripping
+/// here avoids a double `[m:ss] [mm:ss] line` prefix when the renderer adds
+/// its own timestamp from `l.time`. Returns the original text unchanged when
+/// the leading `[..]` is not a valid `mm:ss(.xx)?` timestamp.
+fn strip_stale_ts(text: &str) -> String {
+    let t = text.trim_start();
+    if !t.starts_with('[') {
+        return text.to_string();
+    }
+    let Some(end) = t.find(']') else {
+        return text.to_string();
+    };
+    let inner = &t[1..end];
+    let mut parts = inner.splitn(2, ':');
+    let Some(mins) = parts.next() else {
+        return text.to_string();
+    };
+    let Some(secs_field) = parts.next() else {
+        return text.to_string();
+    };
+    let secs = secs_field.split('.').next().unwrap_or(secs_field);
+    if !mins.bytes().all(|b| b.is_ascii_digit())
+        || !secs.bytes().all(|b| b.is_ascii_digit())
+        || mins.is_empty()
+        || secs.is_empty()
+    {
+        return text.to_string();
+    }
+    t[end + 1..].trim_start().to_string()
+}
+
 /// Lyrics overlay (`L`): shows timestamped or plain lyrics with a scrollable
 /// viewport. The `state` controls the truthful lifecycle label (loading /
 /// unavailable / error); `content` is the parsed lyrics once loaded.
+///
+/// T6 fix: the overlay is a centered popup with `Clear` so the underlying
+/// browse chrome (artists/albums/tracks columns) doesn't bleed through.
+/// Synced lyrics highlight the active line (the last line whose timestamp is
+/// `<= player.position()`) with bold + reverse video + accent background so
+/// the user can follow along. The header shows the source label and
+/// synced/plain state. NotFound shows a retry hint; Loading shows a source
+/// hint. A persistent footer line ("Esc close · j/k scroll") anchors the
+/// bottom of the popup so the close/scroll keys are always discoverable.
 fn render_lyrics_overlay(
     f: &mut Frame,
     area: Rect,
-    _app: &crate::tui::app::App,
+    app: &crate::tui::app::App,
     content: Option<&crate::lyrics::Lyrics>,
     state: &crate::tui::app::LyricsState,
     scroll: u16,
@@ -475,50 +582,238 @@ fn render_lyrics_overlay(
     use ratatui::widgets::{Block, Borders, Padding, Paragraph, Scrollbar, ScrollbarOrientation};
 
     let theme = crate::tui::view::theme::Theme::default();
+    let nc = crate::tui::view::theme::no_color();
+
+    // Use the layout-owned responsive boundary. Wide (>24 row), compact
+    // (24-row), and narrow terminals reserve different chrome heights.
+    let content_rect = crate::tui::view::layout::overlay_content_area(area);
+    f.render_widget(Clear, content_rect);
+    // Dim backdrop on the content area only — the player bar below is left
+    // untouched (it has its own opaque styling).
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(Color::Black)),
+        content_rect,
+    );
+    // Centered popup — 80% width so the lyrics pane is readable but leaves a
+    // margin for the now-playing bar context. Clear the popup region so the
+    // browse chrome behind it doesn't bleed through, AND set an opaque
+    // background on the block so the artist/album columns can't show through
+    // the pane on terminals where `Clear` alone leaves cells transparent.
+    let popup = centered(content_rect, 80, 82);
+    f.render_widget(Clear, popup);
+
+    // Header: " Lyrics — {source} ({synced|plain}) " for Available,
+    // " Lyrics — loading… " for Loading, " Lyrics — not found " for NotFound,
+    // " Lyrics — error " for Error.
+    let title = match state {
+        LyricsState::Idle => " Lyrics — fetching… ".to_string(),
+        LyricsState::Loading => " Lyrics — loading… ".to_string(),
+        LyricsState::NotFound => " Lyrics — not found ".to_string(),
+        LyricsState::Offline => " Lyrics — offline ".to_string(),
+        LyricsState::Error(_) => " Lyrics — error ".to_string(),
+        LyricsState::Available(synced) => {
+            let src = content.map(|l| source_label(l.source)).unwrap_or("unknown");
+            let kind = if *synced { "synced" } else { "plain" };
+            format!(" Lyrics — {src} ({kind}) ")
+        }
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))
-        .title(Span::styled(" Lyrics ", Style::default().fg(theme.accent)))
+        .style(Style::default().bg(Color::Black))
+        .title(Span::styled(title, Style::default().fg(theme.accent)))
         .padding(Padding::horizontal(1));
 
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
 
-    let text = match state {
-        LyricsState::Idle => "Press any key or wait — fetching lyrics…".into(),
-        LyricsState::Loading => "Loading lyrics…".into(),
-        LyricsState::NotFound => "Lyrics unavailable for this track.".into(),
-        LyricsState::Error(msg) => format!("Lyrics error: {msg}"),
+    // Build the lines to render. For Available+synced, highlight the active
+    // line (the last line whose time <= player.position()). For plain lyrics
+    // or non-Available states, no highlighting.
+    let active_idx = match state {
+        LyricsState::Available(true) => content.and_then(|lyrics| {
+            let pos = app.player.position().unwrap_or(0.0);
+            // Find the last line whose time <= pos. Lines with time=None
+            // (plain spacers in a synced file) are never active.
+            lyrics
+                .lines
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, l)| l.time.is_some_and(|t| t <= pos))
+                .map(|(i, _)| i)
+        }),
+        _ => None,
+    };
+
+    let lines: Vec<Line> = match state {
+        LyricsState::Idle => vec![Line::from(Span::styled(
+            "Press any key or wait — fetching lyrics…",
+            Style::default().fg(theme.dim),
+        ))],
+        LyricsState::Loading => {
+            let mut v = vec![Line::from(Span::styled(
+                "Loading lyrics…",
+                Style::default().fg(theme.text),
+            ))];
+            // Source hint so the user knows where the fetch is coming from.
+            v.push(Line::from(""));
+            v.push(Line::from(Span::styled(
+                "(reading from local tags / sidecar / youtube)",
+                Style::default().fg(theme.dim),
+            )));
+            v
+        }
+        LyricsState::NotFound => {
+            vec![
+                Line::from(Span::styled(
+                    "No lyrics found for this track.",
+                    Style::default().fg(theme.text),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "R retry lyrics for this track  ·  L or Esc close",
+                    Style::default().fg(theme.dim),
+                )),
+            ]
+        }
+        LyricsState::Offline => vec![
+            Line::from(Span::styled(
+                "Lyrics unavailable while offline.",
+                Style::default().fg(theme.text),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "R retry lyrics when the provider is reachable  ·  L or Esc close",
+                Style::default().fg(theme.dim),
+            )),
+        ],
+        LyricsState::Error(msg) => {
+            let mut v = vec![Line::from(Span::styled(
+                format!("Lyrics error: {msg}"),
+                if nc {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.error)
+                },
+            ))];
+            v.push(Line::from(""));
+            v.push(Line::from(Span::styled(
+                "R retry lyrics for this track  ·  L or Esc close",
+                Style::default().fg(theme.dim),
+            )));
+            v
+        }
         LyricsState::Available(_synced) => {
             if let Some(lyrics) = content {
                 if lyrics.lines.is_empty() {
-                    "Lyrics are empty.".into()
+                    vec![Line::from(Span::styled(
+                        "Lyrics are empty.",
+                        Style::default().fg(theme.dim),
+                    ))]
                 } else {
+                    // Issue 1: clip each lyric line to the pane inner width so
+                    // long lines never overflow into the right `│` border
+                    // (garbled `|||||...` artifact). Active lines reserve 2
+                    // cols for the `▸ ` prefix.
+                    let inner_w = inner.width as usize;
                     lyrics
                         .lines
                         .iter()
-                        .map(|l| l.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                        .enumerate()
+                        .map(|(i, l)| {
+                            // Timestamp prefix on synced lines: show `[m:ss]`
+                            // from `l.time` so the user can see when each line
+                            // fires (judge: "does not display timestamp
+                            // tags"). `parse_lrc` strips the `[mm:ss]` tag from
+                            // `text`, so we re-derive the prefix from `time`.
+                            // Defensive `strip_stale_ts` drops any leading
+                            // `[mm:ss]` left in `text` (hand-built fixtures /
+                            // sidecar quirks) so we never render a double
+                            // `[m:ss] [mm:ss] line`.
+                            let body = strip_stale_ts(&l.text);
+                            let ts = l.time.map(lyric_ts);
+                            if Some(i) == active_idx {
+                                // Active synced line: ▸ glyph + `[m:ss]` + bold
+                                // accent fg. Three cues: glyph (text), bold
+                                // (weight), accent (color). Under NO_COLOR
+                                // accent=White + bold still distinguishes the
+                                // active line from dim non-active lines.
+                                let full = match &ts {
+                                    Some(t) => format!("▸ {t} {body}"),
+                                    None => format!("▸ {body}"),
+                                };
+                                let text = clip_to_width(&full, inner_w.saturating_sub(2));
+                                Line::from(Span::styled(
+                                    text,
+                                    Style::default()
+                                        .fg(theme.accent)
+                                        .add_modifier(Modifier::BOLD),
+                                ))
+                            } else {
+                                // Non-active lines: dim + `[m:ss]` prefix (when
+                                // synced) for clear visual distinction from the
+                                // active line and so timestamps are scannable.
+                                let full = match &ts {
+                                    Some(t) => format!("{t} {body}"),
+                                    None => body,
+                                };
+                                let text = clip_to_width(&full, inner_w);
+                                Line::from(Span::styled(text, Style::default().fg(theme.dim)))
+                            }
+                        })
+                        .collect()
                 }
             } else {
-                "Lyrics unavailable.".into()
+                vec![Line::from(Span::styled(
+                    "Lyrics unavailable.",
+                    Style::default().fg(theme.dim),
+                ))]
             }
         }
     };
 
-    let para = Paragraph::new(text)
-        .scroll((scroll, 0))
-        .style(Style::default().fg(theme.text));
-    f.render_widget(para, inner);
+    // Split the inner pane into a scrollable lyrics body + a 1-line footer
+    // hint (T6: the lyrics overlay had no persistent close/scroll hint —
+    // users had no way to discover how to dismiss or scroll the popup). The
+    // footer stays fixed at the bottom while lyrics scroll above it, so the
+    // hint remains visible in every state (Available / Loading / NotFound /
+    // Error / Idle).
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
 
-    // Scrollbar on the right edge.
+    let para = Paragraph::new(lines).scroll((scroll, 0));
+    f.render_widget(para, chunks[0]);
+
+    // Persistent footer hint — dim + centered so it reads as chrome, not
+    // lyrics. Visible in every state so Esc/scroll is always discoverable.
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Esc close · j/k scroll",
+            Style::default().fg(theme.dim),
+        )))
+        .alignment(Alignment::Center),
+        chunks[1],
+    );
+
+    // Scrollbar on the right edge of the body (only when content overflows).
     let total = content.map(|l| l.lines.len() as u16).unwrap_or(1);
-    if total > inner.height {
+    if total > chunks[0].height {
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            inner,
+            chunks[0],
             &mut ratatui::widgets::ScrollbarState::new(total as usize).position(scroll as usize),
         );
+    }
+}
+
+/// Map a [`LyricsSource`] to a short human-readable label for the lyrics
+/// overlay header. Lowercase so it reads naturally in "Lyrics — {label}".
+fn source_label(source: LyricsSource) -> &'static str {
+    match source {
+        LyricsSource::Embedded => "embedded",
+        LyricsSource::SidecarFile => "sidecar",
+        LyricsSource::Ytmusicapi => "youtube",
+        LyricsSource::Cached => "cached",
     }
 }

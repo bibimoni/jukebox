@@ -1031,10 +1031,23 @@ impl Session {
     ///
     /// Inflight guard: if a refresh is already in flight, this is a no-op
     /// (prevents a burst of `R` presses from flooding the sidecar).
+    ///
+    /// The stale-pending clearing (`pending_playlists`/`pending_suggestions`)
+    /// lives HERE, AFTER the inflight guard — not in `App::refresh_yt_lists`.
+    /// If the guard blocks (refresh already in flight), the pending data from
+    /// that in-flight fetch must be preserved so `on_tick` can still merge it
+    /// when it lands. Clearing before the guard (the old code path) lost the
+    /// data permanently: the second `refresh_yt_lists` cleared the pending
+    /// slots, `send_refresh` was a no-op, and `yt_lists` stayed empty.
     pub fn send_refresh(&mut self) -> Result<()> {
         if self.refresh_inflight {
             return Ok(());
         }
+        // Drop a stale partial fetch so on_tick merges the fresh pair together.
+        // This MUST be after the inflight guard — if a refresh is already in
+        // flight, the pending data from that fetch must be preserved.
+        self.pending_playlists = None;
+        self.pending_suggestions = None;
         self.refresh_inflight = true;
         self.refresh_gen = self.refresh_gen.wrapping_add(1);
         self.refresh_remaining = 2;

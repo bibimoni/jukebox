@@ -6,9 +6,15 @@
 //! ytmusicapi path is tested via the wire protocol (proto.rs) and session
 //! stubs, not a live sidecar.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use jukebox::catalog::Track;
 use jukebox::lyrics::{parse_lrc, parse_plain, read_sidecar_file, Lyrics, LyricsSource};
+use jukebox::player::StubPlayer;
+use jukebox::tui::app::{App, LyricsState, Overlay};
+use jukebox::tui::input::handle_key;
+use jukebox::tui::view::layout::draw;
 use jukebox::yt::proto::{LyricLineProto, Request, Response};
+use ratatui::{backend::TestBackend, Terminal};
 use std::path::Path;
 
 // --- LRC parsing -----------------------------------------------------------
@@ -390,4 +396,165 @@ fn response_lyrics_error_from_sidecar() {
         Response::Error(msg) => assert!(msg.contains("lyrics")),
         _ => panic!("expected Error"),
     }
+}
+
+#[test]
+fn r_retries_lyrics_for_the_same_track() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("lossless");
+    std::fs::create_dir_all(&root).unwrap();
+    let catalog_path = dir.path().join("catalog.json");
+    std::fs::write(
+        &catalog_path,
+        serde_json::json!({
+            "version": 1, "built_at": "x", "source_root": root,
+            "tracks": [{
+                "id": "same-track", "artists": ["A"], "primary_artist": "A",
+                "title": "Song", "bit_depth": 16, "sample_rate_hz": 44100,
+                "source_path": "missing.flac", "symlinked_into_artists": ["A"]
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let catalog = jukebox::catalog::Catalog::load(&catalog_path).unwrap();
+    let mut app = App::new(catalog, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Lyrics {
+        content: None,
+        state: LyricsState::NotFound,
+        scroll: 7,
+        track_id: "same-track".into(),
+        gen: app.lyrics_gen,
+    });
+    let before = app.lyrics_gen;
+
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+    );
+
+    assert_eq!(app.lyrics_gen, before.wrapping_add(1));
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::Lyrics { ref track_id, scroll: 7, .. }) if track_id == "same-track"
+    ));
+}
+
+fn empty_app() -> App {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("lossless");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = dir.path().join("catalog.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({"version":1,"built_at":"x","source_root":root,"tracks":[]}).to_string(),
+    )
+    .unwrap();
+    App::new(
+        jukebox::catalog::Catalog::load(&path).unwrap(),
+        Box::new(StubPlayer::default()),
+        None,
+        None,
+    )
+}
+
+fn render_lyrics_state(
+    state: LyricsState,
+    content: Option<Lyrics>,
+    scroll: u16,
+    width: u16,
+) -> String {
+    let mut app = empty_app();
+    app.overlay = Some(Overlay::Lyrics {
+        content,
+        state,
+        scroll,
+        track_id: "track".into(),
+        gen: app.lyrics_gen,
+    });
+    let backend = TestBackend::new(width, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let mut rendered = String::new();
+    for y in 0..24 {
+        for x in 0..width {
+            rendered.push(
+                terminal.backend().buffer()[(x, y)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' '),
+            );
+        }
+        rendered.push('\n');
+    }
+    rendered
+}
+
+#[test]
+fn lyrics_state_matrix() {
+    let cases = [
+        (LyricsState::Loading, "loading"),
+        (LyricsState::Available(true), "synced"),
+        (LyricsState::Available(false), "plain"),
+        (LyricsState::NotFound, "not found"),
+        (LyricsState::Offline, "offline"),
+        (LyricsState::Error("provider exploded".into()), "error"),
+    ];
+    for (state, expected) in cases {
+        let content = matches!(state, LyricsState::Available(_))
+            .then(|| parse_plain("line", LyricsSource::Cached));
+        let rendered = render_lyrics_state(state, content, 0, 80);
+        assert!(rendered.to_lowercase().contains(expected), "{rendered}");
+    }
+}
+
+#[test]
+fn synced_lyrics_highlights_current_line() {
+    let lyrics = parse_lrc(
+        "[00:00.00]current\n[00:10.00]later",
+        LyricsSource::SidecarFile,
+    );
+    let rendered = render_lyrics_state(LyricsState::Available(true), Some(lyrics), 0, 80);
+    assert!(rendered.contains("▸ [0:00] current"), "{rendered}");
+}
+
+#[test]
+fn lyrics_scroll() {
+    let lyrics = parse_plain(
+        &(0..40)
+            .map(|n| format!("line-{n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        LyricsSource::Embedded,
+    );
+    let rendered = render_lyrics_state(LyricsState::Available(false), Some(lyrics), 20, 80);
+    assert!(rendered.contains("line-20"), "{rendered}");
+    assert!(!rendered.contains("line-00"), "{rendered}");
+}
+
+#[test]
+fn lyrics_unicode_long_lines_narrow() {
+    let lyrics = parse_plain(&"界e\u{301}".repeat(100), LyricsSource::Embedded);
+    let rendered = render_lyrics_state(LyricsState::Available(false), Some(lyrics), 0, 60);
+    assert!(rendered.contains('界'));
+    assert!(rendered.lines().all(|line| line.chars().count() <= 60));
+}
+
+#[test]
+fn lyrics_cache_invalidates_on_track_change() {
+    let mut app = empty_app();
+    app.overlay = Some(Overlay::Lyrics {
+        content: Some(parse_plain("cached", LyricsSource::Cached)),
+        state: LyricsState::Available(false),
+        scroll: 3,
+        track_id: "old".into(),
+        gen: app.lyrics_gen,
+    });
+    let old_gen = app.lyrics_gen;
+    app.request_lyrics("new");
+    assert_eq!(app.lyrics_gen, old_gen.wrapping_add(1));
+    assert!(
+        matches!(app.overlay, Some(Overlay::Lyrics { content: None, ref track_id, .. }) if track_id == "new")
+    );
 }

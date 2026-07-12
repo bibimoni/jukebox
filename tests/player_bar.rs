@@ -1,8 +1,8 @@
 use jukebox::catalog::Catalog;
 use jukebox::player::StubPlayer;
 use jukebox::tui::app::App;
-use jukebox::tui::view::player_bar::render as render_bar;
-use ratatui::{backend::TestBackend, Terminal};
+use jukebox::tui::view::player_bar::{geometry, render as render_bar, truncate_title};
+use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
 fn one_track_cat() -> (tempfile::TempDir, Catalog, std::path::PathBuf) {
     let d = tempfile::tempdir().unwrap();
@@ -98,4 +98,143 @@ fn bar_renders_without_now_playing() {
     let app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     let _bar = rendered_bar(&app, 120, 3);
     let _bar = rendered_bar(&app, 80, 3);
+}
+
+#[test]
+fn rendered_controls_match_the_exported_hit_regions() {
+    let (_d, cat, _l) = one_track_cat();
+    let app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    let area = Rect::new(0, 10, 120, 2);
+    let geo = geometry(area);
+    let bar = rendered_bar(&app, 120, 2);
+
+    assert!(
+        bar.contains("◀◀"),
+        "previous control must be rendered: {bar}"
+    );
+    assert!(bar.contains("▶"), "play control must be rendered: {bar}");
+    assert!(bar.contains("▶▶"), "next control must be rendered: {bar}");
+    assert_eq!(geo.previous.y, area.y);
+    assert_eq!(geo.play_pause.y, area.y);
+    assert_eq!(geo.next.y, area.y);
+    assert_eq!(geo.progress.y, area.y + 1);
+    assert_eq!(geo.progress.width, area.width * 55 / 100);
+    assert!(geo.previous.right() <= geo.play_pause.x);
+    assert!(geo.play_pause.right() <= geo.next.x);
+}
+
+#[test]
+fn title_truncation_respects_cjk_combining_and_boundaries() {
+    assert_eq!(truncate_title("abc", 3), "abc");
+    assert_eq!(truncate_title("日本語", 5), "日本…");
+    assert_eq!(truncate_title("e\u{301}clair", 3), "e\u{301}c…");
+}
+
+#[test]
+fn player_state_labels_cover_stopped_playing_and_paused() {
+    let (_d, cat, _l) = one_track_cat();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    assert!(rendered_bar(&app, 120, 2).contains("[STOPPED]"));
+    app.play_in_context_ids(vec!["t1".into()], "t1");
+    assert!(rendered_bar(&app, 120, 2).contains("[PLAYING]"));
+    app.player.play_pause().unwrap();
+    assert!(rendered_bar(&app, 120, 2).contains("[PAUSED]"));
+}
+
+#[test]
+fn up_next_preview_covers_idle_title_and_end() {
+    let (_d, cat, _l) = one_track_cat();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    assert!(rendered_bar(&app, 120, 2).contains("Enter to play"));
+    app.transport.enqueue("t1".into());
+    app.play_in_context_ids(vec!["t1".into()], "t1");
+    assert!(rendered_bar(&app, 120, 2).contains("Next: Freedom"));
+    app.transport.manual_queue.clear();
+    assert!(rendered_bar(&app, 120, 2).contains("Next: (end)"));
+}
+
+#[test]
+fn geometry_reserves_transport_columns_from_info_line() {
+    // Bug 1: transport controls occupy the rightmost `min(14, width)` columns
+    // (per `geometry()`), so `render()` passes `info_area.width.saturating_sub(14)`
+    // to `build_info_line` — info content is truncated before the controls so
+    // it is not overwritten by them. Assert the controls start 14 cols from the
+    // right edge (the same 14 `render()` reserves).
+    let area = Rect::new(0, 0, 120, 2);
+    let geo = geometry(area);
+    assert_eq!(
+        geo.previous.x,
+        area.right().saturating_sub(14),
+        "transport controls must start 14 cols from the right edge"
+    );
+    // Narrow bar: controls clamp to the available width, still anchored right.
+    let narrow = Rect::new(0, 0, 10, 2);
+    let ng = geometry(narrow);
+    assert_eq!(ng.previous.x, narrow.right().saturating_sub(10));
+}
+
+#[test]
+fn geometry_compact_bar_has_zero_transport_rects() {
+    // Bug 2: `render_compact` (height 1) draws no transport controls, so
+    // `geometry()` reports zero-size rects for them — `rect_contains` in
+    // input.rs then naturally returns false and clicks on the compact bar's
+    // right edge do not trigger invisible prev/play/next actions.
+    let area = Rect::new(0, 0, 80, 1);
+    let g = geometry(area);
+    assert_eq!(g.previous.width, 0);
+    assert_eq!(g.previous.height, 0);
+    assert_eq!(g.play_pause.width, 0);
+    assert_eq!(g.play_pause.height, 0);
+    assert_eq!(g.next.width, 0);
+    assert_eq!(g.next.height, 0);
+    assert_eq!(g.progress.width, 0, "progress is already zero in compact");
+
+    // Full bar (height 2): transport controls are visible and clickable.
+    let area2 = Rect::new(0, 0, 80, 2);
+    let g2 = geometry(area2);
+    assert!(
+        g2.previous.width > 0,
+        "previous control visible in full bar"
+    );
+    assert!(
+        g2.play_pause.width > 0,
+        "play/pause control visible in full bar"
+    );
+    assert!(g2.next.width > 0, "next control visible in full bar");
+}
+
+#[test]
+fn progress_render_rect_matches_geometry_contract() {
+    // Bug 4: rendering uses `geo.progress` (the same rect input hit-testing
+    // uses) as the single source of truth — no `Layout::horizontal` split +
+    // `debug_assert_eq!` that could round differently and panic at odd widths.
+    let area = Rect::new(0, 0, 101, 2);
+    let geo = geometry(area);
+    assert_eq!(geo.progress.width, (101 * 55) / 100); // 55
+                                                      // Rendering at an odd width must not panic (the old debug_assert could).
+    let (_d, cat, _l) = one_track_cat();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.play_in_context_ids(vec!["t1".into()], "t1");
+    let bar = rendered_bar(&app, 101, 2); // must not panic
+    assert!(
+        bar.contains('▰') || bar.contains('▱'),
+        "progress bar must render at odd width: {bar}"
+    );
+    assert!(
+        bar.contains("SHUF"),
+        "flags must render at odd width: {bar}"
+    );
+    // The flags area is the remaining width to the right of the progress bar.
+    assert_eq!(area.width.saturating_sub(geo.progress.width), 101 - 55);
+}
+
+#[test]
+fn truncate_title_zero_max_returns_empty() {
+    // Bug 5: `max == 0` used to underflow `max - 1` to usize::MAX, returning
+    // the full title + ellipsis. Now it returns an empty string.
+    assert_eq!(truncate_title("Hello", 0), String::new());
+    assert_eq!(truncate_title("", 0), String::new());
+    // Non-zero max still works (regression guard).
+    assert_eq!(truncate_title("Hello", 5), "Hello");
+    assert_eq!(truncate_title("Hello", 3), "He…");
 }
