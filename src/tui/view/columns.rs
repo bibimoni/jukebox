@@ -237,11 +237,18 @@ pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
                     format!("Albums · {artist} ← Artists"),
                     albums
                         .iter()
-                        .map(|a| {
-                            Line::from(Span::styled(
-                                a.title.clone(),
-                                Style::default().fg(theme.text),
-                            ))
+                        .enumerate()
+                        .map(|(i, a)| {
+                            // DEF-024: narrow layout must show the selected
+                            // album with the selection style, not just plain
+                            // text — otherwise selection is invisible at
+                            // 80x24 (no color cue, no glyph).
+                            let style = if i == app.cursors.album {
+                                theme.selected_style()
+                            } else {
+                                Style::default().fg(theme.text)
+                            };
+                            Line::from(Span::styled(a.title.clone(), style))
                         })
                         .collect(),
                 )
@@ -270,11 +277,16 @@ pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
                 "Playlists".into(),
                 app.playlists
                     .iter()
-                    .map(|p| {
-                        Line::from(Span::styled(
-                            p.name.clone(),
-                            Style::default().fg(theme.text),
-                        ))
+                    .enumerate()
+                    .map(|(i, p)| {
+                        // DEF-024: narrow layout must show the selected
+                        // playlist with the selection style.
+                        let style = if i == app.cursors.playlist {
+                            theme.selected_style()
+                        } else {
+                            Style::default().fg(theme.text)
+                        };
+                        Line::from(Span::styled(p.name.clone(), style))
                     })
                     .collect(),
             ),
@@ -300,16 +312,21 @@ pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
                 "YouTube".into(),
                 app.yt_lists
                     .iter()
-                    .map(|l| {
+                    .enumerate()
+                    .map(|(i, l)| {
                         let g = if l.kind == crate::tui::app::YtListKind::Account {
                             ">"
                         } else {
                             "*"
                         };
-                        Line::from(Span::styled(
-                            format!("{g} {}", l.name),
-                            Style::default().fg(theme.text),
-                        ))
+                        // DEF-024: narrow layout must show the selected YT
+                        // list with the selection style.
+                        let style = if i == app.cursors.playlist {
+                            theme.selected_style()
+                        } else {
+                            Style::default().fg(theme.text)
+                        };
+                        Line::from(Span::styled(format!("{g} {}", l.name), style))
                     })
                     .collect(),
             ),
@@ -922,6 +939,15 @@ fn render_queue(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
 /// local — `[L]` is redundant clutter. In YouTube view every row is YT —
 /// `[Y]` is redundant. Badge also stays off on narrow panes (width ≤ 60) so
 /// the title keeps room.
+///
+/// **DEF-023:** the manual queue (and Mixed-mode playlists) can contain both
+/// local catalog ids and YouTube video ids. The old `filter_map` +
+/// `track_by_id_fast(id)?` dropped any id missing from the local catalog, so
+/// YouTube tracks were silently invisible in the Queue view. Now each id is
+/// resolved against the local catalog first, then the YouTube session's
+/// `track_cache`; a YouTube track with no cached metadata renders as
+/// `Loading…` instead of being dropped. The `[L]`/`[Y]` badge (Mixed mode
+/// only) is chosen per row from the resolved source.
 fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Line<'static>> {
     use crate::mode::SourceMode;
     let dim = Style::default().fg(theme.dim);
@@ -930,11 +956,13 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
     // ambiguous per-row). In Local mode every row is local — [L] is redundant
     // clutter. Badge also stays off on very narrow panes (width <= 60).
     let show_badge = width > 60 && app.source_mode == SourceMode::Mixed;
+    // Both "[L] " and "[Y] " are 4 bytes; the badge prefix length is fixed so
+    // the `rest` slice can be taken after the badge span is split out.
+    let badge_len = if show_badge { 4 } else { 0 };
 
     ids.iter()
         .enumerate()
-        .filter_map(|(i, id)| {
-            let t = app.track_by_id_fast(id)?;
+        .map(|(i, id)| {
             let np = app.now_playing.as_ref().map(|s| s.id()) == Some(id.as_str());
             let selected = i == app.cursors.track;
             let glyph = if np {
@@ -945,11 +973,51 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
                 " "
             };
             let num = format!("{:>2}", i + 1);
-            let album = t.album.as_deref().unwrap_or("");
-            let badge = if show_badge { "[L] " } else { "" };
-            let dash = if is_ascii() { "-" } else { "—" };
-            let left = format!("{badge}{glyph} {num} {} {dash} {album}", t.title);
-            let quality = t.quality_label();
+            // DEF-023: resolve local catalog tracks first, then YouTube video
+            // ids via the session's track_cache. The manual queue (and Mixed-
+            // mode playlists) can contain both id kinds; the old filter_map
+            // dropped any id missing from the local catalog, making YouTube
+            // tracks invisible in the Queue view. A YouTube track whose
+            // metadata isn't cached yet renders as "Loading…" (visible, not
+            // dropped) so the lazy-load on_tick can fill it in shortly.
+            let (left, quality, is_yt) = if let Some(t) = app.track_by_id_fast(id) {
+                let album = t.album.as_deref().unwrap_or("");
+                let badge = if show_badge { "[L] " } else { "" };
+                let dash = if is_ascii() { "-" } else { "—" };
+                (
+                    format!("{badge}{glyph} {num} {} {dash} {album}", t.title),
+                    t.quality_label(),
+                    false,
+                )
+            } else {
+                let (title, artist, album, yt_quality) =
+                    match app.yt_session.as_ref().and_then(|s| s.track_for(id)) {
+                        Some(rt) => (
+                            rt.title.clone(),
+                            rt.artist.clone(),
+                            rt.album.clone(),
+                            rt.fmt
+                                .as_ref()
+                                .map(|f| f.yt_label())
+                                .unwrap_or_else(|| "YT".to_string()),
+                        ),
+                        None => (
+                            format!("Loading{}", ellipsis()).to_string(),
+                            String::new(),
+                            None,
+                            "YT".to_string(),
+                        ),
+                    };
+                let album_s = album.as_deref().unwrap_or("");
+                let badge = if show_badge { "[Y] " } else { "" };
+                let dash = if is_ascii() { "-" } else { "—" };
+                let left = if artist.is_empty() {
+                    format!("{badge}{glyph} {num} {title}")
+                } else {
+                    format!("{badge}{glyph} {num} {title} {dash} {artist} {album_s}")
+                };
+                (left, yt_quality, true)
+            };
             let line = pad_between(&left, &quality, width);
             let line = truncate_ellipsis(&line, width);
             // Zebra striping: consistent on ALL non-selected rows. Playing
@@ -978,14 +1046,17 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
                     theme.selected_style()
                 } else if np {
                     theme.playing_style()
+                } else if is_yt {
+                    Style::default().fg(theme.source_yt).bg(zebra_bg)
                 } else {
                     Style::default().fg(theme.source_local).bg(zebra_bg)
                 };
-                spans.push(Span::styled("[L] ", badge_style));
+                let badge_text = if is_yt { "[Y] " } else { "[L] " };
+                spans.push(Span::styled(badge_text, badge_style));
             }
-            let rest = &line[badge.len()..];
+            let rest = &line[badge_len..];
             spans.push(Span::styled(rest.to_string(), style));
-            Some(Line::from(spans))
+            Line::from(spans)
         })
         .collect()
 }

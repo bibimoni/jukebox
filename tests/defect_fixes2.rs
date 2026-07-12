@@ -634,3 +634,192 @@ fn def022_local_smart_albums_no_duplicates_for_collab() {
         collab_items.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// DEF-027: `x` clears ALL queue items instead of just the selected one
+// ---------------------------------------------------------------------------
+// The queue is value-addressed: `remove_from_queue(&id)` uses
+// `retain(|x| x != id)`, which strips EVERY occurrence of the id. A queue
+// with the same track enqueued N times (the RC-02 scenario: `e` pressed 3×
+// on the same track) was wiped by a single `x`. Index-based removal deletes
+// exactly the entry the cursor points at.
+
+#[test]
+fn def027_x_removes_only_one_duplicate_from_queue() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    // Enqueue the SAME track three times (the RC-02 reproduction scenario).
+    app.transport.enqueue("t1".into());
+    app.transport.enqueue("t1".into());
+    app.transport.enqueue("t1".into());
+    app.view = View::Queue;
+    app.cursors.queue = 0;
+    app.clamp_cursors();
+
+    app.remove_selected_from_queue();
+
+    assert_eq!(
+        app.transport.manual_queue,
+        vec!["t1".to_string(), "t1".to_string()],
+        "DEF-027: x should remove exactly ONE entry (the one at the cursor), \
+         not all duplicates of the same track"
+    );
+    assert_eq!(
+        app.cursors.queue, 0,
+        "DEF-027: cursor should stay valid at index 0 after removing the first of 3"
+    );
+}
+
+#[test]
+fn def027_x_removes_one_from_middle_of_duplicate_queue() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    // Mixed queue: t1, t2, t1 — cursor on the second t1 (index 2).
+    app.transport.enqueue("t1".into());
+    app.transport.enqueue("t2".into());
+    app.transport.enqueue("t1".into());
+    app.view = View::Queue;
+    app.cursors.queue = 2;
+    app.clamp_cursors();
+
+    app.remove_selected_from_queue();
+
+    assert_eq!(
+        app.transport.manual_queue,
+        vec!["t1".to_string(), "t2".to_string()],
+        "DEF-027: x should remove only the entry at cursor 2, leaving t1 and t2"
+    );
+}
+
+#[test]
+fn def027_x_removes_last_item_and_adjusts_cursor() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.transport.enqueue("t1".into());
+    app.transport.enqueue("t1".into());
+    app.view = View::Queue;
+    app.cursors.queue = 1;
+    app.clamp_cursors();
+
+    app.remove_selected_from_queue();
+
+    assert_eq!(
+        app.transport.manual_queue,
+        vec!["t1".to_string()],
+        "DEF-027: only the entry at cursor 1 should be removed"
+    );
+    assert_eq!(
+        app.cursors.queue, 0,
+        "DEF-027: cursor should step back to 0 after removing the last item"
+    );
+}
+
+#[test]
+fn def027_x_on_empty_queue_is_a_noop() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.view = View::Queue;
+    app.cursors.queue = 0;
+    app.clamp_cursors();
+
+    app.remove_selected_from_queue();
+
+    assert!(
+        app.transport.manual_queue.is_empty(),
+        "DEF-027: x on an empty queue should be a no-op"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// DEF-028: Discover overlay stays open after Enter error
+// ---------------------------------------------------------------------------
+// `play_discover_selection` never closed the overlay. On the error paths
+// (empty album, no YouTube session, empty mix response) the overlay stayed
+// open and the user had to manually press Escape. The fix closes the overlay
+// on Enter in all cases; errors surface via yt_status in the footer.
+
+#[test]
+fn def028_enter_on_album_with_no_tracks_closes_overlay() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    // An album that doesn't exist in the catalog → tracks_for_album is empty.
+    app.overlay = Some(Overlay::Discover {
+        items: vec![DiscoverItem::Album {
+            artist: "Ghost".into(),
+            album: "No Such Album".into(),
+        }],
+        cursor: 0,
+    });
+
+    app.play_discover_selection();
+
+    assert!(
+        app.overlay.is_none(),
+        "DEF-028: overlay should close after Enter on an album with no tracks"
+    );
+    assert!(
+        app.yt_status.is_some(),
+        "DEF-028: an error status should be surfaced for the empty album"
+    );
+}
+
+#[test]
+fn def028_enter_on_mix_with_no_session_closes_overlay() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.source_mode = jukebox::mode::SourceMode::Youtube;
+    app.overlay = Some(Overlay::Discover {
+        items: vec![DiscoverItem::Playlist {
+            id: "RD1".into(),
+            name: "Daily Mix".into(),
+        }],
+        cursor: 0,
+    });
+
+    app.play_discover_selection();
+
+    assert!(
+        app.overlay.is_none(),
+        "DEF-028: overlay should close after Enter on a mix with no YouTube session"
+    );
+    assert!(
+        app.yt_status.is_some(),
+        "DEF-028: an error status should be surfaced for the no-session case"
+    );
+    assert!(
+        app.pending_discover_play.is_none(),
+        "DEF-028: no pending play should be staged without a session"
+    );
+}
+
+#[test]
+fn def028_enter_on_valid_album_closes_overlay() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    // "Cosmic" is the album in cat_album (3 tracks).
+    app.overlay = Some(Overlay::Discover {
+        items: vec![DiscoverItem::Album {
+            artist: "40mP".into(),
+            album: "Cosmic".into(),
+        }],
+        cursor: 0,
+    });
+
+    app.play_discover_selection();
+
+    assert!(
+        app.overlay.is_none(),
+        "DEF-028: overlay should close after Enter on a valid album"
+    );
+    assert!(
+        app.now_playing.is_some(),
+        "DEF-028: a valid album should start playback"
+    );
+}

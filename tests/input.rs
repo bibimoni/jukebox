@@ -8,7 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use jukebox::catalog::Catalog;
 use jukebox::player::StubPlayer;
 use jukebox::search::Searcher;
-use jukebox::tui::app::{App, Overlay, View};
+use jukebox::tui::app::{App, DiscoverItem, Overlay, View};
 use jukebox::tui::input::{handle_key, handle_mouse_in_area};
 use jukebox::tui::queue::{RepeatMode, ShuffleMode};
 use jukebox::tui::view::{layout::player_bar_area, player_bar::geometry};
@@ -403,6 +403,175 @@ fn s_opens_discover_overlay() {
     app.source_mode = jukebox::mode::SourceMode::Local;
     handle_key(&mut app, key('S'));
     assert!(matches!(app.overlay, Some(Overlay::Discover { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// DEF-026: j/k navigation broken in discover overlay
+// ---------------------------------------------------------------------------
+// The discover overlay only bound ↑↓, not j/k, so pressing j/k (documented in
+// the help text as "h j k l · ↑↓←→ move") was swallowed by the `_` arm, leaving
+// the cursor unchanged while the renderer dropped the highlight. j/k must
+// navigate the overlay the same way as ↑↓.
+
+#[test]
+fn def026_j_navigates_down_in_discover_overlay() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Discover {
+        items: vec![
+            DiscoverItem::Album {
+                artist: "A".into(),
+                album: "One".into(),
+            },
+            DiscoverItem::Album {
+                artist: "B".into(),
+                album: "Two".into(),
+            },
+            DiscoverItem::Album {
+                artist: "C".into(),
+                album: "Three".into(),
+            },
+        ],
+        cursor: 0,
+    });
+    handle_key(&mut app, key('j'));
+    match &app.overlay {
+        Some(Overlay::Discover { cursor, .. }) => assert_eq!(
+            *cursor, 1,
+            "DEF-026: j should move the discover cursor down to index 1"
+        ),
+        _ => panic!("DEF-026: discover overlay should still be open after j"),
+    }
+}
+
+#[test]
+fn def026_j_wraps_around_in_discover_overlay() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Discover {
+        items: vec![
+            DiscoverItem::Album {
+                artist: "A".into(),
+                album: "One".into(),
+            },
+            DiscoverItem::Album {
+                artist: "B".into(),
+                album: "Two".into(),
+            },
+        ],
+        cursor: 1,
+    });
+    handle_key(&mut app, key('j'));
+    match &app.overlay {
+        Some(Overlay::Discover { cursor, .. }) => assert_eq!(
+            *cursor, 0,
+            "DEF-026: j should wrap from the last item back to index 0"
+        ),
+        _ => panic!("DEF-026: discover overlay should still be open after j"),
+    }
+}
+
+#[test]
+fn def026_k_navigates_up_in_discover_overlay() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Discover {
+        items: vec![
+            DiscoverItem::Album {
+                artist: "A".into(),
+                album: "One".into(),
+            },
+            DiscoverItem::Album {
+                artist: "B".into(),
+                album: "Two".into(),
+            },
+            DiscoverItem::Album {
+                artist: "C".into(),
+                album: "Three".into(),
+            },
+        ],
+        cursor: 2,
+    });
+    handle_key(&mut app, key('k'));
+    match &app.overlay {
+        Some(Overlay::Discover { cursor, .. }) => assert_eq!(
+            *cursor, 1,
+            "DEF-026: k should move the discover cursor up to index 1"
+        ),
+        _ => panic!("DEF-026: discover overlay should still be open after k"),
+    }
+}
+
+#[test]
+fn def026_k_wraps_around_in_discover_overlay() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Discover {
+        items: vec![
+            DiscoverItem::Album {
+                artist: "A".into(),
+                album: "One".into(),
+            },
+            DiscoverItem::Album {
+                artist: "B".into(),
+                album: "Two".into(),
+            },
+        ],
+        cursor: 0,
+    });
+    handle_key(&mut app, key('k'));
+    match &app.overlay {
+        Some(Overlay::Discover { cursor, .. }) => assert_eq!(
+            *cursor, 1,
+            "DEF-026: k should wrap from index 0 to the last item"
+        ),
+        _ => panic!("DEF-026: discover overlay should still be open after k"),
+    }
+}
+
+#[test]
+fn def026_jk_match_arrow_navigation_in_discover_overlay() {
+    // j/k and ↑↓ must produce identical cursor movement.
+    let (_d, cat) = cat_album();
+    let items = vec![
+        DiscoverItem::Album {
+            artist: "A".into(),
+            album: "One".into(),
+        },
+        DiscoverItem::Album {
+            artist: "B".into(),
+            album: "Two".into(),
+        },
+        DiscoverItem::Album {
+            artist: "C".into(),
+            album: "Three".into(),
+        },
+    ];
+    let mut app_j = App::new(cat.clone(), Box::new(StubPlayer::default()), None, None);
+    app_j.overlay = Some(Overlay::Discover {
+        items: items.clone(),
+        cursor: 0,
+    });
+    handle_key(&mut app_j, key('j'));
+    handle_key(&mut app_j, key('j'));
+
+    let mut app_down = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app_down.overlay = Some(Overlay::Discover { items, cursor: 0 });
+    handle_key(&mut app_down, key_code(KeyCode::Down));
+    handle_key(&mut app_down, key_code(KeyCode::Down));
+
+    let cursor_j = match app_j.overlay {
+        Some(Overlay::Discover { cursor, .. }) => cursor,
+        _ => panic!("j path: overlay should remain open"),
+    };
+    let cursor_down = match app_down.overlay {
+        Some(Overlay::Discover { cursor, .. }) => cursor,
+        _ => panic!("Down path: overlay should remain open"),
+    };
+    assert_eq!(
+        cursor_j, cursor_down,
+        "DEF-026: j and Down should produce identical cursor positions"
+    );
 }
 
 fn click(column: u16, row: u16) -> MouseEvent {

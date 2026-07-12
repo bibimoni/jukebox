@@ -2628,10 +2628,21 @@ impl App {
     }
 
     /// Apply a discover-overlay selection (Enter): start the album/playlist.
+    /// The overlay is ALWAYS closed on Enter — the selection is committed, and
+    /// loading/error state is surfaced via `yt_status` in the footer rather
+    /// than a stuck modal (DEF-028). Previously the overlay stayed open on the
+    /// error paths (empty album, no YouTube session, empty mix response),
+    /// leaving the user to manually press Escape to dismiss it.
     pub fn play_discover_selection(&mut self) {
         let Some(Overlay::Discover { items, cursor }) = self.overlay.clone() else {
             return;
         };
+        // Close the overlay immediately: the user pressed Enter, committing
+        // their selection. The footer's yt_status carries the "Loading mix…"
+        // / error message so the user isn't left staring at a modal that
+        // already consumed the keypress. (on_tick still clears the overlay
+        // on the async success path — a harmless no-op now.)
+        self.overlay = None;
         let Some(item) = items.get(cursor).cloned() else {
             return;
         };
@@ -2641,6 +2652,11 @@ impl App {
                 if let Some(start) = ids.first().cloned() {
                     self.transport.continue_mode = ContinueMode::NextAlbum;
                     self.play_in_context_ids(ids, &start);
+                } else {
+                    // Empty album (no tracks resolved) — surface a clear
+                    // error in the footer instead of silently doing nothing
+                    // with the overlay closed.
+                    self.yt_status = Some("no tracks found for this album".into());
                 }
             }
             DiscoverItem::Playlist { id, .. } => {
@@ -3073,11 +3089,17 @@ impl App {
         if self.view != View::Queue {
             return;
         }
-        let ids = self.transport.manual_queue.clone();
-        let Some(id) = ids.get(self.cursors.queue).cloned() else {
+        // Remove by INDEX, not by id. The old form called
+        // `transport.remove_from_queue(&id)`, which uses
+        // `manual_queue.retain(|x| x != track_id)` — that strips EVERY
+        // occurrence of the id. A queue with the same track enqueued N times
+        // (common: `e` on the same track) was wiped by a single `x` press
+        // (DEF-027). Index removal deletes exactly the one entry the cursor
+        // points at, preserving duplicates above/below it.
+        if self.cursors.queue >= self.transport.manual_queue.len() {
             return;
-        };
-        self.transport.remove_from_queue(&id);
+        }
+        self.transport.manual_queue.remove(self.cursors.queue);
         // Keep the cursor valid: if we removed the last item, step back.
         let new_len = self.transport.manual_queue.len();
         if new_len > 0 && self.cursors.queue >= new_len {

@@ -29,7 +29,7 @@ use ratatui::{
 use crate::catalog::Track;
 use crate::lyrics::LyricsSource;
 use crate::tui::app::{App, Overlay};
-use crate::tui::view::theme::{clip_to_width, Theme};
+use crate::tui::view::theme::{clip_to_width, em_dash, is_ascii, sep_dot, Theme, ASCII_BORDER_SET};
 
 /// Render the active overlay (if any) into `area`.
 pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
@@ -342,14 +342,20 @@ fn render_search(
 /// `sep_width` is the inner width of the help popup so separator lines fill
 /// the full dialog width (DEF-019: separators were fixed at 72 chars and
 /// didn't reach the right border at wider terminals).
-fn help_lines<'a>(sep_width: usize) -> Vec<Line<'a>> {
+///
+/// `ascii` controls the glyph vocabulary: when true (DEF-025, font mode =
+/// `Ascii`), separators use `-`, arrows become `^v<>`, and the em-dash /
+/// middle-dot become `--` / `*` so the help dialog is fully ASCII under
+/// `JUKEBOX_FONT_MODE=ascii`. Exposed as `pub` so the ASCII/Unicode split is
+/// unit-testable without touching process-global env vars.
+pub fn help_lines(sep_width: usize, ascii: bool) -> Vec<Line<'static>> {
     let theme = Theme::default();
     let accent = Style::default().fg(theme.accent);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let text = Style::default().fg(theme.text);
     let dim = Style::default().fg(theme.dim);
 
-    let entry = |key: &'a str, desc: &'a str| -> Line<'a> {
+    let entry = |key: &str, desc: &str| -> Line<'static> {
         Line::from(vec![
             Span::styled(format!("{:<16}", key), accent),
             Span::styled(desc.to_string(), text),
@@ -357,14 +363,52 @@ fn help_lines<'a>(sep_width: usize) -> Vec<Line<'a>> {
     };
 
     let section =
-        |title: &'a str| -> Line<'a> { Line::from(Span::styled(title.to_string(), bold)) };
+        |title: &str| -> Line<'static> { Line::from(Span::styled(title.to_string(), bold)) };
 
-    let sep = || -> Line<'a> { Line::from(Span::styled("─".repeat(sep_width), dim)) };
+    let sep = || -> Line<'static> {
+        // Respect the `ascii` parameter (not the global env) so help_lines is
+        // a pure function of its inputs and unit-testable without env vars.
+        let sep_char = if ascii { "-" } else { "\u{2500}" };
+        Line::from(Span::styled(sep_char.repeat(sep_width), dim))
+    };
+
+    // DEF-025: in ASCII font mode, replace Unicode arrows / em-dash / middle
+    // dot with ASCII equivalents so the help dialog has no non-ASCII glyphs.
+    let nav_key = if ascii {
+        "h j k l * ^v<>"
+    } else {
+        "h j k l \u{00B7} \u{2191}\u{2193}\u{2190}\u{2192}"
+    };
+    let nav_desc = if ascii {
+        "move (^v<> columns, ^v within)"
+    } else {
+        "move (\u{2190}\u{2192} columns, \u{2191}\u{2193} within)"
+    };
+    let seek_desc = if ascii {
+        "seek -5s / +5s"
+    } else {
+        "seek \u{2212}5s / +5s"
+    };
+    let repeat_desc = if ascii {
+        "cycle repeat (off -> all -> one)"
+    } else {
+        "cycle repeat (off \u{2192} all \u{2192} one)"
+    };
+    let filter_desc = if ascii {
+        "filter focused column * Enter on filter jumps to match"
+    } else {
+        "filter focused column \u{00B7} Enter on filter jumps to match"
+    };
+    let sel_key = if ascii {
+        "^ / v"
+    } else {
+        "\u{2191} / \u{2193}"
+    };
 
     vec![
         Line::from(""),
         section("Navigation"),
-        entry("h j k l · ↑↓←→", "move (←→ columns, ↑↓ within)"),
+        entry(nav_key, nav_desc),
         entry("gg / G", "top / bottom of column"),
         entry(
             "1 2 3 4",
@@ -376,21 +420,18 @@ fn help_lines<'a>(sep_width: usize) -> Vec<Line<'a>> {
         entry("Enter", "play selected in context"),
         entry("Space", "play / pause"),
         entry("> / <", "next / previous track"),
-        entry(", / .", "seek −5s / +5s"),
+        entry(", / .", seek_desc),
         entry("+ / -", "volume up / down"),
         entry("m", "mute"),
         entry("z / Z", "cycle shuffle / reshuffle"),
-        entry("r", "cycle repeat (off → all → one)"),
+        entry("r", repeat_desc),
         entry("c", "cycle continue (mode-dependent)"),
         entry("M", "cycle source mode (Local / YouTube / Mixed)"),
         sep(),
         section("Discover"),
         entry("s", "instant random track"),
         entry("S", "discover overlay"),
-        entry(
-            "f",
-            "filter focused column · Enter on filter jumps to match",
-        ),
+        entry("f", filter_desc),
         sep(),
         section("Modes"),
         entry("/", "search (scoped to view)"),
@@ -408,7 +449,7 @@ fn help_lines<'a>(sep_width: usize) -> Vec<Line<'a>> {
         entry(":yt logout", "clear cookies"),
         entry(":yt setup", "install deps"),
         entry(":queue clear", "empty the play-next queue"),
-        entry("↑ / ↓", "move search-result / discover selection"),
+        entry(sel_key, "move search-result / discover selection"),
         entry("Esc", "close overlay / cancel"),
         entry("q", "quit"),
         sep(),
@@ -440,19 +481,36 @@ fn render_help(f: &mut Frame, area: Rect, scroll: u16) {
     let popup = centered(area, 90, 90);
     f.render_widget(Clear, popup);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .title(Span::styled(
-            " help — j/k scroll · Esc to close ",
-            Style::default().fg(theme.accent),
-        ));
+    // DEF-025: in ASCII font mode, the help popup border must use ASCII
+    // box-drawing (+, -, |) instead of Unicode (┌┐└┘│─). The title's em-dash
+    // and middle-dot are also replaced so the dialog is fully ASCII under
+    // JUKEBOX_FONT_MODE=ascii.
+    let ascii = is_ascii();
+    let dash = em_dash();
+    let dot = sep_dot();
+    let title = if ascii {
+        format!(" help {dash} j/k scroll {dot} Esc to close ")
+    } else {
+        " help — j/k scroll · Esc to close ".to_string()
+    };
+    let block = if ascii {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(ASCII_BORDER_SET)
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(title, Style::default().fg(theme.accent)))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(title, Style::default().fg(theme.accent)))
+    };
     // DEF-019: separator lines must fill the full inner width of the popup.
     // Compute the inner width (popup width minus 2 for borders) and pass it
     // to help_lines so the `─` separators reach the right border.
     let sep_width = popup.width.saturating_sub(2) as usize;
     f.render_widget(
-        Paragraph::new(help_lines(sep_width))
+        Paragraph::new(help_lines(sep_width, ascii))
             .scroll((scroll, 0))
             .block(block),
         popup,

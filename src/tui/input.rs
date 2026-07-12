@@ -588,11 +588,15 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         }
         // Help overlay: any non-Esc key is a no-op (overlay stays open until Esc).
         Some(Overlay::Discover { items, mut cursor }) => {
+            // j/k mirror ↑↓ so the help-text keymap ("h j k l · ↑↓←→ move")
+            // holds in the discover overlay too (DEF-026). Without this the
+            // `_` arm swallowed j/k, leaving the cursor unchanged while the
+            // renderer dropped the highlight — the overlay looked unselected.
             match key.code {
-                KeyCode::Down if !items.is_empty() => {
+                KeyCode::Down | KeyCode::Char('j') if !items.is_empty() => {
                     cursor = (cursor + 1) % items.len();
                 }
-                KeyCode::Up if !items.is_empty() => {
+                KeyCode::Up | KeyCode::Char('k') if !items.is_empty() => {
                     cursor = cursor
                         .checked_sub(1)
                         .unwrap_or(items.len().saturating_sub(1));
