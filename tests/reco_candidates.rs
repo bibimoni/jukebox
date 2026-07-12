@@ -175,7 +175,12 @@ fn empty_profile_no_candidates() {
     ];
     let gen = CandidateGenerator::new(&profile, &catalog);
     let candidates = gen.generate();
-    assert!(candidates.is_empty());
+    // Cold-start fallback: empty profile seeds candidates from the catalog.
+    assert!(
+        !candidates.is_empty(),
+        "cold start should fall back to catalog"
+    );
+    assert!(candidates.iter().all(|c| c.is_local));
 }
 
 #[test]

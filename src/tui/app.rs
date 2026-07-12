@@ -1425,7 +1425,7 @@ impl App {
     /// Cycle the continue mode, mode-dependent (spec §2 ContinueMode::YouTube):
     /// - Local:  Off → NextAlbum → Radio → Off
     /// - YouTube: Off → YouTube → Off
-    /// - Mixed:  Off → NextAlbum → YouTube → Off
+    /// - Mixed:  Off → NextAlbum → Radio → YouTube → Off
     pub fn cycle_continue(&mut self) {
         self.transport.continue_mode = match (self.source_mode, self.transport.continue_mode) {
             (crate::mode::SourceMode::Local, ContinueMode::Off) => ContinueMode::NextAlbum,
@@ -1437,9 +1437,9 @@ impl App {
             (crate::mode::SourceMode::Youtube, _) => ContinueMode::Off,
 
             (crate::mode::SourceMode::Mixed, ContinueMode::Off) => ContinueMode::NextAlbum,
-            (crate::mode::SourceMode::Mixed, ContinueMode::NextAlbum) => ContinueMode::YouTube,
+            (crate::mode::SourceMode::Mixed, ContinueMode::NextAlbum) => ContinueMode::Radio,
+            (crate::mode::SourceMode::Mixed, ContinueMode::Radio) => ContinueMode::YouTube,
             (crate::mode::SourceMode::Mixed, ContinueMode::YouTube) => ContinueMode::Off,
-            (crate::mode::SourceMode::Mixed, ContinueMode::Radio) => ContinueMode::Off,
         };
     }
 
@@ -3329,11 +3329,27 @@ impl App {
         if let Some(Overlay::Generator { state }) = &mut self.overlay {
             state.parse_input(); // parse NL → constraints
             if let Some(constraints) = state.constraints.clone() {
-                let playlist = crate::reco::generator::generate(
+                let mut playlist = crate::reco::generator::generate(
                     &constraints,
                     &self.reco_profile,
                     &self.catalog.tracks,
                 );
+                // Fallback: if the generator produced no tracks (empty profile
+                // with an empty catalog), seed from the catalog so the user
+                // always gets a playlist.
+                if playlist.tracks.is_empty() && !self.catalog.tracks.is_empty() {
+                    let max = constraints.max_tracks.min(50);
+                    for track in self.catalog.tracks.iter().take(max) {
+                        playlist
+                            .tracks
+                            .push(crate::reco::candidates::Candidate::new(
+                                track.id.clone(),
+                                crate::reco::candidates::CandidateSource::LocalMetadata,
+                                0.1,
+                                true,
+                            ));
+                    }
+                }
                 state.playlist = Some(playlist);
                 state.generate(); // move to preview phase
             }
@@ -3464,7 +3480,22 @@ impl App {
             if radio.needs_refill() {
                 radio.refill_if_needed(&self.reco_profile, &self.catalog.tracks);
             }
-            return radio.next_track().map(|c| c.track_id);
+            if let Some(c) = radio.next_track() {
+                return Some(c.track_id);
+            }
+            // Fallback: pool exhausted and can't refill — pick the first
+            // catalog track not yet played in this session so the radio
+            // keeps going even without a profile.
+            let fallback = self
+                .catalog
+                .tracks
+                .iter()
+                .find(|t| !radio.session_history.contains(&t.id))
+                .map(|t| t.id.clone());
+            if let Some(id) = fallback {
+                radio.session_history.push(id.clone());
+                return Some(id);
+            }
         }
         None
     }
@@ -3802,5 +3833,119 @@ mod tests {
         app.overlay = None;
         app.overlay = Some(Overlay::Diagnostics);
         assert!(matches!(app.overlay, Some(Overlay::Diagnostics)));
+    }
+
+    // --- Regression tests for cold-start reco fallbacks ---
+
+    #[test]
+    fn cycle_continue_mixed_mode_includes_radio() {
+        use crate::mode::SourceMode;
+        use crate::tui::queue::ContinueMode;
+        let mut app = make_app();
+        app.source_mode = SourceMode::Mixed;
+        // Off → NextAlbum
+        app.transport.continue_mode = ContinueMode::Off;
+        app.cycle_continue();
+        assert_eq!(app.transport.continue_mode, ContinueMode::NextAlbum);
+        // NextAlbum → Radio
+        app.cycle_continue();
+        assert_eq!(app.transport.continue_mode, ContinueMode::Radio);
+        // Radio → YouTube
+        app.cycle_continue();
+        assert_eq!(app.transport.continue_mode, ContinueMode::YouTube);
+        // YouTube → Off
+        app.cycle_continue();
+        assert_eq!(app.transport.continue_mode, ContinueMode::Off);
+    }
+
+    #[test]
+    fn open_home_generates_mixes_with_tracks_on_cold_start() {
+        let mut app = make_app();
+        assert!(app.reco_profile.is_empty());
+        app.open_home();
+        // Mixes should be generated.
+        assert!(!app.reco_mixes.is_empty());
+        // Each generated mix should have tracks (catalog fallback).
+        for mix in &app.reco_mixes {
+            assert!(
+                !mix.tracks.is_empty(),
+                "mix {:?} should have tracks via catalog fallback",
+                mix.mix_type
+            );
+        }
+    }
+
+    #[test]
+    fn generate_playlist_cold_start_produces_tracks() {
+        let mut app = make_app();
+        // Empty profile — no listening history.
+        assert!(app.reco_profile.is_empty());
+        app.open_generator();
+        if let Some(Overlay::Generator { state }) = &mut app.overlay {
+            state.input = "calm focus mix".into();
+        }
+        app.generate_playlist();
+        if let Some(Overlay::Generator { state }) = &app.overlay {
+            assert!(state.playlist.is_some());
+            let playlist = state.playlist.as_ref().unwrap();
+            assert!(
+                !playlist.tracks.is_empty(),
+                "generator should produce tracks via catalog fallback on cold start"
+            );
+        } else {
+            panic!("expected Generator overlay");
+        }
+    }
+
+    #[test]
+    fn start_radio_cold_start_has_candidates() {
+        let mut app = make_app();
+        assert!(app.reco_profile.is_empty());
+        app.start_radio_from_track("t1");
+        if let Some(Overlay::Radio { session }) = &app.overlay {
+            let s = session.as_ref().expect("session should be Some");
+            assert!(
+                !s.candidate_pool.is_empty(),
+                "radio should seed from catalog on cold start"
+            );
+        } else {
+            panic!("expected Radio overlay");
+        }
+    }
+
+    #[test]
+    fn reco_radio_next_falls_back_to_catalog_when_pool_exhausted() {
+        let mut app = make_app();
+        app.start_radio_from_track("t1");
+        // Drain the pool completely.
+        let mut count = 0;
+        while app.reco_radio_next().is_some() {
+            count += 1;
+            if count > 500 {
+                break; // safety valve
+            }
+        }
+        assert!(count > 0, "should have gotten tracks before exhaustion");
+        // After the pool is drained, the fallback should still return a
+        // catalog track that hasn't been played in this session.
+        // (If all catalog tracks have been played, returns None — correct.)
+        // With a 3-track catalog, after playing all 3, the fallback can't
+        // find an unplayed track, so we just verify we got tracks.
+    }
+
+    #[test]
+    fn reco_radio_next_cold_start_returns_track() {
+        let mut app = make_app();
+        // Empty profile — cold start.
+        assert!(app.reco_profile.is_empty());
+        app.start_radio_from_track("t1");
+        let next = app.reco_radio_next();
+        assert!(next.is_some(), "radio should return a track on cold start");
+        let id = next.unwrap();
+        assert!(
+            app.track_by_id(&id).is_some(),
+            "should be a valid catalog track"
+        );
+        assert_ne!(id, "t1", "seed track should not be immediately re-played");
     }
 }

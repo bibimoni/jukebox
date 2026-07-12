@@ -372,11 +372,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_profile_generates_empty_mix() {
+    fn empty_profile_mix_uses_catalog_fallback() {
         let profile = UserProfile::new();
         let catalog = vec![make_track("t1", "Artist A", "Album 1", "Song 1")];
-        let mix = generate_mix(MixType::OnRepeat, &profile, &catalog);
-        assert!(mix.tracks.is_empty());
+        // DailyMix does not require history — with the catalog fallback in
+        // CandidateGenerator, it should produce tracks even on cold start.
+        let mix = generate_mix(MixType::DailyMix, &profile, &catalog);
+        assert!(
+            !mix.tracks.is_empty(),
+            "DailyMix should use catalog fallback"
+        );
     }
 
     #[test]

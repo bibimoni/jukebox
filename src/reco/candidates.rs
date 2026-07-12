@@ -151,7 +151,32 @@ impl<'a> CandidateGenerator<'a> {
         self.from_existing_playlists(&mut candidates, &mut seen);
         self.from_local_metadata(&mut candidates, &mut seen);
 
+        // Cold-start fallback: when the profile is empty (no listening
+        // history), seed candidates from the local catalog so the
+        // recommendation pipeline always has material to rank and diversify.
+        if candidates.is_empty() && self.profile.is_empty() && !self.catalog.is_empty() {
+            self.from_catalog_fallback(&mut candidates, &mut seen);
+        }
+
         candidates
+    }
+
+    /// Cold-start fallback: seed candidates from the entire local catalog
+    /// when the user has no listening history. Every eligible track becomes a
+    /// weak candidate with a default affinity score so the ranking and
+    /// diversity stages have material to work with.
+    fn from_catalog_fallback(&self, candidates: &mut Vec<Candidate>, seen: &mut HashSet<String>) {
+        for track in self.catalog {
+            if self.is_eligible(&track.id) && !seen.contains(&track.id) {
+                seen.insert(track.id.clone());
+                candidates.push(Candidate::new(
+                    track.id.clone(),
+                    CandidateSource::LocalMetadata,
+                    0.1,
+                    true,
+                ));
+            }
+        }
     }
 
     /// Generate candidates from liked tracks. These are the strongest seeds.
@@ -358,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_profile_generates_no_candidates() {
+    fn empty_profile_falls_back_to_catalog() {
         let profile = UserProfile::new();
         let catalog: Vec<Track> = vec![
             make_track("t1", "Artist A", "Song A"),
@@ -366,10 +391,23 @@ mod tests {
         ];
         let gen = CandidateGenerator::new(&profile, &catalog);
         let candidates = gen.generate();
-        assert!(
-            candidates.is_empty(),
-            "empty profile should produce no candidates"
+        // Cold-start fallback: every catalog track is a weak candidate.
+        assert_eq!(
+            candidates.len(),
+            2,
+            "empty profile should seed from catalog"
         );
+        assert!(candidates.iter().all(|c| c.is_local));
+        assert!(candidates.iter().all(|c| c.affinity > 0.0));
+    }
+
+    #[test]
+    fn empty_profile_with_empty_catalog_generates_nothing() {
+        let profile = UserProfile::new();
+        let catalog: Vec<Track> = vec![];
+        let gen = CandidateGenerator::new(&profile, &catalog);
+        let candidates = gen.generate();
+        assert!(candidates.is_empty(), "no catalog → no fallback candidates");
     }
 
     #[test]

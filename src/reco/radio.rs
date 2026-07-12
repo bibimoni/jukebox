@@ -149,7 +149,28 @@ impl RadioSession {
             &self.session_history,
         );
 
-        diverse.into_iter().take(self.max_pool_size).collect()
+        let mut pool: Vec<Candidate> = diverse.into_iter().take(self.max_pool_size).collect();
+
+        // Fallback: if the pool is empty after exclusions (cold start with no
+        // profile signal, or all candidates excluded), seed from the catalog
+        // so the radio always has something to play.
+        if pool.is_empty() && !catalog.is_empty() {
+            for track in catalog {
+                if !self.exclusions.contains(&track.id)
+                    && !self.session_history.contains(&track.id)
+                    && !self.negative_feedback.contains(&track.id)
+                {
+                    pool.push(Candidate::new(
+                        track.id.clone(),
+                        CandidateSource::LocalMetadata,
+                        0.1,
+                        true,
+                    ));
+                }
+            }
+        }
+
+        pool
     }
 
     /// Get the next track to play. Returns None if the pool is empty.
@@ -351,5 +372,41 @@ mod tests {
         radio.skip("t2");
         // Skip is weak — t2 should still be in the pool (not excluded).
         assert!(radio.skipped.contains("t2"));
+    }
+
+    #[test]
+    fn radio_empty_profile_seeds_from_catalog() {
+        let profile = UserProfile::new();
+        let catalog = vec![
+            make_track("t1", "Artist A", "Album 1", "Song 1"),
+            make_track("t2", "Artist B", "Album 2", "Song 2"),
+            make_track("t3", "Artist C", "Album 3", "Song 3"),
+        ];
+        let mut radio = RadioSession::new(RadioSeed::Track("t1".into()));
+        radio.initialize(&profile, &catalog);
+        // Cold-start fallback: the pool should have catalog tracks even
+        // without a listening profile.
+        assert!(
+            !radio.candidate_pool.is_empty(),
+            "radio should seed from catalog on cold start"
+        );
+    }
+
+    #[test]
+    fn radio_fallback_when_all_candidates_excluded() {
+        let profile = make_profile();
+        let catalog = vec![
+            make_track("t1", "Artist A", "Album 1", "Song 1"),
+            make_track("t2", "Artist B", "Album 2", "Song 2"),
+        ];
+        let mut radio = RadioSession::new(RadioSeed::Track("t1".into()));
+        // Exclude all profile-derived candidates, leaving only the fallback.
+        radio.exclusions.insert("t1".into());
+        radio.initialize(&profile, &catalog);
+        // t2 should still be in the pool (either from the profile or fallback).
+        assert!(
+            radio.candidate_pool.iter().any(|c| c.track_id == "t2"),
+            "fallback should provide t2 when t1 is excluded"
+        );
     }
 }

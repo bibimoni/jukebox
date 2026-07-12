@@ -110,7 +110,8 @@ fn empty_profile_generates_empty_mix() {
     let profile = UserProfile::new();
     let catalog = vec![make_track("t1", "Artist A", "Album 1", "Song 1")];
     let mix = generate_mix(MixType::OnRepeat, &profile, &catalog);
-    assert!(mix.tracks.is_empty());
+    // Cold-start fallback: the catalog seeds candidates even without a profile.
+    assert!(!mix.tracks.is_empty(), "mix should use catalog fallback");
 }
 
 #[test]

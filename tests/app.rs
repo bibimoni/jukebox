@@ -383,6 +383,8 @@ fn cycle_continue_is_mode_aware() {
     app.cycle_continue();
     assert_eq!(app.transport.continue_mode, ContinueMode::NextAlbum);
     app.cycle_continue();
+    assert_eq!(app.transport.continue_mode, ContinueMode::Radio);
+    app.cycle_continue();
     assert_eq!(app.transport.continue_mode, ContinueMode::YouTube);
     app.cycle_continue();
     assert_eq!(app.transport.continue_mode, ContinueMode::Off);

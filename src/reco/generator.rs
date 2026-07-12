@@ -496,6 +496,22 @@ mod tests {
     }
 
     #[test]
+    fn generate_playlist_empty_profile_uses_catalog_fallback() {
+        let profile = UserProfile::new();
+        let catalog = vec![
+            make_track("t1", "Artist A", "Song A"),
+            make_track("t2", "Artist B", "Song B"),
+            make_track("t3", "Artist C", "Song C"),
+        ];
+        let constraints = GeneratorConstraints::default();
+        let playlist = generate(&constraints, &profile, &catalog);
+        assert!(
+            !playlist.tracks.is_empty(),
+            "empty profile should still produce a playlist via catalog fallback"
+        );
+    }
+
+    #[test]
     fn energy_label() {
         assert_eq!(Energy::Low.label(), "Low");
         assert_eq!(Energy::Medium.label(), "Medium");

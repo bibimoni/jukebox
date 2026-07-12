@@ -35,15 +35,23 @@ fn cold_start_no_candidates() {
     let p = UserProfile::new();
     let catalog = vec![mk("t1", "A")];
     let gen = CandidateGenerator::new(&p, &catalog);
-    assert!(gen.generate().is_empty());
+    // Cold-start fallback: empty profile seeds candidates from the catalog.
+    let candidates = gen.generate();
+    assert!(
+        !candidates.is_empty(),
+        "cold start should fall back to catalog"
+    );
+    assert!(candidates.iter().all(|c| c.is_local));
 }
 
 #[test]
 fn cold_start_mix_empty() {
     let p = UserProfile::new();
     let catalog = vec![mk("t1", "A")];
+    // OnRepeat requires history in generate_all_mixes, but generate_mix itself
+    // uses the catalog fallback so the mix has tracks even on cold start.
     let mix = generate_mix(MixType::OnRepeat, &p, &catalog);
-    assert!(mix.tracks.is_empty());
+    assert!(!mix.tracks.is_empty(), "mix should use catalog fallback");
 }
 
 #[test]
@@ -52,7 +60,10 @@ fn cold_start_daily_mix_still_generated() {
     let catalog = vec![mk("t1", "A")];
     // Daily Mix is always generated (even cold start).
     let mix = generate_mix(MixType::DailyMix, &p, &catalog);
-    let _ = mix;
+    assert!(
+        !mix.tracks.is_empty(),
+        "DailyMix should have tracks via catalog fallback"
+    );
 }
 
 #[test]
@@ -65,6 +76,14 @@ fn cold_start_all_mixes_still_has_daily_discover() {
     // Even cold start gets DailyMix + Discover (no history required).
     assert!(mixes.iter().any(|m| m.mix_type == MixType::DailyMix));
     assert!(mixes.iter().any(|m| m.mix_type == MixType::Discover));
+    // Each generated mix should have tracks (catalog fallback).
+    for mix in &mixes {
+        assert!(
+            !mix.tracks.is_empty(),
+            "mix {:?} should have tracks",
+            mix.mix_type
+        );
+    }
 }
 
 #[test]
@@ -74,5 +93,8 @@ fn cold_start_radio_from_track() {
     let mut r = RadioSession::new(RadioSeed::Track("t1".into()));
     r.initialize(&p, &catalog);
     // Radio works even cold start (uses catalog for seed-based candidates).
-    let _ = r;
+    assert!(
+        !r.candidate_pool.is_empty(),
+        "radio should seed from catalog on cold start"
+    );
 }
