@@ -4,13 +4,15 @@
 //! backed by a [`StubPlayer`], asserting on observable state changes. No
 //! terminal, no crossterm event source — just the controller.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use jukebox::catalog::Catalog;
 use jukebox::player::StubPlayer;
 use jukebox::search::Searcher;
 use jukebox::tui::app::{App, Overlay, View};
-use jukebox::tui::input::handle_key;
+use jukebox::tui::input::{handle_key, handle_mouse_in_area};
 use jukebox::tui::queue::{RepeatMode, ShuffleMode};
+use jukebox::tui::view::{layout::player_bar_area, player_bar::geometry};
+use ratatui::layout::Rect;
 
 /// A 3-track catalog under one artist/album, with real on-disk source files
 /// (so `play_selected`'s `std::fs::metadata` check passes and playback starts).
@@ -175,9 +177,15 @@ fn search_overlay_populates_results() {
         Some(Overlay::Search { results, .. }) => results.clone(),
         _ => panic!("expected Search overlay to still be open"),
     };
-    assert!(!results.is_empty(), "search overlay results must be non-empty after a matching query");
-    assert!(results.iter().any(|id| id == "t1"),
-        "results must contain the matched track id t1: {:?}", results);
+    assert!(
+        !results.is_empty(),
+        "search overlay results must be non-empty after a matching query"
+    );
+    assert!(
+        results.iter().any(|id| id == "t1"),
+        "results must contain the matched track id t1: {:?}",
+        results
+    );
 }
 
 #[test]
@@ -220,7 +228,10 @@ fn search_overlay_n_types_into_query_not_navigation() {
     let (_d, cat) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     handle_key(&mut app, key('/'));
-    handle_key(&mut app, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
     let input = match &app.overlay {
         Some(Overlay::Search { input, .. }) => input.clone(),
         _ => panic!("overlay should be open"),
@@ -237,12 +248,18 @@ fn search_overlay_arrow_keys_move_selection() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), Some(searcher), None);
     // Type a query that yields multiple results ("a" matches Ado/Aimer/etc).
     handle_key(&mut app, key('/'));
-    handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+    );
     let n_results = match &app.overlay {
         Some(Overlay::Search { results, .. }) => results.len(),
         _ => panic!("overlay should be open"),
     };
-    assert!(n_results >= 2, "need >=2 results to test navigation, got {n_results}");
+    assert!(
+        n_results >= 2,
+        "need >=2 results to test navigation, got {n_results}"
+    );
     // Down moves the cursor to result 1.
     handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     let cursor = match &app.overlay {
@@ -266,7 +283,10 @@ fn search_overlay_typing_letters_not_intercepted_as_navigation() {
     let (_d, cat) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     handle_key(&mut app, key('/'));
-    handle_key(&mut app, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
     let input = match &app.overlay {
         Some(Overlay::Search { input, .. }) => input.clone(),
         _ => panic!("overlay should be open"),
@@ -274,11 +294,12 @@ fn search_overlay_typing_letters_not_intercepted_as_navigation() {
     assert_eq!(input, "j", "'j' must be typed into the query, not navigate");
 }
 
-
-
 fn isolate_xdg() -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("jk-xdg-{}-{}", std::process::id(),
-        std::sync::atomic::AtomicU64::new(0).fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+    let d = std::env::temp_dir().join(format!(
+        "jk-xdg-{}-{}",
+        std::process::id(),
+        std::sync::atomic::AtomicU64::new(0).fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
     std::fs::create_dir_all(&d).unwrap();
     std::env::set_var("XDG_CONFIG_HOME", &d);
     d
@@ -298,7 +319,9 @@ fn yt_auth_enter_saves_closes_esc_cancels() {
     let _xdg = isolate_xdg();
     let (_d, cat) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
-    app.overlay = Some(Overlay::YtAuth { input: "# Netscape cookies".into() });
+    app.overlay = Some(Overlay::YtAuth {
+        input: "# Netscape cookies".into(),
+    });
     // Enter submits → writes cookies, closes overlay.
     handle_key(&mut app, key_code(KeyCode::Enter));
     assert!(app.overlay.is_none(), "Enter should close the auth overlay");
@@ -373,11 +396,49 @@ fn s_instant_random_via_key() {
     assert!(app.now_playing.is_some(), "s should start a random track");
 }
 
-#[test]
-fn S_opens_discover_overlay() {
+#[test] // `s` documents the shift+s Discover keybinding under test
+fn s_opens_discover_overlay() {
     let (_d, cat) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.source_mode = jukebox::mode::SourceMode::Local;
     handle_key(&mut app, key('S'));
     assert!(matches!(app.overlay, Some(Overlay::Discover { .. })));
+}
+
+fn click(column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+#[test]
+fn mouse_uses_rendered_player_bar_geometry() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    focus_track_col(&mut app);
+    handle_key(&mut app, key_code(KeyCode::Enter));
+    let screen = Rect::new(0, 0, 120, 25);
+    let bar = player_bar_area(screen).expect("wide layout has a player bar");
+    let geo = geometry(bar);
+
+    handle_mouse_in_area(&mut app, click(geo.next.x, geo.next.y), screen);
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t2"));
+
+    let before = app.player.position();
+    handle_mouse_in_area(
+        &mut app,
+        click(geo.progress.right() + 2, geo.progress.y),
+        screen,
+    );
+    assert_eq!(app.player.position(), before, "outside gauge must not seek");
+
+    handle_mouse_in_area(
+        &mut app,
+        click(geo.progress.x + geo.progress.width / 2, geo.progress.y),
+        screen,
+    );
+    assert_eq!(app.player.position(), Some(90.0));
 }

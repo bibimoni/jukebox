@@ -54,20 +54,43 @@ pub trait YtClient {
     fn get_watch_playlist(&mut self, video_id: &str) -> Result<Vec<String>>;
 }
 
-/// Path to the persisted cookies file: `<config_dir>/jukebox/yt-cookies.txt`.
-pub fn cookies_file() -> std::path::PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+/// Resolve the config base dir, returning `None` when the only fallback is
+/// `/tmp/.config` (world-readable on multi-user systems). Cookie secrets must
+/// never live there, so `cookies_file_opt()` returns `None` in that case and
+/// callers degrade to guest mode instead of writing secrets to a world-readable
+/// path. Config/state files (no secrets) may still use the `/tmp/.config`
+/// fallback — see `config::config_path()` / `state::db_path()`.
+fn config_base_opt() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(dirs::config_dir)
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/.config"));
-    let dir = base.join("jukebox");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join("yt-cookies.txt")
 }
 
-/// Load persisted cookies (Netscape cookies.txt). `None` if absent/empty.
+/// Path to the persisted cookies file: `<config_dir>/jukebox/yt-cookies.txt`.
+/// Returns `None` when no proper config dir is available (the `/tmp/.config`
+/// fallback is refused — cookie secrets must not live in a world-readable
+/// location). Callers should degrade to guest mode when `None`.
+pub fn cookies_file_opt() -> Option<std::path::PathBuf> {
+    let base = config_base_opt()?;
+    let dir = base.join("jukebox");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("yt-cookies.txt"))
+}
+
+/// Backwards-compatible `PathBuf` wrapper around `cookies_file_opt()`.
+/// Returns an empty `PathBuf` when no safe config dir exists (the
+/// `/tmp/.config` fallback is refused for secrets). An empty path is benign:
+/// `load_cookies()` returns `None`, `remove_file` on it fails silently, and
+/// `set_cookies` returns an error. Kept for callers (e.g. `app::yt_logout`)
+/// that expect a `PathBuf`.
+pub fn cookies_file() -> std::path::PathBuf {
+    cookies_file_opt().unwrap_or_default()
+}
+
+/// Load persisted cookies (Netscape cookies.txt). `None` if absent/empty or
+/// if no safe config dir exists (the `/tmp/.config` fallback is refused).
 pub fn load_cookies() -> Option<String> {
-    let p = cookies_file();
+    let p = cookies_file_opt()?;
     let s = std::fs::read_to_string(&p).ok()?;
     if s.trim().is_empty() {
         None
@@ -79,6 +102,10 @@ pub fn load_cookies() -> Option<String> {
 /// The jukebox-owned venv directory (`<config>/jukebox/yt-venv`), created by
 /// `:yt setup`. Holds `ytmusicapi`/`yt-dlp`/`browser_cookie3` so the sidecar
 /// doesn't depend on the system python having them.
+///
+/// The `/tmp/.config` fallback is acceptable here: the venv contains only
+/// pip packages (no secrets). Cookie secrets use `cookies_file_opt()` which
+/// refuses the fallback.
 pub fn venv_dir() -> std::path::PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
@@ -130,7 +157,10 @@ pub fn run_setup(requirements: &std::path::Path) -> Result<String> {
             .stderr(stderr_to())
             .status()?;
         if !status.success() {
-            anyhow::bail!("python3 -m venv failed (exit {status}); see {}", log_path.display());
+            anyhow::bail!(
+                "python3 -m venv failed (exit {status}); see {}",
+                log_path.display()
+            );
         }
     }
     let pip = dir.join("bin").join("pip");
@@ -142,9 +172,16 @@ pub fn run_setup(requirements: &std::path::Path) -> Result<String> {
         .stderr(stderr_to())
         .status()?;
     if !status.success() {
-        anyhow::bail!("pip install failed (exit {status}); see {}", log_path.display());
+        anyhow::bail!(
+            "pip install failed (exit {status}); see {}",
+            log_path.display()
+        );
     }
-    Ok(format!("installed YT deps into {} (log: {})", dir.display(), log_path.display()))
+    Ok(format!(
+        "installed YT deps into {} (log: {})",
+        dir.display(),
+        log_path.display()
+    ))
 }
 
 /// Where `:yt setup` writes venv/pip output so it doesn't hit the terminal.
@@ -158,8 +195,12 @@ fn setup_log_path() -> std::path::PathBuf {
 /// queue). `Resolve` carries the video_id the URL is for.
 #[derive(Clone, Debug)]
 enum Pending {
-    Playlists,
-    Suggestions,
+    /// Carries the generation tag (Slice 2) so a stale refresh response (from
+    /// a prior `send_refresh` call) is dropped by `apply_pair` when
+    /// `gen != self.refresh_gen` — the old code had no guard, so a stale
+    /// refresh's playlists could overwrite a fresh refresh's.
+    Playlists(u64),
+    Suggestions(u64),
     /// A fast-tier resolve (tv_embedded, AAC 129k) outstanding.
     Resolve(String),
     /// A premium-tier resolve (tv/web + EJS solver, AAC 256k) outstanding. Kept
@@ -176,7 +217,18 @@ enum Pending {
     /// Carries the playlist id so the Tracks response can be routed back to
     /// the matching `YtList`.
     Tracks(String),
+    /// A lyrics fetch outstanding. Carries the video_id so on_tick can
+    /// discard stale lyrics for a different track.
+    Lyrics(String),
     Watch,
+    /// A discover (`S` overlay) home-suggestions fetch outstanding. Distinct
+    /// from `Suggestions(gen)` (the refresh flow) so a discover response
+    /// routes to `pending_discover` WITHOUT disturbing the generation-guarded
+    /// refresh tracking (`refresh_gen` / `refresh_remaining`). The wire
+    /// request is the same `Request::HomeSuggestions`; only the pending tag
+    /// differs, and FIFO pairing (responses in send order) keeps each
+    /// `HomeSuggestions` response paired with the kind that asked for it.
+    Discover,
     Auth,
     Pong,
 }
@@ -203,6 +255,12 @@ pub struct Session {
     pub browser: Option<String>,
     /// video_id → RemoteTrack metadata seen via search/get_playlist/watch.
     pub track_cache: HashMap<String, RemoteTrack>,
+    /// Insertion-order FIFO of `track_cache` keys, used for cap eviction. A
+    /// VecDeque (not the HashMap's non-deterministic iteration order) so
+    /// eviction drops the oldest-seen entry. A key is pushed only on first
+    /// insert (re-caching an already-seen track overwrites in place without
+    /// re-pushing), keeping the deque and map in 1:1 sync.
+    track_cache_order: std::collections::VecDeque<String>,
     /// Per-video_id cached fast + premium URLs (capped at current+next). A
     /// premium resolve fills the `premium` slot WITHOUT evicting `fast`, so the
     /// fast URL stays playable until the premium swap.
@@ -237,6 +295,44 @@ pub struct Session {
     /// The query currently being searched (guards against re-sending the same
     /// query while in flight).
     search_inflight: Option<String>,
+    /// True while a `send_refresh` is in flight (both Playlists + Suggestions
+    /// responses pending). Guards against stacking duplicate refreshes in
+    /// the FIFO `pending` queue (Slice 2 — the old code had no guard, so
+    /// multiple refreshes could stack and apply out of order).
+    refresh_inflight: bool,
+    /// Generation counter incremented on each `send_refresh`. The gen rides in
+    /// `Pending::Playlists(gen)` / `Pending::Suggestions(gen)` so `apply_pair`
+    /// drops a stale response (from a prior refresh) when `gen !=
+    /// self.refresh_gen` (Slice 2 — stale-refresh-overwrites-fresh fix).
+    refresh_gen: u64,
+    /// How many of the current refresh's responses are still pending (2 at
+    /// send: Playlists + Suggestions; decremented in `apply_pair` as each
+    /// lands; when 0, `refresh_inflight` is cleared).
+    refresh_remaining: u8,
+    /// `(video_id, lines, synced)` from a fire-and-forget `send_get_lyrics`,
+    /// picked up by `App::on_tick` to populate the lyrics overlay. Carries the
+    /// video_id so on_tick can discard stale lyrics for a different track
+    /// (generation guard lives in `App::lyrics_gen`).
+    pub pending_lyrics: Option<(String, Vec<crate::yt::proto::LyricLineProto>, bool)>,
+    /// The video_id whose lyrics are currently being fetched (guards against
+    /// re-sending every tick while the fetch is in flight).
+    lyrics_inflight: Option<String>,
+    /// `(video_ids)` from a fire-and-forget `send_home_suggestions`, picked up
+    /// by `App::on_tick` to populate the `S` discover overlay. Distinct from
+    /// `pending_suggestions` (the refresh flow) so opening discover doesn't
+    /// disturb the Y-view account+suggested lists.
+    pub pending_discover: Option<Vec<crate::yt::proto::PlaylistSummary>>,
+    /// True while a discover fetch is in flight (guards against re-sending
+    /// every tick while the fetch is in flight).
+    discover_inflight: bool,
+    /// `video_ids` from a fire-and-forget `send_watch_playlist` (CONT=YouTube
+    /// auto-advance), picked up by `App::on_tick` to refill the `RadioCursor`
+    /// and start playback of the next track. Non-blocking so a natural
+    /// end-of-track doesn't freeze the UI for the ~4s ytmusicapi roundtrip.
+    pub pending_watch: Option<Vec<String>>,
+    /// True while a watch_playlist fetch is in flight (guards against
+    /// re-sending every tick while the fetch is in flight).
+    watch_inflight: bool,
     /// The most recent sidecar error from an inflight-tracked request
     /// (search/get_playlist/resolve/watch), surfaced to `App::yt_error` by
     /// `on_tick`. Lets the UI exit a "searching…/loading…" state on failure
@@ -261,6 +357,14 @@ const RESPAWN_GAP: Duration = Duration::from_secs(5);
 
 const URL_CACHE_CAP: usize = 2;
 
+/// Max entries in [`Session::track_cache`] (video_id → RemoteTrack). The cache
+/// grew without bound as the user searched/browsed YouTube (PB9); once over
+/// the cap the oldest entry is evicted. Entries whose stream URL is still
+/// held in the 2-entry `url_cache` (the playing / next-preload track) are
+/// never evicted, so the player bar keeps its now-playing metadata mid-play.
+/// `pub` so `tests/perf.rs` can assert the cap value.
+pub const TRACK_CACHE_CAP: usize = 256;
+
 impl Session {
     /// Spawn with pasted `cookies` (Netscape) OR `browser` (profile name) —
     /// pass exactly one; both `None` runs guest mode. `browser` makes the
@@ -272,6 +376,7 @@ impl Session {
             cookies,
             browser: None,
             track_cache: HashMap::new(),
+            track_cache_order: std::collections::VecDeque::new(),
             url_cache: Vec::new(),
             pending: std::collections::VecDeque::new(),
             resolve_inflight: None,
@@ -283,6 +388,15 @@ impl Session {
             playlist_inflight: None,
             pending_search: None,
             search_inflight: None,
+            refresh_inflight: false,
+            refresh_gen: 0,
+            refresh_remaining: 0,
+            pending_lyrics: None,
+            lyrics_inflight: None,
+            pending_discover: None,
+            discover_inflight: false,
+            pending_watch: None,
+            watch_inflight: false,
             pending_errors: Vec::new(),
             respawn_attempts: 0,
             last_respawn: None,
@@ -297,13 +411,18 @@ impl Session {
         // browser jar there (0600) so the next launch can load it WITHOUT
         // re-reading the Keychain. The single Keychain prompt happens here, on
         // the explicit `:yt auth browser` command — not at launch.
-        let cf = cookies_file().to_string_lossy().to_string();
+        // When no safe config dir exists (refusing /tmp/.config), pass an empty
+        // string — the sidecar simply won't persist the decrypted jar.
+        let cf = cookies_file_opt()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
         let sidecar = Sidecar::spawn(python, script, None, Some(browser.clone()), Some(cf))?;
         Ok(Session {
             sidecar,
             cookies: None,
             browser: Some(browser),
             track_cache: HashMap::new(),
+            track_cache_order: std::collections::VecDeque::new(),
             url_cache: Vec::new(),
             pending: std::collections::VecDeque::new(),
             resolve_inflight: None,
@@ -315,6 +434,15 @@ impl Session {
             playlist_inflight: None,
             pending_search: None,
             search_inflight: None,
+            refresh_inflight: false,
+            refresh_gen: 0,
+            refresh_remaining: 0,
+            pending_lyrics: None,
+            lyrics_inflight: None,
+            pending_discover: None,
+            discover_inflight: false,
+            pending_watch: None,
+            watch_inflight: false,
             pending_errors: Vec::new(),
             respawn_attempts: 0,
             last_respawn: None,
@@ -384,12 +512,18 @@ impl Session {
     /// over the cap (current+next). Both tiers of an existing entry survive.
     fn cache_entry(&mut self, video_id: &str) -> &mut CachedResolve {
         if !self.url_cache.iter().any(|c| c.video_id == video_id) {
-            self.url_cache.push(CachedResolve { video_id: video_id.to_string(), ..Default::default() });
+            self.url_cache.push(CachedResolve {
+                video_id: video_id.to_string(),
+                ..Default::default()
+            });
             if self.url_cache.len() > URL_CACHE_CAP {
                 self.url_cache.remove(0);
             }
         }
-        self.url_cache.iter_mut().find(|c| c.video_id == video_id).expect("just inserted")
+        self.url_cache
+            .iter_mut()
+            .find(|c| c.video_id == video_id)
+            .expect("just inserted")
     }
 
     /// Stage a sidecar error for `App::on_tick`. `pending_errors` is a Vec so
@@ -439,12 +573,45 @@ impl Session {
         Ok(())
     }
 
+    /// Clear all in-memory caches + cancel in-flight requests (S2.6.2).
+    /// Called by `App::yt_logout` so stale data from the logged-out account
+    /// doesn't survive logout. Also bumps `refresh_gen` so any in-flight refresh
+    /// response that lands AFTER logout is discarded by the generation guard
+    /// (it carries the old gen, which is now != the new `refresh_gen`).
+    pub fn clear_all_caches(&mut self) {
+        self.track_cache.clear();
+        self.track_cache_order.clear();
+        self.url_cache.clear();
+        self.pending_playlists = None;
+        self.pending_suggestions = None;
+        self.pending_tracks = None;
+        self.pending_search = None;
+        self.pending_premium_url = None;
+        self.pending_lyrics = None;
+        self.pending_discover = None;
+        self.pending_watch = None;
+        self.pending_errors.clear();
+        self.playlist_inflight = None;
+        self.search_inflight = None;
+        self.resolve_inflight = None;
+        self.premium_resolve_inflight = None;
+        self.lyrics_inflight = None;
+        self.discover_inflight = false;
+        self.watch_inflight = false;
+        self.refresh_inflight = false;
+        self.refresh_remaining = 0;
+        // Bump the gen so any in-flight response (carrying the old gen) is
+        // discarded by apply_pair's generation guard.
+        self.refresh_gen = self.refresh_gen.wrapping_add(1);
+    }
+
     /// Persist `cookies` (Netscape cookies.txt) to the cookies file (perms
     /// 0600) and respawn the sidecar with them. One paste feeds both
     /// `ytmusicapi` (via the cookie header) and `yt-dlp` (via the file).
     /// Clears any browser profile (mutually exclusive).
     pub fn set_cookies(&mut self, cookies: String, python: &Path, script: &Path) -> Result<()> {
-        let p = cookies_file();
+        let p = cookies_file_opt()
+            .ok_or_else(|| anyhow!("no safe config dir for cookies (refusing /tmp/.config)"))?;
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -464,7 +631,11 @@ impl Session {
     pub fn set_browser(&mut self, browser: String, python: &Path, script: &Path) -> Result<()> {
         self.browser = Some(browser.clone());
         self.cookies = None;
-        let cf = cookies_file().to_string_lossy().to_string();
+        // Same pattern as spawn_browser: pass empty string when no safe config
+        // dir (refusing /tmp/.config for cookie secrets).
+        let cf = cookies_file_opt()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
         self.sidecar = Sidecar::spawn(python, script, None, Some(browser), Some(cf))?;
         Ok(())
     }
@@ -509,6 +680,22 @@ impl Session {
                 for t in v {
                     self.cache_track(t);
                 }
+                // Surface the radio queue's video_ids so `App::on_tick` can
+                // refill the `RadioCursor` + start playback (non-blocking
+                // auto-advance). Clear the inflight guard on success so a
+                // later auto-advance can fire a fresh fetch.
+                let vids: Vec<String> = v.iter().map(|t| t.video_id.clone()).collect();
+                self.pending_watch = Some(vids);
+                self.watch_inflight = false;
+            }
+            // Discover (`S` overlay) home-suggestions: route to
+            // `pending_discover` (NOT `pending_suggestions`, which is the
+            // gen-guarded refresh flow). Distinct Pending variant → FIFO
+            // pairing keeps a discover response away from a refresh's
+            // Suggestions(gen) slot.
+            (Response::Suggestions(v), Pending::Discover) => {
+                self.pending_discover = Some(v.clone());
+                self.discover_inflight = false;
             }
             (Response::Resolve(u), Pending::Resolve(vid)) => {
                 // FAST tier: fill the fast slot WITHOUT evicting a premium slot
@@ -569,13 +756,45 @@ impl Session {
                 // is just dropped.
                 self.pending_premium_url = Some((vid.clone(), u_clone));
             }
-            (Response::Playlists(v), Pending::Playlists) => {
-                self.pending_playlists = Some(v.clone());
+            (Response::Playlists(v), Pending::Playlists(gen)) => {
+                // Generation guard (Slice 2): a stale refresh response (from a
+                // prior send_refresh) is dropped — its gen != current refresh_gen.
+                // This prevents a slow refresh overwriting a newer one.
+                if *gen == self.refresh_gen {
+                    self.pending_playlists = Some(v.clone());
+                }
+                // Count down the refresh-inflight tracker either way.
+                if self.refresh_remaining > 0 {
+                    self.refresh_remaining -= 1;
+                    if self.refresh_remaining == 0 {
+                        self.refresh_inflight = false;
+                    }
+                }
             }
-            (Response::Suggestions(v), Pending::Suggestions) => {
-                self.pending_suggestions = Some(v.clone());
+            (Response::Suggestions(v), Pending::Suggestions(gen)) => {
+                if *gen == self.refresh_gen {
+                    self.pending_suggestions = Some(v.clone());
+                }
+                if self.refresh_remaining > 0 {
+                    self.refresh_remaining -= 1;
+                    if self.refresh_remaining == 0 {
+                        self.refresh_inflight = false;
+                    }
+                }
             }
             (Response::Auth(_), Pending::Auth) | (Response::Pong, Pending::Pong) => {}
+            (Response::Lyrics(lines, synced), Pending::Lyrics(vid)) => {
+                // Stage the lyrics for App::on_tick. The video_id rides in the
+                // Pending variant so on_tick can discard stale lyrics for a
+                // different track (the App-side generation guard in
+                // `lyrics_gen` is the second layer of staleness protection).
+                self.pending_lyrics = Some((vid.clone(), lines.clone(), *synced));
+                // Free the inflight guard so a later re-request (track change
+                // back to the same id) isn't wedged.
+                if self.lyrics_inflight.as_deref() == Some(vid.as_str()) {
+                    self.lyrics_inflight = None;
+                }
+            }
             // An error response frees the inflight guard for its request kind so
             // a later retry isn't wedged, and surfaces the message so the UI
             // can exit its "searching…/loading…" state. The sidecar's stderr is
@@ -588,6 +807,24 @@ impl Session {
                 }
                 self.set_error(ErrorScope::Search(q.clone()), e.clone());
             }
+            (Response::Error(e), Pending::Playlists(gen)) => {
+                if *gen == self.refresh_gen && self.refresh_remaining > 0 {
+                    self.refresh_remaining -= 1;
+                    if self.refresh_remaining == 0 {
+                        self.refresh_inflight = false;
+                    }
+                }
+                self.set_error(ErrorScope::Other, e.clone());
+            }
+            (Response::Error(e), Pending::Suggestions(gen)) => {
+                if *gen == self.refresh_gen && self.refresh_remaining > 0 {
+                    self.refresh_remaining -= 1;
+                    if self.refresh_remaining == 0 {
+                        self.refresh_inflight = false;
+                    }
+                }
+                self.set_error(ErrorScope::Other, e.clone());
+            }
             (Response::Error(e), Pending::Tracks(_)) => {
                 self.playlist_inflight = None;
                 self.set_error(ErrorScope::Other, e.clone());
@@ -598,6 +835,30 @@ impl Session {
             }
             (Response::Error(e), Pending::ResolvePremium(_)) => {
                 self.premium_resolve_inflight = None;
+                self.set_error(ErrorScope::Other, e.clone());
+            }
+            (Response::Error(e), Pending::Lyrics(vid)) => {
+                // Free the inflight guard so a re-request after an error isn't
+                // wedge. Surface the error so the lyrics overlay can exit its
+                // "loading…" state and show "lyrics error" (the sidecar's
+                // stderr is null'd, so this is the only error path).
+                if self.lyrics_inflight.as_deref() == Some(vid.as_str()) {
+                    self.lyrics_inflight = None;
+                }
+                self.set_error(ErrorScope::Other, e.clone());
+            }
+            (Response::Error(e), Pending::Discover) => {
+                // Free the discover inflight guard so a later `S` press can
+                // re-fetch, and surface the error so `App::on_tick` can clear
+                // the discover overlay's "loading…" state.
+                self.discover_inflight = false;
+                self.set_error(ErrorScope::Other, e.clone());
+            }
+            (Response::Error(e), Pending::Watch) => {
+                // Free the watch inflight guard so a later auto-advance can
+                // fire a fresh radio refill. Surface the error so `App::on_tick`
+                // can stop cleanly instead of hanging on a wedged inflight.
+                self.watch_inflight = false;
                 self.set_error(ErrorScope::Other, e.clone());
             }
             (Response::Error(e), _) => {
@@ -613,6 +874,10 @@ impl Session {
     }
 
     fn cache_track(&mut self, t: &RemoteTrackSummary) {
+        // Only track insertion order for NEW keys; a re-cache (same video_id
+        // seen again via a later search/get_playlist) overwrites in place and
+        // must NOT get a second deque entry, or the deque/map would desync.
+        let is_new = !self.track_cache.contains_key(&t.video_id);
         self.track_cache.insert(
             t.video_id.clone(),
             RemoteTrack {
@@ -625,14 +890,52 @@ impl Session {
                 isrc: t.isrc.clone(),
             },
         );
+        if is_new {
+            self.track_cache_order.push_back(t.video_id.clone());
+            self.evict_track_cache();
+        }
+    }
+
+    /// Public test helper: cache a track summary (wraps the private
+    /// `cache_track`). Used by `tests/perf.rs` to verify the LRU cap + dedup.
+    pub fn cache_track_pub(&mut self, t: &RemoteTrackSummary) {
+        self.cache_track(t);
+    }
+
+    /// Public test helper: the number of entries in the FIFO eviction order
+    /// deque. Used by `tests/perf.rs` to verify dedup (should equal
+    /// `track_cache.len()`).
+    pub fn track_cache_order_len(&self) -> usize {
+        self.track_cache_order.len()
+    }
+
+    /// Evict the oldest `track_cache` entries while over [`TRACK_CACHE_CAP`].
+    /// An entry whose stream URL is still in `url_cache` (the currently-playing
+    /// or next-preload track) is re-queued to the back instead of dropped, so
+    /// `now_playing_view` never loses the playing track's metadata mid-play.
+    /// The loop terminates: `url_cache` holds ≤ 2 protected entries, so once
+    /// `len > cap` there are `len - cap` non-protected entries to remove and
+    /// each non-protected iteration shrinks `len` by 1.
+    fn evict_track_cache(&mut self) {
+        while self.track_cache.len() > TRACK_CACHE_CAP {
+            let Some(victim) = self.track_cache_order.pop_front() else {
+                break;
+            };
+            if self.url_cache.iter().any(|c| c.video_id == victim) {
+                // Playing / next-preload: keep it, reconsider later.
+                self.track_cache_order.push_back(victim);
+                continue;
+            }
+            self.track_cache.remove(&victim);
+        }
     }
 
     fn kind_for(req: &Request) -> Pending {
         match req {
             Request::Search { q, .. } => Pending::Search(q.clone()),
-            Request::LibraryPlaylists => Pending::Playlists,
+            Request::LibraryPlaylists => Pending::Playlists(0),
             Request::GetPlaylist { id } => Pending::Tracks(id.clone()),
-            Request::HomeSuggestions => Pending::Suggestions,
+            Request::HomeSuggestions => Pending::Suggestions(0),
             Request::GetWatchPlaylist { .. } => Pending::Watch,
             Request::ResolveUrl { video_id, quality } => {
                 if quality == "premium" {
@@ -642,6 +945,7 @@ impl Session {
                 }
             }
             Request::AuthStatus => Pending::Auth,
+            Request::GetLyrics { video_id } => Pending::Lyrics(video_id.clone()),
             Request::Ping => Pending::Pong,
         }
     }
@@ -657,13 +961,13 @@ impl Session {
                 Some(resp) => {
                     // Pair with the oldest in-flight kind (FIFO).
                     let pk = self.pending.pop_front();
-                    if let Some(pk) = pk {
-                        if let Some(r) = self.apply_pair(pk, resp, &target) {
-                            return Ok(r);
-                        }
-                        continue; // applied as a stray; keep waiting for ours
+                    let Some(pk) = pk else {
+                        return Ok(resp);
+                    };
+                    if let Some(r) = self.apply_pair(pk, resp, &target) {
+                        return Ok(r);
                     }
-                    return Ok(resp);
+                    continue; // applied as a stray; keep waiting for ours
                 }
                 None => {
                     if start.elapsed() >= deadline {
@@ -676,10 +980,15 @@ impl Session {
                         match &kind {
                             Pending::Resolve(_) => self.resolve_inflight = None,
                             Pending::ResolvePremium(_) => self.premium_resolve_inflight = None,
-                            Pending::Search(q) => {
-                                if self.search_inflight.as_deref() == Some(q.as_str()) {
-                                    self.search_inflight = None;
-                                }
+                            Pending::Search(q)
+                                if self.search_inflight.as_deref() == Some(q.as_str()) =>
+                            {
+                                self.search_inflight = None;
+                            }
+                            Pending::Lyrics(v)
+                                if self.lyrics_inflight.as_deref() == Some(v.as_str()) =>
+                            {
+                                self.lyrics_inflight = None;
                             }
                             _ => {}
                         }
@@ -711,10 +1020,41 @@ impl Session {
     /// Fire-and-forget: ask for the account playlists + suggested/mood lists.
     /// Results land in `pending_playlists`/`pending_suggestions` and are
     /// picked up by `App::on_tick`. Non-blocking — doesn't wait for a reply.
+    ///
+    /// Increments `sync_epoch` before sending and tags both fetches with it
+    /// (stored in `pending_playlists_epoch`/`pending_suggestions_epoch`). When
+    /// `on_tick` drains the response, it checks the epoch — if it's < the
+    /// current `sync_epoch`, the response is STALE (a newer refresh was sent
+    /// after this one) and is discarded. This is the D5 generation-id guard:
+    /// a slow refresh that lands after the user pressed R again (or logged out
+    /// + re-authed) can't overwrite the newer state.
+    ///
+    /// Inflight guard: if a refresh is already in flight, this is a no-op
+    /// (prevents a burst of `R` presses from flooding the sidecar).
+    ///
+    /// The stale-pending clearing (`pending_playlists`/`pending_suggestions`)
+    /// lives HERE, AFTER the inflight guard — not in `App::refresh_yt_lists`.
+    /// If the guard blocks (refresh already in flight), the pending data from
+    /// that in-flight fetch must be preserved so `on_tick` can still merge it
+    /// when it lands. Clearing before the guard (the old code path) lost the
+    /// data permanently: the second `refresh_yt_lists` cleared the pending
+    /// slots, `send_refresh` was a no-op, and `yt_lists` stayed empty.
     pub fn send_refresh(&mut self) -> Result<()> {
-        self.pending.push_back(Pending::Playlists);
+        if self.refresh_inflight {
+            return Ok(());
+        }
+        // Drop a stale partial fetch so on_tick merges the fresh pair together.
+        // This MUST be after the inflight guard — if a refresh is already in
+        // flight, the pending data from that fetch must be preserved.
+        self.pending_playlists = None;
+        self.pending_suggestions = None;
+        self.refresh_inflight = true;
+        self.refresh_gen = self.refresh_gen.wrapping_add(1);
+        self.refresh_remaining = 2;
+        let gen = self.refresh_gen;
+        self.pending.push_back(Pending::Playlists(gen));
         self.sidecar.send(&Request::LibraryPlaylists)?;
-        self.pending.push_back(Pending::Suggestions);
+        self.pending.push_back(Pending::Suggestions(gen));
         self.sidecar.send(&Request::HomeSuggestions)?;
         Ok(())
     }
@@ -732,7 +1072,10 @@ impl Session {
         }
         self.resolve_inflight = Some(video_id.clone());
         self.pending.push_back(Pending::Resolve(video_id.clone()));
-        self.sidecar.send(&Request::ResolveUrl { video_id, quality: String::new() })?;
+        self.sidecar.send(&Request::ResolveUrl {
+            video_id,
+            quality: String::new(),
+        })?;
         Ok(())
     }
 
@@ -751,9 +1094,12 @@ impl Session {
             return Ok(()); // premium already resolved
         }
         self.premium_resolve_inflight = Some(video_id.clone());
-        self.pending.push_back(Pending::ResolvePremium(video_id.clone()));
-        self.sidecar
-            .send(&Request::ResolveUrl { video_id, quality: "premium".to_string() })?;
+        self.pending
+            .push_back(Pending::ResolvePremium(video_id.clone()));
+        self.sidecar.send(&Request::ResolveUrl {
+            video_id,
+            quality: "premium".to_string(),
+        })?;
         Ok(())
     }
 
@@ -813,6 +1159,77 @@ impl Session {
         Ok(())
     }
 
+    /// Fire-and-forget: fetch lyrics for `video_id` and surface them to
+    /// `pending_lyrics` (picked up by `App::on_tick` to fill the lyrics
+    /// overlay). Non-blocking — the lyrics overlay's Loading state uses this
+    /// so opening it never blocks on a ~3s ytmusicapi roundtrip. Only one
+    /// lyrics fetch at a time (`lyrics_inflight`); re-sending the same id while
+    /// in flight is a no-op. A DIFFERENT id is allowed through — the video_id
+    /// rides in `Pending::Lyrics(vid)`, so each response is tagged with its own
+    /// track and on_tick discards stale lyrics via the generation guard.
+    pub fn send_get_lyrics(&mut self, video_id: String) -> Result<()> {
+        if self.lyrics_inflight.as_deref() == Some(video_id.as_str()) {
+            return Ok(());
+        }
+        self.lyrics_inflight = Some(video_id.clone());
+        self.pending.push_back(Pending::Lyrics(video_id.clone()));
+        self.sidecar.send(&Request::GetLyrics { video_id })?;
+        Ok(())
+    }
+
+    /// True if a lyrics fetch for `video_id` is currently in flight.
+    pub fn lyrics_loading(&self, video_id: &str) -> bool {
+        self.lyrics_inflight.as_deref() == Some(video_id)
+    }
+
+    /// Fire-and-forget: fetch home suggestions for the `S` discover overlay.
+    /// Results land in `pending_discover` (picked up by `App::on_tick` to
+    /// populate the overlay). Non-blocking — opening discover never blocks on
+    /// the ~3s ytmusicapi roundtrip (the overlay opens instantly with a
+    /// "loading…" state, items appear when the response lands). Only one
+    /// discover fetch at a time (`discover_inflight`); re-sending while in
+    /// flight is a no-op so repeated `S` presses don't flood the sidecar.
+    /// Distinct from `send_refresh`'s `Pending::Suggestions(gen)` so a discover
+    /// response routes to `pending_discover` without disturbing the
+    /// generation-guarded refresh tracking.
+    pub fn send_home_suggestions(&mut self) -> Result<()> {
+        if self.discover_inflight {
+            return Ok(());
+        }
+        self.discover_inflight = true;
+        self.pending.push_back(Pending::Discover);
+        self.sidecar.send(&Request::HomeSuggestions)?;
+        Ok(())
+    }
+
+    /// True if a discover (home-suggestions) fetch is currently in flight.
+    pub fn discover_loading(&self) -> bool {
+        self.discover_inflight
+    }
+
+    /// Fire-and-forget: fetch a watch_playlist (radio queue) seeded by
+    /// `video_id` for CONT=YouTube auto-advance. Results land in
+    /// `pending_watch` (picked up by `App::on_tick` to refill the
+    /// `RadioCursor` + start playback). Non-blocking — a natural end-of-track
+    /// no longer freezes the UI for the ~4s ytmusicapi roundtrip; the old
+    /// track simply stays current until the next track's id lands, then
+    /// `on_tick` switches. Only one watch fetch at a time (`watch_inflight`);
+    /// re-sending while in flight is a no-op.
+    pub fn send_watch_playlist(&mut self, video_id: String) -> Result<()> {
+        if self.watch_inflight {
+            return Ok(());
+        }
+        self.watch_inflight = true;
+        self.pending.push_back(Pending::Watch);
+        self.sidecar.send(&Request::GetWatchPlaylist { video_id })?;
+        Ok(())
+    }
+
+    /// True if a watch_playlist (radio refill) fetch is currently in flight.
+    pub fn watch_loading(&self) -> bool {
+        self.watch_inflight
+    }
+
     /// Drain any pending responses without pairing (legacy). Returns parsed
     /// responses in arrival order.
     pub fn drain(&mut self) -> Vec<Response> {
@@ -837,8 +1254,13 @@ impl Session {
         }
     }
 
+    /// Query the sidecar for auth status: cookie presence (`ok`), validity
+    /// (`valid` — a lightweight get_home probe succeeds), expiry (`expired` —
+    /// cookie present but probe failed with an auth error), and `reason`.
+    /// The probe makes a real network call (~1-2s), so the deadline is 6s
+    /// (not the 2s that sufficed for the old cookie-presence-only check).
     pub fn auth_status(&mut self) -> Result<AuthStatus> {
-        match self.roundtrip(Request::AuthStatus, Duration::from_secs(2))? {
+        match self.roundtrip(Request::AuthStatus, Duration::from_secs(6))? {
             Response::Auth(a) => Ok(a),
             Response::Error(e) => Err(anyhow!(e)),
             _ => Err(anyhow!("unexpected auth_status response")),
@@ -847,7 +1269,10 @@ impl Session {
 
     pub fn search(&mut self, q: &str, limit: u32) -> Result<Vec<RemoteTrackSummary>> {
         // roundtrip's pairing caches each track into track_cache.
-        match self.roundtrip(Request::Search { q: q.into(), limit }, Duration::from_secs(3))? {
+        match self.roundtrip(
+            Request::Search { q: q.into(), limit },
+            Duration::from_secs(3),
+        )? {
             Response::Search(v) => Ok(v),
             Response::Error(e) => Err(anyhow!(e)),
             _ => Err(anyhow!("unexpected search response")),
@@ -870,7 +1295,10 @@ impl Session {
         // `refresh_yt_lists` absorbs that. The deadline is generous to survive a
         // slow Keychain unlock prompt and the premium EJS-solver download.
         match self.roundtrip(
-            Request::ResolveUrl { video_id: video_id.into(), quality: quality.into() },
+            Request::ResolveUrl {
+                video_id: video_id.into(),
+                quality: quality.into(),
+            },
             Duration::from_secs(15),
         )? {
             Response::Resolve(u) => Ok(u),
@@ -888,7 +1316,10 @@ impl Session {
     }
 
     pub fn get_playlist(&mut self, id: &str) -> Result<Vec<RemoteTrackSummary>> {
-        match self.roundtrip(Request::GetPlaylist { id: id.into() }, Duration::from_secs(4))? {
+        match self.roundtrip(
+            Request::GetPlaylist { id: id.into() },
+            Duration::from_secs(4),
+        )? {
             Response::Tracks(v) => Ok(v),
             Response::Error(e) => Err(anyhow!(e)),
             _ => Err(anyhow!("unexpected get_playlist response")),
@@ -910,7 +1341,12 @@ impl Session {
 
 impl YtClient for Session {
     fn get_watch_playlist(&mut self, video_id: &str) -> Result<Vec<String>> {
-        match self.roundtrip(Request::GetWatchPlaylist { video_id: video_id.into() }, Duration::from_secs(4))? {
+        match self.roundtrip(
+            Request::GetWatchPlaylist {
+                video_id: video_id.into(),
+            },
+            Duration::from_secs(4),
+        )? {
             Response::WatchPlaylist(v) => Ok(v.into_iter().map(|t| t.video_id).collect()),
             Response::Error(e) => Err(anyhow!(e)),
             _ => Err(anyhow!("unexpected watch_playlist response")),
@@ -921,15 +1357,10 @@ impl YtClient for Session {
 /// Drives CONT=YouTube autoplay (spec §3.4). Holds a radio queue of video ids
 /// and a cursor into it; when exhausted, asks the [`YtClient`] for the next
 /// batch seeded by the just-finished track.
+#[derive(Default)]
 pub struct RadioCursor {
     queue: Vec<String>,
     pos: usize,
-}
-
-impl Default for RadioCursor {
-    fn default() -> Self {
-        RadioCursor { queue: Vec::new(), pos: 0 }
-    }
 }
 
 impl RadioCursor {
@@ -965,6 +1396,45 @@ impl RadioCursor {
             }
         }
         None
+    }
+
+    /// Return the next queued video id WITHOUT refilling (no sidecar call).
+    /// Returns `None` when the queue is exhausted — the caller then decides to
+    /// fire-and-forget a refill via [`Session::send_watch_playlist`] and, on
+    /// the response landing, [`RadioCursor::advance_with_vids`]. This splits
+    /// the old blocking [`RadioCursor::advance`] into a non-blocking local
+    /// advance + an async refill so a natural end-of-track never freezes the
+    /// UI for the ~4s ytmusicapi roundtrip.
+    pub fn next_local(&mut self) -> Option<String> {
+        if self.pos < self.queue.len() {
+            let id = self.queue[self.pos].clone();
+            self.pos += 1;
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    /// Refill the queue from pre-fetched `vids` (the fire-and-forget path: the
+    /// sidecar call already happened via `send_watch_playlist`, this just
+    /// advances the cursor over the result). `seed` is dropped if it's the
+    /// leading entry (matches YouTube's "Up Next" excludes the just-played
+    /// track). Returns the first video id to play, or `None` when `vids` is
+    /// empty after dropping the seed. Mirrors the refill half of
+    /// [`RadioCursor::advance`] but without the sidecar roundtrip.
+    pub fn advance_with_vids(&mut self, vids: Vec<String>, seed: Option<String>) -> Option<String> {
+        let mut next = vids;
+        if let Some(seed) = seed {
+            if next.first().map(|s| s == &seed).unwrap_or(false) {
+                next.remove(0);
+            }
+        }
+        if next.is_empty() {
+            return None;
+        }
+        self.queue = next;
+        self.pos = 1;
+        self.queue.first().cloned()
     }
 }
 

@@ -11,6 +11,7 @@ import sys
 import os
 import json
 import time
+import atexit
 
 # Process-lifetime cache for the browser cookie read. On macOS, reading the
 # browser cookie store triggers a Keychain password prompt (Chromium browsers
@@ -20,6 +21,10 @@ import time
 _BC3_JAR = None        # http.cookiejar.CookieJar, or None if not yet/unreadable
 _BC3_JAR_ERR = None    # str error if the read failed (no retry)
 _BC3_FILE = None       # str path to the written cookies.txt, "" if failed
+
+# Cache for the pasted-cookies temp file so we only create one and clean it up
+# on exit instead of leaking a new /tmp file per resolve_url call.
+_PASTED_COOKIE_FILE = None
 
 
 def _have_deps():
@@ -33,10 +38,23 @@ def _have_deps():
 
 def _cookie_pair():
     """Return (Cookie header str, temp cookies.txt path) from the env, or
-    (None, None) when no cookies are set."""
+    (None, None) when no cookies are set. The temp file is created once and
+    cached for the process lifetime; it's cleaned up on exit via atexit."""
+    global _PASTED_COOKIE_FILE
     raw = os.environ.get("JUKEBOX_YT_COOKIES", "")
     if not raw:
         return None, None
+    # Reuse the cached temp file if we already created one.
+    if _PASTED_COOKIE_FILE is not None:
+        # Re-read the header from the cached file (the raw env is still available).
+        parts = []
+        for line in raw.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            f = line.split("\t")
+            if len(f) >= 7:
+                parts.append(f"{f[5]}={f[6]}")
+        return "; ".join(parts) if parts else None, _PASTED_COOKIE_FILE
     parts = []
     for line in raw.splitlines():
         if not line or line.startswith("#"):
@@ -50,7 +68,20 @@ def _cookie_pair():
     tmp = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
     tmp.write(raw)
     tmp.close()
+    _PASTED_COOKIE_FILE = tmp.name
+    atexit.register(_cleanup_pasted_cookie)
     return "; ".join(parts), tmp.name
+
+
+def _cleanup_pasted_cookie():
+    """Remove the pasted-cookies temp file on exit (atexit handler)."""
+    global _PASTED_COOKIE_FILE
+    if _PASTED_COOKIE_FILE:
+        try:
+            os.unlink(_PASTED_COOKIE_FILE)
+        except OSError:
+            pass
+        _PASTED_COOKIE_FILE = None
 
 
 def _browser_name():
@@ -177,6 +208,10 @@ def _browser_cookies_file():
             os.chmod(out_path, 0o600)
         except OSError:
             pass
+    else:
+        # Temp path (no JUKEBOX_YT_COOKIES_FILE): clean it up on exit so we
+        # don't leak decrypted cookies to /tmp for the sidecar's lifetime.
+        atexit.register(_cleanup_temp, tf.name)
     _BC3_FILE = out_path if out_path else tf.name
     return _BC3_FILE
 
@@ -284,8 +319,18 @@ def _yt():
         tf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
         _json.dump(headers, tf)
         tf.close()
-        return ytmusicapi.YTMusic(tf.name)
+        ytm = ytmusicapi.YTMusic(tf.name)
+        atexit.register(_cleanup_temp, tf.name)
+        return ytm
     return ytmusicapi.YTMusic()  # guest
+
+
+def _cleanup_temp(path):
+    """Remove a temp file on exit (atexit handler)."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _is_transient(e):
@@ -326,42 +371,59 @@ def handle(cmd, arg, ytm):
     if cmd == "ping":
         return {"pong": True}
     if cmd == "auth_status":
+        # Cookie presence (backwards compat). The real validity probe lives in
+        # main()'s auth_status handler (which intercepts this cmd before
+        # dispatching to handle()). This is kept for direct handle() callers.
+        # premium/account require a data fetch to detect; presence-only is a
+        # known limitation — we report False (not ok) so the Rust side never
+        # acts on a false "premium" claim.
         ok = _has_auth()
-        return {"auth": {"ok": ok, "premium": ok, "account": ok}}
+        return {"auth": {
+            "ok": ok, "premium": False, "account": False,
+            "valid": False, "expired": False,
+            "reason": "not probed (direct handle call)",
+        }}
     if cmd == "search":
         res = ytm.search(arg.get("q", ""), filter="songs", limit=arg.get("limit", 25))
         return {"search": [_track(r) for r in res]}
     if cmd == "library_playlists":
-        # get_library_playlists() can raise when YouTube returns an alternate
-        # browse layout (singleColumnBrowseResultsRenderer) that ytmusicapi's
-        # parser doesn't expect — an intermittent, account/region-dependent
-        # response. Fall back to get_library() (returns playlists + artists +
-        # albums; filter to playlists) which uses a more tolerant path. If BOTH
-        # fail, return an empty list rather than erroring the whole refresh —
-        # so suggestions still populate and the Y view shows an empty state
-        # instead of blocking on a parse error.
-        ps = []
+        # Full pagination: limit=None makes ytmusicapi loop through all
+        # continuation pages internally, so a user with >25 library playlists
+        # sees ALL of them (not just the first 25). On failure (both the
+        # primary path and the get_library fallback raise), re-raise so main()
+        # returns {"ok": false, "error": "..."} — distinguishing a genuinely
+        # empty library (Ok([])) from a failed fetch (Err). Previously both
+        # paths were swallowed into [] (yt-recon §5), making empty == failed.
+        #
+        # The fallback (get_library) stays because ytmusicapi's
+        # get_library_playlists can raise on an intermittent alternate browse
+        # layout (singleColumnBrowseResultsRenderer) that its parser doesn't
+        # expect — an account/region-dependent response. get_library uses a
+        # more tolerant path.
         try:
-            ps = ytm.get_library_playlists()
+            ps = ytm.get_library_playlists(limit=None)
         except Exception:  # noqa: BLE001
-            try:
-                # Fallback: get_library returns mixed sections; keep only
-                # entries that look like playlists (have a playlistId).
-                lib = ytm.get_library()
-                if isinstance(lib, dict):
-                    lib = lib.get("items", lib)
-                ps = [
-                    it for it in (lib or [])
-                    if isinstance(it, dict) and it.get("playlistId")
-                ]
-            except Exception:  # noqa: BLE001
-                ps = []
+            # Fallback: get_library returns mixed sections; keep only entries
+            # that look like playlists (have a playlistId). If THIS also
+            # fails, let the exception propagate so the caller sees a real
+            # error instead of a silent empty list.
+            lib = ytm.get_library()
+            if isinstance(lib, dict):
+                lib = lib.get("items", lib)
+            ps = [
+                it for it in (lib or [])
+                if isinstance(it, dict) and it.get("playlistId")
+            ]
         return {"playlists": [
             {"id": p.get("playlistId", ""), "name": p.get("title", ""), "count": p.get("playlistCount", 0)}
             for p in ps
         ]}
     if cmd == "get_playlist":
-        p = ytm.get_playlist(arg.get("id", ""))
+        # Full pagination: limit=None makes ytmusicapi loop through all
+        # continuation pages internally, so a playlist with >100 tracks
+        # returns ALL of them (not just the first 100). On failure the
+        # exception propagates to main() which returns {"ok": false, ...}.
+        p = ytm.get_playlist(arg.get("id", ""), limit=None)
         return {"tracks": [_track(t) for t in p.get("tracks", [])]}
     if cmd == "home_suggestions":
         out = []
@@ -508,6 +570,60 @@ def handle(cmd, arg, ytm):
             "container": best.get("ext", "m4a"),
             "premium": is_premium,
         }}
+    if cmd == "get_lyrics":
+        # Two-step ytmusicapi flow (research: ytmusicapi-research.md §1):
+        #   1. get_watch_playlist(videoId, radio=False) → lyrics browseId
+        #      (a string starting with "MPLYt…", NOT the videoId directly).
+        #   2. get_lyrics(browseId, timestamps=True) → timed lyrics if
+        #      available, else plain text. Timestamps come back in
+        #      MILLISECONDS; convert to SECONDS here so the Rust side compares
+        #      directly against player.position() (seconds).
+        # Returns a not-found payload (empty lines, synced=False) when the
+        # track has no lyrics browseId or ytmusicapi returns None — so the UI
+        # shows a truthful "lyrics unavailable" state instead of an error.
+        # Real errors (network, parse) propagate as {"ok": false, "error":…}.
+        try:
+            wp = ytm.get_watch_playlist(
+                videoId=arg.get("video_id", ""), radio=False, limit=1
+            )
+        except Exception as e:  # noqa: BLE001
+            # A network/parse failure on the browseId lookup is a real error —
+            # surface it so the UI can show "lyrics error" (not a silent
+            # not-found, which would hide a transient provider failure).
+            raise RuntimeError(f"lyrics lookup failed: {e}")
+        browse_id = wp.get("lyrics")
+        if not browse_id:
+            return {"lyrics": {"lines": [], "synced": False}}
+        try:
+            result = ytm.get_lyrics(browse_id, timestamps=True)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"lyrics fetch failed: {e}")
+        if result is None:
+            return {"lyrics": {"lines": [], "synced": False}}
+        if result.get("hasTimestamps"):
+            # Timed lyrics: each line has start_time/end_time in MILLISECONDS.
+            lines = []
+            for l in result.get("lyrics", []):
+                start_ms = l.start_time if hasattr(l, "start_time") else None
+                # ytmusicapi's LyricLine dataclass exposes .text/.start_time;
+                # tolerate a plain dict shape too (defensive across versions).
+                if start_ms is None and isinstance(l, dict):
+                    start_ms = l.get("start_time") or l.get("start_ms")
+                text = l.text if hasattr(l, "text") else l.get("text", "")
+                time_s = (start_ms / 1000.0) if start_ms is not None else None
+                lines.append({"time": time_s, "text": text})
+            return {"lyrics": {"lines": lines, "synced": True}}
+        # Plain text: lyrics is a single \n-separated string. Split into lines
+        # so the Rust side gets one LyricLine per row (time=None → unsynced).
+        raw = result.get("lyrics", "")
+        if isinstance(raw, list):
+            # Defensive: some versions return a list of strings even when
+            # hasTimestamps is False.
+            text_lines = [l if isinstance(l, str) else getattr(l, "text", "") for l in raw]
+        else:
+            text_lines = str(raw).split("\n")
+        lines = [{"time": None, "text": t} for t in text_lines]
+        return {"lyrics": {"lines": lines, "synced": False}}
     raise ValueError(f"unknown cmd {cmd}")
 
 
@@ -559,10 +675,44 @@ def main():
             print(json.dumps({"ok": True, "data": {"pong": True}}), flush=True)
             continue
         if cmd == "auth_status":
+            # Cookie presence (backwards compat) + a lightweight data probe
+            # (get_home(limit=1)) to verify the credential actually works.
+            # An expired/revoked cookie has ok=True (the string exists) but
+            # valid=False (the probe fails with an auth error). The probe runs
+            # on every auth_status call, so it must be fast — get_home(limit=1)
+            # fetches a single row of suggestions.
             ok = _has_auth()
-            print(json.dumps({"ok": True, "data": {"auth": {
-                "ok": ok, "premium": ok, "account": ok,
-            }}}), flush=True)
+            if not ok:
+                print(json.dumps({"ok": True, "data": {"auth": {
+                    "ok": False, "premium": False, "account": False,
+                    "valid": False, "expired": False, "reason": None,
+                }}}), flush=True)
+                continue
+            # Cookie present — probe to verify it actually works. ytm may be
+            # None when ytmusicapi isn't installed (have=False); in that case
+            # we can't probe, so valid=False.
+            if ytm is None:
+                print(json.dumps({"ok": True, "data": {"auth": {
+                    "ok": True, "premium": False, "account": False,
+                    "valid": False, "expired": False,
+                    "reason": "ytmusicapi not initialized",
+                }}}), flush=True)
+                continue
+            try:
+                ytm.get_home(limit=1)
+                print(json.dumps({"ok": True, "data": {"auth": {
+                    "ok": True, "premium": False, "account": False,
+                    "valid": True, "expired": False, "reason": None,
+                }}}), flush=True)
+            except Exception as e:  # noqa: BLE001
+                msg = str(e).lower()
+                expired = any(k in msg for k in (
+                    "unauthorized", "401", "login", "auth", "forbidden", "403",
+                ))
+                print(json.dumps({"ok": True, "data": {"auth": {
+                    "ok": True, "premium": False, "account": False,
+                    "valid": False, "expired": expired, "reason": str(e),
+                }}}), flush=True)
             continue
         if not have:
             print(json.dumps({"ok": False, "error": "ytmusicapi/yt-dlp not installed; run :yt setup"}),

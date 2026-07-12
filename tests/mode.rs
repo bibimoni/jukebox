@@ -10,10 +10,10 @@ fn cycles_in_order() {
 #[test]
 fn round_trips_strings() {
     for m in [SourceMode::Local, SourceMode::Youtube, SourceMode::Mixed] {
-        assert_eq!(SourceMode::from_str(m.as_str()), m);
+        assert_eq!(SourceMode::parse_mode(m.as_str()), m);
     }
     // unknown → default Local (forward-compat with old state.db)
-    assert_eq!(SourceMode::from_str("???"), SourceMode::Local);
+    assert_eq!(SourceMode::parse_mode("???"), SourceMode::Local);
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use jukebox::catalog::Catalog;
 use jukebox::player::StubPlayer;
-use jukebox::tui::app::{App, View};
+use jukebox::tui::app::{App, View, YtList, YtListKind};
 use jukebox::tui::queue::{ContinueMode, RepeatMode, ShuffleMode};
 
 fn cat_album() -> (tempfile::TempDir, Catalog, std::path::PathBuf) {
@@ -27,9 +27,9 @@ fn play_selected_sets_context_and_starts_playback() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     // Browse to the album's track column; cursor on track 2.
     app.view = View::Artists;
-    app.cursors.artist = 0;          // 40mP
-    app.cursors.album = 0;          // Cosmic
-    app.cursors.track = 1;          // Song2
+    app.cursors.artist = 0; // 40mP
+    app.cursors.album = 0; // Cosmic
+    app.cursors.track = 1; // Song2
     app.play_selected();
     assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t2"));
     // context is the album; next → Song3 (t3)
@@ -57,7 +57,7 @@ fn dead_track_skipped_and_marked() {
     let cat = Catalog::load(&p).unwrap();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     // Set context to both tracks, start at dead1.
-    app.play_in_context_ids(vec!["dead1".into(),"alive2".into()], "dead1");
+    app.play_in_context_ids(vec!["dead1".into(), "alive2".into()], "dead1");
     assert!(app.dead.contains("dead1"));
     assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("alive2"));
 }
@@ -66,12 +66,12 @@ fn dead_track_skipped_and_marked() {
 fn cycle_shuffle_advances_mode() {
     let (_d, cat, _l) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
-    app.play_in_context_ids(vec!["t1".into(),"t2".into(),"t3".into()], "t1");
-    app.cycle_shuffle();  // Off -> Smart
+    app.play_in_context_ids(vec!["t1".into(), "t2".into(), "t3".into()], "t1");
+    app.cycle_shuffle(); // Off -> Smart
     assert_eq!(app.transport.shuffle, ShuffleMode::Smart);
-    app.cycle_shuffle();  // Smart -> Random
+    app.cycle_shuffle(); // Smart -> Random
     assert_eq!(app.transport.shuffle, ShuffleMode::Random);
-    app.cycle_shuffle();  // Random -> Off
+    app.cycle_shuffle(); // Random -> Off
     assert_eq!(app.transport.shuffle, ShuffleMode::Off);
 }
 
@@ -79,9 +79,12 @@ fn cycle_shuffle_advances_mode() {
 fn cycle_repeat_advances_mode() {
     let (_d, cat, _l) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
-    app.cycle_repeat(); assert_eq!(app.transport.repeat, RepeatMode::All);
-    app.cycle_repeat(); assert_eq!(app.transport.repeat, RepeatMode::One);
-    app.cycle_repeat(); assert_eq!(app.transport.repeat, RepeatMode::Off);
+    app.cycle_repeat();
+    assert_eq!(app.transport.repeat, RepeatMode::All);
+    app.cycle_repeat();
+    assert_eq!(app.transport.repeat, RepeatMode::One);
+    app.cycle_repeat();
+    assert_eq!(app.transport.repeat, RepeatMode::Off);
 }
 
 #[test]
@@ -89,14 +92,21 @@ fn volume_clamps_and_mutes() {
     let (_d, cat, _l) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.volume = 5;
-    app.volume_down(); assert_eq!(app.volume, 0);
-    app.volume_down(); assert_eq!(app.volume, 0); // clamped
+    app.volume_down();
+    assert_eq!(app.volume, 0);
+    app.volume_down();
+    assert_eq!(app.volume, 0); // clamped
     app.volume = 98;
-    app.volume_up(); assert_eq!(app.volume, 100);
-    app.volume_up(); assert_eq!(app.volume, 100);
+    app.volume_up();
+    assert_eq!(app.volume, 100);
+    app.volume_up();
+    assert_eq!(app.volume, 100);
     let was = app.volume;
-    app.toggle_mute(); assert!(app.muted);
-    app.toggle_mute(); assert!(!app.muted); assert_eq!(app.volume, was);
+    app.toggle_mute();
+    assert!(app.muted);
+    app.toggle_mute();
+    assert!(!app.muted);
+    assert_eq!(app.volume, was);
 }
 
 /// Regression for the "Previous does not go back across a context switch" bug.
@@ -156,21 +166,27 @@ fn collaboration_album_shows_and_plays_all_tracks() {
     // tracks_for_album returns all 3 ids across all primary_artists, in
     // (disc, track_number) order.
     let ids = app.tracks_for_album("Collab");
-    assert_eq!(ids, vec!["t1".to_string(), "t2".to_string(), "t3".to_string()]);
+    assert_eq!(
+        ids,
+        vec!["t1".to_string(), "t2".to_string(), "t3".to_string()]
+    );
 
     // Browse A → "Collab" album (under A, the album only has t1 in its
     // track_indices, but the focused-album track list and playback context
     // must be the FULL album).
     app.view = View::Artists;
     app.cursors.artist = 0; // A
-    app.cursors.album = 0;   // Collab
-    app.cursors.track = 0;   // t1
+    app.cursors.album = 0; // Collab
+    app.cursors.track = 0; // t1
     app.play_selected();
     assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
     // `>` advances to a 2nd distinct track (previously stopped: only 1 track
     // in the context).
     app.next();
-    let after = app.now_playing.clone().expect("next must not stop playback");
+    let after = app
+        .now_playing
+        .clone()
+        .expect("next must not stop playback");
     assert_ne!(after.id(), "t1", "next must advance to a distinct track");
     assert!(["t2", "t3"].contains(&after.id()));
 }
@@ -188,10 +204,16 @@ fn clamp_cursors_rescues_stale_album_cursor() {
     app.cursors.track = 9; // stale / out of bounds
     app.clamp_cursors();
     let n_albums = app.albums_by_artist.get("40mP").map(|v| v.len()).unwrap();
-    assert!(app.cursors.album < n_albums, "album cursor must be in range");
+    assert!(
+        app.cursors.album < n_albums,
+        "album cursor must be in range"
+    );
     let n_tracks = app.current_context_ids().len();
     assert!(n_tracks > 0);
-    assert!(app.cursors.track < n_tracks, "track cursor must be in range");
+    assert!(
+        app.cursors.track < n_tracks,
+        "track cursor must be in range"
+    );
 }
 
 #[test]
@@ -219,12 +241,18 @@ fn changing_artist_resets_album_and_track_cursors() {
     app.view = View::Artists;
     app.focus_col = 0;
     // `Down` moves artist Aaa → Bbb; set_focused_cursor must reset album+track.
-    use jukebox::tui::input::handle_key;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use jukebox::tui::input::handle_key;
     handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     assert_eq!(app.cursors.artist, 1, "artist cursor should have advanced");
-    assert_eq!(app.cursors.album, 0, "album cursor must reset on artist change");
-    assert_eq!(app.cursors.track, 0, "track cursor must reset on artist change");
+    assert_eq!(
+        app.cursors.album, 0,
+        "album cursor must reset on artist change"
+    );
+    assert_eq!(
+        app.cursors.track, 0,
+        "track cursor must reset on artist change"
+    );
 }
 
 #[test]
@@ -235,13 +263,15 @@ fn play_selected_plays_highlighted_track_not_a_stale_one() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.view = View::Artists;
     app.cursors.artist = 0; // 40mP
-    app.cursors.album = 0;  // Cosmic
-    app.cursors.track = 2;  // t3 (the 3rd track)
+    app.cursors.album = 0; // Cosmic
+    app.cursors.track = 2; // t3 (the 3rd track)
     app.play_selected();
-    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t3"),
-        "play_selected must play the highlighted track, not a stale one");
+    assert_eq!(
+        app.now_playing.as_ref().map(|s| s.id()),
+        Some("t3"),
+        "play_selected must play the highlighted track, not a stale one"
+    );
 }
-
 
 /// Catalog where artist "40mP" has TWO albums so we can verify NextAlbum
 /// auto-continuation: "Cosmic" (t1..t3) and "Solo" (s1).
@@ -299,8 +329,11 @@ fn continue_next_album_auto_advances_to_next_album() {
     // `>` at the end of Cosmic with continue=NextAlbum must switch to "Solo"
     // and play its first track (s1) — not stop.
     app.next();
-    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("s1"),
-        "NextAlbum continue should advance to the next album's first track");
+    assert_eq!(
+        app.now_playing.as_ref().map(|s| s.id()),
+        Some("s1"),
+        "NextAlbum continue should advance to the next album's first track"
+    );
     // prev returns to the prior track (t3) — history pushed across the switch.
     app.prev();
     assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t3"));
@@ -317,15 +350,16 @@ fn continue_radio_keeps_playing_at_context_end() {
     // `>` with continue=Radio must NOT stop — it switches to the whole library
     // (a Radio/Search context) and plays some track from it.
     app.next();
-    assert!(app.now_playing.is_some(),
-        "Radio continue must keep playing, not stop");
+    assert!(
+        app.now_playing.is_some(),
+        "Radio continue must keep playing, not stop"
+    );
     let after = app.now_playing.clone().unwrap();
     // The radio context is the whole library (t1,t2,t3,s1); the next track
     // must be one of those and (smart shuffle, no back-to-back same artist)
     // distinct from t1 when possible.
-    assert!(["t1","t2","t3","s1"].contains(&after.id()));
+    assert!(["t1", "t2", "t3", "s1"].contains(&after.id()));
 }
-
 
 #[test]
 fn cycle_continue_is_mode_aware() {
@@ -373,11 +407,14 @@ fn s_instant_random_plays_in_context_local() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.source_mode = jukebox::mode::SourceMode::Local;
     app.instant_random();
-    assert!(app.now_playing.is_some(), "instant random should play something");
+    assert!(
+        app.now_playing.is_some(),
+        "instant random should play something"
+    );
 }
 
-#[test]
-fn S_discover_lists_local_albums_in_local_mode() {
+#[test] // `s` documents the shift+s Discover keybinding under test
+fn s_discover_lists_local_albums_in_local_mode() {
     let (_d, cat, _l) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.source_mode = jukebox::mode::SourceMode::Local;
@@ -385,8 +422,112 @@ fn S_discover_lists_local_albums_in_local_mode() {
     match &app.overlay {
         Some(jukebox::tui::app::Overlay::Discover { items, .. }) => {
             assert!(!items.is_empty(), "discover should list albums");
-            assert!(items.iter().any(|i| matches!(i, jukebox::tui::app::DiscoverItem::Album{..})));
+            assert!(items
+                .iter()
+                .any(|i| matches!(i, jukebox::tui::app::DiscoverItem::Album { .. })));
         }
         _ => panic!("expected Discover"),
     }
+}
+
+// --- YouTube view navigation: the shared `cursors.playlist` clamp bug -------
+//
+// `cursors.playlist` is shared between `View::Playlists` (local playlists)
+// and `View::Youtube` (yt_lists). `clamp_cursors` used to clamp it against
+// `playlists.len()` unconditionally — so in the YouTube view, with fewer
+// local playlists than YouTube lists, every render yanked the cursor back
+// down to `playlists.len()-1` and the user could not move between YouTube
+// playlists. The clamp must be view-aware.
+
+fn three_yt_lists() -> Vec<YtList> {
+    (0..3)
+        .map(|i| YtList {
+            id: format!("PL{i}"),
+            name: format!("List {i}"),
+            kind: YtListKind::Account,
+            track_ids: Vec::new(),
+        })
+        .collect()
+}
+
+#[test]
+fn clamp_cursors_in_youtube_view_uses_yt_lists_len() {
+    // 1 local playlist, 3 YouTube lists, YouTube view, cursor on list 2.
+    // Before the fix: clamp_cursors clamped against playlists.len()=1, yanking
+    // the cursor back to 0. After: it must clamp against yt_lists.len()=3 and
+    // leave the cursor at 2.
+    let (_d, cat, _l) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.playlists = vec![jukebox::tui::app::Playlist {
+        name: "local".into(),
+        track_ids: vec![],
+    }];
+    app.yt_lists = three_yt_lists();
+    app.view = View::Youtube;
+    app.cursors.playlist = 2;
+    app.clamp_cursors();
+    assert_eq!(
+        app.cursors.playlist, 2,
+        "YouTube view must clamp against yt_lists.len(), not playlists.len()"
+    );
+}
+
+#[test]
+fn yt_view_navigation_not_blocked_by_local_playlists() {
+    // End-to-end reproduction: 1 local playlist, 3 YouTube lists, YouTube view.
+    // Simulate the render loop (handle_key then clamp_cursors, as layout.rs
+    // does on every frame). Before the fix, pressing `j` twice left the
+    // cursor stuck at 0 (clamped back from 1→0 each frame because
+    // playlists.len()=1). After the fix, the cursor must reach 2.
+    let (_d, cat, _l) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.playlists = vec![jukebox::tui::app::Playlist {
+        name: "local".into(),
+        track_ids: vec![],
+    }];
+    app.yt_lists = three_yt_lists();
+    app.view = View::Youtube;
+    app.focus_col = 0;
+    app.cursors.playlist = 0;
+
+    // Press j (down) — simulating the real loop: handle_key then the render's
+    // clamp_cursors. Two presses should reach list index 2.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use jukebox::tui::input::handle_key;
+    let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+    for _ in 0..2 {
+        handle_key(&mut app, j);
+        app.clamp_cursors(); // what layout.rs:53 does every frame
+    }
+    assert_eq!(
+        app.cursors.playlist, 2,
+        "must be able to move down to the third YouTube playlist"
+    );
+
+    // Press k (up) once — should go back to 1, not get stuck.
+    let k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+    handle_key(&mut app, k);
+    app.clamp_cursors();
+    assert_eq!(app.cursors.playlist, 1, "k must move up one");
+}
+
+#[test]
+fn clamp_cursors_in_playlists_view_uses_playlists_len() {
+    // Symmetric guard: in the Playlists view, the clamp must still use the
+    // local playlists list (not yt_lists), so a stale yt_lists-heavy cursor
+    // is pulled back into the local playlists' range.
+    let (_d, cat, _l) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.playlists = vec![jukebox::tui::app::Playlist {
+        name: "local".into(),
+        track_ids: vec![],
+    }];
+    app.yt_lists = three_yt_lists();
+    app.view = View::Playlists;
+    app.cursors.playlist = 2; // valid for yt_lists (3) but out of range for playlists (1)
+    app.clamp_cursors();
+    assert_eq!(
+        app.cursors.playlist, 0,
+        "Playlists view must clamp against playlists.len()"
+    );
 }

@@ -1,0 +1,23 @@
+---
+source: tests/snapshots_states.rs
+expression: s
+---
+
+
+
+
+
+                        ┏ search · local · Tab scope · Esc close ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+                        ┃/ Song_                                                               ┃
+                        ┃Tab → youtube   ·   Enter plays selection                             ┃
+                        ┃Song1 — 40mP                                                          ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛

@@ -28,8 +28,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // under raw mode.)
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('c') | KeyCode::Char('z') | KeyCode::Char('\\')
-            | KeyCode::Char('s') | KeyCode::Char('q') => return,
+            KeyCode::Char('c')
+            | KeyCode::Char('z')
+            | KeyCode::Char('\\')
+            | KeyCode::Char('s')
+            | KeyCode::Char('q') => return,
             _ => {}
         }
     }
@@ -90,11 +93,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 
         // --- Playback -------------------------------------------------------
         (KeyCode::Enter, _) => app.play_selected(),
-        (KeyCode::Char(' '), _) => { let _ = app.player.play_pause(); }
+        (KeyCode::Char(' '), _) => {
+            let _ = app.player.play_pause();
+        }
         (KeyCode::Char('>'), _) => app.next(),
         (KeyCode::Char('<'), _) => app.prev(),
-        (KeyCode::Char(','), _) => { let _ = app.player.seek(-5.0); }
-        (KeyCode::Char('.'), _) => { let _ = app.player.seek(5.0); }
+        (KeyCode::Char(','), _) => {
+            let _ = app.player.seek(-5.0);
+        }
+        (KeyCode::Char('.'), _) => {
+            let _ = app.player.seek(5.0);
+        }
         (KeyCode::Char('+'), _) => app.volume_up(),
         (KeyCode::Char('-'), _) => app.volume_down(),
         (KeyCode::Char('m'), _) => app.toggle_mute(),
@@ -111,6 +120,20 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // `s` instant random track in context; `S` discover overlay (spec §5.5).
         (KeyCode::Char('s'), _) => app.instant_random(),
         (KeyCode::Char('S'), _) => app.open_discover(),
+        // `R` retry the YouTube provider probe after an error/stale state
+        // (ProviderError / AuthExpired / RateLimited / ReadyStale). No-op when
+        // the state is healthy (Ready) or needs auth (Unconfigured/SignedOut) —
+        // `retry_yt_probe` guards with `can_retry()`. This is the fix for the
+        // "repeated login" root cause: press R instead of re-authenticating.
+        (KeyCode::Char('R'), _) => app.retry_yt_probe(),
+
+        // --- Queue & playlist ----------------------------------------------
+        // `e` enqueues the focused track to the manual "play next" queue.
+        (KeyCode::Char('e'), _) => app.enqueue_selected(),
+        // `x` removes the focused track from the manual queue (Queue view).
+        (KeyCode::Char('x'), _) => app.remove_selected_from_queue(),
+        // `d` deletes the focused playlist (Playlists view, col 0 only).
+        (KeyCode::Char('d'), _) => app.delete_focused_playlist(),
 
         // --- Overlays -------------------------------------------------------
         (KeyCode::Char('/'), _) => {
@@ -138,10 +161,27 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             app.overlay = Some(Overlay::Help);
         }
         (KeyCode::Char('a'), _) => {
-            app.overlay = Some(Overlay::PlaylistPicker);
+            if let Some(track_id) = app.selected_track_id() {
+                app.overlay = Some(Overlay::PlaylistPicker {
+                    track_id,
+                    cursor: 0,
+                });
+            }
         }
         (KeyCode::Char(':'), _) => {
-            app.overlay = Some(Overlay::Command { input: String::new() });
+            app.overlay = Some(Overlay::Command {
+                input: String::new(),
+                cursor: 0,
+            });
+        }
+        // `L` toggles the lyrics overlay for the currently-playing track.
+        // Shows loading → available (synced/plain) / not found / error, with
+        // synced-line highlighting by player.position(). `L` again (or Esc) closes.
+        (KeyCode::Char('L'), _) => app.toggle_lyrics(),
+        // `D` opens the diagnostics overlay (recent provider errors, respawn
+        // notices, sidecar failures). Esc closes. Also reachable via `:diag`.
+        (KeyCode::Char('D'), _) => {
+            app.overlay = Some(Overlay::Diagnostics);
         }
 
         // --- Quit -----------------------------------------------------------
@@ -182,8 +222,12 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 // Results are scope-specific, so clear them on toggle.
                 KeyCode::Tab => {
                     scope = match scope {
-                        crate::tui::app::SearchScope::Local => crate::tui::app::SearchScope::Youtube,
-                        crate::tui::app::SearchScope::Youtube => crate::tui::app::SearchScope::Local,
+                        crate::tui::app::SearchScope::Local => {
+                            crate::tui::app::SearchScope::Youtube
+                        }
+                        crate::tui::app::SearchScope::Youtube => {
+                            crate::tui::app::SearchScope::Local
+                        }
                     };
                     results.clear();
                     cursor = 0;
@@ -211,7 +255,8 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                         }
                     } else {
                         // Youtube scope.
-                        let fresh = submitted.as_deref() == Some(input.as_str()) && !results.is_empty();
+                        let fresh =
+                            submitted.as_deref() == Some(input.as_str()) && !results.is_empty();
                         if fresh {
                             // Results match the current query → pick.
                             if let Some(id) = results.get(cursor).cloned() {
@@ -238,13 +283,16 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     cursor = (cursor + 1) % results.len();
                 }
                 KeyCode::Up if !results.is_empty() => {
-                    cursor = cursor.checked_sub(1).unwrap_or(results.len().saturating_sub(1));
+                    cursor = cursor
+                        .checked_sub(1)
+                        .unwrap_or(results.len().saturating_sub(1));
                 }
                 // Accept Char regardless of SHIFT so capital letters (and
                 // shifted symbols) make it into the input — a Shift+F would
                 // otherwise be dropped because its modifiers != NONE.
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
                 {
                     input.push(c);
                     if scope == crate::tui::app::SearchScope::Local {
@@ -277,24 +325,192 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 _ => {}
             }
             app.overlay = Some(Overlay::Search {
-                input, results, cursor, scope, submitted, searching,
+                input,
+                results,
+                cursor,
+                scope,
+                submitted,
+                searching,
             });
         }
-        Some(Overlay::Command { mut input }) => {
+        Some(Overlay::Command {
+            mut input,
+            mut cursor,
+        }) => {
+            // Word-boundary helpers (byte-level — input is `:` commands, ASCII).
+            fn word_start_left(s: &str, pos: usize) -> usize {
+                let b = s.as_bytes();
+                let mut i = pos.min(b.len());
+                while i > 0 && (b[i - 1] as char).is_whitespace() {
+                    i -= 1;
+                }
+                while i > 0 && !(b[i - 1] as char).is_whitespace() {
+                    i -= 1;
+                }
+                i
+            }
+            fn word_start_right(s: &str, pos: usize) -> usize {
+                let b = s.as_bytes();
+                let mut i = pos.min(b.len());
+                while i < b.len() && (b[i] as char).is_whitespace() {
+                    i += 1;
+                }
+                while i < b.len() && !(b[i] as char).is_whitespace() {
+                    i += 1;
+                }
+                i
+            }
             match key.code {
                 // Accept Char regardless of SHIFT — see the Search arm note.
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) => input.push(c),
-                KeyCode::Backspace => { input.pop(); }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    cursor = cursor.min(input.len());
+                    input.insert(cursor, c);
+                    cursor += c.len_utf8();
+                }
+                KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl-Backspace: delete the word before the cursor.
+                    cursor = cursor.min(input.len());
+                    let start = word_start_left(&input, cursor);
+                    input.drain(start..cursor);
+                    cursor = start;
+                }
+                KeyCode::Backspace => {
+                    cursor = cursor.min(input.len());
+                    if cursor > 0 {
+                        // Move to the previous char boundary (UTF-8 safe).
+                        let mut prev = cursor - 1;
+                        while prev > 0 && !input.is_char_boundary(prev) {
+                            prev -= 1;
+                        }
+                        input.drain(prev..cursor);
+                        cursor = prev;
+                    }
+                }
+                KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl-Delete: delete the word after the cursor.
+                    cursor = cursor.min(input.len());
+                    let end = word_start_right(&input, cursor);
+                    input.drain(cursor..end);
+                }
+                KeyCode::Home => {
+                    cursor = 0;
+                }
+                KeyCode::End => {
+                    cursor = input.len();
+                }
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    cursor = cursor.min(input.len());
+                    cursor = word_start_left(&input, cursor);
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    cursor = cursor.min(input.len());
+                    cursor = word_start_right(&input, cursor);
+                }
+                KeyCode::Left => {
+                    cursor = cursor.min(input.len());
+                    if cursor > 0 {
+                        // Move to the previous char boundary (UTF-8 safe).
+                        let mut prev = cursor - 1;
+                        while prev > 0 && !input.is_char_boundary(prev) {
+                            prev -= 1;
+                        }
+                        cursor = prev;
+                    }
+                }
+                KeyCode::Right => {
+                    cursor = cursor.min(input.len());
+                    if cursor < input.len() {
+                        // Move to the next char boundary (UTF-8 safe).
+                        let mut next = cursor + 1;
+                        while next < input.len() && !input.is_char_boundary(next) {
+                            next += 1;
+                        }
+                        cursor = next;
+                    }
+                }
+                KeyCode::Tab => {
+                    // Tab completion: complete known command prefix.
+                    let known = ["queue", "yt", "lyrics", "diag", "help", "quit", "q"];
+                    let prefix = input.trim_start_matches(':');
+                    let matches: Vec<&str> = known
+                        .iter()
+                        .copied()
+                        .filter(|c| c.starts_with(prefix))
+                        .collect();
+                    if matches.len() == 1 {
+                        input = format!(":{}", matches[0]);
+                        cursor = input.len();
+                    } else if matches.len() > 1 {
+                        // Complete the common prefix.
+                        let common = matches
+                            .iter()
+                            .map(|s| s.as_bytes())
+                            .fold(None::<Vec<u8>>, |acc, s| match acc {
+                                None => Some(s.to_vec()),
+                                Some(a) => {
+                                    let len =
+                                        a.iter().zip(s.iter()).take_while(|(x, y)| x == y).count();
+                                    Some(a[..len].to_vec())
+                                }
+                            })
+                            .unwrap_or_default();
+                        input = format!(":{}", String::from_utf8_lossy(&common));
+                        cursor = input.len();
+                    }
+                }
+                KeyCode::Up if !app.command_history.is_empty() => {
+                    // Traverse command history backwards (most recent first).
+                    if app.command_history_cursor.is_none() {
+                        // Save the current draft before traversing.
+                        app.command_draft = input.clone();
+                        app.command_history_cursor = Some(0);
+                    } else if let Some(i) = app.command_history_cursor {
+                        if i + 1 < app.command_history.len() {
+                            app.command_history_cursor = Some(i + 1);
+                        }
+                    }
+                    if let Some(i) = app.command_history_cursor {
+                        input = app.command_history[i].clone();
+                        cursor = input.len();
+                    }
+                }
+                KeyCode::Down => {
+                    // Traverse command history forwards (toward the draft).
+                    if let Some(i) = app.command_history_cursor {
+                        if i == 0 {
+                            // Past the end → restore the draft.
+                            app.command_history_cursor = None;
+                            input = app.command_draft.clone();
+                            cursor = input.len();
+                        } else {
+                            app.command_history_cursor = Some(i - 1);
+                            input = app.command_history[i - 1].clone();
+                            cursor = input.len();
+                        }
+                    }
+                }
                 KeyCode::Enter => {
                     let cmd = input.trim().to_string();
                     app.overlay = None;
+                    // Push to command history (bounded, adjacent-dedup).
+                    if !cmd.is_empty()
+                        && app.command_history.first().map(|s| s.as_str()) != Some(&cmd)
+                    {
+                        app.command_history.insert(0, cmd.clone());
+                        if app.command_history.len() > 100 {
+                            app.command_history.truncate(100);
+                        }
+                    }
+                    app.command_history_cursor = None;
                     execute_command(app, &cmd);
                     return;
                 }
                 _ => {}
             }
-            app.overlay = Some(Overlay::Command { input });
+            app.overlay = Some(Overlay::Command { input, cursor });
         }
         Some(Overlay::YtAuth { mut input }) => {
             // The auth overlay's own keymap: typing accumulates the pasted
@@ -308,8 +524,9 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     app.overlay = None;
                     return;
                 }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
                 {
                     input.push(if c == '\n' || c == '\r' { ' ' } else { c });
                 }
@@ -347,16 +564,16 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             }
             app.overlay = Some(Overlay::Help);
         }
-        // Help / PlaylistPicker: any non-Esc key is a no-op (overlay stays open
-        // until Esc). PlaylistPicker selection routing is wired up in a later
-        // task; for now the picker is display-only.
+        // Help overlay: any non-Esc key is a no-op (overlay stays open until Esc).
         Some(Overlay::Discover { items, mut cursor }) => {
             match key.code {
                 KeyCode::Down if !items.is_empty() => {
                     cursor = (cursor + 1) % items.len();
                 }
                 KeyCode::Up if !items.is_empty() => {
-                    cursor = cursor.checked_sub(1).unwrap_or(items.len().saturating_sub(1));
+                    cursor = cursor
+                        .checked_sub(1)
+                        .unwrap_or(items.len().saturating_sub(1));
                 }
                 KeyCode::Enter => {
                     app.overlay = Some(Overlay::Discover { items, cursor });
@@ -367,8 +584,104 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             }
             app.overlay = Some(Overlay::Discover { items, cursor });
         }
-        Some(other) => {
-            app.overlay = Some(other);
+        // `a` — playlist picker: j/k/↑↓ move, Enter confirms (add to existing
+        // or create new), Esc cancels (handled at the top of this fn).
+        Some(Overlay::PlaylistPicker {
+            track_id,
+            mut cursor,
+        }) => {
+            // Total rows = playlists + the "+ new playlist..." entry.
+            let n = app.playlists.len() + 1;
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') if n > 0 => {
+                    cursor = (cursor + 1) % n;
+                }
+                KeyCode::Up | KeyCode::Char('k') if n > 0 => {
+                    cursor = cursor.checked_sub(1).unwrap_or(n.saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    if cursor < app.playlists.len() {
+                        app.add_track_to_playlist(&track_id, cursor);
+                        app.save_playlists_db();
+                        app.yt_status =
+                            Some(format!("added to \"{}\"", app.playlists[cursor].name));
+                    } else {
+                        // "+ new playlist..." — create a new one with the track.
+                        let idx = app.create_playlist_with_track(&track_id);
+                        app.save_playlists_db();
+                        app.yt_status = Some(format!("created \"{}\"", app.playlists[idx].name));
+                    }
+                    app.overlay = None;
+                    return;
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::PlaylistPicker { track_id, cursor });
+        }
+        // Lyrics overlay (`L`): j/k/↑/↓/PgUp/PgDn/g/G scroll; Esc closes
+        // (handled at the top of this fn). `L` toggles closed (same as Esc).
+        Some(Overlay::Lyrics {
+            content,
+            state,
+            mut scroll,
+            track_id,
+            gen,
+        }) => {
+            if matches!(key.code, KeyCode::Char('R'))
+                && matches!(
+                    state,
+                    crate::tui::app::LyricsState::NotFound
+                        | crate::tui::app::LyricsState::Offline
+                        | crate::tui::app::LyricsState::Error(_)
+                )
+            {
+                app.overlay = Some(Overlay::Lyrics {
+                    content,
+                    state,
+                    scroll,
+                    track_id: track_id.clone(),
+                    gen,
+                });
+                app.request_lyrics(&track_id);
+                return;
+            }
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    scroll = scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    scroll = scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    scroll = scroll.saturating_add(10);
+                }
+                KeyCode::PageUp => {
+                    scroll = scroll.saturating_sub(10);
+                }
+                KeyCode::Char('g') => scroll = 0,
+                KeyCode::Char('G') => scroll = u16::MAX,
+                KeyCode::Char('L') => {
+                    app.overlay = None;
+                    return;
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::Lyrics {
+                content,
+                state,
+                scroll,
+                track_id,
+                gen,
+            });
+        }
+        Some(Overlay::Diagnostics) => {
+            // Esc closes the diagnostics overlay; all other keys are
+            // swallowed (no interaction while the diag list is open).
+            if key.code == KeyCode::Esc {
+                app.overlay = None;
+                return;
+            }
+            app.overlay = Some(Overlay::Diagnostics);
         }
         None => {}
     }
@@ -388,13 +701,20 @@ fn handle_filter_key(app: &mut App, key: KeyEvent) -> bool {
             app.filter_jump();
             true
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT) =>
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
         {
             // `f` on an empty filter closes it (toggle semantics); otherwise
             // the char goes into the query. Backspace-to-empty + `f` also
             // closes, so you don't get a stranded empty filter.
-            if c == 'f' && app.filter.as_ref().map(|f| f.text.is_empty()).unwrap_or(false) {
+            if c == 'f'
+                && app
+                    .filter
+                    .as_ref()
+                    .map(|f| f.text.is_empty())
+                    .unwrap_or(false)
+            {
                 app.filter = None;
             } else if let Some(f) = &mut app.filter {
                 f.text.push(c);
@@ -416,7 +736,9 @@ fn handle_filter_key(app: &mut App, key: KeyEvent) -> bool {
 fn execute_command(app: &mut App, cmd: &str) {
     match cmd {
         "yt auth" => {
-            app.overlay = Some(Overlay::YtAuth { input: String::new() });
+            app.overlay = Some(Overlay::YtAuth {
+                input: String::new(),
+            });
         }
         "yt logout" => {
             app.yt_logout();
@@ -424,21 +746,43 @@ fn execute_command(app: &mut App, cmd: &str) {
         "yt setup" => {
             app.yt_setup();
         }
+        "queue clear" => {
+            app.transport.clear_queue();
+            app.yt_status = Some("queue cleared".into());
+        }
+        // `:diag` — open the diagnostics overlay (recent provider errors,
+        // respawn notices, sidecar failures). Esc closes (generic handler).
+        "diag" => {
+            app.overlay = Some(Overlay::Diagnostics);
+        }
+        // `:q` / `:quit` — quit the app (same as the `q` keybinding).
+        "q" | "quit" => {
+            app.quit();
+        }
         other if other.starts_with("yt auth browser") => {
-            let browser = other.trim_start_matches("yt auth browser").trim().to_string();
+            let browser = other
+                .trim_start_matches("yt auth browser")
+                .trim()
+                .to_string();
             if browser.is_empty() {
                 app.yt_error = Some(
-                    "usage: :yt auth browser <chrome|firefox|safari|edge|brave|opera|chromium>".into(),
+                    "usage: :yt auth browser <chrome|firefox|safari|edge|brave|opera|chromium>"
+                        .into(),
                 );
             } else {
                 app.apply_yt_browser(browser);
             }
         }
-        _ => {}
+        _ => {
+            // Unknown command — provide feedback so the user isn't left
+            // wondering if their command ran. Known commands are matched
+            // above; anything else (non-empty) is unknown.
+            if !cmd.is_empty() {
+                app.yt_error = Some(format!("unknown command: :{cmd}"));
+            }
+        }
     }
 }
-
-// ---------------------------------------------------------------------------
 // Cursor / view navigation helpers
 // ---------------------------------------------------------------------------
 
@@ -471,7 +815,11 @@ fn focused_column_len(app: &App) -> usize {
 fn focused_track_count(app: &App) -> usize {
     match app.view {
         View::Artists => {
-            let artist = app.artists.get(app.cursors.artist).cloned().unwrap_or_default();
+            let artist = app
+                .artists
+                .get(app.cursors.artist)
+                .cloned()
+                .unwrap_or_default();
             app.albums_by_artist
                 .get(&artist)
                 .and_then(|v| v.get(app.cursors.album))
@@ -610,6 +958,14 @@ fn set_focused_cursor(app: &mut App, v: usize) {
 fn switch_view(app: &mut App, view: View) {
     app.view = view;
     app.focus_col = 0;
+    // Clamp cursors for the target view so a stale cursor from the previous
+    // view (e.g. `cursors.playlist` pointing into `yt_lists` while switching
+    // to Artists/Playlists, or vice-versa) doesn't leave a column empty on
+    // the first render. `layout::draw` also clamps each frame, but doing it
+    // here too means the very first frame after the switch is already
+    // correct — no 1-frame flicker where the Tracks pane reads "no album
+    // selected" because the album cursor was past the end.
+    app.clamp_cursors();
     // Entering the Y view fetches the account + suggested lists (bounded
     // synchronous roundtrip at the view-enter boundary; spec §5.3).
     if view == View::Youtube {
@@ -652,6 +1008,12 @@ fn cycle_view(app: &mut App, fwd: bool) {
 /// approximate by design — pixel-perfect hit-testing belongs to the view layer
 /// in a future refactor.
 pub fn handle_mouse(app: &mut App, m: MouseEvent) {
+    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    handle_mouse_in_area(app, m, ratatui::layout::Rect::new(0, 0, width, height));
+}
+
+/// Deterministic mouse dispatcher for a known frame area.
+pub fn handle_mouse_in_area(app: &mut App, m: MouseEvent, area: ratatui::layout::Rect) {
     match m.kind {
         MouseEventKind::ScrollUp => move_up(app),
         MouseEventKind::ScrollDown => move_down(app),
@@ -660,14 +1022,10 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent) {
             // browse columns. Drag is deliberately NOT routed: a held-drag used
             // to scrub volume on every mouse-move, which jumped the level
             // erratically. Volume is keyboard-only (+/-/m) now.
-            let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-            // Player bar is 2 rows above the 1-row footer hint bar, so its top
-            // is at h-3; the footer (row h-1) is intentionally not clickable.
-            let bar_top = h.saturating_sub(3);
-            let footer_row = h.saturating_sub(1);
-            if m.row >= bar_top && m.row < footer_row {
-                handle_player_bar_click(app, m.column, m.row - bar_top);
-            } else if m.row < bar_top {
+            let bar = crate::tui::view::layout::player_bar_area(area);
+            if let Some(bar) = bar.filter(|bar| rect_contains(*bar, m.column, m.row)) {
+                handle_player_bar_click(app, m.column, m.row, bar);
+            } else if bar.is_none_or(|bar| m.row < bar.y) {
                 handle_browse_click(app, m.column, m.row);
             }
             // clicks on the footer row are ignored
@@ -682,26 +1040,30 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent) {
 /// now-playing text and volume meter are intentionally not clickable, because
 /// coarse hit-testing there made a stray click jump volume to an arbitrary
 /// value.
-fn handle_player_bar_click(app: &mut App, col: u16, row_in_bar: u16) {
-    let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80).max(1);
-    if row_in_bar == 1 {
-        // Progress gauge row: click-to-seek, proportional to column / width.
-        let pct = (col as f64 / width as f64).clamp(0.0, 1.0);
+fn rect_contains(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.right() && row >= rect.y && row < rect.bottom()
+}
+
+fn handle_player_bar_click(app: &mut App, col: u16, row: u16, area: ratatui::layout::Rect) {
+    let geo = crate::tui::view::player_bar::geometry(area);
+    if rect_contains(geo.progress, col, row) {
+        let pct = (col.saturating_sub(geo.progress.x) as f64 / geo.progress.width.max(1) as f64)
+            .clamp(0.0, 1.0);
         if let Some(dur) = app.player.duration() {
             if dur > 0.0 {
-                let _ = app.player.seek(pct * dur - app.player.position().unwrap_or(0.0));
+                let _ = app
+                    .player
+                    .seek(pct * dur - app.player.position().unwrap_or(0.0));
             }
         }
         return;
     }
-    // Row 0: only the transport glyphs (◀◀ ▶ ▶▶, roughly cols 18..32) are
-    // clickable. Anything else (now-playing text, volume, flags) is ignored.
-    if (18..=32).contains(&col) {
-        match col {
-            18..=21 => app.prev(),
-            22..=27 => { let _ = app.player.play_pause(); }
-            _ => app.next(),
-        }
+    if rect_contains(geo.previous, col, row) {
+        app.prev();
+    } else if rect_contains(geo.play_pause, col, row) {
+        let _ = app.player.play_pause();
+    } else if rect_contains(geo.next, col, row) {
+        app.next();
     }
 }
 

@@ -2,27 +2,27 @@
 source: tests/layout.rs
 expression: s
 ---
-A   ┌Artists─────┐┌Albums──────┐┌Tracks────────────────────────────────────────┐
-P   │40mP        ││Cosmic      ││▶  1 Song1 — Cosmic                24bit-96kHz│
-Q   │DECO*27     ││            ││                                              │
-Y   │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    │            ││            ││                                              │
-    └────────────┘└────────────┘└──────────────────────────────────────────────┘
-⏸ Song1 — 40mP · Cosmic   24-bit / 96 kHz · bit-perfect   vol ▰▰▰▱ 70%
-                0:00 / 3:00                 SHUF off · RPT off · CONT off · MODE
-Enter play · Space pause · > < next prev · M mode · / search · ? help · q quit
+1:Artists │ 2:Playlists │ 3:Queue │ 4:YouTube                            Artists
+────────────────────────────────────────────────────────────────────────────────
+                          Artists › [Albums] › [Tracks]
+                           l → Albums · Enter → Tracks
+1   ┏Artists━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+2   ┃40mP                                                                      ┃
+3   ┃DECO*27                                                                   ┃
+4   ┃                                                                          ┃
+    ┃Albums — 40mP:                                                            ┃
+    ┃  Cosmic                                                                  ┃
+    ┃                                                                          ┃
+    ┃                                                                          ┃
+    ┃                                                                          ┃
+    ┃                                                                          ┃
+    ┃                                                                          ┃
+    ┃                                                                          ┃
+    ┃                                                                          ┃
+    ┃                                                                          ┃
+    ┃                                                                          ┃
+    ┃                                                                          ┃
+    ┃                                                                          ┃
+    ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+[PLAYING] ▶ Song1 — 40mP  0:00 / 3:00  ▸ Next: (end)  24bit/96  MODE local · CON
+VIEW: local · SOURCE: local

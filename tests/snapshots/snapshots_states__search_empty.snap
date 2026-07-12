@@ -1,0 +1,23 @@
+---
+source: tests/snapshots_states.rs
+expression: s
+---
+
+
+
+
+
+                        ┏ search · local · Tab scope · Esc close ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+                        ┃/ zzz_                                                                ┃
+                        ┃No results for 'zzz'  ·  Tab → youtube to switch scope                ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┃                                                                      ┃
+                        ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛

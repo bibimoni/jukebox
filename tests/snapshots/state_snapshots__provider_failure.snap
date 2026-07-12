@@ -1,0 +1,28 @@
+---
+source: tests/state_snapshots.rs
+expression: s
+---
+1   ┏YouTube [err]━━━━━━━━━┓┌Tracks────────────────────────────────────────────────────────────────────────────────────┐
+2   ┃                      ┃│                                                                                          │
+3   ┃                      ┃│  [err] YouTube unavailable                                                               │
+4   ┃                      ┃│  provider error — press R to retry                                                       │
+    ┃                      ┃│  connection refused                                                                      │
+    ┃                      ┃│                                                                                          │
+    ┃                      ┃│  R retry · 1 local                                                                       │
+    ┃                      ┃│                                                                                          │
+    ┃                      ┃│                                                                                          │
+    ┃                      ┃│                                                                                          │
+    ┃                      ┃│                                                                                          │
+    ┃                      ┃│                                                                                          │
+    ┃                      ┃│                                                                                          │
+    ┃                      ┃│                                                                                          │
+    ┃                      ┃│                                                                                          │
+    ┃                      ┃│                                                                                          │
+    ┃                      ┃│                                                                                          │
+    ┃                      ┃│                                                                                          │
+    ┃                      ┃│                                                                                          │
+    ┃                      ┃│                                                                                          │
+    ┗━━━━━━━━━━━━━━━━━━━━━━┛└──────────────────────────────────────────────────────────────────────────────────────────┘
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[STOPPED] ■ — nothing playing —  --:-- / --:--  ▸ Enter to play  --  MODE local · CONT off
+VIEW: youtube · SOURCE: local · [!] [err] YT: provider error — press R to retry

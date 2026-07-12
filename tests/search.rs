@@ -15,7 +15,8 @@ fn mini_catalog_json() -> String {
             "title":"Freedom","album":"Best","bit_depth":24,"sample_rate_hz":48000,
             "source_path":"lossless/a/01.flac","symlinked_into_artists":["Ado"] },
         ]
-    }).to_string()
+    })
+    .to_string()
 }
 
 #[test]
@@ -45,7 +46,10 @@ fn build_then_open() -> (tempfile::TempDir, Searcher) {
 fn romaji_finds_katakana_title() {
     let (_d, s) = build_then_open();
     let hits = s.search("burubado", 10).unwrap();
-    assert!(hits.iter().any(|h| h.track_id == "t1"), "romaji -> ブルーバード");
+    assert!(
+        hits.iter().any(|h| h.track_id == "t1"),
+        "romaji -> ブルーバード"
+    );
 }
 
 #[test]

@@ -23,20 +23,40 @@ mod inner {
     /// match for `sample_rate_hz` + `bit_depth`. Returns Ok(()) on success or if
     /// the device already matches; Err if CoreAudio refuses the switch.
     pub fn set_output_format(sample_rate_hz: u32, bit_depth: u32) -> Result<()> {
-        let device = default_output_device()
-            .context("resolving default output device")?;
+        let device = default_output_device().context("resolving default output device")?;
         let stream = first_output_stream(device)
             .context("finding an output stream on the default device")?;
-        let available = available_physical_formats(stream)
-            .context("listing available physical formats")?;
-        let target = match_format(&available, sample_rate_hz, bit_depth)
-            .ok_or_else(|| anyhow!(
+        let available =
+            available_physical_formats(stream).context("listing available physical formats")?;
+        let target = match_format(&available, sample_rate_hz, bit_depth).ok_or_else(|| {
+            anyhow!(
                 "device supports no format near {}Hz/{}bit",
-                sample_rate_hz, bit_depth
-            ))?;
-        set_physical_format(stream, target)
-            .context("setting the stream's physical format")?;
+                sample_rate_hz,
+                bit_depth
+            )
+        })?;
+        set_physical_format(stream, target).context("setting the stream's physical format")?;
         Ok(())
+    }
+
+    /// Fire-and-forget format switch: spawns a background thread to call
+    /// [`set_output_format`] so the caller (the TUI input loop) never blocks.
+    /// The synchronous `set_output_format` can take up to ~310ms (format
+    /// verify polling + settle sleep); this wrapper returns immediately
+    /// (typically <1ms) and the blocking work runs on a detached thread.
+    ///
+    /// Returns a [`JoinHandle<()>`] the caller may poll on `on_tick` for
+    /// best-effort cleanup. The handle can also be dropped (fire-and-forget)
+    /// — the thread runs to completion independently either way. Errors
+    /// are swallowed by the thread (best-effort switch; a failed switch
+    /// doesn't crash the TUI) (AC-M9.2.4).
+    pub fn set_output_format_async(
+        sample_rate_hz: u32,
+        bit_depth: u32,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let _ = set_output_format(sample_rate_hz, bit_depth);
+        })
     }
 
     /// Snapshot of the default output device's stream + its current physical
@@ -96,7 +116,10 @@ mod inner {
             )
         };
         if status != 0 {
-            return Err(anyhow!("AudioObjectGetPropertyData(default device) -> {}", status));
+            return Err(anyhow!(
+                "AudioObjectGetPropertyData(default device) -> {}",
+                status
+            ));
         }
         if dev == kAudioObjectUnknown {
             return Err(anyhow!("no default output device"));
@@ -115,11 +138,13 @@ mod inner {
         // when AudioObjectGetPropertyData is called with a null out-buffer for the
         // size, even though the property is readable. The dedicated size API works.
         let mut size: u32 = 0;
-        let status = unsafe {
-            AudioObjectGetPropertyDataSize(device, &addr, 0, ptr::null(), &mut size)
-        };
+        let status =
+            unsafe { AudioObjectGetPropertyDataSize(device, &addr, 0, ptr::null(), &mut size) };
         if status != 0 {
-            return Err(anyhow!("AudioObjectGetPropertyDataSize(streams) -> {}", status));
+            return Err(anyhow!(
+                "AudioObjectGetPropertyDataSize(streams) -> {}",
+                status
+            ));
         }
         let count = (size / mem::size_of::<AudioStreamID>() as u32) as usize;
         if count == 0 {
@@ -149,16 +174,17 @@ mod inner {
     /// `AudioStreamBasicDescription`s (stripping the range envelope). Falls
     /// back to virtual formats if physical formats aren't exposed (some
     /// virtual/loopback devices only expose virtual).
-    fn available_physical_formats(stream: AudioStreamID) -> Result<Vec<AudioStreamBasicDescription>> {
+    fn available_physical_formats(
+        stream: AudioStreamID,
+    ) -> Result<Vec<AudioStreamBasicDescription>> {
         let addr = AudioObjectPropertyAddress {
             mSelector: kAudioStreamPropertyAvailablePhysicalFormats,
             mScope: kAudioObjectPropertyScopeOutput,
             mElement: kAudioObjectPropertyElementMain,
         };
         let mut size: u32 = 0;
-        let status = unsafe {
-            AudioObjectGetPropertyDataSize(stream, &addr, 0, ptr::null(), &mut size)
-        };
+        let status =
+            unsafe { AudioObjectGetPropertyDataSize(stream, &addr, 0, ptr::null(), &mut size) };
         // Fallback to virtual formats if the device reports no physical formats
         // (common for virtual/loopback devices like eqMac or BlackHole).
         if status != 0 || size == 0 {
@@ -188,18 +214,22 @@ mod inner {
     /// Fallback: virtual formats when a device exposes no physical formats.
     /// Setting the virtual format still drives the underlying DAC at that rate
     /// (the virtual device re-clocks to its physical output).
-    fn available_virtual_formats(stream: AudioStreamID) -> Result<Vec<AudioStreamBasicDescription>> {
+    fn available_virtual_formats(
+        stream: AudioStreamID,
+    ) -> Result<Vec<AudioStreamBasicDescription>> {
         let addr = AudioObjectPropertyAddress {
             mSelector: kAudioStreamPropertyAvailableVirtualFormats,
             mScope: kAudioObjectPropertyScopeOutput,
             mElement: kAudioObjectPropertyElementMain,
         };
         let mut size: u32 = 0;
-        let status = unsafe {
-            AudioObjectGetPropertyDataSize(stream, &addr, 0, ptr::null(), &mut size)
-        };
+        let status =
+            unsafe { AudioObjectGetPropertyDataSize(stream, &addr, 0, ptr::null(), &mut size) };
         if status != 0 {
-            return Err(anyhow!("AudioObjectGetPropertyDataSize(virtual formats) -> {}", status));
+            return Err(anyhow!(
+                "AudioObjectGetPropertyDataSize(virtual formats) -> {}",
+                status
+            ));
         }
         let count = (size / mem::size_of::<AudioStreamRangedDescription>() as u32) as usize;
         if count == 0 {
@@ -217,12 +247,18 @@ mod inner {
             )
         };
         if status != 0 {
-            return Err(anyhow!("AudioObjectGetPropertyData(virtual formats) -> {}", status));
+            return Err(anyhow!(
+                "AudioObjectGetPropertyData(virtual formats) -> {}",
+                status
+            ));
         }
         Ok(ranged.into_iter().map(|r| r.mFormat).collect())
     }
 
-    fn set_physical_format(stream: AudioStreamID, format: AudioStreamBasicDescription) -> Result<()> {
+    fn set_physical_format(
+        stream: AudioStreamID,
+        format: AudioStreamBasicDescription,
+    ) -> Result<()> {
         // Fast path: if the device is already at the target format, do nothing.
         // Consecutive tracks at the same rate (e.g. a 96k album) skip the
         // switch — and the settle delay — entirely, so there's no gap between
@@ -251,7 +287,10 @@ mod inner {
             )
         };
         if status != 0 {
-            return Err(anyhow!("AudioObjectSetPropertyData(physical format) -> {}", status));
+            return Err(anyhow!(
+                "AudioObjectSetPropertyData(physical format) -> {}",
+                status
+            ));
         }
         // Wait for the device to actually apply the new format before
         // returning. SetPropertyData returns once the property is written, but
@@ -286,15 +325,18 @@ mod inner {
                 &mut asbd as *mut _ as *mut c_void,
             )
         };
-        if status == 0 { Some(asbd) } else { None }
+        if status == 0 {
+            Some(asbd)
+        } else {
+            None
+        }
     }
 
     /// True if `a` and `b` describe the same effective playback format — same
     /// sample rate + bit depth. (Other ASBD fields like channel count matter
     /// less for the rate-switch purpose; we match on the two fields we drive.)
     fn same_format(a: &AudioStreamBasicDescription, b: &AudioStreamBasicDescription) -> bool {
-        (a.mSampleRate as u32) == (b.mSampleRate as u32)
-            && a.mBitsPerChannel == b.mBitsPerChannel
+        (a.mSampleRate as u32) == (b.mSampleRate as u32) && a.mBitsPerChannel == b.mBitsPerChannel
     }
 
     /// Poll the device's current physical format until it matches `target`, or
@@ -335,8 +377,10 @@ mod inner {
             return None;
         }
         // Prefer an exact sample-rate match; among those, closest bit depth.
-        let exact_rate: Vec<&&AudioStreamBasicDescription> =
-            pcm.iter().filter(|f| (f.mSampleRate as u32) == target_sr).collect();
+        let exact_rate: Vec<&&AudioStreamBasicDescription> = pcm
+            .iter()
+            .filter(|f| (f.mSampleRate as u32) == target_sr)
+            .collect();
         let pool: Vec<&&AudioStreamBasicDescription> = if !exact_rate.is_empty() {
             exact_rate
         } else {
@@ -414,6 +458,17 @@ mod inner {
         Ok(())
     }
 
+    /// Non-macOS: the sync version is already a no-op, so the async wrapper
+    /// just spawns a thread that returns immediately. This keeps the API
+    /// uniform across platforms (tests on Linux CI exercise the same code
+    /// path as macOS).
+    pub fn set_output_format_async(
+        _sample_rate_hz: u32,
+        _bit_depth: u32,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(|| {})
+    }
+
     /// No-op capture on non-macOS: there's nothing to restore, so `None`.
     pub struct CapturedFormat;
     pub fn capture_default_format() -> Option<CapturedFormat> {
@@ -422,4 +477,7 @@ mod inner {
     pub fn restore_output_format(_fmt: Option<CapturedFormat>) {}
 }
 
-pub use inner::{capture_default_format, restore_output_format, set_output_format, CapturedFormat};
+pub use inner::{
+    capture_default_format, restore_output_format, set_output_format, set_output_format_async,
+    CapturedFormat,
+};

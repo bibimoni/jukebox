@@ -2,27 +2,27 @@
 source: tests/layout.rs
 expression: s
 ---
-A   ┌Artists─────────────────────────────────────────────────────────┐
-P   │40mP                                                            │
-Q   │DECO*27                                                         │
-Y   │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    │                                                                │
-    └────────────────────────────────────────────────────────────────┘
-⏸ Song1 — 40mP  24bit/96  CONT off · MODE local
-Enter play · Space pause · > < next prev · M mode · / search · ? help
+1:Artists │ 2:Playlists │ 3:Queue │ 4:YouTube                  Artists
+──────────────────────────────────────────────────────────────────────
+                     Artists › [Albums] › [Tracks]
+                      l → Albums · Enter → Tracks
+1   ┏Artists━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+2   ┃40mP                                                            ┃
+3   ┃DECO*27                                                         ┃
+4   ┃                                                                ┃
+    ┃Albums — 40mP:                                                  ┃
+    ┃  Cosmic                                                        ┃
+    ┃                                                                ┃
+    ┃                                                                ┃
+    ┃                                                                ┃
+    ┃                                                                ┃
+    ┃                                                                ┃
+    ┃                                                                ┃
+    ┃                                                                ┃
+    ┃                                                                ┃
+    ┃                                                                ┃
+    ┃                                                                ┃
+    ┃                                                                ┃
+    ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+[PLAYING] ▶ Song1 — 40mP  0:00 / 3:00  ▸ Next: (end)  MODE local · CON
+VIEW: local · SOURCE: local

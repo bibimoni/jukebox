@@ -77,7 +77,11 @@ impl StreamFormat {
     /// Short label for the player bar: "Opus 160k · YT" or "AAC 256k · YT Premium".
     pub fn yt_label(&self) -> String {
         let bitrate = format!("{}k", self.abr);
-        let tier = if self.premium { " · YT Premium" } else { " · YT" };
+        let tier = if self.premium {
+            " · YT Premium"
+        } else {
+            " · YT"
+        };
         format!("{} {}{}", self.codec, bitrate, tier)
     }
 }

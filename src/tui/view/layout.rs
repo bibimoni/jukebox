@@ -7,36 +7,104 @@
 //! painted on top via [`overlay::render`] (Task 11 fills in the real overlay
 //! surface — for now it is a no-op stub so layout compiles standalone).
 //!
-//! Responsive breakpoints:
-//! - At `width < 80` or `height < 24` we refuse to render the browse layout
-//!   and instead show a centered "terminal too small" message. 80×24 is the
-//!   minimum that comfortably fits the three-column Miller layout + the player
-//!   bar; below that the columns compress past readability.
-//! - At 80–120 cols the columns themselves compress via `Constraint` ratios
-//!   inside [`columns::render`] (it reads `outer[0].width` and adjusts).
+//! Responsive breakpoints (T3):
+//! - At `width < 60` or `height < 20` we refuse to render and instead show a
+//!   centered "terminal too small" message. Below 60×20 the columns compress
+//!   past readability.
+//! - At `60 ≤ width < 70` the narrow path compresses to a single readable
+//!   column (rail + focused pane) via `render_narrow`.
+//! - At `70 ≤ width ≤ 100` (or `height < 24`) the narrow path shows 2 columns
+//!   (rail + focused pane) with a breadcrumb cue for off-screen panes.
+//! - At `width > 100` and `height ≥ 24` the full 3-column Miller layout is
+//!   rendered. At `height ≤ 24` the full layout collapses chrome: no tab bar
+//!   line (breadcrumb lives in column titles) + 1-row compact player bar,
+//!   saving 2 rows for content (T3).
 
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    text::Line,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
-use crate::tui::app::App;
 use super::{columns, footer, overlay, player_bar};
+use crate::tui::app::{App, View};
+use crate::tui::view::theme::{self, Theme};
 
-/// Minimum terminal size we'll attempt to render the full browse layout in.
-pub const MIN_WIDTH: u16 = 80;
+/// Minimum terminal width for the full 3-column Miller layout. At
+/// `width < MIN_WIDTH` we collapse to the 2-column narrow path (rail +
+/// focused pane) so the three columns don't compress past readability.
+///
+/// **T3 breakpoints:** `< 70` = single column, `70–100` = 2 columns (rail +
+/// focused), `> 100` = 3 columns. The old threshold was 120 (Issue 2 fix);
+/// lowered to 101 so the 3-column layout kicks in at >100 cols where
+/// rail(4)+col1(24)+col2(28)+col3(45)=101 fits comfortably.
+pub const MIN_WIDTH: u16 = 101;
 pub const MIN_HEIGHT: u16 = 24;
 /// Below this the app refuses to render and shows a "terminal too small" message.
 pub const NARROW_MIN_WIDTH: u16 = 60;
 pub const NARROW_MIN_HEIGHT: u16 = 20;
+/// At or below this width the narrow path compresses to a single readable
+/// column (still via `render_narrow` — the rail + focused pane). This is the
+/// tmux-split floor; below `NARROW_MIN_WIDTH` we refuse to render entirely.
+pub const NARROW_SINGLE_COL_WIDTH: u16 = 70;
 
 /// Height of the persistent player bar at the bottom of the screen.
 const PLAYER_BAR_HEIGHT: u16 = 2;
-/// Height of the always-visible footer hint bar.
-const FOOTER_HEIGHT: u16 = 1;
+/// Height of the thin dim separator rule drawn above the player bar so it's
+/// visually distinct from the browse content. One line of chrome — the bar
+/// itself still gets exactly `PLAYER_BAR_HEIGHT` content rows. Suppressed at
+/// `width < 90` to reclaim 1 row for the browse area on narrow terminals.
+const BAR_SEPARATOR_HEIGHT: u16 = 1;
+/// Height of the always-visible footer. 2 lines (status + hints) when there's
+/// vertical room; 1 line (status + compact hints) at ≤24 rows so the browse
+/// area isn't squeezed on minimum-size terminals.
+const FOOTER_HEIGHT_WIDE: u16 = 2;
+const FOOTER_HEIGHT_NARROW: u16 = 1;
+
+/// Return the exact player-bar rectangle used by [`draw`] for `area`.
+/// Mouse input and overlays use this layout-owned contract instead of
+/// reconstructing bottom chrome with fixed row guesses.
+pub fn player_bar_area(area: Rect) -> Option<Rect> {
+    if area.width < NARROW_MIN_WIDTH || area.height < NARROW_MIN_HEIGHT {
+        return None;
+    }
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        return Some(Rect::new(
+            area.x,
+            area.bottom().saturating_sub(FOOTER_HEIGHT_NARROW + 1),
+            area.width,
+            1,
+        ));
+    }
+    let compact = area.height <= MIN_HEIGHT;
+    let footer_h = if compact {
+        FOOTER_HEIGHT_NARROW
+    } else {
+        FOOTER_HEIGHT_WIDE
+    };
+    let bar_h = if compact { 1 } else { PLAYER_BAR_HEIGHT };
+    Some(Rect::new(
+        area.x,
+        area.bottom().saturating_sub(footer_h + bar_h),
+        area.width,
+        bar_h,
+    ))
+}
+
+/// Main content bounds above the responsive player/footer chrome.
+pub fn overlay_content_area(area: Rect) -> Rect {
+    let separator_h = if area.width >= MIN_WIDTH && area.height >= MIN_HEIGHT && area.width >= 90 {
+        BAR_SEPARATOR_HEIGHT
+    } else {
+        0
+    };
+    let height = player_bar_area(area)
+        .map(|bar| bar.y.saturating_sub(area.y).saturating_sub(separator_h))
+        .unwrap_or(area.height);
+    Rect::new(area.x, area.y, area.width, height)
+}
 
 /// The single entry point the event loop calls. Renders the full TUI frame:
 /// too-small guard, columns + player bar + footer, and any active overlay on top.
@@ -52,9 +120,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // leave the Tracks column empty.
     app.clamp_cursors();
 
-    // Narrow terminals (60–80 cols, or < 24 rows) collapse the Miller columns
-    // to a single focused pane with a compressed 1-row player bar + short
-    // footer (spec §5.6) — usable in a tmux split.
+    // Narrow terminals (width ≤ 100, or height < 24) collapse the Miller
+    // columns to a 2-column "rail + focused pane" via `render_narrow` with a
+    // tab bar, compressed 1-row player bar + short footer — usable in a tmux
+    // split. At `width < 70` the collapse deepens to a single readable column.
+    //
+    // T3 breakpoints: <70 single col, 70–100 two cols, >100 three cols.
+    // The threshold is `< MIN_WIDTH` (101): width ≤ 100 stays narrow with the
+    // breadcrumb cue for off-screen panes; width > 100 restores the full
+    // 3-column Miller layout.
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_narrow(f, area, app);
         if app.overlay.is_some() {
@@ -63,49 +137,248 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Vertical split: main browse area gets the remainder; player bar gets a
-    // fixed 2-line strip; footer gets a fixed 1-line hint strip. At 80×24
-    // that's content 21 + bar 2 + footer 1.
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(PLAYER_BAR_HEIGHT),
-            Constraint::Length(FOOTER_HEIGHT),
-        ])
-        .split(area);
+    // T3: At height ≤ 24 (MIN_HEIGHT) the full layout collapses chrome to
+    // reclaim vertical space — no separate tab bar line (the breadcrumb lives
+    // in the column titles) + 1-row compact player bar instead of 2. This
+    // saves 2 rows for content: 5 chrome rows → 3. At height > 24 the full
+    // chrome is restored (tab bar + 2-row player bar + 2-row footer).
+    //
+    // At width < 90 the separator is suppressed (0 height) to reclaim 1
+    // row for the browse area on narrow terminals — the player bar's
+    // distinct styling provides enough visual separation.
+    let compact = area.height <= MIN_HEIGHT;
+    let footer_h = if compact {
+        FOOTER_HEIGHT_NARROW
+    } else {
+        FOOTER_HEIGHT_WIDE
+    };
+    let sep_h = if area.width >= 90 {
+        BAR_SEPARATOR_HEIGHT
+    } else {
+        0
+    };
 
-    columns::render(f, outer[0], app);
-    player_bar::render(f, outer[1], app);
-    footer::render(f, &outer[2], app);
+    if compact {
+        // ≤24 rows: no tab bar, 1-row compact player bar. Chrome = sep(1) +
+        // bar(1) + footer(1) = 3 rows. Content gets height-3 rows.
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(3),
+                Constraint::Length(sep_h),
+                Constraint::Length(1),
+                Constraint::Length(footer_h),
+            ])
+            .split(area);
+        columns::render(f, outer[0], app);
+        if sep_h > 0 {
+            render_separator_rule(f, outer[1], app);
+        }
+        player_bar::render_compact(f, outer[2], app);
+        footer::render(f, &outer[3], app);
+    } else {
+        // >24 rows: full chrome — tab bar(1) + sep(1) + bar(2) + footer(2).
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(sep_h),
+                Constraint::Length(PLAYER_BAR_HEIGHT),
+                Constraint::Length(footer_h),
+            ])
+            .split(area);
+        render_tab_bar(f, outer[0], app);
+        columns::render(f, outer[1], app);
+        if sep_h > 0 {
+            render_separator_rule(f, outer[2], app);
+        }
+        player_bar::render(f, outer[3], app);
+        footer::render(f, &outer[4], app);
+    }
 
     if app.overlay.is_some() {
         overlay::render(f, area, app);
     }
 }
 
-/// Narrow fallback: a single focused pane (Miller collapse — `h`/`l` drills
-/// in/out), a 1-row compressed player bar (info+flags share a row, no gauge),
-/// and a short 1-row footer. Below the columns we still render the rail so the
-/// view letters stay visible.
+/// Narrow fallback: a tab bar showing the available columns, a column
+/// breadcrumb + drill hint (so the user can see what other panes exist and
+/// how to reach them — Issue 3: at 80×24 the narrow path showed only one pane
+/// with no indication that Albums/Tracks columns existed), a single focused
+/// pane (Miller collapse — `h`/`l` drills in/out), a 1-row compressed player
+/// bar, and a short 1-row footer.
+///
+/// **Chrome budget (5 rows):** tab bar (1) · HR (1) · breadcrumb (1) · hint (1)
+/// · player bar (1) · footer (1). The column breadcrumb shows the Miller
+/// hierarchy with brackets around columns that aren't currently visible
+/// (only the focused column is shown in narrow mode), with the focused
+/// column highlighted. The drill hint tells the user which keys move between
+/// columns. Single-column views (Queue) skip the breadcrumb and hint rows.
 fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(1), // compressed player bar
-            Constraint::Length(1), // short footer
-        ])
-        .split(area);
+    let bc = narrow_column_breadcrumb(app);
+
+    let outer = if bc.is_some() {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),                    // tab bar (1 row)
+                Constraint::Length(1),                    // horizontal rule below tabs
+                Constraint::Length(1),                    // column breadcrumb
+                Constraint::Length(1),                    // drill-in/out hint
+                Constraint::Min(3),                       // browse area
+                Constraint::Length(1),                    // compressed player bar (1 row)
+                Constraint::Length(FOOTER_HEIGHT_NARROW), // footer (exactly 1 row)
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),                    // tab bar (1 row)
+                Constraint::Length(1),                    // horizontal rule below tabs
+                Constraint::Min(3),                       // browse area
+                Constraint::Length(1),                    // compressed player bar (1 row)
+                Constraint::Length(FOOTER_HEIGHT_NARROW), // footer (exactly 1 row)
+            ])
+            .split(area)
+    };
+
+    // Tab bar: shows the available columns for the current view with the
+    // focused one highlighted — gives the user context about what panes exist
+    // and which is active, even when only one pane is visible.
+    render_tab_bar(f, outer[0], app);
+
+    // Horizontal rule below the tab bar — visually separates the tab bar
+    // from the browse content so the tabs read as a distinct navigation bar,
+    // not just another row of text (Issue 3: at 80×24 the tabs blended into
+    // the content row below).
+    {
+        let theme = Theme::default();
+        let dim = Style::default().fg(if theme::no_color() {
+            Color::Reset
+        } else {
+            theme.dim
+        });
+        let rule = "─".repeat(outer[1].width as usize);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(rule, dim)))
+                .block(Block::default().borders(Borders::NONE)),
+            outer[1],
+        );
+    }
+
+    // Column breadcrumb + drill hint (multi-column views only). The
+    // breadcrumb shows the Miller hierarchy with brackets around panes that
+    // aren't visible in narrow mode; the hint tells the user how to drill
+    // in/out. Skipped for single-column views (Queue) to reclaim the 2 rows.
+    let mut idx = 2;
+    if let Some((cols, hint)) = bc {
+        render_narrow_breadcrumb(f, outer[idx], &cols);
+        idx += 1;
+        render_narrow_hint(f, outer[idx], hint);
+        idx += 1;
+    }
 
     // Single pane: render the focused column only via the columns module's
     // narrow path. The columns renderer already adapts to area.width; in a
     // narrow area it shows the focused column with a breadcrumb title.
-    columns::render_narrow(f, outer[0], app);
+    columns::render_narrow(f, outer[idx], app);
+    idx += 1;
 
     // Compressed 1-row player bar: now-playing + quality + flags on one line.
-    player_bar::render_compact(f, outer[1], app);
-    footer::render(f, &outer[2], app);
+    player_bar::render_compact(f, outer[idx], app);
+    idx += 1;
+    footer::render(f, &outer[idx], app);
+}
+
+/// Build the column-structure breadcrumb + drill hint for the narrow path
+/// (Issue 3). Returns `Some((cols, hint))` for multi-column views, where
+/// `cols` is a vec of `(label, is_active)` pairs representing the Miller
+/// column hierarchy — `is_active` marks the currently-focused (visible)
+/// column; the others are bracketed in the render to indicate they're not
+/// visible in narrow mode. `hint` is a one-line key hint for drilling in/out.
+/// Returns `None` for single-column views (Queue) where no breadcrumb is
+/// meaningful.
+fn narrow_column_breadcrumb(app: &App) -> Option<(Vec<(&'static str, bool)>, &'static str)> {
+    match app.view {
+        View::Artists => match app.focus_col {
+            0 => Some((
+                vec![("Artists", true), ("Albums", false), ("Tracks", false)],
+                "l → Albums · Enter → Tracks",
+            )),
+            1 => Some((
+                vec![("Artists", false), ("Albums", true), ("Tracks", false)],
+                "h ← Artists · l → Tracks",
+            )),
+            _ => Some((
+                vec![("Artists", false), ("Albums", false), ("Tracks", true)],
+                "h ← Albums",
+            )),
+        },
+        View::Playlists => match app.focus_col {
+            0 => Some((vec![("Playlists", true), ("Tracks", false)], "l → Tracks")),
+            _ => Some((
+                vec![("Playlists", false), ("Tracks", true)],
+                "h ← Playlists",
+            )),
+        },
+        View::Youtube => match app.focus_col {
+            0 => Some((vec![("YouTube", true), ("Tracks", false)], "l → Tracks")),
+            _ => Some((vec![("YouTube", false), ("Tracks", true)], "h ← YouTube")),
+        },
+        View::Queue => None,
+    }
+}
+
+/// Render the narrow column breadcrumb: the Miller column hierarchy with
+/// brackets around columns that aren't currently visible (only the focused
+/// column is shown in narrow mode). The active (focused) column is rendered
+/// with accent + BOLD; bracketed columns are dim. The `›` separator is a
+/// non-color structural cue (survives `NO_COLOR`), matching the wide-layout
+/// breadcrumb convention.
+fn render_narrow_breadcrumb(f: &mut Frame, area: Rect, cols: &[(&str, bool)]) {
+    let theme = Theme::default();
+    let nc = theme::no_color();
+    let dim = Style::default().fg(if nc { Color::Reset } else { theme.dim });
+    let active = Style::default()
+        .fg(if nc { Color::Reset } else { theme.accent })
+        .add_modifier(Modifier::BOLD);
+
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, (label, is_active)) in cols.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" › ", dim));
+        }
+        if *is_active {
+            spans.push(Span::styled(*label, active));
+        } else {
+            spans.push(Span::styled(format!("[{label}]"), dim));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans).alignment(Alignment::Center))
+            .block(Block::default().borders(Borders::NONE)),
+        area,
+    );
+}
+
+/// Render the drill-in/out hint line below the column breadcrumb. A dim,
+/// centered one-liner telling the user which keys move between the columns
+/// shown in the breadcrumb (e.g. `l → Albums · Enter → Tracks`).
+fn render_narrow_hint(f: &mut Frame, area: Rect, hint: &str) {
+    let theme = Theme::default();
+    let dim = Style::default().fg(if theme::no_color() {
+        Color::Reset
+    } else {
+        theme.dim
+    });
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint.to_string(), dim)))
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::NONE)),
+        area,
+    );
 }
 
 /// Render a centered "terminal too small" message and nothing else. The user
@@ -118,4 +391,162 @@ fn render_too_small(f: &mut Frame, area: Rect) {
         .style(Style::default().fg(Color::Yellow))
         .block(Block::default().borders(Borders::NONE));
     f.render_widget(paragraph, area);
+}
+
+// ---------------------------------------------------------------------------
+// Separator rule (full layout) + tab bar with breadcrumb (top bar)
+// ---------------------------------------------------------------------------
+
+/// The thin dim rule drawn directly above the player bar — a plain visual
+/// separator between the browse content and the player bar. The breadcrumb
+/// path now lives in the top tab bar ([`render_tab_bar`]) so the user sees
+/// their location at a glance at the top of the screen (T4); this rule just
+/// marks the boundary above the player bar.
+///
+/// Suppressed at `width < 90` to reclaim 1 row for the browse area on narrow
+/// terminals (see [`draw`]); the narrow path has its own HR below the top bar.
+fn render_separator_rule(f: &mut Frame, area: Rect, _app: &App) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let theme = Theme::default();
+    let dim = Style::default().fg(if theme::no_color() {
+        Color::Reset
+    } else {
+        theme.dim
+    });
+    let rule = "─".repeat(area.width as usize);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(rule, dim)))
+            .block(Block::default().borders(Borders::NONE)),
+        area,
+    );
+}
+
+/// Build a breadcrumb string for the current navigation context. Shows the
+/// path from the view root down to the current selection depth, so the user
+/// always knows where they are in the hierarchy (GLM: no-breadcrumbs).
+///
+/// - Artists view: `Artists › {artist} › {album}` (depth follows `focus_col`)
+/// - Playlists view: `Playlists › {playlist}`
+/// - Queue view: `Queue`
+/// - YouTube view: `YouTube › {list}`
+///
+/// The `›` separator is a non-color structural cue (survives `NO_COLOR`).
+fn breadcrumb(app: &App) -> String {
+    let sep = " › ";
+    match app.view {
+        View::Artists => {
+            let mut parts: Vec<String> = vec!["Artists".to_string()];
+            if app.focus_col >= 1 {
+                if let Some(artist) = app.artists.get(app.cursors.artist) {
+                    parts.push(artist.clone());
+                }
+            }
+            if app.focus_col >= 2 {
+                if let Some(artist) = app.artists.get(app.cursors.artist) {
+                    if let Some(albums) = app.albums_by_artist.get(artist) {
+                        if let Some(album) = albums.get(app.cursors.album) {
+                            parts.push(album.title.clone());
+                        }
+                    }
+                }
+            }
+            parts.join(sep)
+        }
+        View::Playlists => {
+            let mut parts: Vec<String> = vec!["Playlists".to_string()];
+            if app.focus_col >= 1 {
+                if let Some(pl) = app.playlists.get(app.cursors.playlist) {
+                    parts.push(pl.name.clone());
+                }
+            }
+            parts.join(sep)
+        }
+        View::Queue => "Queue".to_string(),
+        View::Youtube => {
+            let mut parts: Vec<String> = vec!["YouTube".to_string()];
+            if app.focus_col >= 1 {
+                if let Some(list) = app.yt_lists.get(app.cursors.playlist) {
+                    parts.push(list.name.clone());
+                }
+            }
+            parts.join(sep)
+        }
+    }
+}
+
+/// Top bar: shows the four top-level views as tabs separated by `│`, with
+/// the active view highlighted (accent + BOLD + REVERSED), AND the current
+/// navigation breadcrumb right-aligned on the same row (T3 + T4). This gives
+/// the user view-switch context + key hints (the `1`–`4` prefix matches the
+/// actual view-switch keys) AND their location in the hierarchy — both at
+/// the top of the screen, at all widths ≥ 80 (T3: previously the wide layout
+/// had no top tab bar; T4: previously the breadcrumb was buried in the
+/// separator above the player bar).
+///
+/// Tabs: `1:Artists │ 2:Playlists │ 3:Queue │ 4:YouTube`
+/// Breadcrumb (right-aligned): `Artists › 40mP › Cosmic` (built by
+/// [`breadcrumb`]). Dropped when the remaining width is too narrow for it
+/// to fit cleanly so the tabs never get crowded out.
+///
+/// The active tab uses accent + BOLD + REVERSED (three non-color cues under
+/// `NO_COLOR` — bold weight + reverse video survive monochrome); inactive
+/// tabs are dim. The `│` separator is dim so the tabs read as a connected
+/// bar, not disconnected labels.
+fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let theme = Theme::default();
+    let nc = theme::no_color();
+    let dim = Style::default().fg(if nc { Color::Reset } else { theme.dim });
+    let active = Style::default()
+        .fg(if nc { Color::Reset } else { theme.accent })
+        .add_modifier(Modifier::BOLD)
+        .add_modifier(Modifier::REVERSED);
+    let text = Style::default().fg(if nc { Color::Reset } else { theme.text });
+
+    // View-switch tabs — the `N:` prefix matches the actual view-switch keys
+    // (1=Artists, 2=Playlists, 3=Queue, 4=YouTube). The full "YouTube" label is
+    // used so the tab name matches the view name exactly (T3: previously
+    // abbreviated to "YT" which was ambiguous).
+    let tabs: [(&str, View); 4] = [
+        ("1:Artists", View::Artists),
+        ("2:Playlists", View::Playlists),
+        ("3:Queue", View::Queue),
+        ("4:YouTube", View::Youtube),
+    ];
+
+    let sep = " │ ";
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut tabs_w: usize = 0;
+    for (i, (label, view)) in tabs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(sep, dim));
+            tabs_w += theme::disp_width(sep);
+        }
+        let style = if app.view == *view { active } else { dim };
+        spans.push(Span::styled((*label).to_string(), style));
+        tabs_w += theme::disp_width(label);
+    }
+
+    // Breadcrumb right-aligned: `Artists › 40mP › Cosmic`. Only render when
+    // there's room (tabs + 2-space gap + breadcrumb ≤ width) so the tabs
+    // never get crowded out on narrower widths. At 80 cols the tabs (~38
+    // cols) + a short breadcrumb fit comfortably.
+    let bc = breadcrumb(app);
+    let bc_w = theme::disp_width(&bc);
+    let gap = 2usize;
+    if !bc.is_empty() && tabs_w + gap + bc_w <= area.width as usize {
+        let spaces = area.width as usize - tabs_w - bc_w;
+        spans.push(Span::raw(" ".repeat(spaces)));
+        spans.push(Span::styled(bc, text));
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans).alignment(Alignment::Left))
+            .block(Block::default().borders(Borders::NONE)),
+        area,
+    );
 }

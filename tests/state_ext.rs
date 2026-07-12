@@ -24,14 +24,16 @@ fn layout_round_trips() {
     };
     save_layout_at(
         &path,
-        "playlists",
-        &widths,
-        42,
-        ShuffleMode::Smart,
-        RepeatMode::One,
-        ContinueMode::Radio,
-        jukebox::mode::SourceMode::Mixed,
-        "chrome",
+        &LayoutSave {
+            focus: "playlists",
+            widths: &widths,
+            volume: 42,
+            shuffle: ShuffleMode::Smart,
+            repeat: RepeatMode::One,
+            continue_mode: ContinueMode::Radio,
+            source_mode: jukebox::mode::SourceMode::Mixed,
+            yt_browser: "chrome",
+        },
     )
     .unwrap();
     let loaded = load_layout_at(&path).unwrap();
@@ -62,8 +64,5 @@ fn playlists_round_trip() {
     let loaded = load_playlists_at(&path).unwrap();
     assert_eq!(loaded.len(), 2);
     assert_eq!(loaded[0].name, "Faves");
-    assert_eq!(
-        loaded[0].track_ids,
-        vec!["a".to_string(), "b".to_string()]
-    );
+    assert_eq!(loaded[0].track_ids, vec!["a".to_string(), "b".to_string()]);
 }

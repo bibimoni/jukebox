@@ -15,6 +15,33 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 
+/// Open a `Stdio` for the sidecar's stderr that captures it to a bounded log
+/// file (`~/.cache/jukebox/sidecar.log`) instead of discarding it. The log is
+/// truncated at 1 MiB before each spawn so it can't grow unbounded across
+/// sessions (one-level rotation like `jukebox.log`). Falls back to
+/// `Stdio::null()` if the cache dir isn't available or the file can't be
+/// opened — never blocks spawn. AC-M5.3.1.
+fn sidecar_stderr() -> Result<Stdio> {
+    let Some(cache) = dirs::cache_dir() else {
+        return Ok(Stdio::null());
+    };
+    let log_dir = cache.join("jukebox");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let path = log_dir.join("sidecar.log");
+    // Bounded: truncate if the previous session left a >1 MiB file.
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 1024 * 1024 {
+            let _ = std::fs::write(&path, b"");
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| anyhow!("opening sidecar log {path:?}: {e}"))?;
+    Ok(Stdio::from(file))
+}
+
 pub struct Sidecar {
     child: Child,
     stdin: std::process::ChildStdin,
@@ -40,7 +67,7 @@ impl Sidecar {
     ///   sidecar read cookies from that browser's profile (yt-dlp's
     ///   `--cookies-from-browser` + browser_cookie3 for ytmusicapi). No cookie
     ///   file is written; values never leave the browser.
-    /// Both `None` → guest mode.
+    ///   Both `None` → guest mode.
     pub fn spawn(
         python: &Path,
         script: &Path,
@@ -52,19 +79,36 @@ impl Sidecar {
         cmd.arg(script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(sidecar_stderr()?)
             .env("JUKEBOX_YT_COOKIES", cookies.clone().unwrap_or_default())
             .env("JUKEBOX_YT_BROWSER", browser.clone().unwrap_or_default())
             .env(
                 "JUKEBOX_YT_COOKIES_FILE",
                 cookies_file.clone().unwrap_or_default(),
             );
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawning sidecar {} {}", python.display(), script.display()))?;
-        let stdin = child.stdin.take().expect("stdin piped");
-        let stdout = child.stdout.take().expect("stdout piped");
-        let (tx, rx) = mpsc::channel::<String>();
+        let mut child = cmd.spawn().with_context(|| {
+            format!("spawning sidecar {} {}", python.display(), script.display())
+        })?;
+        // Take stdin/stdout; if either is missing (fd exhaustion under tight
+        // ulimits), kill the child and return an error instead of panicking —
+        // the caller can degrade to guest mode.
+        let stdin = match child.stdin.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("sidecar stdin pipe unavailable (fd exhaustion?)"));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("sidecar stdout pipe unavailable (fd exhaustion?)"));
+            }
+        };
+        let (tx, rx) = mpsc::sync_channel::<String>(64);
         let reader = std::thread::spawn(move || {
             let mut r = BufReader::new(stdout);
             let mut line = String::new();
@@ -74,10 +118,8 @@ impl Sidecar {
                     Ok(0) => break, // EOF — child closed stdout
                     Ok(_) => {
                         let l = line.trim().to_string();
-                        if !l.is_empty() {
-                            if tx.send(l).is_err() {
-                                break; // receiver dropped
-                            }
+                        if !l.is_empty() && tx.send(l).is_err() {
+                            break; // receiver dropped
                         }
                     }
                     Err(_) => break,
@@ -126,7 +168,13 @@ impl Sidecar {
     pub fn respawn(&mut self) -> Result<()> {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let new = Sidecar::spawn(&self.python, &self.script, self.cookies.clone(), self.browser.clone(), self.cookies_file.clone())?;
+        let new = Sidecar::spawn(
+            &self.python,
+            &self.script,
+            self.cookies.clone(),
+            self.browser.clone(),
+            self.cookies_file.clone(),
+        )?;
         *self = new;
         Ok(())
     }

@@ -30,17 +30,23 @@ pub trait Player {
     /// (afplay has no IPC) return Ok(()) without doing anything, matching the
     /// existing `seek` no-op pattern on afplay. mpv implements this for real
     /// via the `volume` property.
-    fn set_volume(&mut self, _vol: u8) -> Result<()> { Ok(()) }
+    fn set_volume(&mut self, _vol: u8) -> Result<()> {
+        Ok(())
+    }
     /// Mute/unmute. Best-effort like `set_volume`. mpv mutes via the `mute`
     /// property; the default is a no-op so afplay/stub stay consistent.
-    fn set_muted(&mut self, _muted: bool) -> Result<()> { Ok(()) }
+    fn set_muted(&mut self, _muted: bool) -> Result<()> {
+        Ok(())
+    }
     fn position(&self) -> Option<f64>;
     fn duration(&self) -> Option<f64>;
     fn is_playing(&self) -> bool;
     /// True when the current track has finished playing on its own (mpv
     /// end-file with reason "eof", or afplay child exited). The TUI polls
     /// this each loop tick to auto-advance the queue. Default: no detection.
-    fn track_ended(&mut self) -> bool { false }
+    fn track_ended(&mut self) -> bool {
+        false
+    }
 }
 
 // ---------- Stub (tests / dry-run) ----------
@@ -52,23 +58,51 @@ pub struct StubPlayer {
     dur: f64,
 }
 impl StubPlayer {
-    pub fn loaded(&self) -> Option<std::path::PathBuf> { self.loaded.clone() }
+    pub fn loaded(&self) -> Option<std::path::PathBuf> {
+        self.loaded.clone()
+    }
 }
 impl Player for StubPlayer {
-    fn load(&mut self, path: &Path) -> Result<()> { self.loaded = Some(path.to_path_buf()); self.playing = true; self.pos = 0.0; self.dur = 180.0; Ok(()) }
-    fn play_pause(&mut self) -> Result<()> { self.playing = !self.playing; Ok(()) }
-    fn seek(&mut self, secs: f64) -> Result<()> { self.pos = (self.pos + secs).max(0.0).min(self.dur); Ok(()) }
-    fn stop(&mut self) -> Result<()> { self.playing = false; Ok(()) }
-    fn position(&self) -> Option<f64> { Some(self.pos) }
-    fn duration(&self) -> Option<f64> { Some(self.dur) }
-    fn is_playing(&self) -> bool { self.playing }
+    fn load(&mut self, path: &Path) -> Result<()> {
+        self.loaded = Some(path.to_path_buf());
+        self.playing = true;
+        self.pos = 0.0;
+        self.dur = 180.0;
+        Ok(())
+    }
+    fn play_pause(&mut self) -> Result<()> {
+        self.playing = !self.playing;
+        Ok(())
+    }
+    fn seek(&mut self, secs: f64) -> Result<()> {
+        self.pos = (self.pos + secs).max(0.0).min(self.dur);
+        Ok(())
+    }
+    fn stop(&mut self) -> Result<()> {
+        self.playing = false;
+        Ok(())
+    }
+    fn position(&self) -> Option<f64> {
+        Some(self.pos)
+    }
+    fn duration(&self) -> Option<f64> {
+        Some(self.dur)
+    }
+    fn is_playing(&self) -> bool {
+        self.playing
+    }
 }
 
 // ---------- afplay fallback (per-track, no seek) ----------
 #[derive(Default)]
-pub struct AfplayPlayer { child: Option<RefCell<Child>>, paused: bool }
+pub struct AfplayPlayer {
+    child: Option<RefCell<Child>>,
+    paused: bool,
+}
 impl AfplayPlayer {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Kill + reap the current child (if any). Dropping a `Child` on Unix
     /// does NOT kill the process — it only orphans it, leaving afplay playing
@@ -78,7 +112,7 @@ impl AfplayPlayer {
         if let Some(c) = self.child.take() {
             let mut child = c.into_inner();
             let _ = child.kill();
-            let _ = child.wait();   // reap to avoid a zombie
+            let _ = child.wait(); // reap to avoid a zombie
         }
         self.paused = false;
     }
@@ -90,14 +124,15 @@ impl AfplayPlayer {
         if let Some(c) = self.child.as_ref() {
             let pid = c.borrow().id() as i32;
             if pid > 0 {
-                unsafe { libc::kill(pid, sig); }
+                unsafe {
+                    libc::kill(pid, sig);
+                }
             }
         }
     }
 
     #[cfg(not(unix))]
     fn signal_child(&self, _sig: i32) {}
-
 }
 impl Player for AfplayPlayer {
     fn load(&mut self, path: &Path) -> Result<()> {
@@ -107,7 +142,9 @@ impl Player for AfplayPlayer {
         self.kill_current();
         let child = Command::new("afplay")
             .arg(path)
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()?;
         self.child = Some(RefCell::new(child));
         self.paused = false;
@@ -131,20 +168,31 @@ impl Player for AfplayPlayer {
             }
         }
         #[cfg(not(unix))]
-        { let _ = self; }
+        {
+            let _ = self;
+        }
         Ok(())
     }
-    fn seek(&mut self, _secs: f64) -> Result<()> { Ok(()) }
+    fn seek(&mut self, _secs: f64) -> Result<()> {
+        Ok(())
+    }
     fn stop(&mut self) -> Result<()> {
         self.kill_current();
         Ok(())
     }
-    fn position(&self) -> Option<f64> { None }
-    fn duration(&self) -> Option<f64> { None }
+    fn position(&self) -> Option<f64> {
+        None
+    }
+    fn duration(&self) -> Option<f64> {
+        None
+    }
     fn is_playing(&self) -> bool {
         // `Child::try_wait` needs `&mut`, so the child is wrapped in a RefCell
         // to allow this read probe through the trait's `&self` signature.
-        self.child.as_ref().map(|c| c.borrow_mut().try_wait().ok().flatten().is_none()).unwrap_or(false)
+        self.child
+            .as_ref()
+            .map(|c| c.borrow_mut().try_wait().ok().flatten().is_none())
+            .unwrap_or(false)
     }
     fn track_ended(&mut self) -> bool {
         // afplay exits when the track finishes. If the child is present and
@@ -152,7 +200,9 @@ impl Player for AfplayPlayer {
         // child out (None), so a manual stop won't fire this.
         if let Some(c) = self.child.as_ref() {
             if c.borrow_mut().try_wait().ok().flatten().is_some() {
-                if let Some(c) = self.child.take() { let _ = c.into_inner().wait(); }
+                if let Some(c) = self.child.take() {
+                    let _ = c.into_inner().wait();
+                }
                 self.paused = false;
                 return true;
             }
@@ -196,13 +246,22 @@ impl MpvPlayer {
         // turn broke pause and stacked orphaned afplay processes on rapid
         // loads.)
         let mut child = Command::new("mpv")
-            .args(["--no-video", "--no-terminal", "--idle", "--gapless-audio=yes"])
+            .args([
+                "--no-video",
+                "--no-terminal",
+                "--idle",
+                "--gapless-audio=yes",
+            ])
             .arg(format!("--input-ipc-server={}", socket.display()))
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()?;
         // wait for socket to appear (up to 2s)
         for _ in 0..20 {
-            if socket.exists() { break; }
+            if socket.exists() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let conn = std::os::unix::net::UnixStream::connect(socket).ok();
@@ -233,7 +292,10 @@ impl MpvPlayer {
                 // and surface an error so `launch` falls back to AfplayPlayer.
                 let _ = child.kill();
                 let _ = child.wait();
-                Err(anyhow!("mpv ipc socket unavailable at {}", socket.display()))
+                Err(anyhow!(
+                    "mpv ipc socket unavailable at {}",
+                    socket.display()
+                ))
             }
         }
     }
@@ -326,20 +388,28 @@ impl Player for MpvPlayer {
         let _ = self.send(&["quit".into()]);
         let mut child = self.child.borrow_mut();
         let _ = child.kill();
-        let _ = child.wait();   // reap to avoid a zombie
+        let _ = child.wait(); // reap to avoid a zombie
         Ok(())
     }
-    fn position(&self) -> Option<f64> { self.position }
-    fn duration(&self) -> Option<f64> { self.duration }
-    fn is_playing(&self) -> bool { self.child.borrow_mut().try_wait().ok().flatten().is_none() }
+    fn position(&self) -> Option<f64> {
+        self.position
+    }
+    fn duration(&self) -> Option<f64> {
+        self.duration
+    }
+    fn is_playing(&self) -> bool {
+        self.child.borrow_mut().try_wait().ok().flatten().is_none()
+    }
     fn track_ended(&mut self) -> bool {
         use std::io::Read;
-        let Some(c) = self.conn.as_mut() else { return false };
+        let Some(c) = self.conn.as_mut() else {
+            return false;
+        };
         let mut tmp = [0u8; 8192];
         let mut ended = false;
         loop {
             match c.read(&mut tmp) {
-                Ok(0) => break,        // socket closed (mpv quit)
+                Ok(0) => break, // socket closed (mpv quit)
                 Ok(n) => {
                     // Accumulate and process complete newline-delimited JSON
                     // lines. A single read can span multiple events or split
@@ -347,16 +417,24 @@ impl Player for MpvPlayer {
                     self.line_buf.push_str(&String::from_utf8_lossy(&tmp[..n]));
                     while let Some(idx) = self.line_buf.find('\n') {
                         let line: String = self.line_buf.drain(..=idx).collect();
-                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-                        let Some(ev) = v.get("event").and_then(|e| e.as_str()) else { continue };
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                            continue;
+                        };
+                        let Some(ev) = v.get("event").and_then(|e| e.as_str()) else {
+                            continue;
+                        };
                         match ev {
                             // property-change: update cached time-pos / duration.
                             "property-change" => {
                                 let name = v.get("name").and_then(|n| n.as_str());
                                 let data = v.get("data");
                                 match name {
-                                    Some("time-pos") => self.position = data.and_then(|d| d.as_f64()),
-                                    Some("duration") => self.duration = data.and_then(|d| d.as_f64()),
+                                    Some("time-pos") => {
+                                        self.position = data.and_then(|d| d.as_f64())
+                                    }
+                                    Some("duration") => {
+                                        self.duration = data.and_then(|d| d.as_f64())
+                                    }
                                     _ => {}
                                 }
                             }
@@ -364,7 +442,9 @@ impl Player for MpvPlayer {
                             // naturally. "redirect" (replaced by loadfile) and
                             // "stop"/"quit" are ignored so manual skips don't
                             // double-advance the queue.
-                            "end-file" if v.get("reason").and_then(|r| r.as_str()) == Some("eof") => {
+                            "end-file"
+                                if v.get("reason").and_then(|r| r.as_str()) == Some("eof") =>
+                            {
                                 ended = true;
                             }
                             _ => {}
@@ -382,7 +462,7 @@ impl Drop for MpvPlayer {
     fn drop(&mut self) {
         let mut child = self.child.borrow_mut();
         let _ = child.kill();
-        let _ = child.wait();   // reap to avoid a zombie
+        let _ = child.wait(); // reap to avoid a zombie
         let _ = std::fs::remove_file(&self.sock);
     }
 }

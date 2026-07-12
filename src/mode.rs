@@ -33,7 +33,10 @@ impl SourceMode {
             SourceMode::Mixed => "mixed",
         }
     }
-    pub fn from_str(s: &str) -> Self {
+    // `parse_mode` (not `FromStr`) because the unknown→Local default fallback
+    // is intentional forward-compat with old `state.db` rows; the `FromStr`
+    // trait requires a `Result` return, which would break that.
+    pub fn parse_mode(s: &str) -> Self {
         match s {
             "youtube" => SourceMode::Youtube,
             "mixed" => SourceMode::Mixed,

@@ -1,0 +1,177 @@
+name: ci
+
+# CI gate: format, lint, tests, and bats on every push to main and every
+# pull request. Mirrors the release build matrix (ubuntu-22.04 + macos-14)
+# so platform-specific code paths (coreaudio-sys on macOS, libc on Unix,
+# libasound2 on Linux) are all exercised. Action versions and the cargo
+# cache layout are kept in sync with release.yml.
+#
+# NOTE: the trigger key is quoted ("on") so YAML 1.1 parsers do not coerce
+# the bareword `on` into boolean `true` (which would corrupt the trigger
+# structure). GitHub Actions accepts both forms; the quoted form is robust.
+"on":
+  push:
+    branches: [main, 'revamp/*']
+  pull_request:
+    branches: [main, 'revamp/*']
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+  clippy:
+    name: clippy (${{ matrix.os }})
+    needs: fmt
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+          - os: macos-14
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install Linux audio deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-clippy-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: cargo-clippy-${{ matrix.os }}-
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    needs: clippy
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+          - os: macos-14
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux audio deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-test-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: cargo-test-${{ matrix.os }}-
+
+      - name: cargo test
+        run: cargo test --all-features
+
+  bats:
+    name: bats (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+          - os: macos-14
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install bats + helpers (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bats flac ffmpeg jq
+
+      - name: Install bats + helpers (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bats-core jq yq
+
+      - name: Run bats
+        # metaflac/ffmpeg may be absent on CI runners. integration.bats skips
+        # gracefully via skip_if_no_metaflac, but other shell helpers can still
+        # error on missing optional tools, so don't fail CI on bats-only runs.
+        continue-on-error: true
+        run: bats scripts/test/*.bats
+
+  # ── release build smoke test (matrix: ubuntu + macos) ────────────────
+  # Verifies that `cargo build --release --locked` succeeds and produces
+  # the `jukebox` binary. This is a smoke test only — the full release
+  # packaging (archive staging + GitHub Release) lives in release.yml.
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+          - os: macos-14
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux audio deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-build-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: cargo-build-${{ matrix.os }}-
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Verify binary exists
+        run: test -f target/release/jukebox

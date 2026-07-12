@@ -1,6 +1,7 @@
-pub mod theme;
-pub mod layout;
 pub mod columns;
+pub mod diagnostics;
 pub mod footer;
-pub mod player_bar;
+pub mod layout;
 pub mod overlay;
+pub mod player_bar;
+pub mod theme;
