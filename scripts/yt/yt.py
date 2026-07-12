@@ -387,13 +387,15 @@ def handle(cmd, arg, ytm):
         res = ytm.search(arg.get("q", ""), filter="songs", limit=arg.get("limit", 25))
         return {"search": [_track(r) for r in res]}
     if cmd == "library_playlists":
-        # Full pagination: limit=None makes ytmusicapi loop through all
-        # continuation pages internally, so a user with >25 library playlists
-        # sees ALL of them (not just the first 25). On failure (both the
-        # primary path and the get_library fallback raise), re-raise so main()
-        # returns {"ok": false, "error": "..."} — distinguishing a genuinely
-        # empty library (Ok([])) from a failed fetch (Err). Previously both
-        # paths were swallowed into [] (yt-recon §5), making empty == failed.
+        # Load the first 50 library playlists (2 pages, ~1-2s). The previous
+        # limit=None made ytmusicapi loop through ALL continuation pages for
+        # users with >25 playlists, which blocked the single-threaded sidecar
+        # for 10-30s+ — the "stuck on syncing" bug. The first 50 cover the
+        # vast majority of users; larger libraries load their first 50
+        # instantly and the user can browse them immediately. On failure (both
+        # the primary path and the get_library fallback raise), re-raise so
+        # main() returns {"ok": false, "error": "..."} — distinguishing a
+        # genuinely empty library (Ok([])) from a failed fetch (Err).
         #
         # The fallback (get_library) stays because ytmusicapi's
         # get_library_playlists can raise on an intermittent alternate browse
@@ -401,13 +403,17 @@ def handle(cmd, arg, ytm):
         # expect — an account/region-dependent response. get_library uses a
         # more tolerant path.
         try:
-            ps = ytm.get_library_playlists(limit=None)
+            ps = ytm.get_library_playlists(limit=50)
         except Exception:  # noqa: BLE001
             # Fallback: get_library returns mixed sections; keep only entries
             # that look like playlists (have a playlistId). If THIS also
-            # fails, let the exception propagate so the caller sees a real
-            # error instead of a silent empty list.
-            lib = ytm.get_library()
+            # fails (or doesn't exist in the installed ytmusicapi version),
+            # let the exception propagate so the caller sees a real error
+            # instead of a silent empty list.
+            if hasattr(ytm, "get_library"):
+                lib = ytm.get_library()
+            else:
+                raise
             if isinstance(lib, dict):
                 lib = lib.get("items", lib)
             ps = [
@@ -419,19 +425,40 @@ def handle(cmd, arg, ytm):
             for p in ps
         ]}
     if cmd == "get_playlist":
-        # Full pagination: limit=None makes ytmusicapi loop through all
-        # continuation pages internally, so a playlist with >100 tracks
-        # returns ALL of them (not just the first 100). On failure the
-        # exception propagates to main() which returns {"ok": false, ...}.
-        p = ytm.get_playlist(arg.get("id", ""), limit=None)
+        # Load the first 100 tracks (one page, ~1-2s). The previous limit=None
+        # made ytmusicapi loop through ALL continuation pages for large
+        # playlists, which blocked the single-threaded sidecar for 10-30s+
+        # and queued every subsequent request behind it — the "forever
+        # loading" bug. The first 100 tracks cover the vast majority of
+        # playlists; larger playlists load their first 100 instantly and
+        # the user can browse them immediately. On failure the exception
+        # propagates to main() which returns {"ok": false, ...}.
+        p = ytm.get_playlist(arg.get("id", ""), limit=100)
         return {"tracks": [_track(t) for t in p.get("tracks", [])]}
     if cmd == "home_suggestions":
-        out = []
-        for sec in ytm.get_home():
-            for it in sec.get("contents", []):
-                if "playlistId" in it:
-                    out.append({"id": it["playlistId"], "name": it.get("title", ""), "count": 0})
-        return {"suggestions": out}
+        # NOTE: home_suggestions is no longer sent by send_refresh (it was
+        # removed because get_home() can hang in guest mode, blocking the
+        # single-threaded sidecar). This handler stays for the `S` discover
+        # overlay, which sends it on explicit user action. The timeout guard
+        # prevents a hang: if get_home() doesn't return in 5s, we return an
+        # empty list instead of blocking the sidecar forever.
+        import signal as _sig
+        def _timeout_handler(signum, frame):
+            raise TimeoutError("get_home() timed out after 5s")
+        _old_handler = _sig.signal(_sig.SIGALRM, _timeout_handler)
+        _sig.alarm(5)
+        try:
+            out = []
+            for sec in ytm.get_home():
+                for it in sec.get("contents", []):
+                    if "playlistId" in it:
+                        out.append({"id": it["playlistId"], "name": it.get("title", ""), "count": 0})
+            return {"suggestions": out}
+        except TimeoutError:
+            return {"suggestions": []}
+        finally:
+            _sig.alarm(0)
+            _sig.signal(_sig.SIGALRM, _old_handler)
     if cmd == "get_watch_playlist":
         res = ytm.get_watch_playlist(videoId=arg.get("video_id", ""), radio=True)
         return {"watch_playlist": [_track(t) for t in res.get("tracks", [])]}

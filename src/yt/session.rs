@@ -282,12 +282,24 @@ pub struct Session {
     /// Lists fetched async by `send_refresh`, picked up by `App::on_tick`.
     pub pending_playlists: Option<Vec<crate::yt::proto::PlaylistSummary>>,
     pub pending_suggestions: Option<Vec<crate::yt::proto::PlaylistSummary>>,
-    /// `(list_id, video_ids)` from a fire-and-forget `send_get_playlist`,
-    /// picked up by `App::on_tick` to populate the focused `YtList.track_ids`.
-    pub pending_tracks: Option<(String, Vec<String>)>,
-    /// The list id whose tracks are currently being fetched (guards against
-    /// re-sending every tick while the fetch is in flight).
-    playlist_inflight: Option<String>,
+    /// `(list_id, video_ids)` pairs from fire-and-forget `send_get_playlist`
+    /// calls, picked up by `App::on_tick` to populate the focused
+    /// `YtList.track_ids`. A Vec (not a single `Option`) so multiple
+    /// get_playlist responses landing in the same `drain_paired` cycle (user
+    /// switched A→B rapidly) don't OVERWRITE each other — the old single-slot
+    /// design lost PL_A's tracks when PL_B's response landed second in the
+    /// same drain, leaving PL_A with wrong/empty tracks forever.
+    pub pending_tracks: Vec<(String, Vec<String>)>,
+    /// The list ids whose tracks are currently being fetched (guards against
+    /// re-sending every tick while the fetch is in flight). A HashSet (not a
+    /// single `Option<String>`) so switching from playlist A to B while A's
+    /// fetch is in flight doesn't clear A's guard — the single-slot design
+    /// cleared `playlist_inflight = None` when A's response landed, making
+    /// on_tick think B (still in flight) was idle → it fired a DUPLICATE
+    /// `send_get_playlist(B)`. The cascading duplicates flooded the sequential
+    /// sidecar, and the user's currently-focused playlist sat at the back of
+    /// the queue behind redundant fetches → "Loading…" forever.
+    playlist_inflight: std::collections::HashSet<String>,
     /// `(query, video_ids)` from a fire-and-forget `send_search`, picked up by
     /// `App::on_tick` to populate the search overlay's results. Carries the
     /// query so App only applies it to the overlay that asked for it.
@@ -348,6 +360,17 @@ pub struct Session {
     /// on spawn (bad cookies, missing deps) doesn't get respawned every tick.
     pub respawn_attempts: u32,
     last_respawn: Option<Instant>,
+    /// Video_ids whose metadata must NOT be evicted from `track_cache` — the
+    /// focused loaded playlist's `track_ids`. Without this, browsing enough
+    /// playlists fills the 256-entry cache and `evict_track_cache` removes the
+    /// oldest non-playing entry, which can be a track STILL REFERENCED by a
+    /// loaded playlist's `track_ids`. The view then renders that row as
+    /// "Loading…" forever: `track_for(id)` returns `None` (evicted), but the
+    /// lazy-load guard (`!loaded`) prevents a re-fetch because the playlist is
+    /// already marked loaded. Pinning the focused playlist's tracks (kept in
+    /// sync by `App::on_tick` via `set_pinned_tracks`) makes `evict_track_cache`
+    /// skip them, exactly like it skips `url_cache` entries (playing/next).
+    pinned_tracks: std::collections::HashSet<String>,
 }
 
 /// Max auto-respawn attempts before giving up (surfacing `yt_error` instead).
@@ -384,8 +407,8 @@ impl Session {
             pending_premium_url: None,
             pending_playlists: None,
             pending_suggestions: None,
-            pending_tracks: None,
-            playlist_inflight: None,
+            pending_tracks: Vec::new(),
+            playlist_inflight: std::collections::HashSet::new(),
             pending_search: None,
             search_inflight: None,
             refresh_inflight: false,
@@ -400,6 +423,7 @@ impl Session {
             pending_errors: Vec::new(),
             respawn_attempts: 0,
             last_respawn: None,
+            pinned_tracks: std::collections::HashSet::new(),
         })
     }
 
@@ -430,8 +454,8 @@ impl Session {
             pending_premium_url: None,
             pending_playlists: None,
             pending_suggestions: None,
-            pending_tracks: None,
-            playlist_inflight: None,
+            pending_tracks: Vec::new(),
+            playlist_inflight: std::collections::HashSet::new(),
             pending_search: None,
             search_inflight: None,
             refresh_inflight: false,
@@ -446,6 +470,7 @@ impl Session {
             pending_errors: Vec::new(),
             respawn_attempts: 0,
             last_respawn: None,
+            pinned_tracks: std::collections::HashSet::new(),
         })
     }
 
@@ -582,16 +607,17 @@ impl Session {
         self.track_cache.clear();
         self.track_cache_order.clear();
         self.url_cache.clear();
+        self.pinned_tracks.clear();
         self.pending_playlists = None;
         self.pending_suggestions = None;
-        self.pending_tracks = None;
+        self.pending_tracks.clear();
         self.pending_search = None;
         self.pending_premium_url = None;
         self.pending_lyrics = None;
         self.pending_discover = None;
         self.pending_watch = None;
         self.pending_errors.clear();
-        self.playlist_inflight = None;
+        self.playlist_inflight.clear();
         self.search_inflight = None;
         self.resolve_inflight = None;
         self.premium_resolve_inflight = None;
@@ -669,12 +695,15 @@ impl Session {
                 // Surface the resolved video_ids back to App so it can populate
                 // the matching `YtList.track_ids` (the Y view's col2 + Enter/s).
                 let vids: Vec<String> = v.iter().map(|t| t.video_id.clone()).collect();
-                self.pending_tracks = Some((id.clone(), vids));
-                // Free the inflight guard on SUCCESS (not just error) so a later
-                // refresh_yt_lists (which clears loaded_yt_lists) can re-fetch
-                // this list. Without this the guard stays Some(id) forever after
-                // the first successful load, wedging col2 on a re-focus.
-                self.playlist_inflight = None;
+                self.pending_tracks.push((id.clone(), vids));
+                // Free the inflight guard for THIS list only (not all lists).
+                // The old code set `playlist_inflight = None` (clearing the
+                // single slot), which also cleared the guard for any OTHER
+                // list whose fetch was still in flight — causing on_tick to
+                // fire a duplicate request for that other list. The HashSet
+                // design removes only this list's id, preserving other lists'
+                // guards.
+                self.playlist_inflight.remove(id.as_str());
             }
             (Response::WatchPlaylist(v), Pending::Watch) => {
                 for t in v {
@@ -825,8 +854,8 @@ impl Session {
                 }
                 self.set_error(ErrorScope::Other, e.clone());
             }
-            (Response::Error(e), Pending::Tracks(_)) => {
-                self.playlist_inflight = None;
+            (Response::Error(e), Pending::Tracks(id)) => {
+                self.playlist_inflight.remove(id.as_str());
                 self.set_error(ErrorScope::Other, e.clone());
             }
             (Response::Error(e), Pending::Resolve(_)) => {
@@ -913,21 +942,50 @@ impl Session {
     /// An entry whose stream URL is still in `url_cache` (the currently-playing
     /// or next-preload track) is re-queued to the back instead of dropped, so
     /// `now_playing_view` never loses the playing track's metadata mid-play.
-    /// The loop terminates: `url_cache` holds ≤ 2 protected entries, so once
-    /// `len > cap` there are `len - cap` non-protected entries to remove and
-    /// each non-protected iteration shrinks `len` by 1.
+    /// An entry in `pinned_tracks` (the focused playlist's `track_ids`, kept in
+    /// sync by `App::on_tick`) is likewise re-queued — without this, browsing
+    /// enough playlists evicts a track STILL REFERENCED by a loaded playlist's
+    /// `track_ids`, and the view renders that row as "Loading…" forever (the
+    /// lazy-load guard `!loaded` blocks a re-fetch). The loop terminates:
+    /// protected entries (≤ 2 url_cache + the focused playlist's tracks) are a
+    /// strict subset, so once `len > cap` there are `len - cap` non-protected
+    /// entries to remove and each non-protected iteration shrinks `len` by 1.
     fn evict_track_cache(&mut self) {
+        let mut protected_in_a_row = 0;
         while self.track_cache.len() > TRACK_CACHE_CAP {
             let Some(victim) = self.track_cache_order.pop_front() else {
                 break;
             };
-            if self.url_cache.iter().any(|c| c.video_id == victim) {
-                // Playing / next-preload: keep it, reconsider later.
+            if self.url_cache.iter().any(|c| c.video_id == victim)
+                || self.pinned_tracks.contains(&victim)
+            {
+                // Playing / next-preload / focused-playlist track: keep it,
+                // reconsider later.
                 self.track_cache_order.push_back(victim);
+                protected_in_a_row += 1;
+                // Full pass without an eviction → every entry in the deque is
+                // protected (e.g. the focused playlist has > cap tracks, all
+                // pinned). Break to avoid an infinite loop. The cache stays
+                // over the cap in this rare case, bounded by the focused
+                // playlist's (finite) track count — better than hanging the
+                // TUI on a 300-track list.
+                if protected_in_a_row >= self.track_cache_order.len() {
+                    break;
+                }
                 continue;
             }
+            protected_in_a_row = 0;
             self.track_cache.remove(&victim);
         }
+    }
+
+    /// Replace the pinned-track set with `ids` (the focused loaded playlist's
+    /// `track_ids`). Called by `App::on_tick` each tick before draining so the
+    /// eviction never drops a track the user is currently looking at. Passing
+    /// an empty set (no focused list / empty tracks) clears the pin so the cap
+    /// stays effective when the user isn't viewing a playlist.
+    pub fn set_pinned_tracks(&mut self, ids: std::collections::HashSet<String>) {
+        self.pinned_tracks = ids;
     }
 
     fn kind_for(req: &Request) -> Pending {
@@ -1050,12 +1108,17 @@ impl Session {
         self.pending_suggestions = None;
         self.refresh_inflight = true;
         self.refresh_gen = self.refresh_gen.wrapping_add(1);
-        self.refresh_remaining = 2;
+        // Only fetch library_playlists (1 request, not 2). The previous design
+        // also sent home_suggestions, but ytmusicapi's get_home() can HANG in
+        // guest mode (infinite block, no timeout) — the single-threaded sidecar
+        // freezes, and every subsequent get_playlist request (the lazy-load)
+        // queues behind it forever. This was the "stuck on syncing" + "long
+        // loading time" root cause. Suggestions are a nice-to-have (the
+        // "Suggested / Up Next" pane); they're not worth blocking the sidecar.
+        self.refresh_remaining = 1;
         let gen = self.refresh_gen;
         self.pending.push_back(Pending::Playlists(gen));
         self.sidecar.send(&Request::LibraryPlaylists)?;
-        self.pending.push_back(Pending::Suggestions(gen));
-        self.sidecar.send(&Request::HomeSuggestions)?;
         Ok(())
     }
 
@@ -1116,14 +1179,21 @@ impl Session {
 
     /// Fire-and-forget: fetch the tracks of one playlist so the Y view can
     /// populate the focused list's col2. Results land in `pending_tracks`
-    /// (picked up by `App::on_tick`). Only one list is fetched at a time
-    /// (`playlist_inflight`); re-sending the same id while in flight is a
-    /// no-op so `on_tick`'s focus-trigger doesn't flood the sidecar.
+    /// (picked up by `App::on_tick`). **Only ONE playlist fetch is allowed
+    /// in flight at a time** — if any fetch is in progress, this is a no-op.
+    /// The sidecar is single-threaded/sequential; allowing multiple
+    /// concurrent fetches (one per switched-to playlist) queues them all,
+    /// and the user's CURRENTLY focused playlist's request sits at the back
+    /// behind 5-10 others (1-2s each → 10-20s "long loading time"). By
+    /// serializing: switch A→B while A loads → B waits → A completes → next
+    /// tick fires B → B loads in 1-2s. No queue buildup.
     pub fn send_get_playlist(&mut self, id: String) -> Result<()> {
-        if self.playlist_inflight.as_deref() == Some(id.as_str()) {
+        if !self.playlist_inflight.is_empty() {
+            // Any fetch in flight → block. The focused playlist's fetch will
+            // fire on a later tick once the current one completes.
             return Ok(());
         }
-        self.playlist_inflight = Some(id.clone());
+        self.playlist_inflight.insert(id.clone());
         self.pending.push_back(Pending::Tracks(id.clone()));
         self.sidecar.send(&Request::GetPlaylist { id })?;
         Ok(())
@@ -1131,7 +1201,7 @@ impl Session {
 
     /// True if a get_playlist for `id` is currently in flight.
     pub fn playlist_loading(&self, id: &str) -> bool {
-        self.playlist_inflight.as_deref() == Some(id)
+        self.playlist_inflight.contains(id)
     }
 
     /// The query currently being searched, if a search is in flight.

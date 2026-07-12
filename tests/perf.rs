@@ -216,3 +216,195 @@ fn track_cache_dedup_does_not_grow() {
         "duplicate cache should not grow order deque"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Forever-loading fix: pinned tracks (the focused playlist's track_ids) must
+// NOT be evicted from track_cache. Without pinning, browsing enough playlists
+// fills the 256-entry cache and evicts a track STILL REFERENCED by a loaded
+// playlist's track_ids → that row renders "Loading…" forever (the lazy-load
+// guard `!loaded` blocks a re-fetch).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pinned_tracks_survive_eviction() {
+    // Cache the to-be-pinned tracks FIRST (so they land at the FRONT of the
+    // eviction deque), THEN pin them, THEN cache enough fillers to push the
+    // cache over the cap. WITHOUT pinning, the pinned tracks (being the
+    // oldest) would be evicted first → "Loading…" forever. WITH pinning,
+    // eviction skips them and evicts fillers instead.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("fake.py");
+    std::fs::write(&script, "import sys\nfor line in sys.stdin:\n pass\n").unwrap();
+    let mut session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    // 5 tracks that will be pinned — cached FIRST → front of the deque.
+    for i in 0..5 {
+        session.cache_track_pub(&RemoteTrackSummary {
+            video_id: format!("pinned{i}"),
+            title: format!("Pinned{i}"),
+            artist: "Art".into(),
+            album: None,
+            dur: None,
+            isrc: None,
+        });
+    }
+    // Pin them (simulating a focused playlist whose track_ids reference them).
+    let pinned: std::collections::HashSet<String> = (0..5).map(|i| format!("pinned{i}")).collect();
+    session.set_pinned_tracks(pinned.clone());
+    // Cache enough fillers to push over the cap. Eviction triggers on each
+    // insert; the pinned tracks (front of deque) must be skipped.
+    for i in 0..TRACK_CACHE_CAP {
+        session.cache_track_pub(&RemoteTrackSummary {
+            video_id: format!("filler{i}"),
+            title: format!("Filler{i}"),
+            artist: "Art".into(),
+            album: None,
+            dur: None,
+            isrc: None,
+        });
+    }
+    // The 5 pinned tracks MUST still be in the cache (without pinning they'd
+    // be the oldest 5 and would have been evicted).
+    for id in &["pinned0", "pinned1", "pinned2", "pinned3", "pinned4"] {
+        assert!(
+            session.track_cache.contains_key(*id),
+            "pinned track {id} must survive eviction (forever-loading fix) — \
+             without pinning it would be evicted as the oldest entry"
+        );
+    }
+    // The cache must not exceed the cap.
+    assert!(
+        session.track_cache.len() <= TRACK_CACHE_CAP,
+        "cache {} must stay <= cap {}",
+        session.track_cache.len(),
+        TRACK_CACHE_CAP
+    );
+    // The oldest filler tracks (not pinned, not playing) should have been
+    // evicted to make room.
+    assert!(
+        !session.track_cache.contains_key("filler0"),
+        "oldest non-pinned filler should be evicted"
+    );
+}
+
+#[test]
+fn unpinned_tracks_evict_normally_when_pin_set_empty() {
+    // When the pin set is empty (no focused playlist), eviction behaves as
+    // before: oldest non-playing entries are evicted. This guards against the
+    // pin accidentally making the cache unbounded.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("fake.py");
+    std::fs::write(&script, "import sys\nfor line in sys.stdin:\n pass\n").unwrap();
+    let mut session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    for i in 0..(TRACK_CACHE_CAP + 10) {
+        session.cache_track_pub(&RemoteTrackSummary {
+            video_id: format!("vid{i}"),
+            title: format!("T{i}"),
+            artist: "Art".into(),
+            album: None,
+            dur: None,
+            isrc: None,
+        });
+    }
+    assert_eq!(session.track_cache.len(), TRACK_CACHE_CAP);
+    assert!(!session.track_cache.contains_key("vid0"), "oldest evicted");
+    assert!(session
+        .track_cache
+        .contains_key(&format!("vid{}", TRACK_CACHE_CAP + 9)));
+}
+
+#[test]
+fn clear_all_caches_clears_pinned_tracks() {
+    // clear_all_caches (called by yt_logout) must clear the pin set so a
+    // re-auth doesn't keep stale pins.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("fake.py");
+    std::fs::write(&script, "import sys\nfor line in sys.stdin:\n pass\n").unwrap();
+    let mut session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    let pin: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+    session.set_pinned_tracks(pin);
+    // Pin is active: cache a + 256 fillers; a survives.
+    session.cache_track_pub(&RemoteTrackSummary {
+        video_id: "a".into(),
+        title: "A".into(),
+        artist: "X".into(),
+        album: None,
+        dur: None,
+        isrc: None,
+    });
+    for i in 0..TRACK_CACHE_CAP {
+        session.cache_track_pub(&RemoteTrackSummary {
+            video_id: format!("f{i}"),
+            title: format!("F{i}"),
+            artist: "X".into(),
+            album: None,
+            dur: None,
+            isrc: None,
+        });
+    }
+    assert!(session.track_cache.contains_key("a"), "pinned 'a' survives");
+    session.clear_all_caches();
+    // After clear: cache empty, pin cleared. Refill over cap WITHOUT a pin →
+    // 'a' (re-cached first) should now be evicted (no pin protection).
+    session.cache_track_pub(&RemoteTrackSummary {
+        video_id: "a".into(),
+        title: "A".into(),
+        artist: "X".into(),
+        album: None,
+        dur: None,
+        isrc: None,
+    });
+    for i in 0..TRACK_CACHE_CAP {
+        session.cache_track_pub(&RemoteTrackSummary {
+            video_id: format!("g{i}"),
+            title: format!("G{i}"),
+            artist: "X".into(),
+            album: None,
+            dur: None,
+            isrc: None,
+        });
+    }
+    assert!(
+        !session.track_cache.contains_key("a"),
+        "after clear_all_caches, 'a' is no longer pinned and should be evicted"
+    );
+}
+
+#[test]
+fn eviction_terminates_when_all_entries_pinned() {
+    // Edge case: the focused playlist has MORE tracks than the cap (e.g. 300 >
+    // 256). All 300 are pinned. Caching them must NOT infinite-loop the
+    // eviction (every entry is protected → nothing to evict). The loop must
+    // detect the full protected pass and break, leaving the cache over the cap
+    // (bounded by the playlist's finite size — better than hanging the TUI).
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("fake.py");
+    std::fs::write(&script, "import sys\nfor line in sys.stdin:\n pass\n").unwrap();
+    let mut session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    // Pin 300 ids (more than the 256 cap).
+    let pinned: std::collections::HashSet<String> = (0..300).map(|i| format!("vid{i}")).collect();
+    session.set_pinned_tracks(pinned);
+    // Cache all 300 → eviction triggers but every entry is protected.
+    // This must terminate (not hang). Use a timeout-style guard: if it
+    // infinite-loops, the test process would hang and time out.
+    for i in 0..300 {
+        session.cache_track_pub(&RemoteTrackSummary {
+            video_id: format!("vid{i}"),
+            title: format!("T{i}"),
+            artist: "Art".into(),
+            album: None,
+            dur: None,
+            isrc: None,
+        });
+    }
+    // If we reach here, the eviction terminated (no infinite loop).
+    // The cache is over the cap (300 > 256) — all protected, nothing could
+    // evict. That's the accepted rare-case behavior.
+    assert_eq!(
+        session.track_cache.len(),
+        300,
+        "all 300 pinned tracks cached (over cap — no eviction possible, no hang)"
+    );
+    // All tracks still present (none evicted — all protected).
+    assert!(session.track_cache.contains_key("vid0"));
+    assert!(session.track_cache.contains_key("vid299"));
+}
