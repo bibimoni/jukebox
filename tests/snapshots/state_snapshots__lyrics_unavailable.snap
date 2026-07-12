@@ -1,0 +1,28 @@
+---
+source: tests/state_snapshots.rs
+expression: s
+---
+
+
+            ┌ Lyrics — not found ──────────────────────────────────────────────────────────────────────────┐
+            │ No lyrics found for this track.                                                              │
+            │                                                                                              │
+            │ R retry lyrics for this track  ·  L or Esc close                                             │
+            │                                                                                              │
+            │                                                                                              │
+            │                                                                                              │
+            │                                                                                              │
+            │                                                                                              │
+            │                                                                                              │
+            │                                                                                              │
+            │                                                                                              │
+            │                                                                                              │
+            │                                                                                              │
+            │                                                                                              │
+            │                                    Esc close · j/k scroll                                    │
+            └──────────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[STOPPED] ■ — nothing playing —  --:-- / --:--  ▸ Enter to play  --  MODE local · CONT off
+VIEW: local · SOURCE: local

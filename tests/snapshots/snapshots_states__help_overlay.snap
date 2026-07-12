@@ -1,0 +1,27 @@
+---
+source: tests/snapshots_states.rs
+expression: s
+---
+
+      ┌ help — j/k scroll · Esc to close ────────────────────────────────────────────────────────────────────────┐
+      │                                                                                                          │
+      │Navigation                                                                                                │
+      │h j k l · ↑↓←→  move (←→ columns, ↑↓ within)                                                              │
+      │gg / G          top / bottom of column                                                                    │
+      │1 2 3 4         switch view: Artists / Playlists / Queue / YouTube                                        │
+      │Tab / Shift+Tab cycle view                                                                                │
+      │────────────────────────────────────────────────────────────────────────                                  │
+      │Playback                                                                                                  │
+      │Enter           play selected in context                                                                  │
+      │Space           play / pause                                                                              │
+      │> / <           next / previous track                                                                     │
+      │, / .           seek −5s / +5s                                                                            │
+      │+ / -           volume up / down                                                                          │
+      │m               mute                                                                                      │
+      │z / Z           cycle shuffle / reshuffle                                                                 │
+      │r               cycle repeat (off → all → one)                                                            │
+      │c               cycle continue (mode-dependent)                                                           │
+      │M               cycle source mode (Local / YouTube / Mixed)                                               │
+      │────────────────────────────────────────────────────────────────────────                                  │
+      │Discover                                                                                                  │
+      └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘

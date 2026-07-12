@@ -23,5 +23,3 @@ docs/
 # Agent skills (orchestration tooling, not product code)
 .agents/
 
-# Insta snapshot fixtures (regenerate with cargo insta review)
-tests/snapshots/

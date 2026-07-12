@@ -1,0 +1,5 @@
+---
+source: tests/state_snapshots.rs
+expression: s
+---
+  terminal too small — resize or press q to quit
