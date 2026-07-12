@@ -24,7 +24,10 @@ use ratatui::{
 use crate::catalog::Track;
 use crate::tui::app::App;
 use crate::tui::queue::{ContinueMode, RepeatMode, ShuffleMode};
-use crate::tui::view::theme::{disp_width, progress_color, quality_color, Theme};
+use crate::tui::view::theme::{
+    disp_width, ellipsis, em_dash, empty_block, filled_block, marker_glyph, next_glyph,
+    pause_glyph, play_glyph, prev_glyph, progress_color, quality_color, sep_dot, stop_glyph, Theme,
+};
 
 /// Braille spinner frames (U+2800–28FF, width 1) — the same set Claude Code's
 /// CLI uses. Animated in `App::on_tick` while a YouTube resolve is in flight.
@@ -112,13 +115,13 @@ fn up_next_preview(app: &App) -> Option<String> {
         Some(title) => {
             let max = 28;
             let trimmed = truncate_title(&title, max);
-            Some(format!("▸ Next: {trimmed}"))
+            Some(format!("{} Next: {trimmed}", marker_glyph()))
         }
         None => {
             if app.now_playing.is_some() {
-                Some("▸ Next: (end)".to_string())
+                Some(format!("{} Next: (end)", marker_glyph()))
             } else {
-                Some("▸ Enter to play".to_string())
+                Some(format!("{} Enter to play", marker_glyph()))
             }
         }
     }
@@ -145,7 +148,7 @@ pub fn truncate_title(title: &str, max: usize) -> String {
         out.push(c);
         w += cw;
     }
-    out.push('…');
+    out.push_str(ellipsis());
     out
 }
 
@@ -158,6 +161,7 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
     let theme = Theme::default();
     let dim = Style::default().fg(theme.dim);
     let text = Style::default().fg(theme.text);
+    let sd = sep_dot(); // ASCII-safe separator for DEF-006
     let resolving = app.is_resolving();
     let has_track = app.now_playing.is_some();
     let playing = app.player.is_playing() && has_track;
@@ -165,14 +169,14 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
     // old logic showed ⏸ while playing and ▶ while paused — backwards — and
     // □ for stopped which reads as a stop button. Now the glyph reflects the
     // CURRENT state, matching the [PLAYING]/[PAUSED]/[STOPPED] label.)
-    let play_glyph = if resolving {
+    let state_glyph = if resolving {
         spinner_glyph(app)
     } else if playing {
-        "▶"
+        play_glyph()
     } else if has_track {
-        "⏸"
+        pause_glyph()
     } else {
-        "■"
+        stop_glyph()
     };
     // Accent (Cyan) + BOLD while resolving — an attention/progress signal —
     // else the normal text color + BOLD. The play/pause glyph is bold+colored
@@ -210,7 +214,7 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled(state_label, state_style),
         Span::raw(" "),
-        Span::styled(format!("{play_glyph} "), glyph_style),
+        Span::styled(format!("{state_glyph} "), glyph_style),
     ];
 
     // Resolve the now-playing view ONCE per frame — `now_playing_view()` does
@@ -226,7 +230,10 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::styled(" — ", dim));
             spans.push(Span::styled(v.artist.clone(), text));
         }
-        None => spans.push(Span::styled("— nothing playing —", dim)),
+        None => spans.push(Span::styled(
+            format!("{dash} nothing playing {dash}", dash = em_dash()),
+            dim,
+        )),
     }
     // Progress text (always visible — essential playback info; T3:
     // status-drops-indicators — keep title + progress + mode at small size).
@@ -276,11 +283,67 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
     // MODE always visible (essential — shows playback source local/yt/mixed).
     // CONT drops below 70 cols (lower priority). T3: keep title+progress+mode
     // at small sizes so the status bar never loses essential indicators.
+    // DEF-004: SHUF/RPT also visible at >= 80 cols so the compact bar (used
+    // at height <= 24) shows playback state indicators alongside MODE+CONT.
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
         format!("MODE {}", app.source_mode.as_str()),
         dim,
     ));
+    // DEF-011/DEF-012: compact YT auth indicator — always visible at >= 70
+    // cols so the YouTube connection state is visible at all terminal sizes,
+    // not just in the 2-row footer (which requires >100 width or >24 height).
+    // DEF-013: when a track is playing, also show the actual source if it
+    // differs from the mode (e.g., "MODE local" while a YT track plays →
+    // "MODE local · [Y]" so the label isn't misleading).
+    if area.width >= 70 {
+        let nc = crate::tui::view::theme::no_color();
+        // Playing-source badge (DEF-013): if the now-playing track's source
+        // differs from the mode, show [Y] or [L] to disambiguate.
+        if let Some(np) = &app.now_playing {
+            let playing_src = if np.is_remote() { "youtube" } else { "local" };
+            let mode_src = app.source_mode.as_str();
+            if playing_src != mode_src {
+                let badge = if np.is_remote() { "[Y]" } else { "[L]" };
+                let color = if nc {
+                    Color::Reset
+                } else if np.is_remote() {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                };
+                spans.push(Span::styled(
+                    format!(" {sd} {badge}"),
+                    Style::default().fg(color),
+                ));
+            }
+        }
+        // YT auth indicator (DEF-011/DEF-012): compact connection-state glyph.
+        {
+            use crate::yt::state::YtState;
+            let yt_relevant = {
+                use crate::mode::SourceMode;
+                use crate::tui::app::View;
+                app.source_mode != SourceMode::Local || app.view == View::Youtube
+            };
+            if yt_relevant && app.yt_state != YtState::Unconfigured {
+                let (label, color) = match app.yt_state {
+                    YtState::Ready => ("YT", if nc { Color::Reset } else { Color::Green }),
+                    YtState::AuthExpired | YtState::ProviderError | YtState::Failed => {
+                        ("YT!", if nc { Color::Reset } else { Color::Red })
+                    }
+                    YtState::RateLimited | YtState::ReadyStale => {
+                        ("YT~", if nc { Color::Reset } else { Color::Yellow })
+                    }
+                    _ => ("YT…", if nc { Color::Reset } else { Color::Yellow }),
+                };
+                spans.push(Span::styled(
+                    format!(" {sd} {label}"),
+                    Style::default().fg(color),
+                ));
+            }
+        }
+    }
     if area.width >= 70 {
         let cont = match app.transport.continue_mode {
             ContinueMode::Off => "off",
@@ -288,7 +351,21 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
             ContinueMode::Radio => "radio",
             ContinueMode::YouTube => "youtube",
         };
-        spans.push(Span::styled(format!(" · CONT {cont}"), dim));
+        spans.push(Span::styled(format!(" {sd} CONT {cont}"), dim));
+    }
+    if area.width >= 80 {
+        let shuf = match app.transport.shuffle {
+            ShuffleMode::Off => "off",
+            ShuffleMode::Smart => "smart",
+            ShuffleMode::Random => "random",
+        };
+        let rpt = match app.transport.repeat {
+            RepeatMode::Off => "off",
+            RepeatMode::All => "all",
+            RepeatMode::One => "one",
+        };
+        spans.push(Span::styled(format!(" {sd} SHUF {shuf}"), dim));
+        spans.push(Span::styled(format!(" {sd} RPT {rpt}"), dim));
     }
     f.render_widget(
         Paragraph::new(Line::from(spans).alignment(Alignment::Left))
@@ -324,14 +401,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let controls = Style::default()
         .fg(Theme::default().accent)
         .add_modifier(Modifier::BOLD);
-    f.render_widget(Paragraph::new("◀◀").style(controls), geo.previous);
+    f.render_widget(Paragraph::new(prev_glyph()).style(controls), geo.previous);
     f.render_widget(
-        Paragraph::new("▶")
+        Paragraph::new(play_glyph())
             .style(controls)
             .alignment(Alignment::Center),
         geo.play_pause,
     );
-    f.render_widget(Paragraph::new("▶▶").style(controls), geo.next);
+    f.render_widget(Paragraph::new(next_glyph()).style(controls), geo.next);
 
     if let Some(g) = gauge_area {
         // Row 2: progress bar on the left (~55%) + flags right-anchored. We
@@ -389,14 +466,14 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
     // old logic showed ⏸ while playing and ▶ while paused — backwards — and
     // □ for stopped which reads as a stop button. Now the glyph reflects the
     // CURRENT state, matching the [PLAYING]/[PAUSED]/[STOPPED] label.)
-    let play_glyph = if resolving {
+    let state_glyph = if resolving {
         spinner_glyph(app)
     } else if playing && has_track {
-        "▶"
+        play_glyph()
     } else if has_track {
-        "⏸"
+        pause_glyph()
     } else {
-        "■"
+        stop_glyph()
     };
     let glyph_style = if resolving {
         Style::default()
@@ -447,7 +524,7 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
         }
     }
 
-    spans.push(Span::styled(format!("{play_glyph} "), glyph_style));
+    spans.push(Span::styled(format!("{state_glyph} "), glyph_style));
 
     // Now-playing: title — artist · album (or a dim placeholder).
     // Title is the visual hero (accent color — bright + prominent).
@@ -458,7 +535,7 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
             spans.push(Span::styled(v.artist.clone(), text));
             if let Some(album) = &v.album {
                 if !album.is_empty() && width > 60 {
-                    spans.push(Span::styled(" · ", dim));
+                    spans.push(Span::styled(format!(" {} ", sep_dot()), dim));
                     spans.push(Span::styled(album.clone(), text));
                 }
             }
@@ -472,7 +549,10 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
             }
         }
         None => {
-            spans.push(Span::styled("— nothing playing —", dim));
+            spans.push(Span::styled(
+                format!("{} nothing playing {}", em_dash(), em_dash()),
+                dim,
+            ));
             // Up-next hint when nothing is playing.
             if width > 60 {
                 if let Some(next) = up_next_preview(app) {
@@ -502,7 +582,10 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
             let q_text = format!("{}-bit / {} kHz", v.bit_depth, khz(v.sample_rate_hz));
             spans.push(Span::styled(q_text, Style::default().fg(q_color)));
             if app.switch_sample_rate {
-                spans.push(Span::styled(" · bit-perfect", Style::default().fg(q_color)));
+                spans.push(Span::styled(
+                    format!(" {} bit-perfect", sep_dot()),
+                    Style::default().fg(q_color),
+                ));
             }
         }
         None => {
@@ -521,7 +604,11 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
         let filled = ((u32::from(app.volume) * blocks + 50) / 100).min(blocks);
         let mut vol_bar = String::new();
         for i in 0..blocks {
-            vol_bar.push(if i < filled { '▰' } else { '▱' });
+            vol_bar.push(if i < filled {
+                filled_block()
+            } else {
+                empty_block()
+            });
         }
         let vol_pct = if app.muted { 0 } else { app.volume };
         let vol_color = if app.muted { theme.dim } else { theme.text };
@@ -536,7 +623,9 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
 
 /// Row 2 right-anchored flags: `SHUF off · RPT off · CONT off · MODE local`.
 /// `·`-separated and right-anchored so they read as one rhythm; `MODE` last
-/// (spec §5.1 cut #4).
+/// (spec §5.1 cut #4). DEF-013: when a track is playing and its source
+/// differs from `source_mode`, a `· SRC youtube` or `· SRC local` badge is
+/// appended so the label doesn't contradict the actual playing source.
 fn build_flags_line(app: &App, _width: usize) -> Line<'static> {
     let theme = Theme::default();
     let dim = Style::default().fg(theme.dim);
@@ -558,16 +647,42 @@ fn build_flags_line(app: &App, _width: usize) -> Line<'static> {
         ContinueMode::YouTube => "youtube",
     };
     let mode = app.source_mode.as_str();
-    Line::from(vec![
+    let nc = crate::tui::view::theme::no_color();
+    // DEF-013: if the now-playing track's source differs from the mode,
+    // append "· SRC {actual}" so the label isn't misleading.
+    let src_badge = if let Some(np) = &app.now_playing {
+        let playing_src = if np.is_remote() { "youtube" } else { "local" };
+        if playing_src != mode {
+            let color = if nc {
+                Color::Reset
+            } else if np.is_remote() {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
+            Some(vec![
+                Span::raw(format!(" {} ", sep_dot())),
+                Span::styled(format!("SRC {playing_src}"), Style::default().fg(color)),
+            ])
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut spans: Vec<Span<'static>> = vec![
         Span::styled(format!("SHUF {shuf}"), dim),
-        Span::raw(" · "),
+        Span::raw(format!(" {} ", sep_dot())),
         Span::styled(format!("RPT {rpt}"), dim),
-        Span::raw(" · "),
+        Span::raw(format!(" {} ", sep_dot())),
         Span::styled(format!("CONT {cont}"), dim),
-        Span::raw(" · "),
+        Span::raw(format!(" {} ", sep_dot())),
         Span::styled(format!("MODE {mode}"), dim),
-    ])
-    .alignment(Alignment::Right)
+    ];
+    if let Some(src) = src_badge {
+        spans.extend(src);
+    }
+    Line::from(spans).alignment(Alignment::Right)
 }
 
 /// `(percent, "M:SS / M:SS")` for the progress gauge. When position/duration
@@ -624,10 +739,13 @@ fn render_progress_bar(f: &mut Frame, area: Rect, app: &App) {
         let rest = total - filled;
         let mut spans: Vec<Span<'static>> = Vec::new();
         if filled > 0 {
-            spans.push(Span::styled("▰".repeat(filled), fill));
+            spans.push(Span::styled(
+                filled_block().to_string().repeat(filled),
+                fill,
+            ));
         }
         if rest > 0 {
-            spans.push(Span::styled("▱".repeat(rest), dim));
+            spans.push(Span::styled(empty_block().to_string().repeat(rest), dim));
         }
         spans.push(Span::raw(" "));
         spans.push(Span::styled(pct_str, fill));

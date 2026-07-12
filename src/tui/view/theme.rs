@@ -44,6 +44,7 @@
 //! white-on-black palette for users who need maximum contrast.
 
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::border;
 
 use crate::tui::view::icons::{FontMode, Icon};
 
@@ -507,4 +508,138 @@ pub fn pad_between(left: &str, right: &str, width: usize) -> String {
     let rw = disp_width(right);
     let pad = width.saturating_sub(lw + rw);
     format!("{}{}{}", left, " ".repeat(pad), right)
+}
+
+// ---------------------------------------------------------------------------
+// ASCII font mode helpers (DEF-006)
+// ---------------------------------------------------------------------------
+
+/// ASCII border set: `+`, `-`, `|` characters instead of Unicode box-drawing.
+/// Used when `JUKEBOX_FONT_MODE=ascii` so the TUI is fully ASCII-compatible.
+pub const ASCII_BORDER_SET: border::Set = border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+};
+
+/// True when the active font mode is ASCII (either `JUKEBOX_FONT_MODE=ascii`
+/// or `NO_COLOR` triggered the ASCII fallback in `FontMode::auto_detect`).
+pub fn is_ascii() -> bool {
+    Theme::default().font_mode == FontMode::Ascii
+}
+
+/// The horizontal line character for the current font mode: `─` (Unicode) or
+/// `-` (ASCII). Used by separator rules and horizontal dividers.
+pub fn h_line() -> &'static str {
+    if is_ascii() {
+        "-"
+    } else {
+        "─"
+    }
+}
+
+/// The vertical separator character for the current font mode: `│` (Unicode)
+/// or `|` (ASCII). Used by the tab bar between view labels.
+pub fn v_sep() -> &'static str {
+    if is_ascii() {
+        "|"
+    } else {
+        "│"
+    }
+}
+
+// --- Player bar glyph helpers (DEF-006 ASCII mode) ---
+
+/// Play glyph: `▶` (Unicode) or `>` (ASCII).
+pub fn play_glyph() -> &'static str {
+    if is_ascii() {
+        ">"
+    } else {
+        "▶"
+    }
+}
+/// Pause glyph: `⏸` (Unicode) or `||` (ASCII).
+pub fn pause_glyph() -> &'static str {
+    if is_ascii() {
+        "||"
+    } else {
+        "⏸"
+    }
+}
+/// Stop glyph: `■` (Unicode) or `#` (ASCII).
+pub fn stop_glyph() -> &'static str {
+    if is_ascii() {
+        "#"
+    } else {
+        "■"
+    }
+}
+/// Filled block for progress/volume bars: `▰` or `#`.
+pub fn filled_block() -> char {
+    if is_ascii() {
+        '#'
+    } else {
+        '▰'
+    }
+}
+/// Empty block for progress/volume bars: `▱` or `-`.
+pub fn empty_block() -> char {
+    if is_ascii() {
+        '-'
+    } else {
+        '▱'
+    }
+}
+/// Previous-track glyph: `◀◀` or `<<`.
+pub fn prev_glyph() -> &'static str {
+    if is_ascii() {
+        "<<"
+    } else {
+        "◀◀"
+    }
+}
+/// Next-track glyph: `▶▶` or `>>`.
+pub fn next_glyph() -> &'static str {
+    if is_ascii() {
+        ">>"
+    } else {
+        "▶▶"
+    }
+}
+/// Up-next marker glyph: `▸` or `>`.
+pub fn marker_glyph() -> &'static str {
+    if is_ascii() {
+        ">"
+    } else {
+        "▸"
+    }
+}
+/// Separator dot: `·` (Unicode) or `*` (ASCII). Used between status fields.
+pub fn sep_dot() -> &'static str {
+    if is_ascii() {
+        "*"
+    } else {
+        "·"
+    }
+}
+/// Em-dash: `—` (Unicode) or `--` (ASCII). Used in "title — artist" etc.
+pub fn em_dash() -> &'static str {
+    if is_ascii() {
+        "--"
+    } else {
+        "—"
+    }
+}
+/// Ellipsis: `…` (Unicode) or `...` (ASCII). Used in truncation/loading.
+pub fn ellipsis() -> &'static str {
+    if is_ascii() {
+        "..."
+    } else {
+        "…"
+    }
 }

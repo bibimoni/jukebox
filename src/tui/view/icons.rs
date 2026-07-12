@@ -30,7 +30,22 @@ pub enum FontMode {
 impl FontMode {
     /// Auto-detect the best font mode. Checks for Nerd Font environment
     /// hints; defaults to Unicode (the safest wide-compatible mode).
+    ///
+    /// DEF-006: also checks `JUKEBOX_FONT_MODE` — when set to "ascii" (case-
+    /// insensitive), returns `FontMode::Ascii` so all glyphs use ASCII labels.
+    /// When set to "nerd" or "nerdfont", returns `FontMode::NerdFont`. When
+    /// set to "unicode", returns `FontMode::Unicode`. This env var takes
+    /// precedence over `NO_COLOR` and `TERM`/`TERM_FONT` detection.
     pub fn auto_detect() -> Self {
+        // Explicit override via JUKEBOX_FONT_MODE (highest priority).
+        if let Ok(mode) = std::env::var("JUKEBOX_FONT_MODE") {
+            match mode.to_lowercase().as_str() {
+                "ascii" => return FontMode::Ascii,
+                "nerd" | "nerdfont" => return FontMode::NerdFont,
+                "unicode" => return FontMode::Unicode,
+                _ => {}
+            }
+        }
         // Check common Nerd Font environment hints.
         if let Ok(term) = std::env::var("TERM") {
             if term.contains("nerd") || term.contains("NF") {
@@ -253,6 +268,11 @@ impl IconRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that set/unset env vars (JUKEBOX_FONT_MODE) so they
+    /// don't interfere with each other under parallel test execution.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn font_mode_default_is_unicode() {
@@ -423,5 +443,49 @@ mod tests {
             mode,
             FontMode::NerdFont | FontMode::Unicode | FontMode::Ascii
         ));
+    }
+
+    /// DEF-006: JUKEBOX_FONT_MODE=ascii must produce FontMode::Ascii.
+    #[test]
+    fn font_mode_jukebox_font_mode_ascii() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("JUKEBOX_FONT_MODE", "ascii");
+        let mode = FontMode::auto_detect();
+        std::env::remove_var("JUKEBOX_FONT_MODE");
+        drop(_guard);
+        assert_eq!(mode, FontMode::Ascii);
+    }
+
+    /// DEF-006: JUKEBOX_FONT_MODE=nerd must produce FontMode::NerdFont.
+    #[test]
+    fn font_mode_jukebox_font_mode_nerd() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("JUKEBOX_FONT_MODE", "nerd");
+        let mode = FontMode::auto_detect();
+        std::env::remove_var("JUKEBOX_FONT_MODE");
+        drop(_guard);
+        assert_eq!(mode, FontMode::NerdFont);
+    }
+
+    /// DEF-006: JUKEBOX_FONT_MODE=unicode must produce FontMode::Unicode.
+    #[test]
+    fn font_mode_jukebox_font_mode_unicode() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("JUKEBOX_FONT_MODE", "unicode");
+        let mode = FontMode::auto_detect();
+        std::env::remove_var("JUKEBOX_FONT_MODE");
+        drop(_guard);
+        assert_eq!(mode, FontMode::Unicode);
+    }
+
+    /// DEF-006: JUKEBOX_FONT_MODE is case-insensitive.
+    #[test]
+    fn font_mode_jukebox_font_mode_case_insensitive() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("JUKEBOX_FONT_MODE", "ASCII");
+        let mode = FontMode::auto_detect();
+        std::env::remove_var("JUKEBOX_FONT_MODE");
+        drop(_guard);
+        assert_eq!(mode, FontMode::Ascii);
     }
 }

@@ -21,6 +21,7 @@
 //!   saving 2 rows for content (T3).
 
 use ratatui::{
+    buffer::CellDiffOption,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -30,17 +31,19 @@ use ratatui::{
 
 use super::{columns, footer, overlay, player_bar};
 use crate::tui::app::{App, View};
-use crate::tui::view::theme::{self, Theme};
+use crate::tui::view::theme::{self, h_line, v_sep, Theme};
 
 /// Minimum terminal width for the full 3-column Miller layout. At
 /// `width < MIN_WIDTH` we collapse to the 2-column narrow path (rail +
 /// focused pane) so the three columns don't compress past readability.
 ///
-/// **T3 breakpoints:** `< 70` = single column, `70–100` = 2 columns (rail +
-/// focused), `> 100` = 3 columns. The old threshold was 120 (Issue 2 fix);
-/// lowered to 101 so the 3-column layout kicks in at >100 cols where
-/// rail(4)+col1(24)+col2(28)+col3(45)=101 fits comfortably.
-pub const MIN_WIDTH: u16 = 101;
+/// **T3 breakpoints:** `< 70` = single column, `70–99` = 2 columns (rail +
+/// focused), `>= 100` = 3 columns. The old threshold was 120 (Issue 2 fix),
+/// then 101; lowered to 100 so the 3-column layout kicks in at 100 cols
+/// (the standard test terminal size), making SHUF/RPT/volume indicators
+/// visible at 100×30 (DEF-004). rail(4)+col1(24)+col2(28)+col3(44)=100
+/// fits exactly at 100 cols.
+pub const MIN_WIDTH: u16 = 100;
 pub const MIN_HEIGHT: u16 = 24;
 /// Below this the app refuses to render and shows a "terminal too small" message.
 pub const NARROW_MIN_WIDTH: u16 = 60;
@@ -134,6 +137,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if app.overlay.is_some() {
             overlay::render(f, area, app);
         }
+        force_space_redraw(f);
         return;
     }
 
@@ -200,6 +204,67 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.overlay.is_some() {
         overlay::render(f, area, app);
     }
+    force_space_redraw(f);
+}
+
+/// Work around ratatui's `Cell::eq` treating `symbol: None` (empty) as equal to
+/// `symbol: Some(" ")` (space). When text uses `Color::Reset` (the default
+/// `theme.text`), styled spaces are indistinguishable from empty buffer cells.
+/// The diff skips them, so old terminal content at space positions is never
+/// refreshed — the pervasive character-dropping bug (DEF-002). On a fresh
+/// terminal this is invisible (blank ≈ space), but after a view switch the
+/// previous frame's content shows through at every space position, making
+/// words run together ("WorkoutEnergy" instead of "Workout Energy").
+///
+/// Fix: after all rendering, mark every default-styled space cell that is
+/// **adjacent to a non-space cell** as `CellDiffOption::AlwaysUpdate` so the
+/// diff always emits it. This limits the extra writes to spaces that are
+/// actually between words (or between a word and the border), not the vast
+/// empty background. A space in the middle of nowhere doesn't need a forced
+/// write — nothing visually abuts it, so stale content there is harmless.
+fn force_space_redraw(f: &mut Frame) {
+    let area = f.area();
+    let buf = f.buffer_mut();
+    // First pass: identify default-styled space cells adjacent to non-space
+    // content. We check 4-neighbourhood (left, right, up, down) — a space
+    // between two words has non-space neighbours on at least one side.
+    let mut to_mark: Vec<(u16, u16)> = Vec::new();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let is_default_space = match buf.cell((x, y)) {
+                Some(cell) => {
+                    cell.diff_option == CellDiffOption::None
+                        && cell.symbol() == " "
+                        && cell.fg == Color::Reset
+                        && cell.bg == Color::Reset
+                        && cell.modifier == Modifier::empty()
+                }
+                None => false,
+            };
+            if !is_default_space {
+                continue;
+            }
+            // Check if any horizontal neighbour has a non-space symbol (i.e.
+            // a visible character like a letter, glyph, or border char).
+            // `symbol()` returns " " for both empty and space cells, so
+            // this only fires next to actual text/border content.
+            let has_text_neighbour =
+                [(x.wrapping_sub(1), y), (x.wrapping_add(1), y)]
+                    .iter()
+                    .any(|&(nx, ny)| match buf.cell((nx, ny)) {
+                        Some(n) => n.symbol() != " " && !n.symbol().is_empty(),
+                        None => false,
+                    });
+            if has_text_neighbour {
+                to_mark.push((x, y));
+            }
+        }
+    }
+    for (x, y) in to_mark {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+        }
+    }
 }
 
 /// Narrow fallback: a tab bar showing the available columns, a column
@@ -260,7 +325,7 @@ fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
         } else {
             theme.dim
         });
-        let rule = "─".repeat(outer[1].width as usize);
+        let rule = h_line().repeat(outer[1].width as usize);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(rule, dim)))
                 .block(Block::default().borders(Borders::NONE)),
@@ -348,7 +413,10 @@ fn render_narrow_breadcrumb(f: &mut Frame, area: Rect, cols: &[(&str, bool)]) {
     let mut spans: Vec<Span> = Vec::new();
     for (i, (label, is_active)) in cols.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" › ", dim));
+            spans.push(Span::styled(
+                format!(" {} ", if theme::is_ascii() { ">" } else { "›" }),
+                dim,
+            ));
         }
         if *is_active {
             spans.push(Span::styled(*label, active));
@@ -415,7 +483,7 @@ fn render_separator_rule(f: &mut Frame, area: Rect, _app: &App) {
     } else {
         theme.dim
     });
-    let rule = "─".repeat(area.width as usize);
+    let rule = h_line().repeat(area.width as usize);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(rule, dim)))
             .block(Block::default().borders(Borders::NONE)),
@@ -434,7 +502,7 @@ fn render_separator_rule(f: &mut Frame, area: Rect, _app: &App) {
 ///
 /// The `›` separator is a non-color structural cue (survives `NO_COLOR`).
 fn breadcrumb(app: &App) -> String {
-    let sep = " › ";
+    let sep = format!(" {} ", if theme::is_ascii() { ">" } else { "›" });
     match app.view {
         View::Artists => {
             let mut parts: Vec<String> = vec!["Artists".to_string()];
@@ -452,7 +520,7 @@ fn breadcrumb(app: &App) -> String {
                     }
                 }
             }
-            parts.join(sep)
+            parts.join(&sep)
         }
         View::Playlists => {
             let mut parts: Vec<String> = vec!["Playlists".to_string()];
@@ -461,7 +529,7 @@ fn breadcrumb(app: &App) -> String {
                     parts.push(pl.name.clone());
                 }
             }
-            parts.join(sep)
+            parts.join(&sep)
         }
         View::Queue => "Queue".to_string(),
         View::Youtube => {
@@ -471,7 +539,7 @@ fn breadcrumb(app: &App) -> String {
                     parts.push(list.name.clone());
                 }
             }
-            parts.join(sep)
+            parts.join(&sep)
         }
     }
 }
@@ -518,7 +586,7 @@ fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
         ("4:YouTube", View::Youtube),
     ];
 
-    let sep = " │ ";
+    let sep: &'static str = if v_sep() == "|" { " | " } else { " │ " };
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut tabs_w: usize = 0;
     for (i, (label, view)) in tabs.iter().enumerate() {
@@ -549,4 +617,70 @@ fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
             .block(Block::default().borders(Borders::NONE)),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::CellDiffOption;
+    use ratatui::widgets::Paragraph;
+    use ratatui::Terminal;
+
+    /// DEF-002 regression: a space between two words (default style) must be
+    /// marked `AlwaysUpdate` by `force_space_redraw` so the diff writes it
+    /// to the terminal, overwriting stale content from the previous frame.
+    #[test]
+    fn force_space_redraw_marks_spaces_between_words() {
+        let backend = TestBackend::new(20, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("hello world"), f.area());
+                force_space_redraw(f);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Position 5 is the space between "hello" and "world".
+        assert_eq!(
+            buf[(5, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "space between words must be AlwaysUpdate"
+        );
+        // Position 0 is 'h' (non-space) — should NOT be AlwaysUpdate.
+        assert_ne!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "non-space characters should not be force-marked"
+        );
+    }
+
+    /// DEF-002 regression: a space in the empty background (not adjacent to
+    /// any text) should NOT be marked — it doesn't need a forced write.
+    #[test]
+    fn force_space_redraw_skips_isolated_spaces() {
+        let backend = TestBackend::new(20, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                // Render only 5 chars in a 20-wide area — cols 5-19 are empty.
+                f.render_widget(Paragraph::new("hello"), f.area());
+                force_space_redraw(f);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Position 10 is empty background (no text neighbour).
+        assert_ne!(
+            buf[(10, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "isolated background space should not be force-marked"
+        );
+    }
+
+    /// DEF-004 regression: MIN_WIDTH must be 100 so 100×30 uses the full
+    /// 3-column layout with the 2-row player bar (SHUF/RPT/volume visible).
+    #[test]
+    fn min_width_is_100() {
+        assert_eq!(MIN_WIDTH, 100);
+    }
 }

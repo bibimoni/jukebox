@@ -65,6 +65,13 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
         Overlay::Diagnostics => {
             crate::tui::view::diagnostics::render(f, area, &app.diagnostics);
         }
+        Overlay::Confirm { message, .. } => render_confirm(f, area, &message),
+        Overlay::TextInput {
+            prompt,
+            buffer,
+            cursor,
+            ..
+        } => render_text_input(f, area, &prompt, &buffer, cursor),
     }
 }
 
@@ -332,7 +339,10 @@ fn render_search(
 
 /// The grouped keymap lines shown in the Help overlay. Kept here (not in the
 /// spec doc) so the help text can't drift from the implementation.
-fn help_lines<'a>() -> Vec<Line<'a>> {
+/// `sep_width` is the inner width of the help popup so separator lines fill
+/// the full dialog width (DEF-019: separators were fixed at 72 chars and
+/// didn't reach the right border at wider terminals).
+fn help_lines<'a>(sep_width: usize) -> Vec<Line<'a>> {
     let theme = Theme::default();
     let accent = Style::default().fg(theme.accent);
     let bold = Style::default().add_modifier(Modifier::BOLD);
@@ -349,7 +359,7 @@ fn help_lines<'a>() -> Vec<Line<'a>> {
     let section =
         |title: &'a str| -> Line<'a> { Line::from(Span::styled(title.to_string(), bold)) };
 
-    let sep = || -> Line<'a> { Line::from(Span::styled("─".repeat(72), dim)) };
+    let sep = || -> Line<'a> { Line::from(Span::styled("─".repeat(sep_width), dim)) };
 
     vec![
         Line::from(""),
@@ -437,8 +447,12 @@ fn render_help(f: &mut Frame, area: Rect, scroll: u16) {
             " help — j/k scroll · Esc to close ",
             Style::default().fg(theme.accent),
         ));
+    // DEF-019: separator lines must fill the full inner width of the popup.
+    // Compute the inner width (popup width minus 2 for borders) and pass it
+    // to help_lines so the `─` separators reach the right border.
+    let sep_width = popup.width.saturating_sub(2) as usize;
     f.render_widget(
-        Paragraph::new(help_lines())
+        Paragraph::new(help_lines(sep_width))
             .scroll((scroll, 0))
             .block(block),
         popup,
@@ -816,4 +830,81 @@ fn source_label(source: LyricsSource) -> &'static str {
         LyricsSource::Ytmusicapi => "youtube",
         LyricsSource::Cached => "cached",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Confirm dialog (DEF-001, DEF-015)
+// ---------------------------------------------------------------------------
+
+/// Render a yes/no confirmation dialog. The message is shown centered, with
+/// `y: confirm · n / Esc: cancel` as the hint line.
+fn render_confirm(f: &mut Frame, area: Rect, message: &str) {
+    let theme = Theme::default();
+    let popup = centered(area, 50, 20);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(Span::styled(" confirm ", Style::default().fg(theme.accent)));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            message.to_string(),
+            Style::default().fg(theme.text),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "y: confirm  ·  n / Esc: cancel",
+            Style::default().fg(theme.dim),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Text input overlay (DEF-014: playlist name prompt)
+// ---------------------------------------------------------------------------
+
+/// Render a text input overlay with a prompt label, the accumulating buffer,
+/// and a block cursor. Enter confirms; Esc cancels.
+fn render_text_input(f: &mut Frame, area: Rect, prompt: &str, buffer: &str, cursor: usize) {
+    let theme = Theme::default();
+    let popup = centered(area, 50, 20);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(Span::styled(
+            " new playlist ",
+            Style::default().fg(theme.accent),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let cursor = cursor.min(buffer.len());
+    let before = &buffer[..cursor];
+    let after = &buffer[cursor..];
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            prompt.to_string(),
+            Style::default().fg(theme.dim),
+        )),
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(theme.accent)),
+            Span::styled(before.to_string(), Style::default().fg(theme.text)),
+            Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::styled(after.to_string(), Style::default().fg(theme.text)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter: create  ·  Esc: cancel  ·  (empty = auto-name)",
+            Style::default().fg(theme.dim),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
 }

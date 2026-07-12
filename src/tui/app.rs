@@ -170,6 +170,38 @@ pub enum Overlay {
     /// on `App::diagnostics`; this just signals "show it". Esc closes (handled
     /// generically at the top of the key handler).
     Diagnostics,
+    /// Confirmation dialog for destructive actions (DEF-001: delete playlist,
+    /// DEF-015: yt logout). `message` is shown to the user; `action` identifies
+    /// what to do on confirm (y/Enter). n/Esc cancels.
+    Confirm {
+        message: String,
+        action: ConfirmAction,
+    },
+    /// Text input overlay (DEF-014: playlist name prompt). `prompt` is the
+    /// label; `buffer` accumulates typed text; `cursor` is the byte offset;
+    /// `action` identifies what to do on Enter.
+    TextInput {
+        prompt: String,
+        buffer: String,
+        cursor: usize,
+        action: TextInputAction,
+    },
+}
+
+/// Actions that can be confirmed via [`Overlay::Confirm`].
+#[derive(Clone, Debug)]
+pub enum ConfirmAction {
+    /// Delete the focused playlist (Playlists view, col 0).
+    DeletePlaylist,
+    /// Clear YouTube credentials and log out.
+    YtLogout,
+}
+
+/// Actions that can be triggered via [`Overlay::TextInput`].
+#[derive(Clone, Debug)]
+pub enum TextInputAction {
+    /// Create a new playlist with the given name and seed track.
+    NewPlaylist { track_id: String },
 }
 
 /// The lifecycle state of the lyrics overlay. Distinct from `Overlay::Lyrics`
@@ -654,6 +686,14 @@ impl App {
     /// `play_selected` play the wrong/no track — the "this artist has no songs"
     /// and "Enter doesn't play after picking a list" bugs.
     pub fn clamp_cursors(&mut self) {
+        // Queue view: keep cursors.track synced with cursors.queue so the
+        // ▸ selection marker (rendered via cursors.track by `track_rows`)
+        // matches the actual navigation cursor (cursors.queue). Without
+        // this, a stale cursors.track from a prior view makes `x` remove
+        // a different item than the one the user sees highlighted (DEF-016).
+        if self.view == View::Queue {
+            self.cursors.track = self.cursors.queue;
+        }
         let n_artists = self.artists.len();
         if n_artists > 0 && self.cursors.artist >= n_artists {
             self.cursors.artist = n_artists - 1;
@@ -809,6 +849,8 @@ impl App {
                 }) => {
                     if std::fs::metadata(&path).is_err() {
                         self.dead.insert(id.clone());
+                        self.yt_error = Some(format!("file not found: {path:?}"));
+                        self.yt_status = Some(format!("file not found: {}", path.display()));
                         let r = ClonedResolver {
                             playlists: &self.playlists,
                             manual_queue: self.transport.manual_queue.clone(),
@@ -838,7 +880,9 @@ impl App {
                             self.preload_next_url();
                         }
                         Err(e) => {
-                            self.yt_error = Some(format!("playback failed: {e}"));
+                            let msg = format!("playback failed: {e}");
+                            self.yt_error = Some(msg.clone());
+                            self.yt_status = Some(msg);
                             self.dead.insert(id.clone());
                         }
                     }
@@ -992,6 +1036,16 @@ impl App {
                 sample_rate_hz,
                 bit_depth,
             }) => {
+                // Check the file exists before attempting to load — a missing
+                // file would otherwise "succeed" with a stub player or fail
+                // silently with a real one (DEF-009). Mark dead + set a
+                // visible error so the user + next() loop know to skip.
+                if std::fs::metadata(&path).is_err() {
+                    self.dead.insert(id.to_string());
+                    self.yt_error = Some(format!("file not found: {path:?}"));
+                    self.yt_status = Some(format!("file not found: {}", path.display()));
+                    return;
+                }
                 if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
                     &mut self.device_rate,
                     crate::source::device_rate::LoadKind::Local {
@@ -1009,7 +1063,9 @@ impl App {
                         });
                     }
                     Err(e) => {
-                        self.yt_error = Some(format!("playback failed: {e}"));
+                        let msg = format!("playback failed: {e}");
+                        self.yt_error = Some(msg.clone());
+                        self.yt_status = Some(msg);
                         self.dead.insert(id.to_string());
                     }
                 }
@@ -1127,99 +1183,127 @@ impl App {
     }
 
     pub fn next(&mut self) {
-        let r = ClonedResolver {
-            playlists: &self.playlists,
-            manual_queue: self.transport.manual_queue.clone(),
-            yt_lists: &self.yt_lists,
-        };
-        if let Some(id) = self.transport.next(&r, &self.catalog) {
-            // Load the returned id directly: `Transport::next`'s manual-queue
-            // path returns a queued id without updating the cursor, so
-            // re-reading `transport.current()` would load the wrong track.
-            self.load_track(&id);
-        } else {
-            // Context exhausted (repeat off, no manual queue). The continue
-            // mode decides whether playback stops or auto-advances to more
-            // music — this is the "auto discover" feature.
-            match self.transport.continue_mode {
-                ContinueMode::Off => {
-                    self.player.stop().ok();
-                    self.now_playing = None;
-                }
-                ContinueMode::NextAlbum => {
-                    if self.switch_to_next_album() {
-                        self.start_playback();
-                    } else {
-                        // Not in an album context, or no next album: stop.
-                        self.player.stop().ok();
-                        self.now_playing = None;
+        // Skip dead tracks automatically so `>` always advances to the next
+        // playable track in context order (DEF-017: without this, `>` on a
+        // dead track silently does nothing — the user sees no change and
+        // presses `>` again, advancing past the dead track, making the order
+        // appear non-sequential). The loop tries each candidate once; if all
+        // are dead, playback stops.
+        let total = self.transport.order.len() + self.transport.manual_queue.len();
+        for _ in 0..total.max(1) {
+            let r = ClonedResolver {
+                playlists: &self.playlists,
+                manual_queue: self.transport.manual_queue.clone(),
+                yt_lists: &self.yt_lists,
+            };
+            match self.transport.next(&r, &self.catalog) {
+                Some(id) if !self.dead.contains(&id) => {
+                    // Found a live candidate — load it. load_track may still
+                    // mark it dead (missing file, player error); if so, loop
+                    // to try the next candidate instead of returning with
+                    // nothing playing (DEF-017).
+                    self.load_track(&id);
+                    if !self.dead.contains(&id) {
+                        return;
                     }
+                    // Track became dead during load — skip to next.
                 }
-                ContinueMode::Radio => {
-                    self.switch_to_radio();
-                    self.start_playback();
+                Some(_) => {
+                    // Dead track — loop to try the next candidate.
+                    // transport.next already advanced the cursor / popped the
+                    // manual-queue entry.
                 }
-                ContinueMode::YouTube => {
-                    // Drive YouTube autoplay via RadioCursor (spec §3.4). The
-                    // old `radio.advance(session, seed)` made a BLOCKING
-                    // `get_watch_playlist` roundtrip (~4s) every time the queue
-                    // was exhausted, freezing the UI on each auto-advance. Now
-                    // we advance locally when the queue still has entries (no
-                    // sidecar call), and fire-and-forget a radio refill when
-                    // exhausted — `on_tick` refills the cursor + starts
-                    // playback when `pending_watch` lands (non-blocking).
-                    let seed_id = self.now_playing.clone().map(|s| s.id().to_string());
-                    if let Some(vid) = self.radio.next_local() {
-                        // Fast path: the queue still has entries — switch
-                        // context + start playback immediately (same as the
-                        // old `radio.advance` Some(vid) arm).
-                        if let Some(np) = self.now_playing.clone() {
-                            self.transport
-                                .history
-                                .push((np.id().to_string(), self.transport.context.clone()));
-                        }
-                        let ctx = Context::Search {
-                            query: "youtube radio".into(),
-                            track_ids: vec![vid.clone()],
-                        };
-                        let r = ClonedResolver {
-                            playlists: &self.playlists,
-                            manual_queue: self.transport.manual_queue.clone(),
-                            yt_lists: &self.yt_lists,
-                        };
-                        self.transport
-                            .switch_context(ctx, Some(&vid), &r, &self.catalog);
-                        self.start_playback();
-                    } else if let Some(session) = self.yt_session.as_mut() {
-                        // Queue exhausted — fire-and-forget a radio refill
-                        // seeded by the just-finished track. Non-blocking: the
-                        // old track stays current until `on_tick` drains
-                        // `pending_watch` and starts the next. No-op if a
-                        // refill is already in flight so a burst of `next`/
-                        // end-of-track events doesn't flood the sidecar.
-                        if let Some(seed) = seed_id {
-                            if !session.watch_loading()
-                                && session.send_watch_playlist(seed.clone()).is_ok()
-                            {
-                                self.pending_radio_seed = Some(seed);
-                            }
-                            // Leave now_playing on the ended track; on_tick
-                            // will push it to history + switch when the
-                            // response lands. Don't stop here — clearing
-                            // now_playing would lose the history-push target.
-                        } else {
-                            // No seed (nothing was playing) — stop cleanly.
+                None => {
+                    // Context exhausted (repeat off, no manual queue). The
+                    // continue mode decides whether playback stops or auto-
+                    // advances to more music — this is the "auto discover"
+                    // feature.
+                    match self.transport.continue_mode {
+                        ContinueMode::Off => {
                             self.player.stop().ok();
                             self.now_playing = None;
                         }
-                    } else {
-                        // No session — stop cleanly (degrade, spec §3.5).
-                        self.player.stop().ok();
-                        self.now_playing = None;
+                        ContinueMode::NextAlbum => {
+                            if self.switch_to_next_album() {
+                                self.start_playback();
+                            } else {
+                                // Not in an album context, or no next album: stop.
+                                self.player.stop().ok();
+                                self.now_playing = None;
+                            }
+                        }
+                        ContinueMode::Radio => {
+                            self.switch_to_radio();
+                            self.start_playback();
+                        }
+                        ContinueMode::YouTube => {
+                            // Drive YouTube autoplay via RadioCursor (spec §3.4). The
+                            // old `radio.advance(session, seed)` made a BLOCKING
+                            // `get_watch_playlist` roundtrip (~4s) every time the queue
+                            // was exhausted, freezing the UI on each auto-advance. Now
+                            // we advance locally when the queue still has entries (no
+                            // sidecar call), and fire-and-forget a radio refill when
+                            // exhausted — `on_tick` refills the cursor + starts
+                            // playback when `pending_watch` lands (non-blocking).
+                            let seed_id = self.now_playing.clone().map(|s| s.id().to_string());
+                            if let Some(vid) = self.radio.next_local() {
+                                // Fast path: the queue still has entries — switch
+                                // context + start playback immediately (same as the
+                                // old `radio.advance` Some(vid) arm).
+                                if let Some(np) = self.now_playing.clone() {
+                                    self.transport.history.push((
+                                        np.id().to_string(),
+                                        self.transport.context.clone(),
+                                    ));
+                                }
+                                let ctx = Context::Search {
+                                    query: "youtube radio".into(),
+                                    track_ids: vec![vid.clone()],
+                                };
+                                let r = ClonedResolver {
+                                    playlists: &self.playlists,
+                                    manual_queue: self.transport.manual_queue.clone(),
+                                    yt_lists: &self.yt_lists,
+                                };
+                                self.transport
+                                    .switch_context(ctx, Some(&vid), &r, &self.catalog);
+                                self.start_playback();
+                            } else if let Some(session) = self.yt_session.as_mut() {
+                                // Queue exhausted — fire-and-forget a radio refill
+                                // seeded by the just-finished track. Non-blocking: the
+                                // old track stays current until `on_tick` drains
+                                // `pending_watch` and starts the next. No-op if a
+                                // refill is already in flight so a burst of `next`/
+                                // end-of-track events doesn't flood the sidecar.
+                                if let Some(seed) = seed_id {
+                                    if !session.watch_loading()
+                                        && session.send_watch_playlist(seed.clone()).is_ok()
+                                    {
+                                        self.pending_radio_seed = Some(seed);
+                                    }
+                                    // Leave now_playing on the ended track; on_tick
+                                    // will push it to history + switch when the
+                                    // response lands. Don't stop here — clearing
+                                    // now_playing would lose the history-push target.
+                                } else {
+                                    // No seed (nothing was playing) — stop cleanly.
+                                    self.player.stop().ok();
+                                    self.now_playing = None;
+                                }
+                            } else {
+                                // No session — stop cleanly (degrade, spec §3.5).
+                                self.player.stop().ok();
+                                self.now_playing = None;
+                            }
+                        }
                     }
+                    return;
                 }
             }
         }
+        // All candidates were dead — stop playback.
+        self.player.stop().ok();
+        self.now_playing = None;
     }
 
     pub fn prev(&mut self) {
@@ -1659,6 +1743,14 @@ impl App {
                     if want == id {
                         if let Some(start) = vids.first().cloned() {
                             pending_discover_start = Some((vids, start));
+                        } else {
+                            // The sidecar returned an empty track list for
+                            // this mix (e.g. RD* IDs the sidecar doesn't
+                            // know). Surface an error so the user isn't left
+                            // staring at a "Loading mix…" status forever
+                            // (DEF-007).
+                            self.yt_error = Some(format!("mix \"{id}\" returned no tracks"));
+                            self.yt_status = Some("couldn't load mix — no tracks".into());
                         }
                     } else {
                         self.pending_discover_play = Some(want);
@@ -1694,7 +1786,7 @@ impl App {
                         id: p.id,
                         name: p.name,
                     })
-                    .take(5)
+                    .take(6)
                     .collect();
                 // Only touch the overlay if it's still a Discover — a stale
                 // response landing after the user closed/replaced the overlay
@@ -2029,6 +2121,9 @@ impl App {
         // arm). Start the playlist, mirroring the old blocking path's
         // `play_in_context_ids(ids, start)`.
         if let Some((ids, start)) = pending_discover_start {
+            // Close the discover overlay on success so the user sees the
+            // now-playing bar, not the overlay (DEF-007).
+            self.overlay = None;
             self.play_in_context_ids(ids, &start);
         }
 
@@ -2358,8 +2453,17 @@ impl App {
             .map(|v| v.artist)
             .unwrap_or_default();
         let mut scored: Vec<(u64, DiscoverItem)> = Vec::new();
+        // Dedup key: collaboration albums are filed under every artist in
+        // `symlinked_into_artists`, so the same (primary_artist, title) pair
+        // appears under multiple artist keys. Without dedup the discover
+        // overlay shows duplicate entries (DEF-022).
+        let mut seen: HashSet<(String, String)> = HashSet::new();
         for (artist, albums) in &self.albums_by_artist {
             for a in albums {
+                let dup_key = (a.artist.clone(), a.title.clone());
+                if !seen.insert(dup_key) {
+                    continue;
+                }
                 let key = format!("{artist}|{}", a.title);
                 let r = Self::hash_rand(&key);
                 let penalty = if *artist == cur_artist { 1_000_000 } else { 0 };
@@ -2547,12 +2651,16 @@ impl App {
                 // a matching id (see `pending_discover_play`). A cold cache
                 // hit isn't possible here (discover lists never have
                 // pre-fetched tracks), so we always go through the async
-                // path. If there's no session, fall back to a clean no-op.
+                // path. If there's no session, fall back to a clean no-op
+                // with an error message (DEF-007).
                 if let Some(session) = self.yt_session.as_mut() {
                     // `send_get_playlist` is a no-op if this exact id is
                     // already in flight, so a double-Enter doesn't flood.
                     let _ = session.send_get_playlist(id.clone());
                     self.pending_discover_play = Some(id);
+                    self.yt_status = Some("Loading mix…".into());
+                } else {
+                    self.yt_status = Some("can't load mix — no YouTube session".into());
                 }
             }
         }
@@ -2946,10 +3054,15 @@ impl App {
     }
 
     /// `e` — enqueue the track under the cursor to the manual "play next"
-    /// queue. No-op if there's no selected track.
+    /// queue. Shows a status-bar confirmation so the user gets immediate
+    /// feedback (DEF-008: YouTube enqueue previously produced no visible
+    /// result). No-op if there's no selected track.
     pub fn enqueue_selected(&mut self) {
         if let Some(id) = self.selected_track_id() {
             self.transport.enqueue(id);
+            self.yt_status = Some("added to queue".into());
+        } else {
+            self.yt_status = Some("no track selected".into());
         }
     }
 

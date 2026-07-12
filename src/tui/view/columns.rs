@@ -25,7 +25,10 @@ use ratatui::{
 };
 
 use crate::tui::app::{App, View};
-use crate::tui::view::theme::{disp_width, no_color, pad_between, Theme};
+use crate::tui::view::theme::{
+    disp_width, ellipsis, em_dash, is_ascii, marker_glyph, no_color, pad_between, play_glyph,
+    Theme, ASCII_BORDER_SET,
+};
 
 /// Render the rail + columns into `area` using state from `app`.
 pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
@@ -56,16 +59,27 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
 /// (where both colors collapse to `Reset`).
 fn border<'a>(title: &'a str, focused: bool, theme: &Theme) -> Block<'a> {
     let color = if focused { theme.accent } else { theme.dim };
-    let bt = if focused {
-        BorderType::Thick
+    // DEF-006: In ASCII font mode, use ASCII border characters (+, -, |)
+    // instead of Unicode box-drawing. In Unicode mode, focused columns get
+    // Thick (double-line) borders, unfocused get Plain (single-line).
+    if is_ascii() {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(ASCII_BORDER_SET)
+            .border_style(Style::default().fg(color))
+            .title(Span::styled(title, Style::default().fg(color)))
     } else {
-        BorderType::Plain
-    };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(bt)
-        .border_style(Style::default().fg(color))
-        .title(Span::styled(title, Style::default().fg(color)))
+        let bt = if focused {
+            BorderType::Thick
+        } else {
+            BorderType::Plain
+        };
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(bt)
+            .border_style(Style::default().fg(color))
+            .title(Span::styled(title, Style::default().fg(color)))
+    }
 }
 
 /// The column title with an inline filter prompt appended when the filter is
@@ -176,7 +190,14 @@ pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
                 let mut lines: Vec<Line> = app
                     .artists
                     .iter()
-                    .map(|a| Line::from(Span::styled(a.clone(), Style::default().fg(theme.text))))
+                    .enumerate()
+                    .map(|(i, a)| {
+                        if i == app.cursors.artist {
+                            Line::from(Span::styled(a.clone(), theme.selected_style()))
+                        } else {
+                            Line::from(Span::styled(a.clone(), Style::default().fg(theme.text)))
+                        }
+                    })
                     .collect();
                 let artist = app
                     .artists
@@ -191,7 +212,10 @@ pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
                 if !albums.is_empty() {
                     let dim = Style::default().fg(theme.dim);
                     lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(format!("Albums — {artist}:"), dim)));
+                    lines.push(Line::from(Span::styled(
+                        format!("Albums {} {artist}:", em_dash()),
+                        dim,
+                    )));
                     for a in albums.iter().take(3) {
                         lines.push(Line::from(Span::styled(format!("  {}", a.title), dim)));
                     }
@@ -395,7 +419,7 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         f.render_stateful_widget(
             List::new(items)
                 .block(col1_block)
-                .highlight_style(Style::default().fg(theme.accent)),
+                .highlight_style(theme.selected_style()),
             cols[0],
             &mut state,
         );
@@ -457,9 +481,15 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             .iter()
             .filter(|l| l.kind == crate::tui::app::YtListKind::Suggested)
             .collect();
+        let arrow = if is_ascii() { "->" } else { "→" };
         let lines: Vec<Line> = sugg
             .iter()
-            .map(|l| Line::from(Span::styled(format!("▶ {} →", l.name), dim)))
+            .map(|l| {
+                Line::from(Span::styled(
+                    format!("{} {} {}", play_glyph(), l.name, arrow),
+                    dim,
+                ))
+            })
             .collect();
         f.render_widget(
             Paragraph::new(lines).block(border("Suggested / Up Next", false, theme)),
@@ -481,7 +511,7 @@ fn yt_status_line(app: &App, ids_empty: bool) -> String {
             || app.yt_state == YtState::AuthExpired
             || app.yt_state == YtState::RateLimited
         {
-            return format!("YT: {} — {}", app.yt_state.human_label(), e);
+            return format!("YT: {} {} {}", app.yt_state.human_label(), em_dash(), e);
         }
     }
     match app.yt_state {
@@ -489,12 +519,12 @@ fn yt_status_line(app: &App, ids_empty: bool) -> String {
             "YouTube not configured — run :yt auth browser <chrome>".to_string()
         }
         YtState::SignedOut => "signed out — run :yt auth to reconnect".to_string(),
-        YtState::Authenticating => "authenticating…".to_string(),
+        YtState::Authenticating => format!("authenticating{}", ellipsis()).to_string(),
         YtState::AuthenticatedNotSynced | YtState::Synchronizing => {
             if app.yt_lists_loading {
-                "loading…".to_string()
+                format!("loading{}", ellipsis()).to_string()
             } else {
-                "syncing…".to_string()
+                format!("syncing{}", ellipsis()).to_string()
             }
         }
         YtState::Ready => {
@@ -504,10 +534,18 @@ fn yt_status_line(app: &App, ids_empty: bool) -> String {
                 String::new()
             }
         }
-        YtState::ReadyStale => "offline — showing cached lists (press R to retry)".to_string(),
-        YtState::RateLimited => "rate limited — wait, then press R".to_string(),
+        YtState::ReadyStale => format!(
+            "offline {} showing cached lists (press R to retry)",
+            em_dash()
+        )
+        .to_string(),
+        YtState::RateLimited => {
+            format!("rate limited {} wait, then press R", em_dash()).to_string()
+        }
         YtState::AuthExpired => "authorization expired — run :yt auth browser <name>".to_string(),
-        YtState::ProviderError => "provider error — press R to retry".to_string(),
+        YtState::ProviderError => {
+            format!("provider error {} press R to retry", em_dash()).to_string()
+        }
         YtState::Failed => "failed — run :yt setup or check your installation".to_string(),
     }
 }
@@ -556,7 +594,7 @@ fn truncate_ellipsis(s: &str, width: usize) -> String {
         }
         break;
     }
-    out.push('…');
+    out.push_str(ellipsis());
     out
 }
 
@@ -576,7 +614,12 @@ fn yt_error_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
     let err_style = Style::default().fg(err_color);
 
     let icon = app.yt_state.icon().unwrap_or("[!]");
-    let label = app.yt_state.human_label();
+    let label_raw = app.yt_state.human_label();
+    let label = if is_ascii() {
+        label_raw.replace('…', "...")
+    } else {
+        label_raw.to_string()
+    };
     let detail = app.yt_error.as_deref().unwrap_or("").trim();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -654,7 +697,7 @@ fn render_artists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             f.render_stateful_widget(
                 List::new(items)
                     .block(col1_block)
-                    .highlight_style(Style::default().fg(theme.accent)),
+                    .highlight_style(theme.selected_style()),
                 artist_area,
                 &mut state,
             );
@@ -681,7 +724,7 @@ fn render_artists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     f.render_stateful_widget(
         List::new(album_items)
             .block(border("Albums", app.focus_col == 1, theme))
-            .highlight_style(Style::default().fg(theme.accent)),
+            .highlight_style(theme.selected_style()),
         album_area,
         &mut album_state,
     );
@@ -760,7 +803,7 @@ fn render_playlists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             f.render_stateful_widget(
                 List::new(items)
                     .block(col1_block)
-                    .highlight_style(Style::default().fg(theme.accent)),
+                    .highlight_style(theme.selected_style()),
                 cols[0],
                 &mut state,
             );
@@ -817,7 +860,10 @@ fn render_queue(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                 .add_modifier(Modifier::BOLD)
         };
         let lines = vec![
-            Line::from(Span::styled("≡ Queue is empty", dim)),
+            Line::from(Span::styled(
+                format!("{} Queue is empty", if is_ascii() { "#" } else { "≡" }),
+                dim,
+            )),
             Line::from(Span::styled("Press e on a track to enqueue", bold)),
             Line::from(vec![
                 Span::styled("1", key),
@@ -892,16 +938,17 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
             let np = app.now_playing.as_ref().map(|s| s.id()) == Some(id.as_str());
             let selected = i == app.cursors.track;
             let glyph = if np {
-                "▶"
+                play_glyph()
             } else if selected {
-                "▸"
+                marker_glyph()
             } else {
                 " "
             };
             let num = format!("{:>2}", i + 1);
             let album = t.album.as_deref().unwrap_or("");
             let badge = if show_badge { "[L] " } else { "" };
-            let left = format!("{badge}{glyph} {num} {} — {album}", t.title);
+            let dash = if is_ascii() { "-" } else { "—" };
+            let left = format!("{badge}{glyph} {num} {} {dash} {album}", t.title);
             let quality = t.quality_label();
             let line = pad_between(&left, &quality, width);
             let line = truncate_ellipsis(&line, width);
@@ -967,9 +1014,9 @@ fn yt_track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<
             let np = app.now_playing.as_ref().map(|s| s.id()) == Some(id.as_str());
             let selected = i == app.cursors.track;
             let glyph = if np {
-                "▶"
+                play_glyph()
             } else if selected {
-                "▸"
+                marker_glyph()
             } else {
                 " "
             };
@@ -987,11 +1034,11 @@ fn yt_track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<
                     ),
                     // No metadata yet (track_cache miss — e.g. just loaded from
                     // disk cache with track_ids cleared, or cache eviction).
-                    // Show "Loading…" instead of the raw video ID, which looks
+                    // Show format!("Loading{}", ellipsis()) instead of the raw video ID, which looks
                     // like random characters (e.g. "jNQXAC9IVRw"). The lazy-load
                     // at on_tick will fetch the metadata shortly.
                     None => (
-                        "Loading…".to_string(),
+                        format!("Loading{}", ellipsis()).to_string(),
                         String::new(),
                         None,
                         "YT".to_string(),
@@ -999,10 +1046,11 @@ fn yt_track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<
                 };
             let album_s = album.as_deref().unwrap_or("");
             let badge = if show_badge { "[Y] " } else { "" };
+            let dash = if is_ascii() { "-" } else { "—" };
             let left = if artist.is_empty() {
                 format!("{badge}{glyph} {num} {title}")
             } else {
-                format!("{badge}{glyph} {num} {title} — {artist} {album_s}")
+                format!("{badge}{glyph} {num} {title} {dash} {artist} {album_s}")
             };
             let line = pad_between(&left, &quality, width);
             let line = truncate_ellipsis(&line, width);

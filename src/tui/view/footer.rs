@@ -11,7 +11,7 @@ use ratatui::{
 };
 
 use crate::tui::app::{App, Overlay, SearchScope};
-use crate::tui::view::theme::Theme;
+use crate::tui::view::theme::{sep_dot, Theme};
 
 /// Render the footer. When the area is ≥ 2 rows: line 1 = YT provider status
 /// (or blank when Ready), line 2 = persistent key-hint line. When only 1 row
@@ -88,9 +88,9 @@ fn mode_badge(app: &App, theme: &Theme) -> Span<'static> {
     // env is unset (the test fixtures run in a clean env → no snapshot
     // change).
     let hc = if crate::tui::view::theme::high_contrast() {
-        " · HC"
+        format!(" {} HC", sep_dot())
     } else {
-        ""
+        String::new()
     };
     let color = if no_color() {
         Color::Reset
@@ -98,7 +98,7 @@ fn mode_badge(app: &App, theme: &Theme) -> Span<'static> {
         theme.accent
     };
     Span::styled(
-        format!("VIEW: {view_src} · SOURCE: {mode}{hc}"),
+        format!("VIEW: {view_src} {} SOURCE: {mode}{hc}", sep_dot()),
         Style::default().fg(color),
     )
 }
@@ -130,8 +130,17 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
             };
             return Line::from(vec![
                 badge,
-                Span::raw(" · "),
+                Span::raw(format!(" {} ", sep_dot())),
                 Span::styled(msg.clone(), Style::default().fg(color)),
+            ]);
+        }
+        // DEF-003: show yt_error when Ready (e.g., "Unknown command: foobar").
+        if let Some(err) = &app.yt_error {
+            let err_style = theme.error_style();
+            return Line::from(vec![
+                badge,
+                Span::raw(format!(" {} ", sep_dot())),
+                Span::styled(format!("[ERR] {err}"), err_style),
             ]);
         }
         // Ready + no transient: "✓ YT connected" alongside the mode badge.
@@ -142,12 +151,19 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
         };
         return Line::from(vec![
             badge,
-            Span::raw(" · "),
+            Span::raw(format!(" {} ", sep_dot())),
             Span::styled("[ok] YT connected", Style::default().fg(color)),
         ]);
     }
     // Non-Ready: mode badge + YT status.
-    let label = app.yt_state.human_label();
+    // DEF-006: in ASCII mode, replace any Unicode ellipsis in the label with
+    // "..." so the footer is fully ASCII when JUKEBOX_FONT_MODE=ascii.
+    let label_raw = app.yt_state.human_label();
+    let label = if crate::tui::view::theme::is_ascii() {
+        label_raw.replace('…', "...")
+    } else {
+        label_raw.to_string()
+    };
     let icon = app.yt_state.icon();
     let color = if no_color() {
         Color::Reset
@@ -174,7 +190,11 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
     // it overflows the 1-line footer and dumps raw exceptions (T5: footer
     // showed "Unable to find 'contents' using path ['conte"..."). The full
     // error is captured in the diagnostics overlay (press `D`).
-    Line::from(vec![badge, Span::raw(" · "), Span::styled(yt_label, style)])
+    Line::from(vec![
+        badge,
+        Span::raw(format!(" {} ", sep_dot())),
+        Span::styled(yt_label, style),
+    ])
 }
 
 /// Build the footer line: a YT provider status (from `yt_state`) when the
@@ -194,9 +214,20 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
 /// communicate, and the player bar already shows the MODE label).
 pub fn footer_line(app: &App, theme: &Theme, dim: &Style, width: u16) -> Line<'static> {
     use crate::yt::state::YtState;
-    // Ready + no transient: hints are the priority (no error to communicate,
-    // and the player bar already shows the MODE label).
+    // Ready + no transient: check yt_error first (DEF-003: unknown commands
+    // set yt_error while yt_state stays Ready — the old footer only showed
+    // yt_status/yt_state, never yt_error, so the user got no feedback).
     if app.yt_state == YtState::Ready && app.yt_status.is_none() {
+        if let Some(err) = &app.yt_error {
+            let badge = mode_badge(app, theme);
+            let err_style = theme.error_style();
+            let msg = truncate_footer_msg(err, width.saturating_sub(20) as usize);
+            return Line::from(vec![
+                badge,
+                Span::raw(format!(" {} ", sep_dot())),
+                Span::styled(format!("[ERR] {msg}"), err_style),
+            ]);
+        }
         return hint_line(app, dim, width);
     }
     // Non-Ready or Ready+msg: mirror status_line so the 1-row footer shows
@@ -245,7 +276,7 @@ fn hint_line(app: &App, dim: &Style, width: u16) -> Line<'static> {
         return Line::from(spans);
     }
 
-    let sep = " · ";
+    let sep = format!(" {} ", sep_dot());
     let search_hint = "/ search";
     let mut parts: Vec<String> = vec![
         "Enter play".to_string(),
@@ -261,7 +292,7 @@ fn hint_line(app: &App, dim: &Style, width: u16) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, s) in parts.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::raw(sep));
+            spans.push(Span::raw(sep.clone()));
         }
         spans.push(Span::styled(s.clone(), *dim));
     }
@@ -270,4 +301,30 @@ fn hint_line(app: &App, dim: &Style, width: u16) -> Line<'static> {
 
 fn no_color() -> bool {
     crate::tui::view::theme::no_color()
+}
+
+/// Truncate a footer message to fit within `max` display columns, appending
+/// `…` when cut. Prevents long error messages from overflowing the 1-row
+/// footer (T5: raw exceptions overflowed the footer line).
+fn truncate_footer_msg(s: &str, max: usize) -> String {
+    use crate::tui::view::theme::disp_width;
+    if max == 0 {
+        return String::new();
+    }
+    if disp_width(s) <= max {
+        return s.to_string();
+    }
+    let target = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = disp_width(&c.to_string());
+        if w + cw > target {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
 }

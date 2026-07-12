@@ -133,7 +133,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // `x` removes the focused track from the manual queue (Queue view).
         (KeyCode::Char('x'), _) => app.remove_selected_from_queue(),
         // `d` deletes the focused playlist (Playlists view, col 0 only).
-        (KeyCode::Char('d'), _) => app.delete_focused_playlist(),
+        // DEF-001: show a confirmation dialog before deletion — a single
+        // accidental keypress must not destroy a playlist. When the guard
+        // fails (not in Playlists view / col 0 / empty list), the arm falls
+        // through to `_ => {}` (no-op), matching the old gating in
+        // `delete_focused_playlist`.
+        (KeyCode::Char('d'), _)
+            if app.view == View::Playlists
+                && app.focus_col == 0
+                && app.playlists.get(app.cursors.playlist).is_some() =>
+        {
+            let name = app.playlists[app.cursors.playlist].name.clone();
+            app.overlay = Some(Overlay::Confirm {
+                message: format!("Delete playlist \"{name}\"?  y/n"),
+                action: crate::tui::app::ConfirmAction::DeletePlaylist,
+            });
+        }
 
         // --- Overlays -------------------------------------------------------
         (KeyCode::Char('/'), _) => {
@@ -433,6 +448,9 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 }
                 KeyCode::Tab => {
                     // Tab completion: complete known command prefix.
+                    // NOTE: the stored `input` does NOT include the `:` prefix —
+                    // `render_command` (overlay.rs) prepends `:` for display.
+                    // Storing `:` here would double it (`::yt`) on screen (DEF-010).
                     let known = ["queue", "yt", "lyrics", "diag", "help", "quit", "q"];
                     let prefix = input.trim_start_matches(':');
                     let matches: Vec<&str> = known
@@ -441,7 +459,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                         .filter(|c| c.starts_with(prefix))
                         .collect();
                     if matches.len() == 1 {
-                        input = format!(":{}", matches[0]);
+                        input = matches[0].to_string();
                         cursor = input.len();
                     } else if matches.len() > 1 {
                         // Complete the common prefix.
@@ -457,7 +475,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                                 }
                             })
                             .unwrap_or_default();
-                        input = format!(":{}", String::from_utf8_lossy(&common));
+                        input = String::from_utf8_lossy(&common).to_string();
                         cursor = input.len();
                     }
                 }
@@ -560,6 +578,10 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 }
                 KeyCode::Char('g') => app.help_scroll = 0,
                 KeyCode::Char('G') => app.help_scroll = HELP_LINES,
+                // Home/End jump to top/bottom (mirrors g/G) — DEF-018: End was
+                // missing.
+                KeyCode::Home => app.help_scroll = 0,
+                KeyCode::End => app.help_scroll = HELP_LINES,
                 _ => {}
             }
             app.overlay = Some(Overlay::Help);
@@ -605,14 +627,21 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                         app.save_playlists_db();
                         app.yt_status =
                             Some(format!("added to \"{}\"", app.playlists[cursor].name));
+                        app.overlay = None;
+                        return;
                     } else {
-                        // "+ new playlist..." — create a new one with the track.
-                        let idx = app.create_playlist_with_track(&track_id);
-                        app.save_playlists_db();
-                        app.yt_status = Some(format!("created \"{}\"", app.playlists[idx].name));
+                        // "+ new playlist..." — DEF-014: prompt for a name
+                        // before creating instead of auto-naming immediately.
+                        app.overlay = Some(Overlay::TextInput {
+                            prompt: "New playlist name:".to_string(),
+                            buffer: String::new(),
+                            cursor: 0,
+                            action: crate::tui::app::TextInputAction::NewPlaylist {
+                                track_id: track_id.clone(),
+                            },
+                        });
+                        return;
                     }
-                    app.overlay = None;
-                    return;
                 }
                 _ => {}
             }
@@ -683,6 +712,118 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             }
             app.overlay = Some(Overlay::Diagnostics);
         }
+        // Confirmation dialog (DEF-001, DEF-015): y/Enter confirms the
+        // action, n/Esc cancels. Any other key is a no-op (overlay stays).
+        Some(Overlay::Confirm { message, action }) => {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    match action {
+                        crate::tui::app::ConfirmAction::DeletePlaylist => {
+                            app.delete_focused_playlist();
+                        }
+                        crate::tui::app::ConfirmAction::YtLogout => {
+                            app.yt_logout();
+                        }
+                    }
+                    app.overlay = None;
+                    return;
+                }
+                KeyCode::Char('n') => {
+                    app.overlay = None;
+                    return;
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::Confirm { message, action });
+        }
+        // Text input overlay (DEF-014: playlist name). Typing accumulates
+        // in `buffer`; Enter creates the playlist; Esc cancels (handled at
+        // the top of this fn). Backspace/Left/Right/Home/End edit.
+        Some(Overlay::TextInput {
+            prompt,
+            mut buffer,
+            mut cursor,
+            action,
+        }) => {
+            match key.code {
+                KeyCode::Enter => {
+                    match action {
+                        crate::tui::app::TextInputAction::NewPlaylist { track_id } => {
+                            let trimmed = buffer.trim();
+                            if trimmed.is_empty() {
+                                // Empty input → fall back to auto-name.
+                                let idx = app.create_playlist_with_track(&track_id);
+                                app.save_playlists_db();
+                                app.yt_status =
+                                    Some(format!("created \"{}\"", app.playlists[idx].name));
+                            } else {
+                                use crate::tui::app::Playlist;
+                                app.playlists.push(Playlist {
+                                    name: trimmed.to_string(),
+                                    track_ids: vec![track_id.clone()],
+                                });
+                                app.save_playlists_db();
+                                app.yt_status = Some(format!("created \"{trimmed}\""));
+                            }
+                        }
+                    }
+                    app.overlay = None;
+                    return;
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    cursor = cursor.min(buffer.len());
+                    buffer.insert(cursor, c);
+                    cursor += c.len_utf8();
+                }
+                KeyCode::Backspace => {
+                    cursor = cursor.min(buffer.len());
+                    if cursor > 0 {
+                        let mut prev = cursor - 1;
+                        while prev > 0 && !buffer.is_char_boundary(prev) {
+                            prev -= 1;
+                        }
+                        buffer.drain(prev..cursor);
+                        cursor = prev;
+                    }
+                }
+                KeyCode::Left => {
+                    cursor = cursor.min(buffer.len());
+                    if cursor > 0 {
+                        let mut prev = cursor - 1;
+                        while prev > 0 && !buffer.is_char_boundary(prev) {
+                            prev -= 1;
+                        }
+                        cursor = prev;
+                    }
+                }
+                KeyCode::Right => {
+                    cursor = cursor.min(buffer.len());
+                    if cursor < buffer.len() {
+                        let mut next = cursor + 1;
+                        while next < buffer.len() && !buffer.is_char_boundary(next) {
+                            next += 1;
+                        }
+                        cursor = next;
+                    }
+                }
+                KeyCode::Home => {
+                    cursor = 0;
+                }
+                KeyCode::End => {
+                    cursor = buffer.len();
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::TextInput {
+                prompt,
+                buffer,
+                cursor,
+                action,
+            });
+        }
         None => {}
     }
 }
@@ -741,7 +882,11 @@ fn execute_command(app: &mut App, cmd: &str) {
             });
         }
         "yt logout" => {
-            app.yt_logout();
+            // DEF-015: show a confirmation dialog before clearing credentials.
+            app.overlay = Some(Overlay::Confirm {
+                message: "Clear YouTube credentials and log out?  y/n".to_string(),
+                action: crate::tui::app::ConfirmAction::YtLogout,
+            });
         }
         "yt setup" => {
             app.yt_setup();

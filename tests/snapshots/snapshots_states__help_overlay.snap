@@ -10,7 +10,7 @@ expression: s
       │gg / G          top / bottom of column                                                                    │
       │1 2 3 4         switch view: Artists / Playlists / Queue / YouTube                                        │
       │Tab / Shift+Tab cycle view                                                                                │
-      │────────────────────────────────────────────────────────────────────────                                  │
+      │──────────────────────────────────────────────────────────────────────────────────────────────────────────│
       │Playback                                                                                                  │
       │Enter           play selected in context                                                                  │
       │Space           play / pause                                                                              │
@@ -22,6 +22,6 @@ expression: s
       │r               cycle repeat (off → all → one)                                                            │
       │c               cycle continue (mode-dependent)                                                           │
       │M               cycle source mode (Local / YouTube / Mixed)                                               │
-      │────────────────────────────────────────────────────────────────────────                                  │
+      │──────────────────────────────────────────────────────────────────────────────────────────────────────────│
       │Discover                                                                                                  │
       └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
