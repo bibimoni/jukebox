@@ -1148,7 +1148,7 @@ impl Session {
                     out.push(resp);
                 }
                 Ok(None) => break,
-                Err(e) => {
+                Err(_) => {
                     break;
                 }
             }
