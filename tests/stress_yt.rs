@@ -158,12 +158,12 @@ fn sequential_focus_each_playlist_loads_correct_tracks() {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            &app.yt_lists[i].track_ids,
-            &expected_tracks(&app.yt_lists[i].id),
+            app.yt_lists[i].track_ids,
+            expected_tracks(&app.yt_lists[i].id),
             "PL{} has wrong tracks — expected {:?}, got {:?}",
             i + 1,
             expected_tracks(&app.yt_lists[i].id),
-            &app.yt_lists[i].track_ids
+            app.yt_lists[i].track_ids
         );
     }
 
@@ -199,8 +199,8 @@ fn rapid_switch_last_focused_loads_correct_tracks() {
     );
     // PL5 must have its OWN correct tracks.
     assert_eq!(
-        &app.yt_lists[4].track_ids,
-        &expected_tracks("PL5"),
+        app.yt_lists[4].track_ids,
+        expected_tracks("PL5"),
         "PL5 has wrong tracks after rapid switching"
     );
 
@@ -223,7 +223,7 @@ fn switch_back_and_forth_tracks_persist_and_correct() {
         tick_until(&mut app, 100, |a| !a.yt_lists[0].track_ids.is_empty()),
         "PL1 should load"
     );
-    assert_eq!(&app.yt_lists[0].track_ids, &expected_tracks("PL1"));
+    assert_eq!(app.yt_lists[0].track_ids, expected_tracks("PL1"));
 
     // Switch to PL2, let it load.
     app.cursors.playlist = 1;
@@ -232,14 +232,14 @@ fn switch_back_and_forth_tracks_persist_and_correct() {
         tick_until(&mut app, 100, |a| !a.yt_lists[1].track_ids.is_empty()),
         "PL2 should load"
     );
-    assert_eq!(&app.yt_lists[1].track_ids, &expected_tracks("PL2"));
+    assert_eq!(app.yt_lists[1].track_ids, expected_tracks("PL2"));
 
     // Switch BACK to PL1 — tracks should persist (loaded guard).
     app.cursors.playlist = 0;
     app.on_tick();
     assert_eq!(
-        &app.yt_lists[0].track_ids,
-        &expected_tracks("PL1"),
+        app.yt_lists[0].track_ids,
+        expected_tracks("PL1"),
         "PL1 tracks should persist after switching away and back"
     );
 
@@ -253,8 +253,8 @@ fn switch_back_and_forth_tracks_persist_and_correct() {
     app.cursors.playlist = 0;
     app.on_tick();
     assert_eq!(
-        &app.yt_lists[0].track_ids,
-        &expected_tracks("PL1"),
+        app.yt_lists[0].track_ids,
+        expected_tracks("PL1"),
         "PL1 tracks should still be correct after PL3 load + switch back"
     );
 
@@ -285,7 +285,7 @@ fn reselect_same_playlist_while_loading_no_duplicate() {
     // Let PL1 load.
     let loaded = tick_until(&mut app, 100, |a| !a.yt_lists[0].track_ids.is_empty());
     assert!(loaded, "PL1 should load");
-    assert_eq!(&app.yt_lists[0].track_ids, &expected_tracks("PL1"));
+    assert_eq!(app.yt_lists[0].track_ids, expected_tracks("PL1"));
 
     let _ = std::fs::remove_file(&script);
 }
@@ -328,8 +328,8 @@ fn refresh_replaces_lists_while_fetch_in_flight_no_corruption() {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            &app.yt_lists[i].track_ids,
-            &expected_tracks(&app.yt_lists[i].id),
+            app.yt_lists[i].track_ids,
+            expected_tracks(&app.yt_lists[i].id),
             "PL{} has wrong tracks after refresh — stale corruption",
             i + 1
         );
@@ -401,7 +401,7 @@ fn rapid_switch_then_settle_each_playlist_correct() {
             .map(|l| &l.track_ids)
             .collect::<Vec<_>>()
     );
-    assert_eq!(&app.yt_lists[2].track_ids, &expected_tracks("PL3"));
+    assert_eq!(app.yt_lists[2].track_ids, expected_tracks("PL3"));
 
     // Now visit each other playlist — each must load with correct tracks.
     for i in 0..5 {
@@ -421,8 +421,8 @@ fn rapid_switch_then_settle_each_playlist_correct() {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            &app.yt_lists[i].track_ids,
-            &expected_tracks(&app.yt_lists[i].id),
+            app.yt_lists[i].track_ids,
+            expected_tracks(&app.yt_lists[i].id),
             "PL{} has wrong tracks on visit",
             i + 1
         );
@@ -531,7 +531,7 @@ fn rapid_switch_all_five_should_load() {
         last_loaded,
         "PL5 (last focused) should load after rapid switching"
     );
-    assert_eq!(&app.yt_lists[4].track_ids, &expected_tracks("PL5"));
+    assert_eq!(app.yt_lists[4].track_ids, expected_tracks("PL5"));
 
     // Now visit each unloaded playlist. Each should load with correct tracks.
     for i in 0..5 {
@@ -551,8 +551,8 @@ fn rapid_switch_all_five_should_load() {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            &app.yt_lists[i].track_ids,
-            &expected_tracks(&app.yt_lists[i].id),
+            app.yt_lists[i].track_ids,
+            expected_tracks(&app.yt_lists[i].id),
             "WRONG TRACKS for PL{}",
             i + 1
         );
