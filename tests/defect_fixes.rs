@@ -542,13 +542,13 @@ fn def021_q_documented_in_help() {
     let (_d, cat) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.overlay = Some(Overlay::Help);
-    let backend = TestBackend::new(120, 80);
+    let backend = TestBackend::new(120, 120);
     let mut term = Terminal::new(backend).unwrap();
     term.draw(|f| jukebox::tui::view::layout::draw(f, &mut app))
         .unwrap();
 
     let w = 120u16;
-    let h = 80u16;
+    let h = 120u16;
     let mut found_q = false;
     for y in 0..h {
         let line: String = (0..w)
