@@ -49,6 +49,12 @@ read_cfg() { # <key> <default>
 find "$SOURCE" -type f -iname '*.flac' -print -quit | grep -q . \
   || { echo "no .flac in $SOURCE" >&2; exit 1; }
 
+# Check required tools early so we don't hang silently on missing deps.
+for dep in metaflac ffprobe python3; do
+  command -v "$dep" >/dev/null 2>&1 \
+    || { echo "missing required tool: $dep (install it and retry)" >&2; exit 1; }
+done
+
 # safety: refuse to wipe a dir that doesn't look like a filtered_lossless layout
 if [[ -d "$OUT" && -n "$(find "$OUT" -mindepth 1 -maxdepth 1 2>/dev/null | head -1)" ]]; then
   [[ -e "$OUT/catalog.json" || -e "$OUT/_build.log" ]] \
@@ -103,6 +109,10 @@ WINNERS="$TMP/winners.tsv"   # dedup_key \t winner-line
 LOSERS="$TMP/losers.tsv"     # dedup_key \t loser-line (one row per loser)
 : > "$RECORDS"
 
+# Count total FLACs for progress reporting.
+TOTAL="$(find "$SOURCE" -type f -iname '*.flac' | wc -l | tr -d ' ')"
+echo "scanning $TOTAL flac files in $SOURCE..." >&2
+
 probe() { # <flac-path>
   local flac="$1"
   local artists title album track disc isrc tidal date
@@ -140,9 +150,18 @@ probe() { # <flac-path>
     "$(dedup_key "$artists" "$title")" "$bd" "$sr" "$isrc" "$tidal" "$ntags" "$flac"
 }
 
+COUNT=0
+SKIPPED=0
 while IFS= read -r -d '' flac; do
-  probe "$flac" >> "$RECORDS" || true   # probe returns 1 on skip (already logged)
+  COUNT=$((COUNT + 1))
+  probe "$flac" >> "$RECORDS" || { SKIPPED=$((SKIPPED + 1)); }
+  # Progress every 100 files or on the last one.
+  if (( COUNT % 100 == 0 )) || (( COUNT == TOTAL )); then
+    printf '\rprobed %d/%d' "$COUNT" "$TOTAL" >&2
+  fi
 done < <(find "$SOURCE" -type f -iname '*.flac' -print0)
+echo "" >&2
+echo "probed $COUNT files ($SKIPPED skipped)" >&2
 
 # Sort records by dedup_key (field 1) so all candidates of a song are adjacent.
 sort -t$'\t' -k1,1 "$RECORDS" > "$SORTED"
@@ -258,10 +277,18 @@ emit_winner() { # <dedup_key> <winner-line>
      }]')"
 }
 
+WINNER_COUNT="$(wc -l < "$WINNERS" | tr -d ' ')"
+echo "writing $WINNER_COUNT unique tracks to $OUT..." >&2
+WCOUNT=0
 while IFS=$'\t' read -r wkey wline; do
   [[ -z "$wkey" ]] && continue
   emit_winner "$wkey" "$wline"
+  WCOUNT=$((WCOUNT + 1))
+  if (( WCOUNT % 100 == 0 )) || (( WCOUNT == WINNER_COUNT )); then
+    printf '\rlinking %d/%d' "$WCOUNT" "$WINNER_COUNT" >&2
+  fi
 done < "$WINNERS"
+echo "" >&2
 
 # losers log — lline is tab-separated: bd \t sr \t isrc \t tidal \t ntags \t path
 while IFS=$'\t' read -r lkey lline; do
@@ -277,3 +304,4 @@ jq -n --argjson tracks "$tracks_json" --arg src "$SRC_ABS" --arg at "$(date -u +
   '{version:1, built_at:$at, source_root:$src, tracks:$tracks}' > "$OUT/catalog.json"
 
 echo "indexed $(echo "$tracks_json" | jq 'length') unique tracks" >&3
+echo "done: $(echo "$tracks_json" | jq 'length') unique tracks written to $OUT/catalog.json" >&2

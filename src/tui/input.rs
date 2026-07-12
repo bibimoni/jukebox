@@ -14,6 +14,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
+use crate::reco::feedback::FeedbackAction;
 use crate::tui::app::{App, Overlay, View};
 
 // ---------------------------------------------------------------------------
@@ -78,8 +79,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 app.pending_g = true;
             }
         }
-        // `G` bottom of column.
-        (KeyCode::Char('G'), _) => bottom_of_column(app),
+        // `G` opens the playlist generator in the YouTube view (where the
+        // recommendation features live); in other views it remains the
+        // vim-style "bottom of column" jump so the existing keymap is
+        // preserved. Also reachable via `:gen`.
+        (KeyCode::Char('G'), _) => {
+            if app.view == View::Youtube {
+                app.open_generator();
+            } else {
+                bottom_of_column(app);
+            }
+        }
 
         // View switching: 1/2/3/4 = Artists/Playlists/Queue/YouTube.
         (KeyCode::Char('1'), m) if m == KeyModifiers::NONE => switch_view(app, View::Artists),
@@ -198,6 +208,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('D'), _) => {
             app.overlay = Some(Overlay::Diagnostics);
         }
+        // `H` opens the YouTube Home view (recommendation discovery). Also
+        // reachable via `:home`.
+        (KeyCode::Char('H'), _) => app.open_home(),
 
         // --- Quit -----------------------------------------------------------
         (KeyCode::Char('q'), _) => app.quit(),
@@ -451,7 +464,10 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     // NOTE: the stored `input` does NOT include the `:` prefix —
                     // `render_command` (overlay.rs) prepends `:` for display.
                     // Storing `:` here would double it (`::yt`) on screen (DEF-010).
-                    let known = ["queue", "yt", "lyrics", "diag", "help", "quit", "q"];
+                    let known = [
+                        "queue", "yt", "lyrics", "diag", "help", "quit", "q", "home", "gen",
+                        "radio", "publish",
+                    ];
                     let prefix = input.trim_start_matches(':');
                     let matches: Vec<&str> = known
                         .iter()
@@ -832,6 +848,194 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 action,
             });
         }
+        // --- Recommendation overlays -----------------------------------------
+        // Home overlay (`H` / `:home`): j/k navigate items, Tab switches
+        // sections, Enter selects the highlighted item, Esc closes (generic).
+        Some(Overlay::Home { mut state }) => {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    state.cursor_down(usize::MAX);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.cursor_up();
+                }
+                KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    state.section_prev();
+                }
+                KeyCode::Tab => {
+                    state.section_next(crate::tui::view::home::HomeSection::all().len());
+                }
+                KeyCode::Enter => {
+                    // Select the highlighted item. The Home overlay's items are
+                    // populated by `open_home`; selection dispatches back to
+                    // the app (play a mix, open a playlist, start radio). Close
+                    // the overlay and play the selected context track.
+                    app.overlay = Some(Overlay::Home { state });
+                    app.play_selected();
+                    return;
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::Home { state });
+        }
+        // Radio overlay (`:radio`): +/- feedback, s skip, n next, Esc stops.
+        Some(Overlay::Radio { session }) => {
+            // The current track is what's playing now (the radio's last pick).
+            let track_id = app.now_playing.as_ref().map(|ts| ts.id().to_string());
+            match key.code {
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    if let Some(id) = &track_id {
+                        app.apply_reco_feedback(FeedbackAction::Like, id);
+                    }
+                    // Positive feedback doesn't advance; the user stays on
+                    // the track they like.
+                }
+                KeyCode::Char('-') => {
+                    if let Some(id) = &track_id {
+                        app.apply_reco_feedback(FeedbackAction::HideTrack, id);
+                    }
+                    app.next();
+                }
+                KeyCode::Char('s') => {
+                    if let Some(id) = &track_id {
+                        app.apply_reco_feedback(FeedbackAction::RemoveFromMix, id);
+                    }
+                    app.next();
+                }
+                KeyCode::Char('n') => {
+                    app.next();
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::Radio { session });
+        }
+        // Generator overlay (`G` / `:gen`): NL input -> plan -> preview. In
+        // the Input phase, typing accumulates in `state.input`; Enter
+        // generates. In the Preview phase, p/x pin/remove, g regenerates, e
+        // edits, j/k navigate, Enter saves.
+        Some(Overlay::Generator { mut state }) => {
+            use crate::tui::view::generator::GeneratorPhase;
+            match key.code {
+                // Input phase: typing accumulates into the NL query.
+                KeyCode::Char(c)
+                    if state.phase == GeneratorPhase::Input
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    state.input.push(c);
+                }
+                KeyCode::Backspace if state.phase == GeneratorPhase::Input => {
+                    state.input.pop();
+                }
+                // Enter: Input/ReviewPlan -> generate; Preview -> save.
+                KeyCode::Enter
+                    if state.phase == GeneratorPhase::Input
+                        || state.phase == GeneratorPhase::ReviewPlan =>
+                {
+                    app.overlay = Some(Overlay::Generator { state });
+                    app.generate_playlist();
+                    return;
+                }
+                KeyCode::Enter if state.phase == GeneratorPhase::Preview => {
+                    // Save the generated playlist locally.
+                    if let Some(p) = &state.playlist {
+                        let track_ids: Vec<String> =
+                            p.tracks.iter().map(|t| t.track_id.clone()).collect();
+                        let name = if !state.input.trim().is_empty() {
+                            state.input.trim().to_string()
+                        } else {
+                            "Generated Playlist".to_string()
+                        };
+                        app.playlists
+                            .push(crate::tui::app::Playlist { name, track_ids });
+                        app.save_playlists_db();
+                        app.yt_status = Some("playlist saved".into());
+                    }
+                    app.overlay = None;
+                    return;
+                }
+                // Preview phase: p pin, x remove, g regenerate, e edit.
+                KeyCode::Char('p') if state.phase == GeneratorPhase::Preview => {
+                    let tid = state
+                        .playlist
+                        .as_ref()
+                        .and_then(|p| p.tracks.get(state.cursor))
+                        .map(|t| t.track_id.clone());
+                    if let Some(id) = tid {
+                        state.pin_track(id);
+                    }
+                }
+                KeyCode::Char('x') if state.phase == GeneratorPhase::Preview => {
+                    let tid = state
+                        .playlist
+                        .as_ref()
+                        .and_then(|p| p.tracks.get(state.cursor))
+                        .map(|t| t.track_id.clone());
+                    if let Some(id) = tid {
+                        state.remove_track(&id);
+                    }
+                }
+                KeyCode::Char('g') if state.phase == GeneratorPhase::Preview => {
+                    app.overlay = Some(Overlay::Generator { state });
+                    app.generate_playlist();
+                    return;
+                }
+                KeyCode::Char('e') if state.phase == GeneratorPhase::ReviewPlan => {
+                    state.phase = GeneratorPhase::Input;
+                }
+                // Preview phase: j/k navigate the track list.
+                KeyCode::Down | KeyCode::Char('j') if state.phase == GeneratorPhase::Preview => {
+                    if let Some(p) = &state.playlist {
+                        if state.cursor + 1 < p.tracks.len() {
+                            state.cursor += 1;
+                        }
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') if state.phase == GeneratorPhase::Preview => {
+                    state.cursor = state.cursor.saturating_sub(1);
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::Generator { state });
+        }
+        // Explanation overlay: Esc closes (generic). Any other key is a no-op
+        // — the overlay stays until the user reads and closes it.
+        Some(Overlay::Explanation { explanation }) => {
+            app.overlay = Some(Overlay::Explanation { explanation });
+        }
+        // Publication overlay (`:publish`): Tab cycles privacy, Enter
+        // proceeds, y confirms, n cancels, Esc closes (generic).
+        Some(Overlay::Publication { mut state }) => {
+            match key.code {
+                KeyCode::Tab => {
+                    state.privacy = match state.privacy.as_str() {
+                        "PRIVATE" => "UNLISTED".into(),
+                        "UNLISTED" => "PUBLIC".into(),
+                        _ => "PRIVATE".into(),
+                    };
+                }
+                KeyCode::Enter => {
+                    if state.is_ready() {
+                        state.confirmed = true;
+                        app.overlay = None;
+                        app.yt_status = Some(format!("publishing \"{}\" to YouTube", state.name));
+                    } else {
+                        state.step = state.step.saturating_add(1);
+                    }
+                }
+                KeyCode::Char('y') if state.is_ready() => {
+                    state.confirmed = true;
+                    app.overlay = None;
+                    app.yt_status = Some(format!("publishing \"{}\" to YouTube", state.name));
+                }
+                KeyCode::Char('n') => {
+                    app.overlay = None;
+                    return;
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::Publication { state });
+        }
         None => {}
     }
 }
@@ -923,6 +1127,34 @@ fn execute_command(app: &mut App, cmd: &str) {
         "q" | "quit" => {
             app.quit();
         }
+        // `:home` — open the YouTube Home view (same as the `H` keybinding).
+        "home" => {
+            app.open_home();
+        }
+        // `:gen` — open the playlist generator (same as `G` in the Y view).
+        "gen" => {
+            app.open_generator();
+        }
+        // `:radio` — start a radio session from the currently selected track.
+        "radio" => {
+            if let Some(track_id) = app.selected_track_id() {
+                app.start_radio_from_track(&track_id);
+            } else {
+                app.yt_status = Some("no track selected".into());
+            }
+        }
+        // `:publish` — start the publication flow for the focused playlist.
+        "publish" => {
+            if let Some(name) = app
+                .playlists
+                .get(app.cursors.playlist)
+                .map(|p| p.name.clone())
+            {
+                app.open_publication(&name);
+            } else {
+                app.yt_status = Some("no playlist selected".into());
+            }
+        }
         other if other.starts_with("yt auth browser") => {
             let browser = other
                 .trim_start_matches("yt auth browser")
@@ -935,6 +1167,25 @@ fn execute_command(app: &mut App, cmd: &str) {
                 );
             } else {
                 app.apply_yt_browser(browser);
+            }
+        }
+        // `:radio artist <name>` — start a radio session from an artist.
+        other if other.starts_with("radio artist ") => {
+            let artist = other.trim_start_matches("radio artist ").trim().to_string();
+            if artist.is_empty() {
+                app.yt_status = Some("usage: :radio artist <name>".into());
+            } else {
+                app.start_radio_from_artist(&artist);
+            }
+        }
+        // `:publish <playlist>` — start the publication flow for a named
+        // playlist.
+        other if other.starts_with("publish ") => {
+            let name = other.trim_start_matches("publish ").trim().to_string();
+            if name.is_empty() {
+                app.yt_status = Some("usage: :publish <playlist>".into());
+            } else {
+                app.open_publication(&name);
             }
         }
         _ => {

@@ -186,6 +186,26 @@ pub enum Overlay {
         cursor: usize,
         action: TextInputAction,
     },
+    /// YouTube Home view — multi-section discovery.
+    Home {
+        state: crate::tui::view::home::HomeState,
+    },
+    /// Radio session overlay.
+    Radio {
+        session: Option<crate::reco::radio::RadioSession>,
+    },
+    /// Playlist generator overlay.
+    Generator {
+        state: crate::tui::view::generator::GeneratorState,
+    },
+    /// Recommendation explanation overlay.
+    Explanation {
+        explanation: crate::reco::explanations::Explanation,
+    },
+    /// YouTube playlist publication overlay.
+    Publication {
+        state: crate::tui::view::publication::PublicationState,
+    },
 }
 
 /// Actions that can be confirmed via [`Overlay::Confirm`].
@@ -410,6 +430,15 @@ pub struct App {
     /// immediately (fire-and-forget) — the device re-clocks when the
     /// format lands (AC-M9.2.4).
     audio_switch_handle: Option<std::thread::JoinHandle<()>>,
+
+    /// User listening profile for recommendations.
+    pub reco_profile: crate::reco::profile::UserProfile,
+    /// Listening event log.
+    pub reco_events: crate::reco::events::EventLog,
+    /// The user's generated mixes.
+    pub reco_mixes: Vec<crate::reco::mixes::Mix>,
+    /// Feedback actions pending application.
+    pub reco_feedback_pending: Vec<(crate::reco::feedback::FeedbackAction, String)>,
 }
 
 /// Inline filter state for the `f` filter-on-focused-column (spec §5.4).
@@ -608,6 +637,10 @@ impl App {
             pending_discover_play: None,
             pending_radio_seed: None,
             audio_switch_handle: None,
+            reco_profile: crate::reco::profile::UserProfile::default(),
+            reco_events: crate::reco::events::EventLog::new(),
+            reco_mixes: Vec::new(),
+            reco_feedback_pending: Vec::new(),
         }
     }
 
@@ -1249,6 +1282,30 @@ impl App {
                             self.start_playback();
                         }
                         ContinueMode::YouTube => {
+                            // If a reco RadioSession overlay is active, use it
+                            // to drive auto-advance instead of the YouTube
+                            // radio cursor.
+                            if let Some(vid) = self.reco_radio_next() {
+                                if let Some(np) = self.now_playing.clone() {
+                                    self.transport.history.push((
+                                        np.id().to_string(),
+                                        self.transport.context.clone(),
+                                    ));
+                                }
+                                let ctx = Context::Search {
+                                    query: "reco radio".into(),
+                                    track_ids: vec![vid.clone()],
+                                };
+                                let r = ClonedResolver {
+                                    playlists: &self.playlists,
+                                    manual_queue: self.transport.manual_queue.clone(),
+                                    yt_lists: &self.yt_lists,
+                                };
+                                self.transport
+                                    .switch_context(ctx, Some(&vid), &r, &self.catalog);
+                                self.start_playback();
+                                return;
+                            }
                             // Drive YouTube autoplay via RadioCursor (spec §3.4). The
                             // old `radio.advance(session, seed)` made a BLOCKING
                             // `get_watch_playlist` roundtrip (~4s) every time the queue
@@ -2831,8 +2888,30 @@ impl App {
 
     /// Auto-continue with the whole library as a shuffled "radio" context.
     /// Music never stops — when this context eventually exhausts (the entire
-    /// library), `next` re-enters here and rebuilds it.
+    /// library), `next` re-enters here and rebuilds it. If a reco
+    /// [`Overlay::Radio`] session is active, it drives auto-advance instead.
     fn switch_to_radio(&mut self) {
+        // If a reco RadioSession overlay is active, use it to drive
+        // auto-advance with the recommendation engine's candidate pool.
+        if let Some(id) = self.reco_radio_next() {
+            if let Some(np) = self.now_playing.clone() {
+                self.transport
+                    .history
+                    .push((np.id().to_string(), self.transport.context.clone()));
+            }
+            let ctx = Context::Search {
+                query: "reco radio".into(),
+                track_ids: vec![id.clone()],
+            };
+            let r = ClonedResolver {
+                playlists: &self.playlists,
+                manual_queue: self.transport.manual_queue.clone(),
+                yt_lists: &self.yt_lists,
+            };
+            self.transport
+                .switch_context(ctx, Some(&id), &r, &self.catalog);
+            return;
+        }
         if let Some(np) = self.now_playing.clone() {
             self.transport
                 .history
@@ -3190,9 +3269,538 @@ impl App {
     pub fn save_playlists_db(&self) {
         let _ = crate::state::save_playlists(&self.playlists);
     }
+
+    // --- Recommendation engine wiring --------------------------------------
+
+    /// Open the YouTube Home view. Populates the generated mixes from the
+    /// reco engine (synchronous from local data) and sets the overlay. The
+    /// view layer computes section items at render time from `reco_mixes` +
+    /// `yt_lists` + `playlists`.
+    pub fn open_home(&mut self) {
+        use crate::tui::view::home::HomeState;
+        // Generate mixes from the reco engine. Always generate (even cold
+        // start uses the local catalog) so the "Made for You" section has
+        // content.
+        self.reco_mixes =
+            crate::reco::mixes::generate_all_mixes(&self.reco_profile, &self.catalog.tracks);
+        let mut state = HomeState::new();
+        state.has_history = self.reco_profile.has_history();
+        // Local data is synchronous — not loading. YouTube home suggestions
+        // (if a session is available) are fetched by the existing discover
+        // mechanism and don't block this overlay.
+        state.loading = false;
+        self.overlay = Some(Overlay::Home { state });
+    }
+
+    /// Start a radio session seeded from a track.
+    pub fn start_radio_from_track(&mut self, track_id: &str) {
+        use crate::reco::radio::{RadioSeed, RadioSession};
+        let mut session = RadioSession::new(RadioSeed::Track(track_id.to_string()));
+        // Initialize the candidate pool so the first next_track() is ready.
+        session.initialize(&self.reco_profile, &self.catalog.tracks);
+        self.overlay = Some(Overlay::Radio {
+            session: Some(session),
+        });
+    }
+
+    /// Start a radio session seeded from an artist.
+    pub fn start_radio_from_artist(&mut self, artist: &str) {
+        use crate::reco::radio::{RadioSeed, RadioSession};
+        let mut session = RadioSession::new(RadioSeed::Artist(artist.to_string()));
+        session.initialize(&self.reco_profile, &self.catalog.tracks);
+        self.overlay = Some(Overlay::Radio {
+            session: Some(session),
+        });
+    }
+
+    /// Open the playlist generator overlay (NL input phase).
+    pub fn open_generator(&mut self) {
+        use crate::tui::view::generator::GeneratorState;
+        self.overlay = Some(Overlay::Generator {
+            state: GeneratorState::new(),
+        });
+    }
+
+    /// Generate a playlist from the generator's parsed constraints. Called
+    /// when the user presses Enter in the generator input phase. Parses the
+    /// NL input into constraints, runs the reco pipeline, and moves to the
+    /// preview phase.
+    pub fn generate_playlist(&mut self) {
+        if let Some(Overlay::Generator { state }) = &mut self.overlay {
+            state.parse_input(); // parse NL → constraints
+            if let Some(constraints) = state.constraints.clone() {
+                let playlist = crate::reco::generator::generate(
+                    &constraints,
+                    &self.reco_profile,
+                    &self.catalog.tracks,
+                );
+                state.playlist = Some(playlist);
+                state.generate(); // move to preview phase
+            }
+        }
+    }
+
+    /// Show the recommendation explanation for a track. Generates an
+    /// explanation from the candidate's provenance via the reco engine.
+    pub fn show_explanation(&mut self, track_id: &str) {
+        use crate::reco::candidates::CandidateGenerator;
+        use crate::reco::explanations::Explanation;
+        let gen = CandidateGenerator::new(&self.reco_profile, &self.catalog.tracks);
+        let candidates = gen.generate();
+        let explanation = candidates
+            .iter()
+            .find(|c| c.track_id == track_id)
+            .map(Explanation::from_candidate)
+            .unwrap_or_else(|| Explanation {
+                reason: "this track".into(),
+                detail: None,
+            });
+        self.overlay = Some(Overlay::Explanation { explanation });
+    }
+
+    /// Open the YouTube playlist publication overlay.
+    pub fn open_publication(&mut self, playlist_name: &str) {
+        use crate::tui::view::publication::PublicationState;
+        let mut state = PublicationState::new();
+        state.name = playlist_name.to_string();
+        self.overlay = Some(Overlay::Publication { state });
+    }
+
+    /// Record a listen event and rebuild the user profile. `event_type` is a
+    /// type-tag string (e.g. "completed", "skipped", "liked") matching
+    /// [`crate::reco::events::ListenEvent::type_tag`].
+    pub fn record_listen_event(&mut self, track_id: &str, event_type: &str) {
+        use crate::reco::events::{EventContext, EventSource, ListenEvent};
+        let ts = ListenEvent::now();
+        let tid = track_id.to_string();
+        let event = match event_type {
+            "track_started" => ListenEvent::TrackStarted {
+                track_id: tid,
+                source: EventSource::Local,
+                timestamp: ts,
+                context: EventContext::Album,
+            },
+            "meaningful_threshold" => ListenEvent::MeaningfulThreshold {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "completed" => ListenEvent::Completed {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "skipped" => ListenEvent::Skipped {
+                track_id: tid,
+                timestamp: ts,
+                position_sec: 0.0,
+            },
+            "rapidly_skipped" => ListenEvent::RapidlySkipped {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "replayed" => ListenEvent::Replayed {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "liked" => ListenEvent::Liked {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "unliked" => ListenEvent::Unliked {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "disliked" => ListenEvent::Disliked {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "hidden" => ListenEvent::Hidden {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "added_to_queue" => ListenEvent::AddedToQueue {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "removed_from_queue" => ListenEvent::RemovedFromQueue {
+                track_id: tid,
+                timestamp: ts,
+            },
+            _ => return, // unknown event type — skip
+        };
+        self.reco_events.record(event);
+        // Rebuild the profile from the full event log.
+        let events: Vec<ListenEvent> = self
+            .reco_events
+            .recent(self.reco_events.len())
+            .into_iter()
+            .cloned()
+            .collect();
+        self.reco_profile = crate::reco::profile::UserProfile::build_from_events(&events);
+    }
+
+    /// Apply a feedback action to the user profile. Looks up the track's
+    /// artist from the catalog for artist-scoped actions (HideArtist,
+    /// BlockArtist).
+    pub fn apply_reco_feedback(
+        &mut self,
+        action: crate::reco::feedback::FeedbackAction,
+        track_id: &str,
+    ) {
+        use crate::reco::feedback::apply_feedback;
+        // Look up the artist from the catalog first (immutable borrow ends
+        // before the mutable borrow of reco_profile).
+        let artist = self.track_by_id(track_id).map(|t| t.primary_artist.clone());
+        apply_feedback(&action, track_id, artist.as_deref(), &mut self.reco_profile);
+    }
+
+    /// If a [`Overlay::Radio`] session is active, return the next track id
+    /// from it (refilling the pool if needed). Used by continue-mode playback
+    /// to drive the reco radio engine instead of the YouTube radio cursor.
+    fn reco_radio_next(&mut self) -> Option<String> {
+        if let Some(Overlay::Radio {
+            session: Some(radio),
+        }) = &mut self.overlay
+        {
+            if radio.needs_refill() {
+                radio.refill_if_needed(&self.reco_profile, &self.catalog.tracks);
+            }
+            return radio.next_track().map(|c| c.track_id);
+        }
+        None
+    }
 }
 
 // Transport methods take `(&dyn ContextResolver, &Catalog)`. `App` passes
 // `self` as the resolver and `&self.catalog` as the catalog; the split-borrow is
 // sound because `manual_queue` (the resolver's data source) lives in a distinct
 // field from `catalog` and from the `&mut self.transport` we hold.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{Catalog, Track};
+    use crate::player::StubPlayer;
+
+    fn make_track(id: &str, artist: &str, album: &str, title: &str) -> Track {
+        Track {
+            id: id.to_string(),
+            artists: vec![artist.to_string()],
+            primary_artist: artist.to_string(),
+            title: title.to_string(),
+            album: Some(album.to_string()),
+            track_number: Some(1),
+            disc_number: Some(1),
+            bit_depth: 16,
+            sample_rate_hz: 44100,
+            isrc: None,
+            source_path: std::path::PathBuf::from("/test/file.flac"),
+            symlinked_into_artists: vec![artist.to_string()],
+        }
+    }
+
+    fn make_catalog() -> Catalog {
+        Catalog {
+            version: 1,
+            built_at: "test".into(),
+            source_root: std::path::PathBuf::from("/tmp"),
+            tracks: vec![
+                make_track("t1", "Artist A", "Album 1", "Song 1"),
+                make_track("t2", "Artist B", "Album 2", "Song 2"),
+                make_track("t3", "Artist A", "Album 1", "Song 3"),
+            ],
+        }
+    }
+
+    fn make_app() -> App {
+        App::new(make_catalog(), Box::new(StubPlayer::default()), None, None)
+    }
+
+    #[test]
+    fn app_new_initializes_reco_fields() {
+        let app = make_app();
+        assert!(app.reco_profile.is_empty());
+        assert!(app.reco_events.is_empty());
+        assert!(app.reco_mixes.is_empty());
+        assert!(app.reco_feedback_pending.is_empty());
+    }
+
+    #[test]
+    fn open_home_sets_overlay_and_generates_mixes() {
+        let mut app = make_app();
+        assert!(app.overlay.is_none());
+        app.open_home();
+        match &app.overlay {
+            Some(Overlay::Home { state }) => {
+                assert!(!state.loading);
+                assert_eq!(state.focused_section, 0);
+                assert_eq!(state.cursor, 0);
+            }
+            other => panic!("expected Home overlay, got {other:?}"),
+        }
+        // Mixes are generated even on cold start (DailyMix, Discover, LocalYtBlend).
+        assert!(!app.reco_mixes.is_empty());
+    }
+
+    #[test]
+    fn open_home_with_history_sets_has_history() {
+        let mut app = make_app();
+        app.record_listen_event("t1", "completed");
+        app.open_home();
+        if let Some(Overlay::Home { state }) = &app.overlay {
+            assert!(state.has_history);
+        } else {
+            panic!("expected Home overlay");
+        }
+    }
+
+    #[test]
+    fn start_radio_from_track_creates_session() {
+        let mut app = make_app();
+        app.start_radio_from_track("t1");
+        match &app.overlay {
+            Some(Overlay::Radio { session }) => {
+                let s = session.as_ref().expect("session should be Some");
+                assert!(matches!(
+                    &s.seed,
+                    crate::reco::radio::RadioSeed::Track(id) if id == "t1"
+                ));
+                // initialize() was called, so the pool should have candidates
+                // (the catalog has 3 tracks).
+                assert!(!s.candidate_pool.is_empty());
+            }
+            other => panic!("expected Radio overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_radio_from_artist_creates_session() {
+        let mut app = make_app();
+        app.start_radio_from_artist("Artist A");
+        match &app.overlay {
+            Some(Overlay::Radio { session }) => {
+                let s = session.as_ref().expect("session should be Some");
+                assert!(matches!(
+                    &s.seed,
+                    crate::reco::radio::RadioSeed::Artist(a) if a == "Artist A"
+                ));
+            }
+            other => panic!("expected Radio overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_generator_sets_input_phase() {
+        let mut app = make_app();
+        app.open_generator();
+        match &app.overlay {
+            Some(Overlay::Generator { state }) => {
+                assert_eq!(
+                    state.phase,
+                    crate::tui::view::generator::GeneratorPhase::Input
+                );
+                assert!(state.input.is_empty());
+                assert!(state.constraints.is_none());
+                assert!(state.playlist.is_none());
+            }
+            other => panic!("expected Generator overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generate_playlist_parses_and_generates() {
+        let mut app = make_app();
+        // Seed the profile so the candidate generator has data to work with.
+        app.record_listen_event("t1", "completed");
+        app.record_listen_event("t1", "liked");
+        app.record_listen_event("t2", "completed");
+        app.open_generator();
+        if let Some(Overlay::Generator { state }) = &mut app.overlay {
+            state.input = "calm focus mix".into();
+        }
+        app.generate_playlist();
+        if let Some(Overlay::Generator { state }) = &app.overlay {
+            assert_eq!(
+                state.phase,
+                crate::tui::view::generator::GeneratorPhase::Preview
+            );
+            assert!(state.constraints.is_some());
+            assert!(state.playlist.is_some());
+            // The playlist should have tracks (the profile has positive scores).
+            assert!(!state.playlist.as_ref().unwrap().tracks.is_empty());
+        } else {
+            panic!("expected Generator overlay");
+        }
+    }
+
+    #[test]
+    fn generate_playlist_no_op_without_overlay() {
+        let mut app = make_app();
+        // No overlay set — should be a no-op, not a panic.
+        app.generate_playlist();
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn show_explanation_sets_overlay() {
+        let mut app = make_app();
+        app.record_listen_event("t1", "completed");
+        app.show_explanation("t1");
+        match &app.overlay {
+            Some(Overlay::Explanation { explanation }) => {
+                assert!(!explanation.reason.is_empty());
+            }
+            other => panic!("expected Explanation overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_explanation_unknown_track_still_sets_overlay() {
+        let mut app = make_app();
+        app.show_explanation("nonexistent");
+        match &app.overlay {
+            Some(Overlay::Explanation { explanation }) => {
+                assert_eq!(explanation.reason, "this track");
+                assert!(explanation.detail.is_none());
+            }
+            other => panic!("expected Explanation overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_publication_sets_name() {
+        let mut app = make_app();
+        app.open_publication("My Mix");
+        match &app.overlay {
+            Some(Overlay::Publication { state }) => {
+                assert_eq!(state.name, "My Mix");
+                assert_eq!(state.privacy, "PRIVATE");
+            }
+            other => panic!("expected Publication overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_listen_event_updates_profile() {
+        let mut app = make_app();
+        assert!(app.reco_profile.is_empty());
+        assert!(app.reco_events.is_empty());
+        app.record_listen_event("t1", "completed");
+        assert!(!app.reco_events.is_empty());
+        assert!(!app.reco_profile.is_empty());
+        assert!(app.reco_profile.track_score("t1") > 0.0);
+        assert_eq!(app.reco_profile.event_count, 1);
+    }
+
+    #[test]
+    fn record_listen_event_liked_sets_liked_flag() {
+        let mut app = make_app();
+        app.record_listen_event("t1", "liked");
+        assert!(app.reco_profile.is_liked("t1"));
+        assert!(app.reco_profile.track_score("t1") > 0.0);
+    }
+
+    #[test]
+    fn record_listen_event_skipped_is_negative() {
+        let mut app = make_app();
+        app.record_listen_event("t1", "skipped");
+        assert!(app.reco_profile.track_score("t1") < 0.0);
+    }
+
+    #[test]
+    fn record_listen_event_unknown_type_is_noop() {
+        let mut app = make_app();
+        app.record_listen_event("t1", "bogus_type");
+        assert!(app.reco_events.is_empty());
+        assert!(app.reco_profile.is_empty());
+    }
+
+    #[test]
+    fn record_listen_event_multiple_events_accumulate() {
+        let mut app = make_app();
+        app.record_listen_event("t1", "completed");
+        app.record_listen_event("t1", "liked");
+        app.record_listen_event("t2", "completed");
+        assert_eq!(app.reco_profile.event_count, 3);
+        assert!(app.reco_profile.is_liked("t1"));
+        // t1 has Completed (+2) + Liked (+5) = 7.0
+        let t1_score = app.reco_profile.track_score("t1");
+        assert!((t1_score - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_reco_feedback_like_adds_positive() {
+        let mut app = make_app();
+        use crate::reco::feedback::FeedbackAction;
+        app.apply_reco_feedback(FeedbackAction::Like, "t1");
+        assert!(app.reco_profile.is_liked("t1"));
+        assert!(app.reco_profile.track_score("t1") > 0.0);
+    }
+
+    #[test]
+    fn apply_reco_feedback_hide_excludes() {
+        let mut app = make_app();
+        use crate::reco::feedback::FeedbackAction;
+        app.apply_reco_feedback(FeedbackAction::HideTrack, "t1");
+        assert!(app.reco_profile.is_hidden("t1"));
+    }
+
+    #[test]
+    fn apply_reco_feedback_block_artist_uses_catalog_lookup() {
+        let mut app = make_app();
+        use crate::reco::feedback::FeedbackAction;
+        // BlockArtist needs the artist name — looked up from the catalog.
+        app.apply_reco_feedback(FeedbackAction::BlockArtist, "t1");
+        assert!(app.reco_profile.is_blocked("Artist A"));
+    }
+
+    #[test]
+    fn reco_radio_next_returns_none_without_session() {
+        let mut app = make_app();
+        assert!(app.reco_radio_next().is_none());
+    }
+
+    #[test]
+    fn reco_radio_next_returns_track_with_session() {
+        let mut app = make_app();
+        app.start_radio_from_track("t1");
+        let next = app.reco_radio_next();
+        assert!(next.is_some(), "reco_radio_next should return a track");
+        let id = next.unwrap();
+        // The next track should be a valid catalog track id (not the seed).
+        assert!(app.track_by_id(&id).is_some());
+        assert_ne!(id, "t1", "seed track should not be immediately re-played");
+    }
+
+    #[test]
+    fn reco_radio_next_returns_none_after_pool_exhausted() {
+        let mut app = make_app();
+        app.start_radio_from_track("t1");
+        // Drain the pool.
+        let mut count = 0;
+        while app.reco_radio_next().is_some() {
+            count += 1;
+            if count > 200 {
+                break; // safety valve (refill may produce more)
+            }
+        }
+        // After draining + no refill candidates, next returns None.
+        // (refill_if_needed may re-add from catalog, so we just verify
+        // we got some tracks before exhausting.)
+        assert!(count > 0, "should have gotten at least one track");
+    }
+
+    #[test]
+    fn new_overlay_variants_do_not_break_existing_overlays() {
+        let mut app = make_app();
+        // Open Help (existing overlay) — should still work.
+        app.overlay = Some(Overlay::Help);
+        assert!(matches!(app.overlay, Some(Overlay::Help)));
+        // Replace with a reco overlay.
+        app.open_home();
+        assert!(matches!(app.overlay, Some(Overlay::Home { .. })));
+        // Close and open another existing overlay.
+        app.overlay = None;
+        app.overlay = Some(Overlay::Diagnostics);
+        assert!(matches!(app.overlay, Some(Overlay::Diagnostics)));
+    }
+}

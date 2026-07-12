@@ -611,3 +611,443 @@ fn mouse_uses_rendered_player_bar_geometry() {
     );
     assert_eq!(app.player.position(), Some(90.0));
 }
+
+// ---------------------------------------------------------------------------
+// Recommendation feature keybindings (Home, Radio, Generator, Explanation,
+// Publication overlays + :home/:gen/:radio/:publish commands)
+// ---------------------------------------------------------------------------
+
+/// `H` opens the YouTube Home overlay.
+#[test]
+fn h_opens_home_overlay() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    assert!(app.overlay.is_none());
+    handle_key(&mut app, key('H'));
+    assert!(
+        matches!(app.overlay, Some(Overlay::Home { .. })),
+        "H should open the Home overlay"
+    );
+}
+
+/// `G` in the YouTube view opens the playlist generator.
+#[test]
+fn g_in_youtube_view_opens_generator() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.view = View::Youtube;
+    handle_key(&mut app, key('G'));
+    assert!(
+        matches!(app.overlay, Some(Overlay::Generator { .. })),
+        "G in the Y view should open the generator overlay"
+    );
+}
+
+/// `G` in a non-YouTube view remains "bottom of column" (existing keymap
+/// preserved — the generator is only on G in the Y view).
+#[test]
+fn g_in_artists_view_is_bottom_of_column() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.view = View::Artists;
+    app.focus_col = 0;
+    app.cursors.artist = 0; // "40mP"
+                            // Press j a few times to move down, then G should jump to the bottom.
+                            // With 1 artist, bottom = index 0. Verify G doesn't open an overlay.
+    handle_key(&mut app, key('G'));
+    assert!(
+        app.overlay.is_none(),
+        "G in Artists view must not open an overlay"
+    );
+}
+
+/// `:home` command opens the Home overlay.
+#[test]
+fn home_command_opens_home() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    open_command(&mut app, "home");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Home { .. })),
+        ":home should open the Home overlay"
+    );
+}
+
+/// `:gen` command opens the generator overlay.
+#[test]
+fn gen_command_opens_generator() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    open_command(&mut app, "gen");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Generator { .. })),
+        ":gen should open the generator overlay"
+    );
+}
+
+/// `:radio` command starts a radio session from the selected track.
+#[test]
+fn radio_command_starts_radio_from_track() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    focus_track_col(&mut app); // cursor on t1
+    open_command(&mut app, "radio");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Radio { .. })),
+        ":radio should open the Radio overlay"
+    );
+}
+
+/// `:publish` command opens the publication overlay for the focused playlist.
+#[test]
+fn publish_command_opens_publication() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    // Create a playlist so there's one to publish.
+    app.playlists.push(jukebox::tui::app::Playlist {
+        name: "My Mix".into(),
+        track_ids: vec!["t1".into()],
+    });
+    app.view = View::Playlists;
+    app.cursors.playlist = 0;
+    open_command(&mut app, "publish");
+    match &app.overlay {
+        Some(Overlay::Publication { state }) => {
+            assert_eq!(state.name, "My Mix");
+        }
+        _ => panic!(":publish should open the Publication overlay"),
+    }
+}
+
+/// `:radio artist <name>` starts a radio session from an artist.
+#[test]
+fn radio_artist_command_starts_radio() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    open_command(&mut app, "radio artist 40mP");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Radio { .. })),
+        ":radio artist <name> should open the Radio overlay"
+    );
+}
+
+/// Home overlay: j moves the cursor down.
+#[test]
+fn home_overlay_j_moves_cursor_down() {
+    use jukebox::tui::view::home::HomeState;
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Home {
+        state: HomeState::new(),
+    });
+    handle_key(&mut app, key('j'));
+    match &app.overlay {
+        Some(Overlay::Home { state }) => {
+            assert_eq!(state.cursor, 1, "j should move the Home cursor down to 1")
+        }
+        _ => panic!("Home overlay should remain open after j"),
+    }
+}
+
+/// Home overlay: k moves the cursor up.
+#[test]
+fn home_overlay_k_moves_cursor_up() {
+    use jukebox::tui::view::home::HomeState;
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    let mut state = HomeState::new();
+    state.cursor = 2;
+    app.overlay = Some(Overlay::Home { state });
+    handle_key(&mut app, key('k'));
+    match &app.overlay {
+        Some(Overlay::Home { state }) => {
+            assert_eq!(state.cursor, 1, "k should move the Home cursor up to 1")
+        }
+        _ => panic!("Home overlay should remain open after k"),
+    }
+}
+
+/// Home overlay: Tab switches to the next section.
+#[test]
+fn home_overlay_tab_switches_section() {
+    use jukebox::tui::view::home::HomeState;
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Home {
+        state: HomeState::new(),
+    });
+    handle_key(&mut app, key_code(KeyCode::Tab));
+    match &app.overlay {
+        Some(Overlay::Home { state }) => assert_eq!(
+            state.focused_section, 1,
+            "Tab should advance the focused section to 1"
+        ),
+        _ => panic!("Home overlay should remain open after Tab"),
+    }
+}
+
+/// Home overlay: Esc closes.
+#[test]
+fn home_overlay_esc_closes() {
+    use jukebox::tui::view::home::HomeState;
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Home {
+        state: HomeState::new(),
+    });
+    handle_key(&mut app, key_code(KeyCode::Esc));
+    assert!(app.overlay.is_none(), "Esc should close the Home overlay");
+}
+
+/// Generator overlay: typing in the input phase accumulates into state.input.
+#[test]
+fn generator_overlay_types_into_input() {
+    use jukebox::tui::view::generator::GeneratorState;
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Generator {
+        state: GeneratorState::new(),
+    });
+    handle_key(&mut app, key('h'));
+    handle_key(&mut app, key('i'));
+    match &app.overlay {
+        Some(Overlay::Generator { state }) => assert_eq!(
+            state.input, "hi",
+            "typing should accumulate in the generator input"
+        ),
+        _ => panic!("Generator overlay should remain open while typing"),
+    }
+}
+
+/// Generator overlay: Backspace removes the last character.
+#[test]
+fn generator_overlay_backspace_removes_char() {
+    use jukebox::tui::view::generator::GeneratorState;
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    let mut state = GeneratorState::new();
+    state.input = "hello".into();
+    app.overlay = Some(Overlay::Generator { state });
+    handle_key(&mut app, key_code(KeyCode::Backspace));
+    match &app.overlay {
+        Some(Overlay::Generator { state }) => {
+            assert_eq!(state.input, "hell", "Backspace should remove the last char");
+        }
+        _ => panic!("Generator overlay should remain open after Backspace"),
+    }
+}
+
+/// Generator overlay: Enter in the input phase calls generate_playlist (the
+/// overlay transitions to the preview phase with a generated playlist).
+#[test]
+fn generator_overlay_enter_generates() {
+    use jukebox::tui::view::generator::{GeneratorPhase, GeneratorState};
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    let mut state = GeneratorState::new();
+    state.input = "calm focus mix".into();
+    app.overlay = Some(Overlay::Generator { state });
+    handle_key(&mut app, key_code(KeyCode::Enter));
+    match &app.overlay {
+        Some(Overlay::Generator { state }) => {
+            assert_eq!(
+                state.phase,
+                GeneratorPhase::Preview,
+                "Enter should generate and move to the preview phase"
+            );
+            assert!(
+                state.playlist.is_some(),
+                "Enter should produce a generated playlist"
+            );
+        }
+        _ => panic!("Generator overlay should remain open after Enter"),
+    }
+}
+
+/// Generator overlay: Esc closes.
+#[test]
+fn generator_overlay_esc_closes() {
+    use jukebox::tui::view::generator::GeneratorState;
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Generator {
+        state: GeneratorState::new(),
+    });
+    handle_key(&mut app, key_code(KeyCode::Esc));
+    assert!(
+        app.overlay.is_none(),
+        "Esc should close the generator overlay"
+    );
+}
+
+/// Publication overlay: Tab cycles privacy PRIVATE -> UNLISTED -> PUBLIC.
+#[test]
+fn publication_overlay_tab_cycles_privacy() {
+    use jukebox::tui::view::publication::PublicationState;
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Publication {
+        state: PublicationState::new(),
+    });
+    // PRIVATE -> UNLISTED
+    handle_key(&mut app, key_code(KeyCode::Tab));
+    match &app.overlay {
+        Some(Overlay::Publication { state }) => {
+            assert_eq!(state.privacy, "UNLISTED", "Tab should cycle to UNLISTED");
+        }
+        _ => panic!("Publication overlay should remain open after Tab"),
+    }
+    // UNLISTED -> PUBLIC
+    handle_key(&mut app, key_code(KeyCode::Tab));
+    match &app.overlay {
+        Some(Overlay::Publication { state }) => {
+            assert_eq!(state.privacy, "PUBLIC", "Tab should cycle to PUBLIC");
+        }
+        _ => panic!("Publication overlay should remain open after Tab"),
+    }
+    // PUBLIC -> PRIVATE (wraps)
+    handle_key(&mut app, key_code(KeyCode::Tab));
+    match &app.overlay {
+        Some(Overlay::Publication { state }) => {
+            assert_eq!(state.privacy, "PRIVATE", "Tab should wrap to PRIVATE");
+        }
+        _ => panic!("Publication overlay should remain open after Tab"),
+    }
+}
+
+/// Publication overlay: n cancels (closes the overlay).
+#[test]
+fn publication_overlay_n_cancels() {
+    use jukebox::tui::view::publication::PublicationState;
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Publication {
+        state: PublicationState::new(),
+    });
+    handle_key(&mut app, key('n'));
+    assert!(
+        app.overlay.is_none(),
+        "n should cancel and close the publication overlay"
+    );
+}
+
+/// Publication overlay: Esc closes.
+#[test]
+fn publication_overlay_esc_closes() {
+    use jukebox::tui::view::publication::PublicationState;
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Publication {
+        state: PublicationState::new(),
+    });
+    handle_key(&mut app, key_code(KeyCode::Esc));
+    assert!(
+        app.overlay.is_none(),
+        "Esc should close the publication overlay"
+    );
+}
+
+/// Explanation overlay: Esc closes.
+#[test]
+fn explanation_overlay_esc_closes() {
+    use jukebox::reco::explanations::Explanation;
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Explanation {
+        explanation: Explanation {
+            reason: "from your liked tracks".into(),
+            detail: None,
+        },
+    });
+    handle_key(&mut app, key_code(KeyCode::Esc));
+    assert!(
+        app.overlay.is_none(),
+        "Esc should close the explanation overlay"
+    );
+}
+
+/// Explanation overlay: a non-Esc key does NOT close it (stays open).
+#[test]
+fn explanation_overlay_stays_open_on_other_keys() {
+    use jukebox::reco::explanations::Explanation;
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Explanation {
+        explanation: Explanation {
+            reason: "a track you used to love".into(),
+            detail: None,
+        },
+    });
+    handle_key(&mut app, key('j'));
+    assert!(
+        matches!(app.overlay, Some(Overlay::Explanation { .. })),
+        "non-Esc keys should not close the explanation overlay"
+    );
+}
+
+/// Radio overlay: n advances to the next track.
+#[test]
+fn radio_overlay_n_advances() {
+    use jukebox::reco::radio::{RadioSeed, RadioSession};
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    // Start playback so next() has something to advance from.
+    focus_track_col(&mut app);
+    handle_key(&mut app, key_code(KeyCode::Enter));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
+    // Open the radio overlay.
+    app.overlay = Some(Overlay::Radio {
+        session: Some(RadioSession::new(RadioSeed::Track("t1".into()))),
+    });
+    handle_key(&mut app, key('n'));
+    assert!(
+        matches!(app.overlay, Some(Overlay::Radio { .. })),
+        "Radio overlay should remain open after n"
+    );
+}
+
+/// Radio overlay: Esc closes.
+#[test]
+fn radio_overlay_esc_closes() {
+    use jukebox::reco::radio::{RadioSeed, RadioSession};
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Radio {
+        session: Some(RadioSession::new(RadioSeed::Track("t1".into()))),
+    });
+    handle_key(&mut app, key_code(KeyCode::Esc));
+    assert!(app.overlay.is_none(), "Esc should close the radio overlay");
+}
+
+/// Tab completion includes the new commands.
+#[test]
+fn tab_completes_home_command() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    // Open command overlay, type "ho", press Tab — should complete to "home".
+    handle_key(&mut app, key(':'));
+    handle_key(&mut app, key('h'));
+    handle_key(&mut app, key('o'));
+    handle_key(&mut app, key_code(KeyCode::Tab));
+    let input = match &app.overlay {
+        Some(Overlay::Command { input, .. }) => input.clone(),
+        _ => panic!("Command overlay should be open"),
+    };
+    assert_eq!(input, "home", "Tab should complete 'ho' to 'home'");
+}
+
+/// Tab completion includes the gen command.
+#[test]
+fn tab_completes_gen_command() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    handle_key(&mut app, key(':'));
+    handle_key(&mut app, key('g'));
+    handle_key(&mut app, key('e'));
+    handle_key(&mut app, key_code(KeyCode::Tab));
+    let input = match &app.overlay {
+        Some(Overlay::Command { input, .. }) => input.clone(),
+        _ => panic!("Command overlay should be open"),
+    };
+    assert_eq!(input, "gen", "Tab should complete 'ge' to 'gen'");
+}

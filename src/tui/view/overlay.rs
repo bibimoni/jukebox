@@ -28,11 +28,15 @@ use ratatui::{
 
 use crate::catalog::Track;
 use crate::lyrics::LyricsSource;
+use crate::reco::explanations::Explanation;
+use crate::reco::radio::RadioSession;
 use crate::tui::app::{App, Overlay};
+use crate::tui::view::icons::IconRenderer;
 use crate::tui::view::theme::{
     clip_to_width, down_arrow, ellipsis, em_dash, is_ascii, marker_glyph, right_arrow, sep_dot,
     up_arrow, Theme, ASCII_BORDER_SET,
 };
+use crate::tui::view::{explanation, generator, home, publication, radio};
 
 /// Render the active overlay (if any) into `area`.
 pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
@@ -75,6 +79,18 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
             cursor,
             ..
         } => render_text_input(f, area, &prompt, &buffer, cursor),
+        // YouTube Home — a full-screen view (not a popup) that replaces the
+        // main browse content with the multi-section Home layout.
+        Overlay::Home { state } => render_home_overlay(f, area, &state),
+        // Radio session — centered popup; `None` shows a "no active session"
+        // placeholder.
+        Overlay::Radio { session } => render_radio_overlay(f, area, session.as_ref()),
+        // Playlist generator (NL input → plan → preview) — centered popup.
+        Overlay::Generator { state } => render_generator_overlay(f, area, &state),
+        // Recommendation explanation — centered popup.
+        Overlay::Explanation { explanation } => render_explanation_overlay(f, area, &explanation),
+        // Publication confirmation — centered popup.
+        Overlay::Publication { state } => render_publication_overlay(f, area, &state),
     }
 }
 
@@ -1128,6 +1144,123 @@ fn render_text_input(f: &mut Frame, area: Rect, prompt: &str, buffer: &str, curs
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+// ---------------------------------------------------------------------------
+// New overlays: Home / Radio / Generator / Explanation / Publication
+// ---------------------------------------------------------------------------
+//
+// The view modules (`src/tui/view/{home,radio,generator,explanation,
+// publication}.rs`) implement the content renderers; the helpers below wire
+// them into the overlay chrome (centered popup block, or a full-screen clear
+// for Home). `IconRenderer::auto()` reads `JUKEBOX_FONT_MODE` so the glyph
+// vocabulary matches the rest of the TUI. The match arms in [`render`]
+// dispatch to these helpers.
+
+/// Build a centered-popup block with a title, matching the existing overlay
+/// popup style: ASCII border set (`+`, `-`, `|`) under `JUKEBOX_FONT_MODE=
+/// ascii`, Unicode box-drawing otherwise. Returns `Block<'static>` so the
+/// caller can take `.inner(popup)` and render content inside.
+fn titled_block(title: &str, theme: &Theme) -> Block<'static> {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(Span::styled(
+            title.to_string(),
+            Style::default().fg(theme.accent),
+        ));
+    if is_ascii() {
+        block.border_set(ASCII_BORDER_SET)
+    } else {
+        block
+    }
+}
+
+/// The YouTube Home overlay. Unlike the other new overlays, Home is a
+/// full-screen view (not a centered popup): it replaces the main browse
+/// content with the multi-section Home layout. The overlay carries only
+/// [`home::HomeState`]; the section data is assembled by the app layer, so
+/// here we render the surfaces derivable from the state alone:
+/// - `loading` → the header (which already shows a "loading…" status line).
+/// - cold start (no history) → the welcome / getting-started paragraph.
+/// - otherwise → the header (status "ready").
+fn render_home_overlay(f: &mut Frame, area: Rect, state: &home::HomeState) {
+    let icons = IconRenderer::auto();
+    // Full-screen: clear so the browse chrome (columns / player bar) doesn't
+    // bleed through behind the Home content.
+    f.render_widget(Clear, area);
+
+    if state.loading {
+        let lines = home::render_header(area, state, &icons);
+        f.render_widget(Paragraph::new(lines), area);
+    } else if !state.has_history {
+        let p = home::render_empty(&icons);
+        f.render_widget(p, area);
+    } else {
+        let lines = home::render_header(area, state, &icons);
+        f.render_widget(Paragraph::new(lines), area);
+    }
+}
+
+/// The radio session overlay — a centered popup showing the seed, pool, and
+/// history when a session is active, or a "no active session" placeholder.
+fn render_radio_overlay(f: &mut Frame, area: Rect, session: Option<&RadioSession>) {
+    let theme = Theme::default();
+    let icons = IconRenderer::auto();
+    let popup = centered(area, 60, 60);
+    f.render_widget(Clear, popup);
+    let block = titled_block(" radio ", &theme);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let para = if let Some(s) = session {
+        radio::render(popup, s, &icons)
+    } else {
+        Paragraph::new(Line::from(Span::styled(
+            "No active radio session.".to_string(),
+            Style::default().fg(theme.dim),
+        )))
+    };
+    f.render_widget(para, inner);
+}
+
+/// The playlist generator overlay (NL input → plan → preview). Centered popup.
+fn render_generator_overlay(f: &mut Frame, area: Rect, state: &generator::GeneratorState) {
+    let theme = Theme::default();
+    let icons = IconRenderer::auto();
+    let popup = centered(area, 60, 70);
+    f.render_widget(Clear, popup);
+    let block = titled_block(" generator ", &theme);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let para = generator::render(popup, state, &icons);
+    f.render_widget(para, inner);
+}
+
+/// The recommendation explanation overlay. Centered popup.
+fn render_explanation_overlay(f: &mut Frame, area: Rect, explanation: &Explanation) {
+    let theme = Theme::default();
+    let icons = IconRenderer::auto();
+    let popup = centered(area, 60, 50);
+    f.render_widget(Clear, popup);
+    let block = titled_block(" explanation ", &theme);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let para = explanation::render(popup, explanation, &icons);
+    f.render_widget(para, inner);
+}
+
+/// The publication confirmation overlay. Centered popup.
+fn render_publication_overlay(f: &mut Frame, area: Rect, state: &publication::PublicationState) {
+    let theme = Theme::default();
+    let icons = IconRenderer::auto();
+    let popup = centered(area, 60, 70);
+    f.render_widget(Clear, popup);
+    let block = titled_block(" publish ", &theme);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let para = publication::render(popup, state, &icons);
+    f.render_widget(para, inner);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1254,6 +1387,145 @@ mod tests {
         assert!(
             hint.contains("No results"),
             "MOD-8: hint must show No results for unmatched query: {hint:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // New overlay render dispatch (Home / Radio / Generator / Explanation /
+    // Publication). These call the helper functions directly (no Overlay
+    // variant needed) so the render paths are exercised even before the
+    // `Overlay::Home`/… match arms are wired in `render`.
+    // -----------------------------------------------------------------------
+
+    /// Render an overlay helper into a `TestBackend` buffer and return the
+    /// joined cell text (each row concatenated, rows separated by `\n`) so
+    /// tests can assert on visible content.
+    fn overlay_text<F>(width: u16, height: u16, render_fn: F) -> String
+    where
+        F: FnOnce(&mut Frame, Rect),
+    {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_fn(f, area);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                out.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn home_overlay_loading_shows_header() {
+        let state = crate::tui::view::home::HomeState::new(); // loading = true
+        let text = overlay_text(80, 24, |f, area| render_home_overlay(f, area, &state));
+        assert!(
+            text.contains("YouTube Home"),
+            "loading Home must render the header title: {text:?}"
+        );
+        assert!(
+            text.contains("loading"),
+            "loading Home must show a loading indicator: {text:?}"
+        );
+    }
+
+    #[test]
+    fn home_overlay_cold_start_shows_welcome() {
+        let mut state = crate::tui::view::home::HomeState::new();
+        state.loading = false;
+        state.has_history = false;
+        let text = overlay_text(80, 24, |f, area| render_home_overlay(f, area, &state));
+        assert!(
+            text.contains("Welcome"),
+            "cold-start Home must show the welcome paragraph: {text:?}"
+        );
+    }
+
+    #[test]
+    fn home_overlay_ready_shows_ready_status() {
+        let mut state = crate::tui::view::home::HomeState::new();
+        state.loading = false;
+        state.has_history = true;
+        let text = overlay_text(80, 24, |f, area| render_home_overlay(f, area, &state));
+        assert!(
+            text.contains("ready"),
+            "ready Home must show the ready status: {text:?}"
+        );
+    }
+
+    #[test]
+    fn radio_overlay_with_session_shows_seed() {
+        let session = RadioSession::new(crate::reco::radio::RadioSeed::Track("t1".into()));
+        let text = overlay_text(80, 24, |f, area| {
+            render_radio_overlay(f, area, Some(&session))
+        });
+        assert!(
+            text.contains("Radio Session"),
+            "radio overlay with a session must show the title: {text:?}"
+        );
+        assert!(
+            text.contains("Seed"),
+            "radio overlay with a session must show the seed label: {text:?}"
+        );
+    }
+
+    #[test]
+    fn radio_overlay_no_session_shows_placeholder() {
+        let text = overlay_text(80, 24, |f, area| render_radio_overlay(f, area, None));
+        assert!(
+            text.contains("No active radio session"),
+            "radio overlay with no session must show the placeholder: {text:?}"
+        );
+    }
+
+    #[test]
+    fn generator_overlay_input_phase_renders() {
+        let state = crate::tui::view::generator::GeneratorState::new();
+        let text = overlay_text(80, 24, |f, area| render_generator_overlay(f, area, &state));
+        assert!(
+            text.contains("Playlist Generator"),
+            "generator overlay must show the title: {text:?}"
+        );
+        assert!(
+            text.contains("Describe"),
+            "generator input phase must show the prompt: {text:?}"
+        );
+    }
+
+    #[test]
+    fn explanation_overlay_shows_reason() {
+        let exp = Explanation {
+            reason: "from your liked tracks".into(),
+            detail: Some("seeded by track t1".into()),
+        };
+        let text = overlay_text(80, 24, |f, area| render_explanation_overlay(f, area, &exp));
+        assert!(
+            text.contains("Explanation"),
+            "explanation overlay must show the title: {text:?}"
+        );
+        assert!(
+            text.contains("liked tracks"),
+            "explanation overlay must show the reason: {text:?}"
+        );
+    }
+
+    #[test]
+    fn publication_overlay_renders_title() {
+        let state = crate::tui::view::publication::PublicationState::new();
+        let text = overlay_text(80, 24, |f, area| {
+            render_publication_overlay(f, area, &state)
+        });
+        assert!(
+            text.contains("Publish"),
+            "publication overlay must show the publish title: {text:?}"
         );
     }
 }
