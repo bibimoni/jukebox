@@ -210,34 +210,36 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 /// Post-render diff forcing. Called at the end of every `draw` after all
 /// widgets (and any overlay) have rendered. Combines two diff-forcing passes:
 ///
-/// 1. **View-change full redraw** (MOD-7): when `app.view` differs from
-///    `app.last_rendered_view`, marks every non-empty cell as
-///    `AlwaysUpdate` so the diff emits it unconditionally. Without this,
-///    a cell whose content+style coincidentally matches the previous frame
-///    at the same position is skipped by ratatui's `Cell::eq`, leaving
-///    stale content on the view switch. The confirmed case: switching from
-///    Artists (row "Test Artist", "i" at col 13) to YouTube (row "Late Night
-///    Jazz", "i" at col 13) — the diff skips the "i" (same symbol, same
-///    `fg=Reset` style), so the terminal keeps the old "i" and the per-frame
-///    evidence shows "Late N ght Jazz". Forcing every non-empty cell
-///    re-emits the "i" (and everything else), resyncing the terminal.
+/// 1. **Every-frame full redraw** (MOD-7 / DEF-002 persistent fix): marks
+///    every non-empty cell as `AlwaysUpdate` so the diff emits it
+///    unconditionally on EVERY frame. The persistent character-dropping bug
+///    ("delete" → "del te", "Test Artist" → "Test Art st", "YouTube" →
+///    "utube", "lossless" → "lossle s") happened on initial render, same-view
+///    updates (j/k navigation, scrolling), and view switches — anywhere
+///    ratatui's `Cell::eq` found a coincidental content+style match at the
+///    same position and skipped the cell, leaving stale terminal content.
+///    The previous view-change-only fix was insufficient because the same
+///    diff-skip happens whenever content shifts within a view (scroll,
+///    cursor move) or on the very first frame (where the cleared buffer can
+///    coincidentally match a styled cell). Forcing every non-empty cell on
+///    every frame guarantees the terminal always reflects the buffer.
 ///
 /// 2. **`force_space_redraw`** (DEF-002 / MAJ-2): marks default-styled
 ///    inter-word spaces so the diff writes them, clearing stale content
 ///    at space positions.
 fn post_render_force(f: &mut Frame, app: &mut App) {
-    if app.view != app.last_rendered_view {
-        force_full_redraw(f);
-        app.last_rendered_view = app.view;
-    }
+    force_full_redraw(f);
     force_space_redraw(f);
+    app.last_rendered_view = app.view;
 }
 
 /// Mark every non-empty cell in the buffer as `AlwaysUpdate` so the diff
-/// emits it regardless of whether it matches the previous frame. Used on
-/// view switches (see [`post_render_force`]) to prevent the MOD-7
-/// character-dropping bug where a new view's text coincidentally matches
-/// the old view's text at the same position with the same style.
+/// emits it regardless of whether it matches the previous frame. Called on
+/// EVERY frame by [`post_render_force`] to prevent the MOD-7
+/// character-dropping bug where a cell whose content+style coincidentally
+/// matches the previous frame at the same position is skipped by ratatui's
+/// `Cell::eq`, leaving stale terminal content. This happens on initial
+/// render, same-view updates (scroll/cursor move), and view switches.
 ///
 /// "Non-empty" means the cell has a non-space symbol OR a non-default style
 /// (fg/bg/modifier). Default-styled spaces are left to `force_space_redraw`,
@@ -878,14 +880,16 @@ mod tests {
         );
     }
 
-    /// MOD-7: `post_render_force` must trigger `force_full_redraw` when the
-    /// view changed between frames, and NOT trigger it when the view is the
-    /// same. This is the core of the view-change full-redraw fix: on a view
-    /// switch, every non-empty cell is marked so the diff re-emits it,
-    /// preventing the character-dropping bug where a coincidental content+style
-    /// match at the same position causes the diff to skip a cell.
+    /// MOD-7: `post_render_force` must trigger `force_full_redraw` on EVERY
+    /// frame — not just on view change. This is the persistent
+    /// character-dropping fix: ratatui's diff skips cells whose content+style
+    /// coincidentally match the previous frame at the same position, which
+    /// happens on initial render, same-view updates (j/k navigation,
+    /// scrolling), AND view switches. Marking all non-empty cells as
+    /// `AlwaysUpdate` on every frame guarantees the terminal always reflects
+    /// the buffer.
     #[test]
-    fn post_render_force_triggers_full_redraw_on_view_change() {
+    fn post_render_force_always_triggers_full_redraw() {
         use crate::catalog::Catalog;
         use crate::player::StubPlayer;
         use crate::tui::app::{App, View};
@@ -915,7 +919,8 @@ mod tests {
         let backend = TestBackend::new(40, 1);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        // Frame 1: same view → no full redraw. 'h' should NOT be AlwaysUpdate.
+        // Frame 1: same view → full redraw NOW runs on every frame. 'h'
+        // must be AlwaysUpdate (MOD-7 persistent fix).
         terminal
             .draw(|f| {
                 f.render_widget(Paragraph::new("hello"), f.area());
@@ -923,13 +928,13 @@ mod tests {
             })
             .unwrap();
         let buf = terminal.backend().buffer();
-        assert_ne!(
+        assert_eq!(
             buf[(0, 0)].diff_option,
             CellDiffOption::AlwaysUpdate,
-            "MOD-7: cell should NOT be marked when view is unchanged"
+            "MOD-7: cell must be marked AlwaysUpdate on every frame, even when view is unchanged"
         );
 
-        // Switch view → triggers full redraw on next frame.
+        // Switch view → full redraw still runs.
         app.view = View::Youtube;
 
         // Frame 2: view changed → full redraw. 'w' must be AlwaysUpdate.
@@ -945,15 +950,15 @@ mod tests {
             CellDiffOption::AlwaysUpdate,
             "MOD-7: cell must be marked AlwaysUpdate after view change"
         );
-        // last_rendered_view must be updated so subsequent same-view frames
-        // don't re-trigger the full redraw.
+        // last_rendered_view must be updated so other code can track it.
         assert_eq!(
             app.last_rendered_view,
             View::Youtube,
             "MOD-7: last_rendered_view must be updated after view change"
         );
 
-        // Frame 3: same view again → no full redraw.
+        // Frame 3: same view again → full redraw STILL runs (the persistent
+        // fix). 'a' must be AlwaysUpdate.
         terminal
             .draw(|f| {
                 f.render_widget(Paragraph::new("again"), f.area());
@@ -961,10 +966,133 @@ mod tests {
             })
             .unwrap();
         let buf = terminal.backend().buffer();
-        assert_ne!(
+        assert_eq!(
             buf[(0, 0)].diff_option,
             CellDiffOption::AlwaysUpdate,
-            "MOD-7: cell should NOT be marked when view is unchanged after a switch"
+            "MOD-7: cell must be marked AlwaysUpdate on every frame, even after a view switch"
+        );
+    }
+
+    /// MOD-7 persistent fix: the first frame (initial render) must mark all
+    /// non-empty cells as `AlwaysUpdate`. The cleared initial buffer can
+    /// coincidentally match a styled cell, causing the diff to skip it and
+    /// drop a character on the very first render.
+    #[test]
+    fn post_render_force_marks_cells_on_initial_frame() {
+        use crate::catalog::Catalog;
+        use crate::player::StubPlayer;
+        use crate::tui::app::{App, View};
+
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({
+            "version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+            "tracks":[
+              {"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"Freedom",
+               "album":"Adele","bit_depth":24,"sample_rate_hz":96000,
+               "source_path":"lossless/A/01.flac","symlinked_into_artists":["Ado"]}
+            ]
+        })
+        .to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        let cat = Catalog::load(&p).unwrap();
+
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.view = View::Artists;
+        app.last_rendered_view = View::Artists;
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // The very first draw on a fresh terminal — every non-empty cell
+        // must be marked so the diff emits it, even though the previous
+        // buffer is the cleared all-spaces buffer.
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("delete"), f.area());
+                post_render_force(f, &mut app);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // All 6 characters of "delete" must be AlwaysUpdate.
+        for (i, _ch) in "delete".chars().enumerate() {
+            assert_eq!(
+                buf[(i as u16, 0)].diff_option,
+                CellDiffOption::AlwaysUpdate,
+                "MOD-7: initial frame must mark every char of 'delete' as AlwaysUpdate (char at {i})"
+            );
+        }
+    }
+
+    /// MOD-7 persistent fix: a same-view update (e.g. j/k navigation changes
+    /// the rendered text) must mark all non-empty cells as `AlwaysUpdate`.
+    /// Without this, a cell whose new character coincidentally matches the
+    /// old character at the same position with the same style is skipped
+    /// (e.g. "i" in "Test Artist" → "i" in "Best Artist" at the same col).
+    #[test]
+    fn post_render_force_marks_cells_on_same_view_update() {
+        use crate::catalog::Catalog;
+        use crate::player::StubPlayer;
+        use crate::tui::app::{App, View};
+
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({
+            "version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+            "tracks":[
+              {"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"Freedom",
+               "album":"Adele","bit_depth":24,"sample_rate_hz":96000,
+               "source_path":"lossless/A/01.flac","symlinked_into_artists":["Ado"]}
+            ]
+        })
+        .to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        let cat = Catalog::load(&p).unwrap();
+
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.view = View::Artists;
+        app.last_rendered_view = View::Artists;
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Frame 1: "Test Artist".
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("Test Artist"), f.area());
+                post_render_force(f, &mut app);
+            })
+            .unwrap();
+
+        // Frame 2: same view, different text where "i" is at the same
+        // position. Without every-frame force_full_redraw, the "i" would
+        // be skipped by the diff (same char + same style).
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("Best Artist"), f.area());
+                post_render_force(f, &mut app);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // "Best Artist" — 'B' at (0,0) must be AlwaysUpdate (the old 'T'
+        // was different, but force ensures it regardless). And the 'i' at
+        // (5,0) must also be AlwaysUpdate even though the previous frame
+        // also had 'i' at (5,0) with the same style.
+        assert_eq!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: same-view update must mark 'B' as AlwaysUpdate"
+        );
+        assert_eq!(
+            buf[(5, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: same-view update must mark 'i' as AlwaysUpdate even though previous frame also had 'i' at the same position"
         );
     }
 }

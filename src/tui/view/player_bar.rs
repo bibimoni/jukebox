@@ -95,11 +95,13 @@ pub fn geometry(area: Rect) -> PlayerBarGeometry {
     }
 }
 
-/// Pick the current spinner glyph: ASCII when `JUKEBOX_FONT_MODE=ascii` (or
-/// `NO_COLOR` triggered the ASCII fallback), braille otherwise. `spinner_frame`
-/// wraps modulo the active frame count. MOD-6: the old check used `no_color()`
-/// alone, so `JUKEBOX_FONT_MODE=ascii` without `NO_COLOR` still rendered braille
-/// dots that may not exist in the font — `is_ascii()` covers both paths.
+/// Pick the current spinner glyph: ASCII when `JUKEBOX_FONT_MODE=ascii`,
+/// braille otherwise. `spinner_frame` wraps modulo the active frame count.
+/// MOD-6: the old check used `no_color()` alone, so
+/// `JUKEBOX_FONT_MODE=ascii` without `NO_COLOR` still rendered braille
+/// dots that may not exist in the font — `is_ascii()` covers the path.
+/// D2: `NO_COLOR` no longer triggers ASCII mode, so it now correctly keeps
+/// braille under `NO_COLOR=1` (colorless but Unicode).
 fn spinner_glyph(app: &App) -> &'static str {
     let frames = if crate::tui::view::theme::is_ascii() {
         &SPINNER_ASCII[..]
@@ -1209,12 +1211,13 @@ mod mod_tests {
 
     /// MOD-6: The ASCII spinner frames (`SPINNER_ASCII`) must contain only
     /// single ASCII characters — never braille dots. This is the fallback
-    /// used when `theme::is_ascii()` is true (either `JUKEBOX_FONT_MODE=ascii`
-    /// or `NO_COLOR` triggered the ASCII fallback in `FontMode::auto_detect`).
+    /// used when `theme::is_ascii()` is true (`JUKEBOX_FONT_MODE=ascii`).
     /// The old `spinner_glyph` checked `no_color()` alone, so
     /// `JUKEBOX_FONT_MODE=ascii` without `NO_COLOR` still rendered braille —
-    /// `is_ascii()` covers both paths. (The `is_ascii()` → `FontMode::Ascii`
-    /// mapping itself is covered by `icons::tests::font_mode_*`.)
+    /// `is_ascii()` covers the path. D2: `NO_COLOR` no longer triggers ASCII
+    /// mode, so it now correctly keeps braille under `NO_COLOR=1`.
+    /// (The `is_ascii()` → `FontMode::Ascii` mapping itself is covered by
+    /// `icons::tests::font_mode_*`.)
     #[test]
     fn mod6_spinner_ascii_frames_are_ascii() {
         for (i, glyph) in SPINNER_ASCII.iter().enumerate() {

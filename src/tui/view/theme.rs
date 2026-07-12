@@ -527,8 +527,9 @@ pub const ASCII_BORDER_SET: border::Set = border::Set {
     horizontal_bottom: "-",
 };
 
-/// True when the active font mode is ASCII (either `JUKEBOX_FONT_MODE=ascii`
-/// or `NO_COLOR` triggered the ASCII fallback in `FontMode::auto_detect`).
+/// True when the active font mode is ASCII (`JUKEBOX_FONT_MODE=ascii`).
+/// D2: `NO_COLOR` no longer triggers ASCII mode — it only disables colors
+/// (see `theme::no_color`). Use `JUKEBOX_FONT_MODE=ascii` for ASCII glyphs.
 pub fn is_ascii() -> bool {
     Theme::default().font_mode == FontMode::Ascii
 }

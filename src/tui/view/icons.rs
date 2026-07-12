@@ -34,8 +34,14 @@ impl FontMode {
     /// DEF-006: also checks `JUKEBOX_FONT_MODE` — when set to "ascii" (case-
     /// insensitive), returns `FontMode::Ascii` so all glyphs use ASCII labels.
     /// When set to "nerd" or "nerdfont", returns `FontMode::NerdFont`. When
-    /// set to "unicode", returns `FontMode::Unicode`. This env var takes
-    /// precedence over `NO_COLOR` and `TERM`/`TERM_FONT` detection.
+    /// set to "unicode", returns `FontMode::Unicode`.
+    ///
+    /// D2: `NO_COLOR` is NOT checked here. `NO_COLOR` (no-color.org) only
+    /// disables colors (handled in `theme.rs`); it must not change Unicode
+    /// symbols to ASCII labels. `JUKEBOX_FONT_MODE=ascii` is the sole way to
+    /// enable ASCII font mode. Conflating the two broke `NO_COLOR=1` by
+    /// replacing all Unicode structural glyphs (›, ─, ♫) with ASCII, which
+    /// is non-standard.
     pub fn auto_detect() -> Self {
         // Explicit override via JUKEBOX_FONT_MODE (highest priority).
         if let Ok(mode) = std::env::var("JUKEBOX_FONT_MODE") {
@@ -57,11 +63,10 @@ impl FontMode {
                 return FontMode::NerdFont;
             }
         }
-        // Check for NO_COLOR — if set, prefer ASCII for maximum compatibility.
-        if std::env::var_os("NO_COLOR").is_some() {
-            return FontMode::Ascii;
-        }
         // Default: Unicode (works with most modern terminals).
+        // NOTE: NO_COLOR intentionally does NOT trigger ASCII mode here —
+        // it only disables colors (see `theme::no_color`). Use
+        // JUKEBOX_FONT_MODE=ascii for ASCII font mode.
         FontMode::Unicode
     }
 
@@ -487,5 +492,67 @@ mod tests {
         std::env::remove_var("JUKEBOX_FONT_MODE");
         drop(_guard);
         assert_eq!(mode, FontMode::Ascii);
+    }
+
+    /// D2: `NO_COLOR=1` must NOT trigger `FontMode::Ascii`. `NO_COLOR`
+    /// (no-color.org) only disables colors (handled in `theme::no_color`);
+    /// it must not change Unicode symbols to ASCII labels. The previous
+    /// code conflated the two, replacing all Unicode structural glyphs (›,
+    /// ─, ♫) with ASCII under `NO_COLOR=1`, which is non-standard. Only
+    /// `JUKEBOX_FONT_MODE=ascii` enables ASCII font mode.
+    #[test]
+    fn font_mode_no_color_does_not_trigger_ascii() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Clear any explicit override so the default path runs.
+        std::env::remove_var("JUKEBOX_FONT_MODE");
+        std::env::remove_var("TERM_FONT");
+        // Set NO_COLOR — must NOT produce Ascii.
+        std::env::set_var("NO_COLOR", "1");
+        std::env::set_var("TERM", "xterm-256color");
+        let mode = FontMode::auto_detect();
+        std::env::remove_var("NO_COLOR");
+        drop(_guard);
+        assert_eq!(
+            mode,
+            FontMode::Unicode,
+            "D2: NO_COLOR=1 must NOT trigger ASCII font mode (got {mode:?})"
+        );
+    }
+
+    /// D2: `NO_COLOR=1` must not override an explicit `JUKEBOX_FONT_MODE`.
+    /// When both are set, the explicit font mode wins (NO_COLOR only
+    /// affects colors).
+    #[test]
+    fn font_mode_jukebox_font_mode_takes_precedence_over_no_color() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("JUKEBOX_FONT_MODE", "unicode");
+        std::env::set_var("NO_COLOR", "1");
+        let mode = FontMode::auto_detect();
+        std::env::remove_var("JUKEBOX_FONT_MODE");
+        std::env::remove_var("NO_COLOR");
+        drop(_guard);
+        assert_eq!(
+            mode,
+            FontMode::Unicode,
+            "D2: JUKEBOX_FONT_MODE=unicode must win over NO_COLOR=1"
+        );
+    }
+
+    /// D2: `NO_COLOR=1` + `JUKEBOX_FONT_MODE=ascii` still produces Ascii
+    /// (the explicit ASCII override is independent of NO_COLOR).
+    #[test]
+    fn font_mode_ascii_env_with_no_color() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("JUKEBOX_FONT_MODE", "ascii");
+        std::env::set_var("NO_COLOR", "1");
+        let mode = FontMode::auto_detect();
+        std::env::remove_var("JUKEBOX_FONT_MODE");
+        std::env::remove_var("NO_COLOR");
+        drop(_guard);
+        assert_eq!(
+            mode,
+            FontMode::Ascii,
+            "D2: JUKEBOX_FONT_MODE=ascii must produce Ascii even with NO_COLOR=1"
+        );
     }
 }
