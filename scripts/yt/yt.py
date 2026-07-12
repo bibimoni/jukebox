@@ -346,22 +346,25 @@ def _is_transient(e):
     ))
 
 
-def _extract_with_retry(ydl_opts, url, attempts=3):
+def _extract_with_retry(ydl_opts, url, attempts=2):
     """Run yt-dlp extract_info, retrying transient network errors (SSL EOF,
     timeout, connection reset) with a short linear backoff. YouTube / the
     CDN will drop a TLS connection mid-handshake every so often — retrying
     the same client once usually succeeds, whereas falling through to the
-    next client_set won't (a network-level error isn't client-specific)."""
+    next client_set won't (a network-level error isn't client-specific).
+    Reduced from 3 to 2 attempts so a DRM-protected video doesn't block
+    the sidecar for 30+ seconds (each yt-dlp call takes 5-10s)."""
+    opts = {**ydl_opts, "socket_timeout": 5}
     last = None
     for attempt in range(attempts):
         try:
             import yt_dlp
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
         except Exception as e:  # noqa: BLE001
             last = e
             if attempt < attempts - 1 and _is_transient(e):
-                time.sleep(0.4 * (attempt + 1))  # 0.4s, 0.8s
+                time.sleep(0.4 * (attempt + 1))  # 0.4s
                 continue
             raise
     raise last  # unreachable — loop always returns or re-raises
@@ -855,15 +858,16 @@ def main():
                     error_box[0] = e
             t = threading.Thread(target=_run, daemon=True)
             t.start()
-            # 15s timeout: enough for normal resolve_url (1-3s), catches DRM
-            # stuck videos that retry across 2-3 client sets (10-30s each).
-            t.join(timeout=15)
+            # 8s timeout: enough for normal resolve_url (1-3s), catches DRM
+            # stuck videos early so other requests (home_suggestions, search)
+            # don't wait behind a 30s yt-dlp retry loop.
+            t.join(timeout=8)
             if t.is_alive():
                 # The request timed out — respond with an error so the Rust
                 # side doesn't hang. The thread continues in the background
                 # (daemon=True, so it won't block exit) and its result is
                 # discarded.
-                print(json.dumps({"ok": False, "error": "request timed out (15s) — the video may be DRM-protected or YouTube is rate-limiting; try another track"}), flush=True)
+                print(json.dumps({"ok": False, "error": "request timed out (8s) — the video may be DRM-protected or YouTube is rate-limiting; try another track"}), flush=True)
                 continue
             if error_box[0] is not None:
                 raise error_box[0]
