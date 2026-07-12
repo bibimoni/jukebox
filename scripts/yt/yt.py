@@ -842,38 +842,39 @@ def main():
             print(json.dumps({"ok": False, "error": "ytmusicapi/yt-dlp not installed; run :yt setup"}),
                   flush=True)
             continue
-        # Process the request with a timeout so a single slow resolve_url
-        # (DRM-protected video, yt-dlp retrying across multiple client sets)
-        # doesn't block the entire sidecar for 30+ seconds. Other requests
-        # (home_suggestions, library_playlists, search) are quick API calls
-        # that won't trip the timeout. Only resolve_url is slow.
-        try:
-            import threading
-            result_box = [None]
-            error_box = [None]
-            def _run():
-                try:
-                    result_box[0] = handle(cmd, req, ytm)
-                except Exception as e:  # noqa: BLE001
-                    error_box[0] = e
-            t = threading.Thread(target=_run, daemon=True)
-            t.start()
-            # 8s timeout: enough for normal resolve_url (1-3s), catches DRM
-            # stuck videos early so other requests (home_suggestions, search)
-            # don't wait behind a 30s yt-dlp retry loop.
-            t.join(timeout=8)
-            if t.is_alive():
-                # The request timed out — respond with an error so the Rust
-                # side doesn't hang. The thread continues in the background
-                # (daemon=True, so it won't block exit) and its result is
-                # discarded.
-                print(json.dumps({"ok": False, "error": "request timed out (8s) — the video may be DRM-protected or YouTube is rate-limiting; try another track"}), flush=True)
-                continue
-            if error_box[0] is not None:
-                raise error_box[0]
-            print(json.dumps({"ok": True, "data": result_box[0]}), flush=True)
-        except Exception as e:  # noqa: BLE001
-            print(json.dumps({"ok": False, "error": str(e)}), flush=True)
+        # Only resolve_url is slow (yt-dlp retries across multiple client sets
+        # for DRM-protected videos, 10-30s). All other commands (home_suggestions,
+        # library_playlists, search, get_lyrics) are quick ytmusicapi calls (<2s).
+        # We only wrap resolve_url in a thread with timeout; other commands run
+        # directly in the main thread (ytmusicapi uses signal.alarm which only
+        # works in the main thread).
+        if cmd == "resolve_url":
+            try:
+                import threading
+                result_box = [None]
+                error_box = [None]
+                def _run():
+                    try:
+                        result_box[0] = handle(cmd, req, ytm)
+                    except Exception as e:  # noqa: BLE001
+                        error_box[0] = e
+                t = threading.Thread(target=_run, daemon=True)
+                t.start()
+                t.join(timeout=8)
+                if t.is_alive():
+                    print(json.dumps({"ok": False, "error": "request timed out (8s) — the video may be DRM-protected or YouTube is rate-limiting; try another track"}), flush=True)
+                    continue
+                if error_box[0] is not None:
+                    raise error_box[0]
+                print(json.dumps({"ok": True, "data": result_box[0]}), flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(json.dumps({"ok": False, "error": str(e)}), flush=True)
+        else:
+            try:
+                data = handle(cmd, req, ytm)
+                print(json.dumps({"ok": True, "data": data}), flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(json.dumps({"ok": False, "error": str(e)}), flush=True)
 
 
 if __name__ == "__main__":
