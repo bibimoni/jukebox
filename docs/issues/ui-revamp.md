@@ -1,20 +1,17 @@
 # UI Revamp Issues
 
-## Design constraint: NO ICONS
+## Design constraint: No emoji
 
-The UI must NOT use icons (Nerd Font glyphs, Unicode symbols, emoji, or pictographic characters) for any UI element. All information must be conveyed through **text labels** and **layout** alone. This includes:
+The UI must NOT use emoji (🔊, 🎵, ❤️, etc.) for any UI element. Unicode symbols and box-drawing characters are fine:
 
-- No `♫`, `✦`, `◆`, `◎`, `▶`, `■`, `▰`, `▱`, `⠋`, `┏`, `┃`, `┗`, `━` or any other Unicode pictographs
-- No Nerd Font PUA glyphs
-- No emoji
-- No box-drawing characters for borders — use plain ASCII (`+`, `-`, `|`) or CSS-style spacing
-- No spinner animations with braille dots (`⠋⠙⠹`) — use text like `[loading]` or `[...]`
-- No `▸` or `▶` markers — use `>` or `->` in plain ASCII
-- No progress bar blocks (`▰▱`) — use text like `[|||||---]` or percentage text
+- OK: `♫`, `✦`, `◆`, `◎`, `▶`, `■`, `▰`, `▱`, `⠋`, `┏`, `┃`, `┗`, `━`
+- OK: Nerd Font PUA glyphs (when a Nerd Font is detected)
+- OK: Box-drawing characters for borders
+- OK: Braille spinner animations
+- OK: Progress bar blocks (`▰▱`)
+- NOT OK: `🔊`, `🎵`, `❤️`, `⏮`, `⏯`, `⏭`, `✅`, `❌` or any other emoji
 
-**Rationale:** Icons are font-dependent, break in ASCII-only terminals, cause width-calculation bugs, and add visual noise without information. Text labels are universal, accessible, and testable. The existing `icons.rs` module and `FontMode` system should be removed entirely.
-
-**Affected files:** `src/tui/view/icons.rs` (delete), `src/tui/view/theme.rs` (remove icon helpers), all view files that call `IconRenderer`, `icons.glyph()`, or use Unicode box-drawing characters.
+All information must also have a text label alongside the symbol so meaning doesn't depend on the glyph alone (accessibility in no-color and ASCII fallback modes).
 
 ---
 
