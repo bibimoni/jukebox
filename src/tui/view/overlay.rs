@@ -356,13 +356,26 @@ fn render_search(
                     ),
                     dim,
                 ))
-            } else {
+            } else if !results.is_empty() {
+                // MOD-8: only show "Enter plays selection" when there ARE
+                // results to play. The old hint showed it unconditionally,
+                // even with an empty input (no results), so pressing Enter
+                // did nothing — the hint promised an action that wasn't
+                // available. Now the hint matches the actual Enter behavior
+                // (play the highlighted result, which requires results).
                 Line::from(Span::styled(
                     format!(
                         "Tab {} youtube   {}   Enter plays selection",
                         right_arrow(),
                         sep_dot()
                     ),
+                    dim,
+                ))
+            } else {
+                // No input yet, no results — Enter does nothing, so don't
+                // claim it does. Just show the scope-switch hint.
+                Line::from(Span::styled(
+                    format!("Tab {} youtube to search", right_arrow()),
                     dim,
                 ))
             }
@@ -1113,4 +1126,134 @@ fn render_text_input(f: &mut Frame, area: Rect, prompt: &str, buffer: &str, curs
         )),
     ];
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::Catalog;
+    use crate::player::StubPlayer;
+    use crate::tui::app::{App, SearchScope};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// Minimal one-track catalog so `App::new` succeeds for overlay tests.
+    fn one_track_cat() -> (tempfile::TempDir, Catalog) {
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({
+            "version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+            "tracks":[
+              {"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"Freedom",
+               "album":"Adele","bit_depth":24,"sample_rate_hz":96000,
+               "source_path":"lossless/A/01.flac","symlinked_into_artists":["Ado"]}
+            ]
+        })
+        .to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        (d, Catalog::load(&p).unwrap())
+    }
+
+    /// Render the search overlay and return the status/hint line as a flat
+    /// string. The status line is row 1 of the popup inner area (below the
+    /// title border and the input line). We scan every row for a line
+    /// containing "youtube" (lowercase) — the Local-scope status line always
+    /// mentions "youtube" as the scope to switch to, while the title bar says
+    /// "local" not "youtube", so this uniquely identifies the status line.
+    fn search_status_line(
+        app: &App,
+        input: &str,
+        results: &[String],
+        cursor: usize,
+        scope: SearchScope,
+        submitted: &Option<String>,
+        searching: bool,
+    ) -> String {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render_search(
+                    f,
+                    f.area(),
+                    app,
+                    input,
+                    results,
+                    cursor,
+                    scope,
+                    submitted,
+                    searching,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        for y in 0..24u16 {
+            let mut row = String::new();
+            for x in 0..80u16 {
+                row.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+            let trimmed = row.trim().to_string();
+            if trimmed.contains("youtube") || trimmed.contains("No results") {
+                return trimmed;
+            }
+        }
+        String::new()
+    }
+
+    /// MOD-8: When the local search scope has NO results (empty input), the
+    /// hint must NOT say "Enter plays selection" — Enter does nothing with an
+    /// empty result set, so the hint would be misleading. The old code showed
+    /// "Tab → youtube · Enter plays selection" unconditionally.
+    #[test]
+    fn mod8_local_search_hint_no_enter_when_no_results() {
+        let (_d, cat) = one_track_cat();
+        let app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        let hint = search_status_line(&app, "", &[], 0, SearchScope::Local, &None, false);
+        assert!(
+            !hint.contains("Enter plays selection"),
+            "MOD-8: hint must not promise Enter plays when there are no results: {hint:?}"
+        );
+        assert!(
+            hint.contains("Tab"),
+            "MOD-8: hint must still show the Tab scope-switch key: {hint:?}"
+        );
+    }
+
+    /// MOD-8: When the local search scope HAS results, the hint must say
+    /// "Enter plays selection" — Enter plays the highlighted result, matching
+    /// the hint.
+    #[test]
+    fn mod8_local_search_hint_shows_enter_when_results_exist() {
+        let (_d, cat) = one_track_cat();
+        let app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        let results = vec!["t1".to_string()];
+        let hint = search_status_line(
+            &app,
+            "free",
+            &results,
+            0,
+            SearchScope::Local,
+            &Some("free".to_string()),
+            false,
+        );
+        assert!(
+            hint.contains("Enter plays selection"),
+            "MOD-8: hint must show Enter plays selection when results exist: {hint:?}"
+        );
+    }
+
+    /// MOD-8: When the local search query returned no matches, the hint must
+    /// show "No results" (the existing behavior — unchanged by this fix).
+    #[test]
+    fn mod8_local_search_hint_shows_no_results_when_empty_matches() {
+        let (_d, cat) = one_track_cat();
+        let app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        let hint = search_status_line(&app, "zzz", &[], 0, SearchScope::Local, &None, false);
+        assert!(
+            hint.contains("No results"),
+            "MOD-8: hint must show No results for unmatched query: {hint:?}"
+        );
+    }
 }

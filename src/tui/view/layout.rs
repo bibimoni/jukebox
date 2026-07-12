@@ -137,7 +137,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if app.overlay.is_some() {
             overlay::render(f, area, app);
         }
-        force_space_redraw(f);
+        post_render_force(f, app);
         return;
     }
 
@@ -204,7 +204,63 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.overlay.is_some() {
         overlay::render(f, area, app);
     }
+    post_render_force(f, app);
+}
+
+/// Post-render diff forcing. Called at the end of every `draw` after all
+/// widgets (and any overlay) have rendered. Combines two diff-forcing passes:
+///
+/// 1. **View-change full redraw** (MOD-7): when `app.view` differs from
+///    `app.last_rendered_view`, marks every non-empty cell as
+///    `AlwaysUpdate` so the diff emits it unconditionally. Without this,
+///    a cell whose content+style coincidentally matches the previous frame
+///    at the same position is skipped by ratatui's `Cell::eq`, leaving
+///    stale content on the view switch. The confirmed case: switching from
+///    Artists (row "Test Artist", "i" at col 13) to YouTube (row "Late Night
+///    Jazz", "i" at col 13) — the diff skips the "i" (same symbol, same
+///    `fg=Reset` style), so the terminal keeps the old "i" and the per-frame
+///    evidence shows "Late N ght Jazz". Forcing every non-empty cell
+///    re-emits the "i" (and everything else), resyncing the terminal.
+///
+/// 2. **`force_space_redraw`** (DEF-002 / MAJ-2): marks default-styled
+///    inter-word spaces so the diff writes them, clearing stale content
+///    at space positions.
+fn post_render_force(f: &mut Frame, app: &mut App) {
+    if app.view != app.last_rendered_view {
+        force_full_redraw(f);
+        app.last_rendered_view = app.view;
+    }
     force_space_redraw(f);
+}
+
+/// Mark every non-empty cell in the buffer as `AlwaysUpdate` so the diff
+/// emits it regardless of whether it matches the previous frame. Used on
+/// view switches (see [`post_render_force`]) to prevent the MOD-7
+/// character-dropping bug where a new view's text coincidentally matches
+/// the old view's text at the same position with the same style.
+///
+/// "Non-empty" means the cell has a non-space symbol OR a non-default style
+/// (fg/bg/modifier). Default-styled spaces are left to `force_space_redraw`,
+/// which marks the inter-word ones.
+fn force_full_redraw(f: &mut Frame) {
+    let area = f.area();
+    let buf = f.buffer_mut();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if cell.diff_option != CellDiffOption::None {
+                    continue;
+                }
+                let is_default_space = cell.symbol() == " "
+                    && cell.fg == Color::Reset
+                    && cell.bg == Color::Reset
+                    && cell.modifier == Modifier::empty();
+                if !is_default_space {
+                    cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+                }
+            }
+        }
+    }
 }
 
 /// Maximum number of cells `force_space_redraw` will mark as `AlwaysUpdate`
@@ -756,6 +812,159 @@ mod tests {
         assert!(
             count <= MAX_MARKED_CELLS,
             "MAJ-2: too many cells marked at 160×50: {count} > {MAX_MARKED_CELLS}"
+        );
+    }
+
+    /// MOD-7: `force_full_redraw` must mark every non-empty (non-default-space)
+    /// cell as `AlwaysUpdate` so the diff emits it unconditionally on a view
+    /// switch. Without this, a cell whose content+style coincidentally matches
+    /// the previous frame at the same position is skipped (e.g. "i" in "Test
+    /// Artist" → "i" in "Late Night Jazz"), leaving stale content.
+    #[test]
+    fn force_full_redraw_marks_non_empty_cells() {
+        let backend = TestBackend::new(20, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("hello"), f.area());
+                force_full_redraw(f);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // 'h' at (0,0) is a non-space character → must be AlwaysUpdate.
+        assert_eq!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: non-space cell must be marked AlwaysUpdate by force_full_redraw"
+        );
+        // 'o' at (4,0) is the last char of "hello" → must be AlwaysUpdate.
+        assert_eq!(
+            buf[(4, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: non-space cell must be marked AlwaysUpdate by force_full_redraw"
+        );
+        // Cell at (10,0) is an empty/default space → must NOT be marked
+        // (left to force_space_redraw to handle inter-word spaces).
+        assert_ne!(
+            buf[(10, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: default-styled empty cell should not be marked by force_full_redraw"
+        );
+    }
+
+    /// MOD-7: `force_full_redraw` must mark styled (non-default fg/bg/modifier)
+    /// cells even if their symbol is a space. A styled space (e.g. a colored
+    /// background) is "non-empty" in the visual sense and must be re-emitted
+    /// on a view switch so the old frame's styling doesn't linger.
+    #[test]
+    fn force_full_redraw_marks_styled_spaces() {
+        let backend = TestBackend::new(20, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    Paragraph::new(" ").style(Style::default().bg(Color::Blue)),
+                    f.area(),
+                );
+                force_full_redraw(f);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // The styled space at (0,0) has bg=Blue → must be AlwaysUpdate.
+        assert_eq!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: styled space (non-default bg) must be marked AlwaysUpdate"
+        );
+    }
+
+    /// MOD-7: `post_render_force` must trigger `force_full_redraw` when the
+    /// view changed between frames, and NOT trigger it when the view is the
+    /// same. This is the core of the view-change full-redraw fix: on a view
+    /// switch, every non-empty cell is marked so the diff re-emits it,
+    /// preventing the character-dropping bug where a coincidental content+style
+    /// match at the same position causes the diff to skip a cell.
+    #[test]
+    fn post_render_force_triggers_full_redraw_on_view_change() {
+        use crate::catalog::Catalog;
+        use crate::player::StubPlayer;
+        use crate::tui::app::{App, View};
+
+        // Minimal catalog for App::new.
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({
+            "version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+            "tracks":[
+              {"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"Freedom",
+               "album":"Adele","bit_depth":24,"sample_rate_hz":96000,
+               "source_path":"lossless/A/01.flac","symlinked_into_artists":["Ado"]}
+            ]
+        })
+        .to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        let cat = Catalog::load(&p).unwrap();
+
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.view = View::Artists;
+        app.last_rendered_view = View::Artists;
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Frame 1: same view → no full redraw. 'h' should NOT be AlwaysUpdate.
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("hello"), f.area());
+                post_render_force(f, &mut app);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        assert_ne!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: cell should NOT be marked when view is unchanged"
+        );
+
+        // Switch view → triggers full redraw on next frame.
+        app.view = View::Youtube;
+
+        // Frame 2: view changed → full redraw. 'w' must be AlwaysUpdate.
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("world"), f.area());
+                post_render_force(f, &mut app);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: cell must be marked AlwaysUpdate after view change"
+        );
+        // last_rendered_view must be updated so subsequent same-view frames
+        // don't re-trigger the full redraw.
+        assert_eq!(
+            app.last_rendered_view,
+            View::Youtube,
+            "MOD-7: last_rendered_view must be updated after view change"
+        );
+
+        // Frame 3: same view again → no full redraw.
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("again"), f.area());
+                post_render_force(f, &mut app);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        assert_ne!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: cell should NOT be marked when view is unchanged after a switch"
         );
     }
 }

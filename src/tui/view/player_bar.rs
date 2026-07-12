@@ -95,10 +95,13 @@ pub fn geometry(area: Rect) -> PlayerBarGeometry {
     }
 }
 
-/// Pick the current spinner glyph: ASCII under `NO_COLOR` (minimal terminals),
-/// braille otherwise. `spinner_frame` wraps modulo the active frame count.
+/// Pick the current spinner glyph: ASCII when `JUKEBOX_FONT_MODE=ascii` (or
+/// `NO_COLOR` triggered the ASCII fallback), braille otherwise. `spinner_frame`
+/// wraps modulo the active frame count. MOD-6: the old check used `no_color()`
+/// alone, so `JUKEBOX_FONT_MODE=ascii` without `NO_COLOR` still rendered braille
+/// dots that may not exist in the font — `is_ascii()` covers both paths.
 fn spinner_glyph(app: &App) -> &'static str {
-    let frames = if crate::tui::view::theme::no_color() {
+    let frames = if crate::tui::view::theme::is_ascii() {
         &SPINNER_ASCII[..]
     } else {
         &SPINNER[..]
@@ -1202,5 +1205,66 @@ mod mod_tests {
             bar.contains("Loading"),
             "MAJ-1: should show Loading for unresolvable queued track: {bar}"
         );
+    }
+
+    /// MOD-6: The ASCII spinner frames (`SPINNER_ASCII`) must contain only
+    /// single ASCII characters — never braille dots. This is the fallback
+    /// used when `theme::is_ascii()` is true (either `JUKEBOX_FONT_MODE=ascii`
+    /// or `NO_COLOR` triggered the ASCII fallback in `FontMode::auto_detect`).
+    /// The old `spinner_glyph` checked `no_color()` alone, so
+    /// `JUKEBOX_FONT_MODE=ascii` without `NO_COLOR` still rendered braille —
+    /// `is_ascii()` covers both paths. (The `is_ascii()` → `FontMode::Ascii`
+    /// mapping itself is covered by `icons::tests::font_mode_*`.)
+    #[test]
+    fn mod6_spinner_ascii_frames_are_ascii() {
+        for (i, glyph) in SPINNER_ASCII.iter().enumerate() {
+            assert!(
+                glyph.len() == 1 && glyph.is_ascii(),
+                "MOD-6: SPINNER_ASCII[{i}] = {glyph:?} must be a single ASCII char"
+            );
+        }
+        // The braille set and ASCII set must be disjoint so a glyph from one
+        // can never be mistaken for a glyph from the other.
+        for braille in &SPINNER {
+            assert!(
+                !SPINNER_ASCII.contains(braille),
+                "MOD-6: braille glyph {braille:?} must not appear in SPINNER_ASCII"
+            );
+        }
+    }
+
+    /// MOD-6: The braille spinner frames (`SPINNER`) must contain only braille
+    /// pattern dots (U+2800 block), used in the default Unicode/color mode.
+    /// This confirms the default wasn't inverted by the fix.
+    #[test]
+    fn mod6_spinner_braille_frames_are_braille() {
+        for (i, glyph) in SPINNER.iter().enumerate() {
+            let cp = glyph.chars().next().unwrap() as u32;
+            assert!(
+                (0x2800..=0x28FF).contains(&cp),
+                "MOD-6: SPINNER[{i}] = {glyph:?} (U+{cp:04X}) must be a braille pattern"
+            );
+        }
+    }
+
+    /// MOD-6: In the default (Unicode, no `JUKEBOX_FONT_MODE`, no `NO_COLOR`)
+    /// mode, `spinner_glyph` must return a braille frame. This confirms the
+    /// `is_ascii()` check resolves to `false` by default and the braille path
+    /// is taken. (Runs without touching env vars so it can't leak state to
+    /// parallel tests — the `is_ascii()` → `true` path is exercised by the
+    /// `icons::tests::font_mode_*` suite instead.)
+    #[test]
+    fn mod6_spinner_uses_braille_in_default_mode() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        for frame in 0..10u8 {
+            app.spinner_frame = frame;
+            let glyph = spinner_glyph(&app);
+            assert!(
+                SPINNER.contains(&glyph),
+                "MOD-6: spinner glyph {glyph:?} must be a braille frame {SPINNER:?} \
+                 in default unicode mode"
+            );
+        }
     }
 }

@@ -264,6 +264,14 @@ pub struct App {
     /// `collaboration_album_shows_and_plays_all_tracks` in `tests/app.rs`.
     pub album_tracks: HashMap<String, Vec<String>>,
     pub view: View,
+    /// The view rendered in the last frame. Used by `layout::draw` to detect
+    /// view switches and force a full redraw (MOD-7: when switching views,
+    /// a cell whose content+style coincidentally matches the previous frame
+    /// at the same position — e.g. "i" in "Test Artist" → "i" in "Late Night
+    /// Jazz" at the same column — is skipped by ratatui's diff, leaving stale
+    /// content. Forcing every non-empty cell to `AlwaysUpdate` on a view
+    /// switch ensures the diff emits all visible characters).
+    pub last_rendered_view: View,
     pub focus_col: usize,
     pub cursors: ColumnCursors,
     pub column_widths: ColumnWidths,
@@ -558,6 +566,7 @@ impl App {
             track_index,
             album_tracks,
             view: View::Artists,
+            last_rendered_view: View::Artists,
             focus_col: 0,
             cursors: ColumnCursors::default(),
             column_widths: ColumnWidths::default(),
