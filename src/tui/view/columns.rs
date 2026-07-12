@@ -308,9 +308,14 @@ pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
             }
         },
         View::Youtube => match app.focus_col {
-            0 => (
-                "YouTube".into(),
-                app.yt_lists
+            0 => {
+                // MOD-4: at narrow widths (<=100 cols) the Tracks column
+                // collapses out of view (judge: "tracks panel empty at
+                // 80x24"). Show a preview of the selected list's tracks below
+                // the list so track titles are visible without pressing `l`
+                // — mirroring the Artists narrow path's inline album preview.
+                let mut lines: Vec<Line> = app
+                    .yt_lists
                     .iter()
                     .enumerate()
                     .map(|(i, l)| {
@@ -328,8 +333,40 @@ pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
                         };
                         Line::from(Span::styled(format!("{g} {}", l.name), style))
                     })
-                    .collect(),
-            ),
+                    .collect();
+                let name = app
+                    .yt_lists
+                    .get(app.cursors.playlist)
+                    .map(|l| l.name.clone())
+                    .unwrap_or_default();
+                let ids = app
+                    .yt_lists
+                    .get(app.cursors.playlist)
+                    .map(|l| l.track_ids.clone())
+                    .unwrap_or_default();
+                if !ids.is_empty() {
+                    let dim = Style::default().fg(theme.dim);
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        format!("Tracks {} {}:", em_dash(), name),
+                        dim,
+                    )));
+                    let rows =
+                        yt_track_rows(app, &ids, pane.width.saturating_sub(2) as usize, &theme);
+                    // Show as many track rows as fit in the remaining pane
+                    // height (minus the list + blank + header already drawn),
+                    // so the preview never pushes the list off-screen. Cap at
+                    // a minimum of 1 so a single track still shows when the
+                    // list is long.
+                    let list_h = lines.len();
+                    let visible_h = pane.height.saturating_sub(2) as usize; // minus borders
+                    let budget = visible_h.saturating_sub(list_h).max(1);
+                    for row in rows.iter().take(budget) {
+                        lines.push(row.clone());
+                    }
+                }
+                ("YouTube".into(), lines)
+            }
             _ => {
                 let name = app
                     .yt_lists

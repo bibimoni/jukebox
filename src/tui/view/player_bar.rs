@@ -22,6 +22,7 @@ use ratatui::{
 };
 
 use crate::catalog::Track;
+use crate::mode::SourceMode;
 use crate::tui::app::App;
 use crate::tui::queue::{ContinueMode, RepeatMode, ShuffleMode};
 use crate::tui::view::theme::{
@@ -110,11 +111,16 @@ fn spinner_glyph(app: &App) -> &'static str {
 /// always visible while a track is playing — GLM: up-next-missing). When
 /// nothing is playing, a `▸ Enter to play` hint fills the slot so the up-next
 /// area is never empty (GLM: up-next-missing-when-stopped).
-fn up_next_preview(app: &App) -> Option<String> {
+///
+/// `max_title` is the max display columns for the title portion (not the whole
+/// string). The title is truncated via [`truncate_title`] to fit so the
+/// up-next preview doesn't push the info line under the transport controls
+/// (MOD-1). When `max_title` is 0 the title is empty (but "▸ Next: " still
+/// shows if there IS a next track — the slot is never blank while playing).
+fn up_next_preview(app: &App, max_title: usize) -> Option<String> {
     match app.up_next_title() {
         Some(title) => {
-            let max = 28;
-            let trimmed = truncate_title(&title, max);
+            let trimmed = truncate_title(&title, max_title);
             Some(format!("{} Next: {trimmed}", marker_glyph()))
         }
         None => {
@@ -150,6 +156,38 @@ pub fn truncate_title(title: &str, max: usize) -> String {
     }
     out.push_str(ellipsis());
     out
+}
+
+/// Total display width of all spans' content. Used to compute how much room
+/// remains for the up-next preview so it can be truncated to fit (MOD-1).
+fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(|s| disp_width(s.content.as_ref())).sum()
+}
+
+/// Display width of the compact YT auth indicator (` · YT` = 5, ` · YT!` = 6).
+/// Returns 0 when the indicator won't be shown (Local mode + not YT view, or
+/// Unconfigured) so the width budget doesn't over-reserve (MOD-3).
+fn compact_yt_indicator_width(app: &App) -> usize {
+    use crate::tui::app::View;
+    use crate::yt::state::YtState;
+    let yt_relevant = app.source_mode != SourceMode::Local || app.view == View::Youtube;
+    if !yt_relevant || app.yt_state == YtState::Unconfigured {
+        return 0;
+    }
+    // " {sd} {label}" → " · YT" (5) .. " · YT…" (6). Use 6 as a safe upper bound.
+    6
+}
+
+/// Display width of the compact source badge (` · [Y]` / ` · [L]` = 6).
+/// Returns 0 when the badge won't be shown (playing source matches mode).
+fn compact_src_badge_width(app: &App) -> usize {
+    if let Some(np) = &app.now_playing {
+        let playing_src = if np.is_remote() { "youtube" } else { "local" };
+        if playing_src != app.source_mode.as_str() {
+            return 6; // " · [Y]" or " · [L]"
+        }
+    }
+    0
 }
 
 /// Compact 1-row player bar for the narrow (60–80 col) fallback: now-playing +
@@ -242,42 +280,77 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
         let (_pct, plabel) = progress(app);
         spans.push(Span::styled(format!("  {plabel}"), dim));
     }
+    // MOD-3: Reserve width for the essential trailing items (MODE + YT auth
+    // indicator + source badge) so they're always visible at 80×24 even when
+    // the up-next preview or quality readout would push them off-screen. The
+    // up-next and quality are only added if there's room after reserving.
+    let mode_str = app.source_mode.as_str();
+    let mode_w = disp_width(&format!("  MODE {mode_str}"));
+    let yt_w = compact_yt_indicator_width(app);
+    let badge_w = compact_src_badge_width(app);
+    let reserved = mode_w + yt_w + badge_w;
+
     // Up-next preview (width > 60) — so the narrow bar also shows what's
     // queued, matching the full bar's up-next slot (GLM:
     // up-next-missing-in-compact). Grouped right after the now-playing text.
+    // Truncated to fit the remaining width after reserving the trailing
+    // essentials (MOD-1/MOD-3). The "(end)" and "Enter to play" hints are
+    // fixed-length — only add them if they actually fit in `avail`.
     if area.width > 60 {
-        if let Some(next) = up_next_preview(app) {
-            spans.push(Span::styled("  ", dim));
-            spans.push(Span::styled(next, dim));
+        let used = spans_width(&spans);
+        let avail = (area.width as usize).saturating_sub(used + reserved + 2);
+        if avail >= 10 {
+            let max_title = avail.saturating_sub(8);
+            if let Some(next) = up_next_preview(app, max_title) {
+                if disp_width(&next) <= avail {
+                    spans.push(Span::styled("  ", dim));
+                    spans.push(Span::styled(next, dim));
+                }
+            }
         }
     }
     // quality (drop below 80 cols — at narrow widths the bit depth / sample
     // rate readout crowds the status bar; keep title + play glyph + progress
-    // text + mode as the essential minimum, drop quality + volume)
+    // text + mode as the essential minimum, drop quality + volume).
+    // MOD-3: also check that adding quality won't push the trailing essentials
+    // (MODE + YT indicator) off-screen.
     if area.width >= 80 {
-        spans.push(Span::raw("  "));
-        match &np {
-            Some(v) if v.source.is_remote() => {
-                let label = v
-                    .fmt
+        let used = spans_width(&spans);
+        let q_w = match &np {
+            Some(v) if v.source.is_remote() => disp_width(
+                &v.fmt
                     .as_ref()
                     .map(|f| f.yt_label())
-                    .unwrap_or_else(|| "YT".to_string());
-                let color = if crate::tui::view::theme::no_color() {
-                    Color::Reset
-                } else {
-                    Color::Yellow
-                };
-                spans.push(Span::styled(label, Style::default().fg(color)));
+                    .unwrap_or_else(|| "YT".to_string()),
+            ),
+            Some(v) => disp_width(&format!("{}bit/{}", v.bit_depth, khz(v.sample_rate_hz))),
+            None => 2, // "--"
+        } + 2; // "  " prefix
+        if used + q_w + reserved < area.width as usize {
+            spans.push(Span::raw("  "));
+            match &np {
+                Some(v) if v.source.is_remote() => {
+                    let label = v
+                        .fmt
+                        .as_ref()
+                        .map(|f| f.yt_label())
+                        .unwrap_or_else(|| "YT".to_string());
+                    let color = if crate::tui::view::theme::no_color() {
+                        Color::Reset
+                    } else {
+                        Color::Yellow
+                    };
+                    spans.push(Span::styled(label, Style::default().fg(color)));
+                }
+                Some(v) => {
+                    let q_color = quality_color(v.bit_depth, v.sample_rate_hz);
+                    spans.push(Span::styled(
+                        format!("{}bit/{}", v.bit_depth, khz(v.sample_rate_hz)),
+                        Style::default().fg(q_color),
+                    ));
+                }
+                None => spans.push(Span::styled("--", dim)),
             }
-            Some(v) => {
-                let q_color = quality_color(v.bit_depth, v.sample_rate_hz);
-                spans.push(Span::styled(
-                    format!("{}bit/{}", v.bit_depth, khz(v.sample_rate_hz)),
-                    Style::default().fg(q_color),
-                ));
-            }
-            None => spans.push(Span::styled("--", dim)),
         }
     }
     // MODE always visible (essential — shows playback source local/yt/mixed).
@@ -286,16 +359,16 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
     // DEF-004: SHUF/RPT also visible at >= 80 cols so the compact bar (used
     // at height <= 24) shows playback state indicators alongside MODE+CONT.
     spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        format!("MODE {}", app.source_mode.as_str()),
-        dim,
-    ));
+    spans.push(Span::styled(format!("MODE {mode_str}"), dim));
     // DEF-011/DEF-012: compact YT auth indicator — always visible at >= 70
     // cols so the YouTube connection state is visible at all terminal sizes,
     // not just in the 2-row footer (which requires >100 width or >24 height).
     // DEF-013: when a track is playing, also show the actual source if it
     // differs from the mode (e.g., "MODE local" while a YT track plays →
     // "MODE local · [Y]" so the label isn't misleading).
+    // MOD-3: the YT indicator is always added when relevant (width >= 70 +
+    // yt_relevant + non-Unconfigured) — the width budget above reserves space
+    // for it so earlier content is truncated/dropped instead.
     if area.width >= 70 {
         let nc = crate::tui::view::theme::no_color();
         // Playing-source badge (DEF-013): if the now-playing track's source
@@ -322,7 +395,6 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
         {
             use crate::yt::state::YtState;
             let yt_relevant = {
-                use crate::mode::SourceMode;
                 use crate::tui::app::View;
                 app.source_mode != SourceMode::Local || app.view == View::Youtube
             };
@@ -344,28 +416,47 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
-    if area.width >= 70 {
-        let cont = match app.transport.continue_mode {
-            ContinueMode::Off => "off",
-            ContinueMode::NextAlbum => "next",
-            ContinueMode::Radio => "radio",
-            ContinueMode::YouTube => "youtube",
-        };
-        spans.push(Span::styled(format!(" {sd} CONT {cont}"), dim));
-    }
-    if area.width >= 80 {
-        let shuf = match app.transport.shuffle {
-            ShuffleMode::Off => "off",
-            ShuffleMode::Smart => "smart",
-            ShuffleMode::Random => "random",
-        };
-        let rpt = match app.transport.repeat {
-            RepeatMode::Off => "off",
-            RepeatMode::All => "all",
-            RepeatMode::One => "one",
-        };
-        spans.push(Span::styled(format!(" {sd} SHUF {shuf}"), dim));
-        spans.push(Span::styled(format!(" {sd} RPT {rpt}"), dim));
+    // CONT / SHUF / RPT — low priority, only if there's room (MOD-3: don't
+    // let these push the YT indicator off-screen; they come after it).
+    {
+        let used = spans_width(&spans);
+        let remaining = (area.width as usize).saturating_sub(used);
+        if area.width >= 70 {
+            let cont = match app.transport.continue_mode {
+                ContinueMode::Off => "off",
+                ContinueMode::NextAlbum => "next",
+                ContinueMode::Radio => "radio",
+                ContinueMode::YouTube => "youtube",
+            };
+            let cont_w = disp_width(&format!(" {sd} CONT {cont}"));
+            if remaining >= cont_w {
+                spans.push(Span::styled(format!(" {sd} CONT {cont}"), dim));
+            }
+        }
+        if area.width >= 80 {
+            let shuf = match app.transport.shuffle {
+                ShuffleMode::Off => "off",
+                ShuffleMode::Smart => "smart",
+                ShuffleMode::Random => "random",
+            };
+            let rpt = match app.transport.repeat {
+                RepeatMode::Off => "off",
+                RepeatMode::All => "all",
+                RepeatMode::One => "one",
+            };
+            let shuf_w = disp_width(&format!(" {sd} SHUF {shuf}"));
+            let used = spans_width(&spans);
+            let rem = (area.width as usize).saturating_sub(used);
+            if rem >= shuf_w {
+                spans.push(Span::styled(format!(" {sd} SHUF {shuf}"), dim));
+            }
+            let rpt_w = disp_width(&format!(" {sd} RPT {rpt}"));
+            let used = spans_width(&spans);
+            let rem = (area.width as usize).saturating_sub(used);
+            if rem >= rpt_w {
+                spans.push(Span::styled(format!(" {sd} RPT {rpt}"), dim));
+            }
+        }
     }
     f.render_widget(
         Paragraph::new(Line::from(spans).alignment(Alignment::Left))
@@ -526,6 +617,59 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
 
     spans.push(Span::styled(format!("{state_glyph} "), glyph_style));
 
+    // Pre-compute the quality + volume spans (they come after the up-next
+    // preview) so we can budget the up-next title to fit the remaining width
+    // (MOD-1: a long next-track title used to push quality/volume under the
+    // transport controls, creating garbled overlap).
+    let mut trailing: Vec<Span<'static>> = Vec::new();
+    trailing.push(Span::raw("   "));
+    match &np {
+        Some(v) if v.source.is_remote() => {
+            let label = v
+                .fmt
+                .as_ref()
+                .map(|f| f.yt_label())
+                .unwrap_or_else(|| "YT".to_string());
+            let color = if nc { Color::Reset } else { Color::Yellow };
+            trailing.push(Span::styled(label, Style::default().fg(color)));
+        }
+        Some(v) => {
+            let q_color = quality_color(v.bit_depth, v.sample_rate_hz);
+            let q_text = format!("{}-bit / {} kHz", v.bit_depth, khz(v.sample_rate_hz));
+            trailing.push(Span::styled(q_text, Style::default().fg(q_color)));
+            if app.switch_sample_rate {
+                trailing.push(Span::styled(
+                    format!(" {} bit-perfect", sep_dot()),
+                    Style::default().fg(q_color),
+                ));
+            }
+        }
+        None => {
+            trailing.push(Span::styled("--bit / -- kHz", dim));
+        }
+    }
+    if width >= 70 {
+        trailing.push(Span::raw("   "));
+        trailing.push(Span::styled("vol ", dim));
+        let blocks = 4u32;
+        let filled = ((u32::from(app.volume) * blocks + 50) / 100).min(blocks);
+        let mut vol_bar = String::new();
+        for i in 0..blocks {
+            vol_bar.push(if i < filled {
+                filled_block()
+            } else {
+                empty_block()
+            });
+        }
+        let vol_pct = if app.muted { 0 } else { app.volume };
+        let vol_color = if app.muted { theme.dim } else { theme.text };
+        trailing.push(Span::styled(
+            format!("{vol_bar} {vol_pct}%"),
+            Style::default().fg(vol_color),
+        ));
+    }
+    let trailing_w = spans_width(&trailing);
+
     // Now-playing: title — artist · album (or a dim placeholder).
     // Title is the visual hero (accent color — bright + prominent).
     match &np {
@@ -541,10 +685,21 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
             }
             // Up-next preview right after the now-playing text — grouped
             // with the playback context. Only when there's room (width > 60).
+            // The title is truncated to fit the remaining width after the
+            // now-playing text and the trailing quality+volume (MOD-1).
+            // The "(end)" hint is fixed-length — only add if it fits.
             if width > 60 {
-                if let Some(next) = up_next_preview(app) {
-                    spans.push(Span::styled("  ", dim));
-                    spans.push(Span::styled(next, dim));
+                let used = spans_width(&spans);
+                // 2 cols "  " prefix + 8 cols "▸ Next: " prefix + trailing.
+                let avail = width.saturating_sub(used + trailing_w + 2);
+                if avail >= 10 {
+                    let max_title = avail.saturating_sub(8);
+                    if let Some(next) = up_next_preview(app, max_title) {
+                        if disp_width(&next) <= avail {
+                            spans.push(Span::styled("  ", dim));
+                            spans.push(Span::styled(next, dim));
+                        }
+                    }
                 }
             }
         }
@@ -555,70 +710,66 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
             ));
             // Up-next hint when nothing is playing.
             if width > 60 {
-                if let Some(next) = up_next_preview(app) {
-                    spans.push(Span::styled("  ", dim));
-                    spans.push(Span::styled(next, dim));
+                let used = spans_width(&spans);
+                let avail = width.saturating_sub(used + trailing_w + 2);
+                if avail >= 10 {
+                    let max_title = avail.saturating_sub(8);
+                    if let Some(next) = up_next_preview(app, max_title) {
+                        if disp_width(&next) <= avail {
+                            spans.push(Span::styled("  ", dim));
+                            spans.push(Span::styled(next, dim));
+                        }
+                    }
                 }
             }
         }
     }
 
-    spans.push(Span::raw("   "));
-
-    // Quality readout: local → `24-bit / 96 kHz` (+`· bit-perfect`);
-    // remote → stream format label (`Opus 160k · YT` / `AAC 256k · YT Premium`).
-    match &np {
-        Some(v) if v.source.is_remote() => {
-            let label = v
-                .fmt
-                .as_ref()
-                .map(|f| f.yt_label())
-                .unwrap_or_else(|| "YT".to_string());
-            let color = if nc { Color::Reset } else { Color::Yellow };
-            spans.push(Span::styled(label, Style::default().fg(color)));
-        }
-        Some(v) => {
-            let q_color = quality_color(v.bit_depth, v.sample_rate_hz);
-            let q_text = format!("{}-bit / {} kHz", v.bit_depth, khz(v.sample_rate_hz));
-            spans.push(Span::styled(q_text, Style::default().fg(q_color)));
-            if app.switch_sample_rate {
-                spans.push(Span::styled(
-                    format!(" {} bit-perfect", sep_dot()),
-                    Style::default().fg(q_color),
-                ));
-            }
-        }
-        None => {
-            spans.push(Span::styled("--bit / -- kHz", dim));
-        }
-    }
-
-    // Volume (always visible when width >= 70 — the volume meter is a
-    // persistent control, not an informational readout, so it shows even when
-    // nothing is playing. T2: volume-no-numeric-in-wide — always show
-    // `vol ▰▰▰▰▱▱ 70%` with the block bar + numeric percentage.)
-    if width >= 70 {
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled("vol ", dim));
-        let blocks = 4u32;
-        let filled = ((u32::from(app.volume) * blocks + 50) / 100).min(blocks);
-        let mut vol_bar = String::new();
-        for i in 0..blocks {
-            vol_bar.push(if i < filled {
-                filled_block()
-            } else {
-                empty_block()
-            });
-        }
-        let vol_pct = if app.muted { 0 } else { app.volume };
-        let vol_color = if app.muted { theme.dim } else { theme.text };
-        spans.push(Span::styled(
-            format!("{vol_bar} {vol_pct}%"),
-            Style::default().fg(vol_color),
-        ));
-    }
+    // Quality readout + volume (pre-computed above).
+    spans.extend(trailing);
 
     Line::from(spans).alignment(Alignment::Left)
+}
+
+/// Abbreviated shuffle mode for narrow flag areas (MOD-2). Keeps "off" as-is
+/// (already 3 chars); "smart"→"smt", "random"→"rnd" so the flags line fits at
+/// 100×30 where the flags area is only 45 cols.
+fn abbrev_shuf(m: ShuffleMode) -> &'static str {
+    match m {
+        ShuffleMode::Off => "off",
+        ShuffleMode::Smart => "smt",
+        ShuffleMode::Random => "rnd",
+    }
+}
+
+/// Abbreviated continue mode for narrow flag areas (MOD-2). "next"→"nxt",
+/// "radio"→"rad", "youtube"→"yt".
+fn abbrev_cont(m: ContinueMode) -> &'static str {
+    match m {
+        ContinueMode::Off => "off",
+        ContinueMode::NextAlbum => "nxt",
+        ContinueMode::Radio => "rad",
+        ContinueMode::YouTube => "yt",
+    }
+}
+
+/// Abbreviated source mode for narrow flag areas (MOD-2). "youtube"→"yt",
+/// "mixed"→"mix", "local" stays.
+fn abbrev_mode(m: SourceMode) -> &'static str {
+    match m {
+        SourceMode::Local => "local",
+        SourceMode::Youtube => "yt",
+        SourceMode::Mixed => "mix",
+    }
+}
+
+/// Abbreviate a source string ("youtube"→"yt", "local"→"local") for the
+/// SRC badge in narrow flag areas (MOD-2).
+fn abbrev_src_str(s: &str) -> &'static str {
+    match s {
+        "youtube" => "yt",
+        _ => "local",
+    }
 }
 
 /// Row 2 right-anchored flags: `SHUF off · RPT off · CONT off · MODE local`.
@@ -626,11 +777,18 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
 /// (spec §5.1 cut #4). DEF-013: when a track is playing and its source
 /// differs from `source_mode`, a `· SRC youtube` or `· SRC local` badge is
 /// appended so the label doesn't contradict the actual playing source.
-fn build_flags_line(app: &App, _width: usize) -> Line<'static> {
+///
+/// MOD-2: at 100×30 the flags area is 45 cols. The full line
+/// "SHUF smart · RPT off · CONT off · MODE youtube" is 46 cols, which
+/// truncates "MODE youtube" to "MODE youtu" (mid-word). When the full line
+/// exceeds `width`, the values are abbreviated (smart→smt, youtube→yt, etc.)
+/// so every word remains complete.
+fn build_flags_line(app: &App, width: usize) -> Line<'static> {
     let theme = Theme::default();
     let dim = Style::default().fg(theme.dim);
+    let nc = crate::tui::view::theme::no_color();
 
-    let shuf = match app.transport.shuffle {
+    let shuf_full = match app.transport.shuffle {
         ShuffleMode::Off => "off",
         ShuffleMode::Smart => "smart",
         ShuffleMode::Random => "random",
@@ -640,19 +798,49 @@ fn build_flags_line(app: &App, _width: usize) -> Line<'static> {
         RepeatMode::All => "all",
         RepeatMode::One => "one",
     };
-    let cont = match app.transport.continue_mode {
+    let cont_full = match app.transport.continue_mode {
         ContinueMode::Off => "off",
         ContinueMode::NextAlbum => "next",
         ContinueMode::Radio => "radio",
         ContinueMode::YouTube => "youtube",
     };
-    let mode = app.source_mode.as_str();
-    let nc = crate::tui::view::theme::no_color();
+    let mode_full = app.source_mode.as_str();
+    let sd = sep_dot();
+    let sep = format!(" {} ", sd);
+
+    // Build the full flags line and measure it. If it exceeds `width`,
+    // switch to abbreviated values (MOD-2).
+    let full_line =
+        format!("SHUF {shuf_full}{sep}RPT {rpt}{sep}CONT {cont_full}{sep}MODE {mode_full}");
+    let abbrev = width > 0 && disp_width(&full_line) > width;
+
+    let shuf = if abbrev {
+        abbrev_shuf(app.transport.shuffle)
+    } else {
+        shuf_full
+    };
+    let cont = if abbrev {
+        abbrev_cont(app.transport.continue_mode)
+    } else {
+        cont_full
+    };
+    let mode = if abbrev {
+        abbrev_mode(app.source_mode)
+    } else {
+        mode_full
+    };
+
     // DEF-013: if the now-playing track's source differs from the mode,
-    // append "· SRC {actual}" so the label isn't misleading.
+    // append "· SRC {actual}" so the label isn't misleading. Compare full
+    // forms for the decision; abbreviate the display when in abbreviation mode.
     let src_badge = if let Some(np) = &app.now_playing {
-        let playing_src = if np.is_remote() { "youtube" } else { "local" };
-        if playing_src != mode {
+        let playing_src_full = if np.is_remote() { "youtube" } else { "local" };
+        if playing_src_full != mode_full {
+            let playing_disp = if abbrev {
+                abbrev_src_str(playing_src_full)
+            } else {
+                playing_src_full
+            };
             let color = if nc {
                 Color::Reset
             } else if np.is_remote() {
@@ -661,8 +849,8 @@ fn build_flags_line(app: &App, _width: usize) -> Line<'static> {
                 Color::Green
             };
             Some(vec![
-                Span::raw(format!(" {} ", sep_dot())),
-                Span::styled(format!("SRC {playing_src}"), Style::default().fg(color)),
+                Span::raw(sep.clone()),
+                Span::styled(format!("SRC {playing_disp}"), Style::default().fg(color)),
             ])
         } else {
             None
@@ -672,11 +860,11 @@ fn build_flags_line(app: &App, _width: usize) -> Line<'static> {
     };
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled(format!("SHUF {shuf}"), dim),
-        Span::raw(format!(" {} ", sep_dot())),
+        Span::raw(sep.clone()),
         Span::styled(format!("RPT {rpt}"), dim),
-        Span::raw(format!(" {} ", sep_dot())),
+        Span::raw(sep.clone()),
         Span::styled(format!("CONT {cont}"), dim),
-        Span::raw(format!(" {} ", sep_dot())),
+        Span::raw(sep.clone()),
         Span::styled(format!("MODE {mode}"), dim),
     ];
     if let Some(src) = src_badge {
@@ -786,4 +974,152 @@ fn khz(sample_rate_hz: u32) -> String {
 fn now_playing_track(app: &App) -> Option<&Track> {
     let id = app.now_playing.as_ref().map(|s| s.id())?;
     app.track_by_id_fast(id)
+}
+
+#[cfg(test)]
+mod mod_tests {
+    use super::*;
+    use crate::catalog::Catalog;
+    use crate::mode::SourceMode;
+    use crate::player::StubPlayer;
+    use crate::tui::app::App;
+    use crate::tui::queue::ShuffleMode;
+    use crate::yt::state::YtState;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// Two-track catalog: t1 short title, t2 very long title (for MOD-1).
+    fn two_track_cat() -> (tempfile::TempDir, Catalog) {
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        std::fs::write(lossless.join("A").join("02.flac"), b"x").unwrap();
+        let json = serde_json::json!({
+            "version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+            "tracks":[
+              {"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"Freedom","album":"Adele","bit_depth":24,"sample_rate_hz":96000,"source_path":"lossless/A/01.flac","symlinked_into_artists":["Ado"]},
+              {"id":"t2","artists":["Bop"],"primary_artist":"Bop","title":"A Very Long Track Title That Exceeds Available Width For Sure","album":"Beep","bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/A/02.flac","symlinked_into_artists":["Bop"]}
+            ]
+        })
+        .to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        (d, Catalog::load(&p).unwrap())
+    }
+
+    /// Render the full 2-row player bar into a flat string.
+    fn rendered_bar(app: &App, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, f.area(), app)).unwrap();
+        let mut buf = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                let c = &term.backend().buffer()[(x, y)];
+                buf.push(c.symbol().chars().next().unwrap_or(' '));
+            }
+            buf.push('\n');
+        }
+        buf
+    }
+
+    /// Render the 1-row compact player bar into a flat string.
+    fn rendered_compact(app: &App, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_compact(f, f.area(), app)).unwrap();
+        let mut buf = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                let c = &term.backend().buffer()[(x, y)];
+                buf.push(c.symbol().chars().next().unwrap_or(' '));
+            }
+            buf.push('\n');
+        }
+        buf
+    }
+
+    /// MOD-1: When the next-track title is long, the "Next:" preview must be
+    /// truncated to fit the available info-line width so the info content
+    /// doesn't run under the transport controls (rightmost 14 cols). The
+    /// control area must contain only transport glyphs and spaces — no info
+    /// text (title, quality, volume) leaking through.
+    #[test]
+    fn mod1_long_next_title_truncated_before_transport_controls() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.transport.enqueue("t2".into());
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        let bar = rendered_bar(&app, 100, 2);
+        // Row 0 is the info line + transport controls.
+        let row0 = bar.lines().next().unwrap();
+        // The rightmost 14 cols (86..100) are the transport control area.
+        let controls_area: String = row0.chars().skip(86).collect();
+        // Transport controls must be present there.
+        assert!(
+            controls_area.contains("◀◀"),
+            "MOD-1: transport prev must be in the controls area: {bar}"
+        );
+        // No info text (alphanumeric chars from quality/volume/title) should
+        // leak into the control area — only transport glyphs and spaces.
+        let info_leak: String = controls_area
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect();
+        assert!(
+            info_leak.is_empty(),
+            "MOD-1: info text leaked into transport controls area: \
+             controls_area={controls_area:?} leaked={info_leak:?}\nfull bar: {bar}"
+        );
+    }
+
+    /// MOD-2: At 100×30 the flags area is 45 cols. With SHUF=smart and
+    /// MODE=youtube the full flags line is 46 cols, which truncates
+    /// "MODE youtube" to "MODE youtu" (mid-word). The flags must either
+    /// abbreviate or fit so every word is complete.
+    #[test]
+    fn mod2_flags_fit_at_100_cols_smart_shuffle_youtube() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.transport.shuffle = ShuffleMode::Smart;
+        app.source_mode = SourceMode::Youtube;
+        let bar = rendered_bar(&app, 100, 2);
+        assert!(
+            bar.contains("MODE"),
+            "MOD-2: MODE flag must be present: {bar}"
+        );
+        // Must show a complete mode word — "youtube" (fits) or "yt" (abbreviated).
+        // "youtu" without trailing letter = mid-word truncation = bug.
+        let has_complete_mode = bar.contains("MODE youtube") || bar.contains("MODE yt");
+        assert!(
+            has_complete_mode,
+            "MOD-2: MODE must show a complete word (youtube or yt), not truncated mid-word: {bar}"
+        );
+        assert!(
+            bar.contains("SHUF"),
+            "MOD-2: SHUF flag must be present: {bar}"
+        );
+        let has_complete_shuf = bar.contains("SHUF smart") || bar.contains("SHUF smt");
+        assert!(
+            has_complete_shuf,
+            "MOD-2: SHUF must show a complete word (smart or smt), not truncated: {bar}"
+        );
+    }
+
+    /// MOD-3: At 80×24 the compact player bar must show the YT auth indicator
+    /// (at least "YT" in compact form) so the YouTube connection state is
+    /// visible even on narrow terminals.
+    #[test]
+    fn mod3_yt_auth_indicator_visible_at_80x24_compact() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        app.source_mode = SourceMode::Youtube;
+        app.yt_state = YtState::Ready;
+        let bar = rendered_compact(&app, 80, 1);
+        assert!(
+            bar.contains("YT"),
+            "MOD-3: YT auth indicator must be visible at 80x24 compact bar: {bar}"
+        );
+    }
 }

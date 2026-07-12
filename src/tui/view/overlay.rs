@@ -107,7 +107,12 @@ fn render_discover(
                 crate::tui::app::DiscoverItem::Playlist { name, .. } => ("✦", name.clone()),
             };
             let style = if i == cursor {
-                Style::default().fg(theme.hi_fg).bg(theme.accent)
+                // MOD-5: use selected_style() (REVERSED|BOLD under NO_COLOR,
+                // hi_fg on accent + BOLD in color) so the selected item has a
+                // visible non-color cue in monochrome — consistent with the
+                // main browse views. The old fg(hi_fg).bg(accent) relied on
+                // color alone and left no indicator under NO_COLOR.
+                theme.selected_style()
             } else {
                 Style::default().fg(theme.text)
             };
