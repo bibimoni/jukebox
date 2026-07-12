@@ -26,8 +26,8 @@ use ratatui::{
 
 use crate::tui::app::{App, View};
 use crate::tui::view::theme::{
-    disp_width, ellipsis, em_dash, is_ascii, marker_glyph, no_color, pad_between, play_glyph,
-    Theme, ASCII_BORDER_SET,
+    ascii_sanitize, disp_width, ellipsis, em_dash, is_ascii, left_arrow, marker_glyph, no_color,
+    pad_between, play_glyph, sep_dot, Theme, ASCII_BORDER_SET,
 };
 
 /// Render the rail + columns into `area` using state from `app`.
@@ -234,7 +234,7 @@ pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
                     .cloned()
                     .unwrap_or_default();
                 (
-                    format!("Albums · {artist} ← Artists"),
+                    format!("Albums {} {artist} {} Artists", sep_dot(), left_arrow()),
                     albums
                         .iter()
                         .enumerate()
@@ -267,7 +267,12 @@ pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
                     .unwrap_or_default();
                 let ids = app.tracks_for_album(&album);
                 (
-                    format!("Tracks · {album} ← Albums · {artist}"),
+                    format!(
+                        "Tracks {} {album} {} Albums {} {artist}",
+                        sep_dot(),
+                        left_arrow(),
+                        sep_dot()
+                    ),
                     track_rows(app, &ids, pane.width.saturating_sub(2) as usize, &theme),
                 )
             }
@@ -302,7 +307,7 @@ pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
                     .map(|p| p.track_ids.clone())
                     .unwrap_or_default();
                 (
-                    format!("Tracks · {name} ← Playlists"),
+                    format!("Tracks {} {name} {} Playlists", sep_dot(), left_arrow()),
                     track_rows(app, &ids, pane.width.saturating_sub(2) as usize, &theme),
                 )
             }
@@ -379,7 +384,7 @@ pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
                     .map(|l| l.track_ids.clone())
                     .unwrap_or_default();
                 (
-                    format!("Tracks · {name} ← YouTube"),
+                    format!("Tracks {} {name} {} YouTube", sep_dot(), left_arrow()),
                     yt_track_rows(app, &ids, pane.width.saturating_sub(2) as usize, &theme),
                 )
             }
@@ -569,10 +574,14 @@ fn yt_status_line(app: &App, ids_empty: bool) -> String {
         }
     }
     match app.yt_state {
-        YtState::Unconfigured => {
-            "YouTube not configured — run :yt auth browser <chrome>".to_string()
+        YtState::Unconfigured => format!(
+            "YouTube not configured {} run :yt auth browser <chrome>",
+            em_dash()
+        )
+        .to_string(),
+        YtState::SignedOut => {
+            format!("signed out {} run :yt auth to reconnect", em_dash()).to_string()
         }
-        YtState::SignedOut => "signed out — run :yt auth to reconnect".to_string(),
         YtState::Authenticating => format!("authenticating{}", ellipsis()).to_string(),
         YtState::AuthenticatedNotSynced | YtState::Synchronizing => {
             if app.yt_lists_loading {
@@ -596,11 +605,19 @@ fn yt_status_line(app: &App, ids_empty: bool) -> String {
         YtState::RateLimited => {
             format!("rate limited {} wait, then press R", em_dash()).to_string()
         }
-        YtState::AuthExpired => "authorization expired — run :yt auth browser <name>".to_string(),
+        YtState::AuthExpired => format!(
+            "authorization expired {} run :yt auth browser <name>",
+            em_dash()
+        )
+        .to_string(),
         YtState::ProviderError => {
             format!("provider error {} press R to retry", em_dash()).to_string()
         }
-        YtState::Failed => "failed — run :yt setup or check your installation".to_string(),
+        YtState::Failed => format!(
+            "failed {} run :yt setup or check your installation",
+            em_dash()
+        )
+        .to_string(),
     }
 }
 
@@ -642,7 +659,7 @@ fn truncate_ellipsis(s: &str, width: usize) -> String {
         if trimmed.len() < out.len() {
             out = trimmed.to_string();
         }
-        if out.ends_with('—') || out.ends_with('·') || out.ends_with('-') {
+        if out.ends_with('—') || out.ends_with('·') || out.ends_with('-') || out.ends_with('*') {
             out.pop();
             continue;
         }
@@ -668,12 +685,7 @@ fn yt_error_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
     let err_style = Style::default().fg(err_color);
 
     let icon = app.yt_state.icon().unwrap_or("[!]");
-    let label_raw = app.yt_state.human_label();
-    let label = if is_ascii() {
-        label_raw.replace('…', "...")
-    } else {
-        label_raw.to_string()
-    };
+    let label = ascii_sanitize(app.yt_state.human_label());
     let detail = app.yt_error.as_deref().unwrap_or("").trim();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -693,7 +705,10 @@ fn yt_error_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
     // Recovery hint: R retries the provider, 1 switches to the local Artists
     // view so the user can browse local tracks without the broken provider.
-    lines.push(Line::from(Span::styled("  R retry · 1 local", accent)));
+    lines.push(Line::from(Span::styled(
+        format!("  R retry {} 1 local", sep_dot()),
+        accent,
+    )));
     lines
 }
 
@@ -726,7 +741,10 @@ fn render_artists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     if app.artists.is_empty() {
         f.render_widget(
             dim_centered(
-                "no artists — run `jukebox sync` to index your library".to_string(),
+                format!(
+                    "no artists {} run `jukebox sync` to index your library",
+                    em_dash()
+                ),
                 theme,
             )
             .block(col1_block),
@@ -830,7 +848,10 @@ fn render_playlists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     if app.playlists.is_empty() {
         f.render_widget(
             dim_centered(
-                "no playlists — press `a` on a track to create one".to_string(),
+                format!(
+                    "no playlists {} press `a` on a track to create one",
+                    em_dash()
+                ),
                 theme,
             )
             .block(col1_block),
@@ -921,9 +942,9 @@ fn render_queue(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             Line::from(Span::styled("Press e on a track to enqueue", bold)),
             Line::from(vec![
                 Span::styled("1", key),
-                Span::styled(" Artists · ", dim),
+                Span::styled(format!(" Artists {} ", sep_dot()), dim),
                 Span::styled("/", key),
-                Span::styled(" search · ", dim),
+                Span::styled(format!(" search {} ", sep_dot()), dim),
                 Span::styled("?", key),
                 Span::styled(" help", dim),
             ]),
@@ -1020,7 +1041,7 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
             let (left, quality, is_yt) = if let Some(t) = app.track_by_id_fast(id) {
                 let album = t.album.as_deref().unwrap_or("");
                 let badge = if show_badge { "[L] " } else { "" };
-                let dash = if is_ascii() { "-" } else { "—" };
+                let dash = em_dash();
                 (
                     format!("{badge}{glyph} {num} {} {dash} {album}", t.title),
                     t.quality_label(),
@@ -1047,7 +1068,7 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
                     };
                 let album_s = album.as_deref().unwrap_or("");
                 let badge = if show_badge { "[Y] " } else { "" };
-                let dash = if is_ascii() { "-" } else { "—" };
+                let dash = em_dash();
                 let left = if artist.is_empty() {
                     format!("{badge}{glyph} {num} {title}")
                 } else {
@@ -1168,7 +1189,7 @@ fn yt_track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<
                 };
             let album_s = album.as_deref().unwrap_or("");
             let badge = if show_badge { "[Y] " } else { "" };
-            let dash = if is_ascii() { "-" } else { "—" };
+            let dash = em_dash();
             let left = if artist.is_empty() {
                 format!("{badge}{glyph} {num} {title}")
             } else {

@@ -29,7 +29,10 @@ use ratatui::{
 use crate::catalog::Track;
 use crate::lyrics::LyricsSource;
 use crate::tui::app::{App, Overlay};
-use crate::tui::view::theme::{clip_to_width, em_dash, is_ascii, sep_dot, Theme, ASCII_BORDER_SET};
+use crate::tui::view::theme::{
+    clip_to_width, down_arrow, ellipsis, em_dash, is_ascii, marker_glyph, right_arrow, sep_dot,
+    up_arrow, Theme, ASCII_BORDER_SET,
+};
 
 /// Render the active overlay (if any) into `area`.
 pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
@@ -164,13 +167,24 @@ fn render_yt_auth(f: &mut Frame, area: Rect, input: &str) {
     let popup = centered(area, 70, 40);
     f.render_widget(Clear, popup);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .title(Span::styled(
-            " YouTube auth ",
-            Style::default().fg(theme.accent),
-        ));
+    let block = if is_ascii() {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(ASCII_BORDER_SET)
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(
+                " YouTube auth ",
+                Style::default().fg(theme.accent),
+            ))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(
+                " YouTube auth ",
+                Style::default().fg(theme.accent),
+            ))
+    };
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -195,7 +209,7 @@ fn render_yt_auth(f: &mut Frame, area: Rect, input: &str) {
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "Enter: save & connect    ·    Esc: cancel",
+            format!("Enter: save & connect    {}    Esc: cancel", sep_dot()),
             Style::default().fg(theme.dim),
         )),
     ];
@@ -230,13 +244,13 @@ fn track_label(app: &App, id: &str) -> String {
         ..
     }) = app.catalog.tracks.iter().find(|t| t.id == id)
     {
-        return format!("{title} — {primary_artist}");
+        return format!("{title} {} {primary_artist}", em_dash());
     }
     if let Some(rt) = app.yt_session.as_ref().and_then(|s| s.track_for(id)) {
         if rt.artist.is_empty() {
             return rt.title.clone();
         }
-        return format!("{} — {}", rt.title, rt.artist);
+        return format!("{} {} {}", rt.title, em_dash(), rt.artist);
     }
     id.to_string()
 }
@@ -280,13 +294,28 @@ fn render_search(
     // scope-swap keys are discoverable without reading the status row. The
     // old plain border + ` search · {scope} ` title blended into the dim
     // background; the thick border + hint title makes the modal pop.
-    let title = format!(" search · {} · Tab scope · Esc close ", scope.as_str());
-    let inner = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Thick)
-        .border_style(Style::default().fg(theme.accent))
-        .style(Style::default().bg(Color::Black))
-        .title(Span::styled(title, Style::default().fg(theme.accent)));
+    let title = format!(
+        " search {} {} {} Tab scope {} Esc close ",
+        sep_dot(),
+        scope.as_str(),
+        sep_dot(),
+        sep_dot()
+    );
+    let inner = if is_ascii() {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(ASCII_BORDER_SET)
+            .border_style(Style::default().fg(theme.accent))
+            .style(Style::default().bg(Color::Black))
+            .title(Span::styled(title, Style::default().fg(theme.accent)))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Thick)
+            .border_style(Style::default().fg(theme.accent))
+            .style(Style::default().bg(Color::Black))
+            .title(Span::styled(title, Style::default().fg(theme.accent)))
+    };
     let inner_area = inner.inner(popup);
     f.render_widget(inner, popup);
 
@@ -320,38 +349,73 @@ fn render_search(
                 // Tab hint so the user knows they can switch to YouTube
                 // (T7: search had no "No results" indicator for local scope).
                 Line::from(Span::styled(
-                    format!("No results for '{input}'  ·  Tab → youtube to switch scope"),
+                    format!(
+                        "No results for '{input}'  {}  Tab {} youtube to switch scope",
+                        sep_dot(),
+                        right_arrow()
+                    ),
                     dim,
                 ))
             } else {
                 Line::from(Span::styled(
-                    "Tab → youtube   ·   Enter plays selection",
+                    format!(
+                        "Tab {} youtube   {}   Enter plays selection",
+                        right_arrow(),
+                        sep_dot()
+                    ),
                     dim,
                 ))
             }
         }
         crate::tui::app::SearchScope::Youtube => {
             if searching {
-                Line::from(Span::styled("searching…   (Tab → local · Esc cancel)", dim))
+                Line::from(Span::styled(
+                    format!(
+                        "searching{}   (Tab {} local {} Esc cancel)",
+                        ellipsis(),
+                        right_arrow(),
+                        sep_dot()
+                    ),
+                    dim,
+                ))
             } else if input.trim().is_empty() {
                 Line::from(Span::styled(
-                    "type a query, then Enter to search   ·   Tab → local",
+                    format!(
+                        "type a query, then Enter to search   {}   Tab {} local",
+                        sep_dot(),
+                        right_arrow()
+                    ),
                     dim,
                 ))
             } else if results.is_empty() && submitted.as_deref() == Some(input) {
                 // A search ran and returned nothing.
                 Line::from(Span::styled(
-                    format!("No results for '{input}'  ·  Tab → local to switch scope"),
+                    format!(
+                        "No results for '{input}'  {}  Tab {} local to switch scope",
+                        sep_dot(),
+                        right_arrow()
+                    ),
                     dim,
                 ))
             } else if submitted.as_deref() == Some(input) && !results.is_empty() {
                 Line::from(Span::styled(
-                    "↑↓ select   ·   Enter plays   ·   Tab → local",
+                    format!(
+                        "{}{} select   {}   Enter plays   {}   Tab {} local",
+                        up_arrow(),
+                        down_arrow(),
+                        sep_dot(),
+                        sep_dot(),
+                        right_arrow()
+                    ),
                     dim,
                 ))
             } else {
                 Line::from(Span::styled(
-                    "Enter to search YouTube   ·   Tab → local",
+                    format!(
+                        "Enter to search YouTube   {}   Tab {} local",
+                        sep_dot(),
+                        right_arrow()
+                    ),
                     dim,
                 ))
             }
@@ -567,13 +631,22 @@ fn render_playlist_picker(f: &mut Frame, area: Rect, app: &App, track_id: &str, 
     f.render_widget(Clear, popup);
 
     let title = format!(
-        " add \"{}\" to playlist · Enter confirm ",
-        track_label(app, track_id)
+        " add \"{}\" to playlist {} Enter confirm ",
+        track_label(app, track_id),
+        sep_dot()
     );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .title(Span::styled(title, Style::default().fg(theme.accent)));
+    let block = if is_ascii() {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(ASCII_BORDER_SET)
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(title, Style::default().fg(theme.accent)))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(title, Style::default().fg(theme.accent)))
+    };
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -717,25 +790,37 @@ fn render_lyrics_overlay(
     // Header: " Lyrics — {source} ({synced|plain}) " for Available,
     // " Lyrics — loading… " for Loading, " Lyrics — not found " for NotFound,
     // " Lyrics — error " for Error.
+    let dash = em_dash();
+    let ell = ellipsis();
     let title = match state {
-        LyricsState::Idle => " Lyrics — fetching… ".to_string(),
-        LyricsState::Loading => " Lyrics — loading… ".to_string(),
-        LyricsState::NotFound => " Lyrics — not found ".to_string(),
-        LyricsState::Offline => " Lyrics — offline ".to_string(),
-        LyricsState::Error(_) => " Lyrics — error ".to_string(),
+        LyricsState::Idle => format!(" Lyrics {dash} fetching{ell} "),
+        LyricsState::Loading => format!(" Lyrics {dash} loading{ell} "),
+        LyricsState::NotFound => format!(" Lyrics {dash} not found "),
+        LyricsState::Offline => format!(" Lyrics {dash} offline "),
+        LyricsState::Error(_) => format!(" Lyrics {dash} error "),
         LyricsState::Available(synced) => {
             let src = content.map(|l| source_label(l.source)).unwrap_or("unknown");
             let kind = if *synced { "synced" } else { "plain" };
-            format!(" Lyrics — {src} ({kind}) ")
+            format!(" Lyrics {dash} {src} ({kind}) ")
         }
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .style(Style::default().bg(Color::Black))
-        .title(Span::styled(title, Style::default().fg(theme.accent)))
-        .padding(Padding::horizontal(1));
+    let block = if is_ascii() {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(ASCII_BORDER_SET)
+            .border_style(Style::default().fg(theme.accent))
+            .style(Style::default().bg(Color::Black))
+            .title(Span::styled(title, Style::default().fg(theme.accent)))
+            .padding(Padding::horizontal(1))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent))
+            .style(Style::default().bg(Color::Black))
+            .title(Span::styled(title, Style::default().fg(theme.accent)))
+            .padding(Padding::horizontal(1))
+    };
 
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -759,14 +844,15 @@ fn render_lyrics_overlay(
         _ => None,
     };
 
+    let sd = sep_dot();
     let lines: Vec<Line> = match state {
         LyricsState::Idle => vec![Line::from(Span::styled(
-            "Press any key or wait — fetching lyrics…",
+            format!("Press any key or wait {dash} fetching lyrics{ell}",),
             Style::default().fg(theme.dim),
         ))],
         LyricsState::Loading => {
             let mut v = vec![Line::from(Span::styled(
-                "Loading lyrics…",
+                format!("Loading lyrics{ell}"),
                 Style::default().fg(theme.text),
             ))];
             // Source hint so the user knows where the fetch is coming from.
@@ -785,7 +871,7 @@ fn render_lyrics_overlay(
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "R retry lyrics for this track  ·  L or Esc close",
+                    format!("R retry lyrics for this track  {sd}  L or Esc close"),
                     Style::default().fg(theme.dim),
                 )),
             ]
@@ -797,7 +883,7 @@ fn render_lyrics_overlay(
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "R retry lyrics when the provider is reachable  ·  L or Esc close",
+                format!("R retry lyrics when the provider is reachable  {sd}  L or Esc close"),
                 Style::default().fg(theme.dim),
             )),
         ],
@@ -812,7 +898,7 @@ fn render_lyrics_overlay(
             ))];
             v.push(Line::from(""));
             v.push(Line::from(Span::styled(
-                "R retry lyrics for this track  ·  L or Esc close",
+                format!("R retry lyrics for this track  {sd}  L or Esc close"),
                 Style::default().fg(theme.dim),
             )));
             v
@@ -853,8 +939,8 @@ fn render_lyrics_overlay(
                                 // accent=White + bold still distinguishes the
                                 // active line from dim non-active lines.
                                 let full = match &ts {
-                                    Some(t) => format!("▸ {t} {body}"),
-                                    None => format!("▸ {body}"),
+                                    Some(t) => format!("{} {t} {body}", marker_glyph()),
+                                    None => format!("{} {body}", marker_glyph()),
                                 };
                                 let text = clip_to_width(&full, inner_w.saturating_sub(2));
                                 Line::from(Span::styled(
@@ -901,7 +987,7 @@ fn render_lyrics_overlay(
     // lyrics. Visible in every state so Esc/scroll is always discoverable.
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "Esc close · j/k scroll",
+            format!("Esc close {} j/k scroll", sep_dot()),
             Style::default().fg(theme.dim),
         )))
         .alignment(Alignment::Center),
@@ -940,10 +1026,18 @@ fn render_confirm(f: &mut Frame, area: Rect, message: &str) {
     let theme = Theme::default();
     let popup = centered(area, 50, 20);
     f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .title(Span::styled(" confirm ", Style::default().fg(theme.accent)));
+    let block = if is_ascii() {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(ASCII_BORDER_SET)
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(" confirm ", Style::default().fg(theme.accent)))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(" confirm ", Style::default().fg(theme.accent)))
+    };
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -955,7 +1049,7 @@ fn render_confirm(f: &mut Frame, area: Rect, message: &str) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "y: confirm  ·  n / Esc: cancel",
+            format!("y: confirm  {}  n / Esc: cancel", sep_dot()),
             Style::default().fg(theme.dim),
         )),
     ];
@@ -972,13 +1066,24 @@ fn render_text_input(f: &mut Frame, area: Rect, prompt: &str, buffer: &str, curs
     let theme = Theme::default();
     let popup = centered(area, 50, 20);
     f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .title(Span::styled(
-            " new playlist ",
-            Style::default().fg(theme.accent),
-        ));
+    let block = if is_ascii() {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(ASCII_BORDER_SET)
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(
+                " new playlist ",
+                Style::default().fg(theme.accent),
+            ))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(
+                " new playlist ",
+                Style::default().fg(theme.accent),
+            ))
+    };
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -1000,7 +1105,10 @@ fn render_text_input(f: &mut Frame, area: Rect, prompt: &str, buffer: &str, curs
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "Enter: create  ·  Esc: cancel  ·  (empty = auto-name)",
+            format!(
+                "Enter: create  {sd}  Esc: cancel  {sd}  (empty = auto-name)",
+                sd = sep_dot()
+            ),
             Style::default().fg(theme.dim),
         )),
     ];

@@ -6,6 +6,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::reco::explanations::Explanation;
 use crate::tui::view::icons::{Icon, IconRenderer};
+use crate::tui::view::theme::is_ascii;
 
 /// Render the explanation overlay.
 pub fn render(_area: Rect, explanation: &Explanation, icons: &IconRenderer) -> Paragraph<'static> {
@@ -27,7 +28,7 @@ pub fn render(_area: Rect, explanation: &Explanation, icons: &IconRenderer) -> P
 
     if let Some(detail) = &explanation.detail {
         lines.push(Line::from(Span::styled(
-            format!("  └ {detail}"),
+            format!("  {} {detail}", if is_ascii() { "\\" } else { "└" }),
             Style::default().fg(Color::DarkGray),
         )));
     }

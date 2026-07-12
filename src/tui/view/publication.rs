@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::tui::view::icons::{Icon, IconRenderer};
+use crate::tui::view::theme::{ellipsis, em_dash, sep_dot};
 
 /// The publication confirmation state.
 #[derive(Clone, Debug, Default)]
@@ -78,7 +79,11 @@ pub fn render(_area: Rect, state: &PublicationState, icons: &IconRenderer) -> Pa
     }
     if state.publishable_ids.len() > 5 {
         lines.push(Line::from(Span::styled(
-            format!("   … and {} more", state.publishable_ids.len() - 5),
+            format!(
+                "   {} and {} more",
+                ellipsis(),
+                state.publishable_ids.len() - 5
+            ),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -88,8 +93,9 @@ pub fn render(_area: Rect, state: &PublicationState, icons: &IconRenderer) -> Pa
     if !state.local_only.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(
-                "2. Local-only ({} — cannot be published):",
-                state.local_only.len()
+                "2. Local-only ({} {} cannot be published):",
+                state.local_only.len(),
+                em_dash()
             ),
             Style::default().fg(Color::Yellow),
         )));
@@ -135,7 +141,7 @@ pub fn render(_area: Rect, state: &PublicationState, icons: &IconRenderer) -> Pa
         lines.push(Line::from(format!("   {}", state.intended_operation())));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Enter to confirm · Esc to cancel".to_string(),
+            format!("Enter to confirm {} Esc to cancel", sep_dot()),
             Style::default().fg(Color::Green),
         )));
     } else {

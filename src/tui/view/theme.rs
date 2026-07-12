@@ -643,3 +643,67 @@ pub fn ellipsis() -> &'static str {
         "…"
     }
 }
+/// Right arrow: `→` (Unicode) or `->` (ASCII). Used in breadcrumbs and hints.
+pub fn right_arrow() -> &'static str {
+    if is_ascii() {
+        "->"
+    } else {
+        "→"
+    }
+}
+/// Left arrow: `←` (Unicode) or `<-` (ASCII). Used in breadcrumbs.
+pub fn left_arrow() -> &'static str {
+    if is_ascii() {
+        "<-"
+    } else {
+        "←"
+    }
+}
+/// Up arrow: `↑` (Unicode) or `^` (ASCII). Used in navigation hints.
+pub fn up_arrow() -> &'static str {
+    if is_ascii() {
+        "^"
+    } else {
+        "↑"
+    }
+}
+/// Down arrow: `↓` (Unicode) or `v` (ASCII). Used in navigation hints.
+pub fn down_arrow() -> &'static str {
+    if is_ascii() {
+        "v"
+    } else {
+        "↓"
+    }
+}
+/// Bullet: `•` (Unicode) or `*` (ASCII). Used for list items in overlays.
+pub fn bullet() -> &'static str {
+    if is_ascii() {
+        "*"
+    } else {
+        "•"
+    }
+}
+/// Replace all known Unicode decorative characters in `s` with their ASCII
+/// equivalents when ASCII font mode is active. Used for strings that originate
+/// outside the view layer (e.g. `YtState::human_label()`) where per-call
+/// helpers like `em_dash()` can't be inserted at the source. When not in ASCII
+/// mode, returns `s` unchanged.
+pub fn ascii_sanitize(s: &str) -> String {
+    if !is_ascii() {
+        return s.to_string();
+    }
+    s.replace('—', "--")
+        .replace('·', "*")
+        .replace('…', "...")
+        .replace('→', "->")
+        .replace('←', "<-")
+        .replace('↑', "^")
+        .replace('↓', "v")
+        .replace(['▸', '▶'], ">")
+        .replace('♫', "#")
+        .replace('✦', "*")
+        .replace('≡', "#")
+        .replace('⏸', "||")
+        .replace('■', "#")
+        .replace('•', "*")
+}

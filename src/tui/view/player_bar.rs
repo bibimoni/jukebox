@@ -290,7 +290,7 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
     match &np {
         Some(v) => {
             spans.push(Span::styled(v.title.clone(), text));
-            spans.push(Span::styled(" — ", dim));
+            spans.push(Span::styled(format!(" {} ", em_dash()), dim));
             spans.push(Span::styled(v.artist.clone(), text));
         }
         None => spans.push(Span::styled(
@@ -424,15 +424,18 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
                 app.source_mode != SourceMode::Local || app.view == View::Youtube
             };
             if yt_relevant && app.yt_state != YtState::Unconfigured {
-                let (label, color) = match app.yt_state {
-                    YtState::Ready => ("YT", if nc { Color::Reset } else { Color::Green }),
+                let (label, color): (String, Color) = match app.yt_state {
+                    YtState::Ready => ("YT".into(), if nc { Color::Reset } else { Color::Green }),
                     YtState::AuthExpired | YtState::ProviderError | YtState::Failed => {
-                        ("YT!", if nc { Color::Reset } else { Color::Red })
+                        ("YT!".into(), if nc { Color::Reset } else { Color::Red })
                     }
                     YtState::RateLimited | YtState::ReadyStale => {
-                        ("YT~", if nc { Color::Reset } else { Color::Yellow })
+                        ("YT~".into(), if nc { Color::Reset } else { Color::Yellow })
                     }
-                    _ => ("YT…", if nc { Color::Reset } else { Color::Yellow }),
+                    _ => (
+                        format!("YT{}", ellipsis()),
+                        if nc { Color::Reset } else { Color::Yellow },
+                    ),
                 };
                 spans.push(Span::styled(
                     format!(" {sd} {label}"),
@@ -700,7 +703,7 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
     match &np {
         Some(v) => {
             spans.push(Span::styled(v.title.clone(), accent));
-            spans.push(Span::styled(" — ", dim));
+            spans.push(Span::styled(format!(" {} ", em_dash()), dim));
             spans.push(Span::styled(v.artist.clone(), text));
             if let Some(album) = &v.album {
                 if !album.is_empty() && width > 60 {

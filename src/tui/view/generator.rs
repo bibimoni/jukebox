@@ -6,6 +6,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::reco::generator::{GeneratedPlaylist, GeneratorConstraints};
 use crate::tui::view::icons::{Icon, IconRenderer};
+use crate::tui::view::theme::{ellipsis, sep_dot};
 
 /// The state of the generator overlay.
 #[derive(Clone, Debug, Default)]
@@ -88,7 +89,7 @@ pub fn render(_area: Rect, state: &GeneratorState, icons: &IconRenderer) -> Para
             lines.push(Line::from(format!("  {}", state.input)));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Enter to generate · Esc to cancel".to_string(),
+                format!("Enter to generate {} Esc to cancel", sep_dot()),
                 Style::default().fg(Color::DarkGray),
             )));
             lines.push(Line::from(Span::styled(
@@ -109,7 +110,11 @@ pub fn render(_area: Rect, state: &GeneratorState, icons: &IconRenderer) -> Para
                 }
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    "Enter to generate · e edit constraints · Esc cancel".to_string(),
+                    format!(
+                        "Enter to generate {} e edit constraints {} Esc cancel",
+                        sep_dot(),
+                        sep_dot()
+                    ),
                     Style::default().fg(Color::DarkGray),
                 )));
             }
@@ -135,13 +140,19 @@ pub fn render(_area: Rect, state: &GeneratorState, icons: &IconRenderer) -> Para
                 }
                 if playlist.tracks.len() > 20 {
                     lines.push(Line::from(Span::styled(
-                        format!("  … and {} more", playlist.tracks.len() - 20),
+                        format!("  {} and {} more", ellipsis(), playlist.tracks.len() - 20),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    "Enter save · p pin · x remove · g regenerate · Esc cancel".to_string(),
+                    format!(
+                        "Enter save {} p pin {} x remove {} g regenerate {} Esc cancel",
+                        sep_dot(),
+                        sep_dot(),
+                        sep_dot(),
+                        sep_dot()
+                    ),
                     Style::default().fg(Color::DarkGray),
                 )));
             }

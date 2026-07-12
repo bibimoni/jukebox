@@ -405,6 +405,238 @@ fn def025_help_overlay_renders_unicode_border_by_default() {
 }
 
 // ---------------------------------------------------------------------------
+// DEF-029: ASCII mode Unicode leaks in dynamic UI
+// ---------------------------------------------------------------------------
+
+/// Lock the env var, recovering from a poisoned mutex (a prior test may have
+/// panicked while holding the lock).
+fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[test]
+fn def029_theme_arrow_helpers_return_ascii_in_ascii_mode() {
+    let _guard = lock_env();
+    std::env::set_var("JUKEBOX_FONT_MODE", "ascii");
+    use jukebox::tui::view::theme;
+    assert_eq!(theme::right_arrow(), "->");
+    assert_eq!(theme::left_arrow(), "<-");
+    assert_eq!(theme::up_arrow(), "^");
+    assert_eq!(theme::down_arrow(), "v");
+    assert_eq!(theme::bullet(), "*");
+    assert_eq!(theme::em_dash(), "--");
+    assert_eq!(theme::sep_dot(), "*");
+    assert_eq!(theme::ellipsis(), "...");
+    std::env::remove_var("JUKEBOX_FONT_MODE");
+}
+
+#[test]
+fn def029_theme_arrow_helpers_return_unicode_in_unicode_mode() {
+    let _guard = lock_env();
+    std::env::set_var("JUKEBOX_FONT_MODE", "unicode");
+    use jukebox::tui::view::theme;
+    assert_eq!(theme::right_arrow(), "\u{2192}");
+    assert_eq!(theme::left_arrow(), "\u{2190}");
+    assert_eq!(theme::up_arrow(), "\u{2191}");
+    assert_eq!(theme::down_arrow(), "\u{2193}");
+    assert_eq!(theme::bullet(), "\u{2022}");
+    assert_eq!(theme::em_dash(), "\u{2014}");
+    assert_eq!(theme::sep_dot(), "\u{00B7}");
+    assert_eq!(theme::ellipsis(), "\u{2026}");
+    std::env::remove_var("JUKEBOX_FONT_MODE");
+}
+
+#[test]
+fn def029_ascii_sanitize_replaces_all_known_unicode() {
+    let _guard = lock_env();
+    std::env::set_var("JUKEBOX_FONT_MODE", "ascii");
+    use jukebox::tui::view::theme;
+    let input = "test — · … → ← ↑ ↓ ▸ ▶ ♫ ✦ ≡ ⏸ ■ • end";
+    let sanitized = theme::ascii_sanitize(input);
+    assert!(
+        sanitized.is_ascii(),
+        "DEF-029: ascii_sanitize must produce pure ASCII: {sanitized:?}"
+    );
+    assert_eq!(sanitized, "test -- * ... -> <- ^ v > > # * # || # * end");
+    std::env::remove_var("JUKEBOX_FONT_MODE");
+}
+
+#[test]
+fn def029_ascii_sanitize_noop_in_unicode_mode() {
+    let _guard = lock_env();
+    std::env::set_var("JUKEBOX_FONT_MODE", "unicode");
+    use jukebox::tui::view::theme;
+    let input = "test — · … → end";
+    let sanitized = theme::ascii_sanitize(input);
+    assert_eq!(
+        sanitized, input,
+        "DEF-029: ascii_sanitize must be noop in Unicode mode"
+    );
+    std::env::remove_var("JUKEBOX_FONT_MODE");
+}
+
+#[test]
+fn def029_columns_ascii_mode_no_unicode_in_breadcrumbs() {
+    let _guard = lock_env();
+    std::env::set_var("JUKEBOX_FONT_MODE", "ascii");
+    let (_d, cat) = two_artist_cat();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.view = View::Artists;
+    app.focus_col = 1; // Albums pane — narrow breadcrumb shows "Albums * 40mP <- Artists"
+    app.cursors.artist = 0;
+    app.cursors.album = 0;
+    // 80x24 triggers the narrow render path with breadcrumbs.
+    let (buf, _term) = rendered_draw(&mut app, 80, 24);
+    std::env::remove_var("JUKEBOX_FONT_MODE");
+    // No Unicode arrows or middle dots in the rendered output.
+    assert!(
+        !buf.contains('\u{2192}') && !buf.contains('\u{2190}') && !buf.contains('\u{00B7}'),
+        "DEF-029: ASCII narrow layout must not contain Unicode arrows/middle-dot: {buf}"
+    );
+    // Must contain ASCII breadcrumb equivalents.
+    assert!(
+        buf.contains("<-"),
+        "DEF-029: ASCII breadcrumb must use '<-' for left arrow: {buf}"
+    );
+}
+
+#[test]
+fn def029_columns_ascii_mode_no_unicode_in_empty_state_hints() {
+    let _guard = lock_env();
+    std::env::set_var("JUKEBOX_FONT_MODE", "ascii");
+    let d = tempfile::tempdir().unwrap();
+    let lossless = d.path().join("lossless");
+    std::fs::create_dir_all(&lossless).unwrap();
+    let json = serde_json::json!({
+        "version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+        "tracks":[]
+    })
+    .to_string();
+    let p = d.path().join("catalog.json");
+    std::fs::write(&p, json).unwrap();
+    let cat = Catalog::load(&p).unwrap();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.view = View::Artists;
+    let buf = rendered_cols(&mut app, 120, 30);
+    std::env::remove_var("JUKEBOX_FONT_MODE");
+    // The "no artists" hint must not contain Unicode em-dash.
+    assert!(
+        !buf.contains('\u{2014}'),
+        "DEF-029: ASCII empty-state hint must not contain Unicode em-dash: {buf}"
+    );
+    assert!(
+        buf.contains("--"),
+        "DEF-029: ASCII empty-state hint must use '--' for em-dash: {buf}"
+    );
+}
+
+#[test]
+fn def029_layout_ascii_mode_no_unicode_in_navigation_hints() {
+    let _guard = lock_env();
+    std::env::set_var("JUKEBOX_FONT_MODE", "ascii");
+    let (_d, cat) = two_artist_cat();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.view = View::Artists;
+    app.focus_col = 0;
+    // 80x24 triggers the narrow render path with navigation hints.
+    let (buf, _term) = rendered_draw(&mut app, 80, 24);
+    std::env::remove_var("JUKEBOX_FONT_MODE");
+    // Navigation hints must not contain Unicode arrows or middle dots.
+    assert!(
+        !buf.contains('\u{2192}') && !buf.contains('\u{2190}') && !buf.contains('\u{00B7}'),
+        "DEF-029: ASCII narrow navigation hints must not contain Unicode arrows/middle-dot: {buf}"
+    );
+    // Must contain ASCII arrow equivalents.
+    assert!(
+        buf.contains("->"),
+        "DEF-029: ASCII navigation hint must use '->' for right arrow: {buf}"
+    );
+}
+
+#[test]
+fn def029_footer_ascii_mode_no_unicode_in_search_hints() {
+    let _guard = lock_env();
+    std::env::set_var("JUKEBOX_FONT_MODE", "ascii");
+    let (_d, cat) = two_artist_cat();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Search {
+        input: "test".into(),
+        results: vec![],
+        cursor: 0,
+        scope: jukebox::tui::app::SearchScope::Local,
+        submitted: None,
+        searching: false,
+    });
+    let (buf, _term) = rendered_draw(&mut app, 100, 30);
+    std::env::remove_var("JUKEBOX_FONT_MODE");
+    // The footer search hint must not contain Unicode middle dot.
+    assert!(
+        !buf.contains('\u{00B7}'),
+        "DEF-029: ASCII footer search hint must not contain Unicode middle dot: {buf}"
+    );
+}
+
+#[test]
+fn def029_search_overlay_ascii_mode_no_unicode_arrows() {
+    let _guard = lock_env();
+    std::env::set_var("JUKEBOX_FONT_MODE", "ascii");
+    let (_d, cat) = two_artist_cat();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Search {
+        input: "test".into(),
+        results: vec![],
+        cursor: 0,
+        scope: jukebox::tui::app::SearchScope::Youtube,
+        submitted: None,
+        searching: false,
+    });
+    let (buf, _term) = rendered_draw(&mut app, 100, 30);
+    std::env::remove_var("JUKEBOX_FONT_MODE");
+    // Search overlay hints must not contain Unicode arrows, middle dots, or ellipsis.
+    assert!(
+        !buf.contains('\u{2192}')
+            && !buf.contains('\u{2190}')
+            && !buf.contains('\u{00B7}')
+            && !buf.contains('\u{2026}'),
+        "DEF-029: ASCII search overlay must not contain Unicode arrows/middle-dot/ellipsis: {buf}"
+    );
+}
+
+#[test]
+fn def029_diagnostics_overlay_ascii_mode_no_unicode_em_dash() {
+    let _guard = lock_env();
+    std::env::set_var("JUKEBOX_FONT_MODE", "ascii");
+    let (_d, cat) = one_track_cat();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Diagnostics);
+    let (buf, _term) = rendered_draw(&mut app, 100, 30);
+    std::env::remove_var("JUKEBOX_FONT_MODE");
+    // Diagnostics overlay title must not contain Unicode em-dash.
+    assert!(
+        !buf.contains('\u{2014}'),
+        "DEF-029: ASCII diagnostics overlay must not contain Unicode em-dash: {buf}"
+    );
+}
+
+#[test]
+fn def029_confirm_overlay_ascii_mode_no_unicode_middle_dot() {
+    let _guard = lock_env();
+    std::env::set_var("JUKEBOX_FONT_MODE", "ascii");
+    let (_d, cat) = one_track_cat();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.overlay = Some(Overlay::Confirm {
+        message: "Delete playlist?".into(),
+        action: jukebox::tui::app::ConfirmAction::DeletePlaylist,
+    });
+    let (buf, _term) = rendered_draw(&mut app, 100, 30);
+    std::env::remove_var("JUKEBOX_FONT_MODE");
+    assert!(
+        !buf.contains('\u{00B7}'),
+        "DEF-029: ASCII confirm overlay must not contain Unicode middle dot: {buf}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Minimal fake sidecar (for DEF-023 session-backed tests)
 // ---------------------------------------------------------------------------
 

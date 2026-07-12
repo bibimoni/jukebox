@@ -11,6 +11,7 @@
 
 use crate::reco::mixes::MixType;
 use crate::tui::view::icons::{Icon, IconRenderer};
+use crate::tui::view::theme::{bullet, ellipsis, em_dash, h_line, is_ascii, play_glyph, sep_dot};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -279,12 +280,18 @@ pub fn render_header(_area: Rect, state: &HomeState, icons: &IconRenderer) -> Ve
 
     // Status line (loading / ready / offline).
     let status = if state.loading {
-        Span::styled("loading…".to_string(), Style::default().fg(Color::Yellow))
+        Span::styled(
+            format!("loading{}", ellipsis()),
+            Style::default().fg(Color::Yellow),
+        )
     } else if state.has_history {
         Span::styled("ready".to_string(), Style::default().fg(Color::Green))
     } else {
         Span::styled(
-            "cold start — listening to music builds your profile".to_string(),
+            format!(
+                "cold start {} listening to music builds your profile",
+                em_dash()
+            ),
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -304,7 +311,7 @@ pub fn render_section(
     let description = section.description();
 
     let header = if is_focused {
-        format!("▶ {title} — {description}")
+        format!("{} {title} {} {description}", play_glyph(), em_dash())
     } else {
         format!("  {title}")
     };
@@ -344,9 +351,13 @@ pub fn render_section(
             let title = &item.title;
             let subtitle = item.subtitle.as_deref().unwrap_or("");
 
-            let prefix = if is_focused && i == 0 { "▸ " } else { "  " };
+            let prefix = if is_focused && i == 0 {
+                format!("{} ", crate::tui::view::theme::marker_glyph())
+            } else {
+                "  ".to_string()
+            };
 
-            ListItem::new(format!("{prefix}{glyph} {title} — {subtitle}"))
+            ListItem::new(format!("{prefix}{glyph} {title} {} {subtitle}", em_dash()))
         })
         .collect();
 
@@ -370,8 +381,9 @@ pub fn render_compact(
     for (section, items) in sections {
         // Section header
         lines.push(Line::from(""));
+        let hl = h_line();
         lines.push(Line::from(Span::styled(
-            format!("── {} ──", section.title()),
+            format!("{hl}{hl} {} {hl}{hl}", section.title()),
             Style::default().add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
@@ -381,7 +393,10 @@ pub fn render_compact(
 
         if items.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  (no items — listen to music to build this section)".to_string(),
+                format!(
+                    "  (no items {} listen to music to build this section)",
+                    em_dash()
+                ),
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
@@ -409,11 +424,18 @@ pub fn render_compact(
                 };
                 let glyph = icons.glyph(icon);
                 let subtitle = item.subtitle.as_deref().unwrap_or("");
-                lines.push(Line::from(format!("  {glyph} {} — {subtitle}", item.title)));
+                lines.push(Line::from(format!(
+                    "  {glyph} {} {} {subtitle}",
+                    item.title,
+                    em_dash()
+                )));
 
                 if let Some(expl) = &item.explanation {
                     lines.push(Line::from(Span::styled(
-                        format!("    └ {expl}"),
+                        format!(
+                            "    {corner} {expl}",
+                            corner = if is_ascii() { "\\" } else { "└" }
+                        ),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
@@ -439,21 +461,36 @@ pub fn render_empty(icons: &IconRenderer) -> Paragraph<'static> {
         )),
         Line::from(""),
         Line::from("To get started:"),
-        Line::from("  • Play a local track (browse with h j k l, Enter to play)"),
-        Line::from("  • Authenticate YouTube (:yt auth browser <name>) for YouTube content"),
-        Line::from("  • Search with / in any view"),
-        Line::from("  • Open the Discover overlay with S for suggestions"),
+        Line::from(format!(
+            "  {} Play a local track (browse with h j k l, Enter to play)",
+            bullet()
+        )),
+        Line::from(format!(
+            "  {} Authenticate YouTube (:yt auth browser <name>) for YouTube content",
+            bullet()
+        )),
+        Line::from(format!("  {} Search with / in any view", bullet())),
+        Line::from(format!(
+            "  {} Open the Discover overlay with S for suggestions",
+            bullet()
+        )),
         Line::from(""),
         Line::from(Span::styled(
             "As you listen, this Home will show:".to_string(),
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
-            "  Continue Listening · Quick Picks · Made for You · Start Radio".to_string(),
+            format!(
+                "  Continue Listening {sd} Quick Picks {sd} Made for You {sd} Start Radio",
+                sd = sep_dot()
+            ),
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
-            "  New and Relevant · Your YouTube Library · Explore".to_string(),
+            format!(
+                "  New and Relevant {sd} Your YouTube Library {sd} Explore",
+                sd = sep_dot()
+            ),
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -468,7 +505,11 @@ pub fn render_offline(icons: &IconRenderer) -> Paragraph<'static> {
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("{} YouTube Home — Offline", icons.glyph(Icon::Offline)),
+            format!(
+                "{} YouTube Home {} Offline",
+                icons.glyph(Icon::Offline),
+                em_dash()
+            ),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -478,9 +519,12 @@ pub fn render_offline(icons: &IconRenderer) -> Paragraph<'static> {
         )),
         Line::from(""),
         Line::from("Available offline:"),
-        Line::from("  • Local music (fully functional)"),
-        Line::from("  • Cached YouTube playlists (browse-only, no streaming)"),
-        Line::from("  • Generated mixes from local profile"),
+        Line::from(format!("  {} Local music (fully functional)", bullet())),
+        Line::from(format!(
+            "  {} Cached YouTube playlists (browse-only, no streaming)",
+            bullet()
+        )),
+        Line::from(format!("  {} Generated mixes from local profile", bullet())),
         Line::from(""),
         Line::from("Press R to retry the connection when you're back online."),
     ];

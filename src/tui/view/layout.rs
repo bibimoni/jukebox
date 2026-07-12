@@ -482,8 +482,9 @@ fn render_narrow_hint(f: &mut Frame, area: Rect, hint: &str) {
     } else {
         theme.dim
     });
+    let hint = theme::ascii_sanitize(hint);
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint.to_string(), dim)))
+        Paragraph::new(Line::from(Span::styled(hint, dim)))
             .alignment(Alignment::Center)
             .block(Block::default().borders(Borders::NONE)),
         area,
@@ -494,7 +495,10 @@ fn render_narrow_hint(f: &mut Frame, area: Rect, hint: &str) {
 /// is told to resize the window or press `q` to quit — no browse chrome is
 /// drawn in this state so a cramped terminal doesn't show garbage.
 fn render_too_small(f: &mut Frame, area: Rect) {
-    let msg = "terminal too small — resize or press q to quit";
+    let msg = format!(
+        "terminal too small {} resize or press q to quit",
+        theme::em_dash()
+    );
     let paragraph = Paragraph::new(Line::from(msg))
         .alignment(Alignment::Center)
         .style(Style::default().fg(Color::Yellow))

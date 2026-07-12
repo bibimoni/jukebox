@@ -11,7 +11,7 @@ use ratatui::{
 };
 
 use crate::tui::app::{App, Overlay, SearchScope};
-use crate::tui::view::theme::{sep_dot, Theme};
+use crate::tui::view::theme::{ascii_sanitize, ellipsis, sep_dot, Theme};
 
 /// Render the footer. When the area is ≥ 2 rows: line 1 = YT provider status
 /// (or blank when Ready), line 2 = persistent key-hint line. When only 1 row
@@ -158,12 +158,7 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
     // Non-Ready: mode badge + YT status.
     // DEF-006: in ASCII mode, replace any Unicode ellipsis in the label with
     // "..." so the footer is fully ASCII when JUKEBOX_FONT_MODE=ascii.
-    let label_raw = app.yt_state.human_label();
-    let label = if crate::tui::view::theme::is_ascii() {
-        label_raw.replace('…', "...")
-    } else {
-        label_raw.to_string()
-    };
+    let label = ascii_sanitize(app.yt_state.human_label());
     let icon = app.yt_state.icon();
     let color = if no_color() {
         Color::Reset
@@ -271,7 +266,14 @@ fn hint_line(app: &App, dim: &Style, width: u16) -> Line<'static> {
             Span::raw(" "),
             Span::styled("[YouTube]", yt_st),
             Span::raw("   "),
-            Span::styled("Tab scope · Enter search · Esc close", *dim),
+            Span::styled(
+                format!(
+                    "Tab scope {} Enter search {} Esc close",
+                    sep_dot(),
+                    sep_dot()
+                ),
+                *dim,
+            ),
         ];
         return Line::from(spans);
     }
@@ -325,6 +327,6 @@ fn truncate_footer_msg(s: &str, max: usize) -> String {
         out.push(c);
         w += cw;
     }
-    out.push('…');
+    out.push_str(ellipsis());
     out
 }

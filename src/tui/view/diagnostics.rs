@@ -17,7 +17,7 @@ use ratatui::{
 };
 
 use crate::diagnostics::Diagnostics;
-use crate::tui::view::theme::Theme;
+use crate::tui::view::theme::{em_dash, is_ascii, Theme, ASCII_BORDER_SET};
 
 /// Render the diagnostics overlay into `area`: a bordered box titled
 /// "diagnostics — Esc to close" listing the buffered messages (newest last),
@@ -38,9 +38,20 @@ pub fn render(f: &mut Frame, area: Rect, diag: &Diagnostics) {
     f.render_widget(Clear, area);
 
     let title_style = Style::default().add_modifier(Modifier::BOLD);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled("diagnostics — Esc to close", title_style));
+    let block = if is_ascii() {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(ASCII_BORDER_SET)
+            .title(Span::styled(
+                format!("diagnostics {} Esc to close", em_dash()),
+                title_style,
+            ))
+    } else {
+        Block::default().borders(Borders::ALL).title(Span::styled(
+            format!("diagnostics {} Esc to close", em_dash()),
+            title_style,
+        ))
+    };
 
     let msgs = diag.messages();
     let body: Vec<Line> = if msgs.is_empty() {

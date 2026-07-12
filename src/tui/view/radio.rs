@@ -6,6 +6,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::reco::radio::RadioSession;
 use crate::tui::view::icons::{Icon, IconRenderer};
+use crate::tui::view::theme::{ellipsis, sep_dot};
 
 /// Render the radio session overlay.
 pub fn render(_area: Rect, session: &RadioSession, icons: &IconRenderer) -> Paragraph<'static> {
@@ -31,7 +32,7 @@ pub fn render(_area: Rect, session: &RadioSession, icons: &IconRenderer) -> Para
 
     if session.needs_refill() {
         lines.push(Line::from(Span::styled(
-            "  (refilling…)".to_string(),
+            format!("  (refilling{})", ellipsis()),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -49,7 +50,7 @@ pub fn render(_area: Rect, session: &RadioSession, icons: &IconRenderer) -> Para
         }
         if history.len() > 10 {
             lines.push(Line::from(Span::styled(
-                format!("  … and {} more", history.len() - 10),
+                format!("  {} and {} more", ellipsis(), history.len() - 10),
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -57,8 +58,10 @@ pub fn render(_area: Rect, session: &RadioSession, icons: &IconRenderer) -> Para
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "n next · s skip · x negative · + positive · c change seed · q stop · Esc close"
-            .to_string(),
+        format!(
+            "n next {sd} s skip {sd} x negative {sd} + positive {sd} c change seed {sd} q stop {sd} Esc close",
+            sd = sep_dot()
+        ),
         Style::default().fg(Color::DarkGray),
     )));
 
