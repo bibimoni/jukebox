@@ -1586,6 +1586,19 @@ impl App {
         // below, after the session borrow ends. The video_id to play next.
         let mut pending_radio_start: Option<String> = None;
         if let Some(session) = self.yt_session.as_mut() {
+            // Pin the focused playlist's tracks before draining so
+            // `evict_track_cache` (triggered by `cache_track` inside
+            // `apply_pair`) never drops a track the user is currently viewing.
+            // Without this, browsing enough playlists fills the 256-entry
+            // cache and evicts a track STILL REFERENCED by the focused
+            // playlist's `track_ids` → that row renders "Loading…" forever
+            // (the lazy-load guard `!loaded` then blocks a re-fetch).
+            let pinned: std::collections::HashSet<String> = self
+                .yt_lists
+                .get(self.cursors.playlist)
+                .map(|l| l.track_ids.iter().cloned().collect())
+                .unwrap_or_default();
+            session.set_pinned_tracks(pinned);
             session.drain_paired();
             // Pull any lists the session buffered for us.
             let got_playlists = session.pending_playlists.take();
@@ -1623,12 +1636,13 @@ impl App {
                 self.loaded_yt_lists.clear();
             }
 
-            // Fold a fetched playlist's tracks into the matching YtList. The
-            // session paired the response with the list id we requested.
-            if let Some((id, vids)) = session.pending_tracks.take() {
-                // Re-arming the inflight guard lets a re-focus re-fetch only
-                // if the list genuinely changed (not every tick on an empty
-                // result). Mark the list loaded either way.
+            // Fold fetched playlist tracks into the matching YtLists. Drain
+            // ALL pending pairs — multiple get_playlist responses can land in
+            // the same drain_paired cycle (user switched A→B rapidly), and the
+            // Vec design preserves ALL of them. The old single-slot Option
+            // lost the first when the second landed (wrong tracks per playlist).
+            while let Some((id, vids)) = session.pending_tracks.pop() {
+                // Mark the list loaded + set its track_ids.
                 for l in self.yt_lists.iter_mut() {
                     if l.id == id {
                         l.track_ids = vids.clone();
@@ -2045,8 +2059,15 @@ impl App {
         }
 
         // Lazy-load the focused YT list's tracks: the Y view's col2 + Enter/s
-        // need them, but they're only fetched on demand (spec §5.3). Skip
-        // lists already loaded (even if empty) and any fetch in flight.
+        // need them, but they're only fetched on demand (spec §5.3). Skip lists
+        // already loaded (even if empty) and any fetch in flight. ALSO re-fetch
+        // when a loaded list has tracks whose metadata was evicted from
+        // `track_cache` (e.g. the user browsed enough other playlists to push
+        // them out before the pin was set, or a prior session left the list
+        // loaded with stale references): `track_for(id)` returns `None` for
+        // those rows, which render as "Loading…" forever without this re-fetch.
+        // The pin (set above) protects the re-fetched tracks from re-eviction
+        // while the list stays focused, so the re-fetch doesn't loop.
         if self.view == View::Youtube {
             if let Some(l) = self.yt_lists.get(self.cursors.playlist).cloned() {
                 let id = l.id.clone();
@@ -2057,7 +2078,19 @@ impl App {
                     .as_ref()
                     .map(|s| s.playlist_loading(&id))
                     .unwrap_or(false);
-                if empty && !loaded && !inflight {
+                // A loaded list with tracks but missing metadata (eviction) →
+                // re-fetch to fill the gaps. `any_missing` is only computed
+                // when needed (loaded && non-empty) to avoid scanning every
+                // tick for fresh lists.
+                let any_missing = if loaded && !empty {
+                    self.yt_session
+                        .as_ref()
+                        .map(|s| l.track_ids.iter().any(|t| s.track_for(t).is_none()))
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                if !inflight && ((empty && !loaded) || any_missing) {
                     if let Some(session) = self.yt_session.as_mut() {
                         let _ = session.send_get_playlist(id);
                     }
@@ -2183,18 +2216,24 @@ impl App {
     }
 
     /// `R` — retry the YouTube provider probe after a `ProviderError` /
-    /// `AuthExpired` / `RateLimited` / `ReadyStale` state. Re-runs a real
-    /// `library_playlists` fetch (the same probe the launch path uses) and
-    /// transitions to `Ready` on success or `ProviderError`/`AuthExpired` on
-    /// failure. Keeps the session (sidecar + caches) — does NOT re-spawn or
-    /// re-prompt the Keychain. This is the fix for the "repeated login" root
-    /// cause: the user presses R instead of re-authenticating.
+    /// `AuthExpired` / `RateLimited` / `ReadyStale` state. Non-blocking:
+    /// immediately transitions to `Synchronizing` (visible feedback in the
+    /// footer — "synchronizing…") and fire-and-forgets a `send_refresh`.
+    /// `on_tick` promotes to `Ready` when the playlists response lands, or
+    /// classifies the error (`AuthExpired`/`RateLimited`/`ProviderError`/
+    /// `ReadyStale`) when an error response lands — the same error-
+    /// classification logic that already handles `refresh_yt_lists` errors.
     ///
-    /// Blocks briefly (~1-3s) for the probe — acceptable because it's an
-    /// explicit user action (not a hot path), and the alternative (fire-and-
-    /// forget `refresh_yt_lists`) can't distinguish "auth expired" from
-    /// "network blip" until the response lands, leaving the footer on
-    /// "synchronizing…" without a verdict.
+    /// The previous implementation called the BLOCKING `library_playlists()`
+    /// (a 3s `roundtrip`), which froze the TUI event loop for up to 3s — no
+    /// rendering, no input. The user pressed R and saw nothing happen. The
+    /// non-blocking approach gives immediate visual feedback (state →
+    /// Synchronizing, footer updates on the next render) and lets the user
+    /// continue interacting while the refresh is in flight.
+    ///
+    /// Keeps the session (sidecar + caches) — does NOT re-spawn or re-prompt
+    /// the Keychain. This is the fix for the "repeated login" root cause: the
+    /// user presses R instead of re-authenticating.
     pub fn retry_yt_probe(&mut self) {
         let Some(session) = self.yt_session.as_mut() else {
             // No session — nothing to retry. The footer's state hint tells the
@@ -2206,50 +2245,23 @@ impl App {
             // (already healthy) or Unconfigured/SignedOut (need auth, not retry).
             return;
         }
+        // Immediate visual feedback: clear the old error, transition to
+        // Synchronizing. The footer renders "synchronizing…" on the next frame
+        // (within ~150ms — the poll timeout), so the user sees the retry is
+        // in progress without waiting for the sidecar roundtrip.
         self.yt_error = None;
         self.yt_state = crate::yt::state::YtState::Synchronizing;
-        match session.library_playlists() {
-            Ok(playlists) => {
-                // The probe succeeded — the credential works. Fold the result
-                // into yt_lists immediately (the probe returned data) and mark
-                // Ready. Also fire refresh for the suggestions (the probe only
-                // fetches playlists).
-                self.yt_state = crate::yt::state::YtState::Ready;
-                let lists: Vec<YtList> = playlists
-                    .into_iter()
-                    .map(|pl| YtList {
-                        id: pl.id,
-                        name: pl.name,
-                        kind: YtListKind::Account,
-                        track_ids: Vec::new(),
-                    })
-                    .collect();
-                self.yt_lists = lists;
-                self.yt_lists_loading = false;
-                self.loaded_yt_lists.clear();
-                // Fire-and-forget the suggestions half of a refresh so the Y
-                // view's "Suggested / Up Next" pane populates too.
-                let _ = session.send_refresh();
-            }
-            Err(e) => {
-                let msg = format!("{e}");
-                self.yt_error = Some(format!("retry failed: {msg}"));
-                let lower = msg.to_lowercase();
-                if lower.contains("login required")
-                    || lower.contains("unauthorized")
-                    || lower.contains("expired")
-                    || lower.contains("logged out")
-                {
-                    self.yt_state = crate::yt::state::YtState::AuthExpired;
-                } else if lower.contains("rate")
-                    || lower.contains("429")
-                    || lower.contains("throttl")
-                {
-                    self.yt_state = crate::yt::state::YtState::RateLimited;
-                } else {
-                    self.yt_state = crate::yt::state::YtState::ProviderError;
-                }
-            }
+        // Fire-and-forget: send_refresh queues LibraryPlaylists + HomeSuggestions.
+        // on_tick drains the responses and:
+        //   - On success: replaces yt_lists, promotes to Ready (line ~1648).
+        //   - On error: classifies via the heuristic in on_tick's error handler
+        //     (AuthExpired for 401/auth/expired, ReadyStale if cached data,
+        //     ProviderError otherwise) — lines ~1919-1946.
+        // A refresh already in flight is a no-op (inflight guard in send_refresh),
+        // so rapid R presses don't flood the sidecar.
+        if let Err(e) = session.send_refresh() {
+            self.yt_error = Some(format!("retry: {e}"));
+            self.yt_state = crate::yt::state::YtState::ProviderError;
         }
     }
 
@@ -2624,14 +2636,15 @@ impl App {
             self.yt_error = Some(format!("refresh: {e}"));
             self.yt_state = crate::yt::state::YtState::ProviderError;
         }
-        // Pre-warm the PREMIUM tier on the first refresh: the deno EJS nsig
-        // solver downloads once (~10s cold) and caches, and the macOS Keychain
-        // read + cookie-file write happen once here too. Warming with the
-        // premium client (not fast) means the solver download is absorbed on
-        // Y-view open — otherwise the first PREMIUM preload (next-track) would
-        // eat it during the first track. Fire-and-forget, so it never blocks;
-        // the result (for a harmless well-known video) is just discarded.
-        let _ = session.send_resolve_premium("jNQXAC9IVRw".into()); // "Me at the zoo"
+        // NOTE: the premium-tier pre-warm (nsig-solver download + Keychain read,
+        // ~10-15s cold) used to fire here. But the sidecar is single-threaded
+        // and sequential — a premium resolve queued here would block every
+        // subsequent `get_playlist` (the lazy-load fires one on the next tick).
+        // That kept the Y view on "Loading…" for 10-15s+ after every refresh.
+        // The pre-warm is now REMOVED entirely: the one-time nsig-solver
+        // download + Keychain read happens on the first real `preload_next_url`
+        // (during playback, not browsing), and the fast-URL fallback covers the
+        // gap. Browsing responsiveness > gapless handoff cold-start.
     }
 
     /// Auto-continue to the next album by the same artist. Pushes the current

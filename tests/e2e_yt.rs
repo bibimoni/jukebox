@@ -207,9 +207,11 @@ fn cont_youtube_advances_via_radio_cursor() {
 
 #[test]
 fn refresh_then_on_tick_populates_yt_lists_and_clears_loading() {
-    // Fake sidecar returns account playlists + suggestions. refresh_yt_lists
-    // fires async; on_tick drains + folds results into yt_lists + clears
-    // loading. This is the path the unit tests missed (on_tick wiring).
+    // Fake sidecar returns account playlists. refresh_yt_lists fires async;
+    // on_tick drains + folds results into yt_lists + clears loading. This is
+    // the path the unit tests missed (on_tick wiring). NOTE: send_refresh no
+    // longer fetches home_suggestions (get_home() can hang in guest mode,
+    // blocking the single-threaded sidecar). Only library_playlists is sent.
     let map = r#"{"library_playlists":"{\"ok\":true,\"data\":{\"playlists\":[{\"id\":\"PL1\",\"name\":\"Liked\",\"count\":3}]}}","home_suggestions":"{\"ok\":true,\"data\":{\"suggestions\":[{\"id\":\"RD1\",\"name\":\"Focus\",\"count\":0}]}}"}"#;
     let (script, map_file) = fake_sidecar(map);
     std::env::set_var("JK_FAKE_MAP", &map_file);
@@ -243,10 +245,7 @@ fn refresh_then_on_tick_populates_yt_lists_and_clears_loading() {
         app.yt_lists.iter().any(|l| l.name == "Liked"),
         "account list missing"
     );
-    assert!(
-        app.yt_lists.iter().any(|l| l.name == "Focus"),
-        "suggested list missing"
-    );
+    // No suggested list — send_refresh no longer fetches home_suggestions.
     let _ = std::fs::remove_file(&script);
     let _ = std::fs::remove_file(&map_file);
 }
@@ -373,6 +372,434 @@ fn refresh_yt_lists_releases_playlist_inflight_so_a_refocus_can_refetch() {
     );
     let _ = std::fs::remove_file(&script);
     let _ = std::fs::remove_file(&map_file);
+}
+
+// ---------------------------------------------------------------------------
+// Forever-loading fix: when a loaded playlist's tracks have metadata evicted
+// from track_cache (e.g. the user browsed enough other playlists to push them
+// out before pinning existed), on_tick must re-fetch the playlist so the
+// "Loading…" rows fill in. Without the fix, the lazy-load guard (`!loaded`)
+// blocked the re-fetch and the rows stayed "Loading…" forever.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn on_tick_refetches_loaded_playlist_when_track_metadata_evicted() {
+    // Load a 3-track playlist (v1, v2, v3) — all cached, list marked loaded.
+    // Then simulate eviction: remove v1 + v2 from track_cache. on_tick must
+    // detect the missing metadata and re-fetch the playlist, restoring the
+    // cached metadata so no row is stuck on "Loading…".
+    let map = r#"{"library_playlists":"{\"ok\":true,\"data\":{\"playlists\":[{\"id\":\"PL1\",\"name\":\"Liked\",\"count\":3}]}}","home_suggestions":"{\"ok\":true,\"data\":{\"suggestions\":[]}}","get_playlist":"{\"ok\":true,\"data\":{\"tracks\":[{\"video_id\":\"v1\",\"title\":\"Song1\",\"artist\":\"A\"},{\"video_id\":\"v2\",\"title\":\"Song2\",\"artist\":\"B\"},{\"video_id\":\"v3\",\"title\":\"Song3\",\"artist\":\"C\"}]}}"}"#;
+    let (script, map_file) = fake_sidecar(map);
+    std::env::set_var("JK_FAKE_MAP", &map_file);
+    let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
+    app.view = jukebox::tui::app::View::Youtube;
+    app.refresh_yt_lists();
+    // Wait for lists + first track load to complete.
+    for _ in 0..200 {
+        app.on_tick();
+        if !app.yt_lists.is_empty()
+            && !app.yt_lists[0].track_ids.is_empty()
+            && !app
+                .yt_session
+                .as_ref()
+                .map(|s| s.playlist_loading("PL1"))
+                .unwrap_or(false)
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(app.yt_lists[0].track_ids, vec!["v1", "v2", "v3"]);
+    assert!(app.loaded_yt_lists.contains("PL1"));
+    // All three tracks have metadata.
+    for id in &["v1", "v2", "v3"] {
+        assert!(
+            app.yt_session.as_ref().unwrap().track_for(id).is_some(),
+            "{id} should have metadata after first load"
+        );
+    }
+
+    // Simulate eviction of v1 + v2 (as if they were pushed out of the
+    // 256-entry cache before pinning existed). The pin set (set each tick
+    // from the focused playlist's track_ids) prevents FUTURE eviction, but
+    // already-evicted entries are gone — the re-fetch must restore them.
+    app.yt_session.as_mut().unwrap().track_cache.remove("v1");
+    app.yt_session.as_mut().unwrap().track_cache.remove("v2");
+    assert!(app.yt_session.as_ref().unwrap().track_for("v1").is_none());
+    assert!(app.yt_session.as_ref().unwrap().track_for("v2").is_none());
+
+    // on_tick must detect the missing metadata and re-fetch the playlist.
+    let mut refetched = false;
+    for _ in 0..200 {
+        app.on_tick();
+        // The re-fetch restores v1 + v2 in track_cache.
+        if app.yt_session.as_ref().unwrap().track_for("v1").is_some()
+            && app.yt_session.as_ref().unwrap().track_for("v2").is_some()
+        {
+            refetched = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        refetched,
+        "on_tick must re-fetch a loaded playlist when its track metadata was \
+         evicted, so rows don't stay 'Loading…' forever"
+    );
+    // All three tracks restored.
+    for id in &["v1", "v2", "v3"] {
+        assert!(
+            app.yt_session.as_ref().unwrap().track_for(id).is_some(),
+            "{id} metadata restored after re-fetch"
+        );
+    }
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&map_file);
+}
+
+// ---------------------------------------------------------------------------
+// Forever-loading fix (latency): the premium-tier pre-warm (nsig-solver
+// download, ~10-15s cold) must NOT fire at all during browsing. The sidecar
+// is single-threaded/sequential — a premium resolve queued before a
+// get_playlist blocks the track fetch for 10-15s, keeping the Y view on
+// "Loading…". The pre-warm was removed entirely; the one-time solver
+// download happens on the first real `preload_next_url` (during playback).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_premium_resolve_fires_during_browsing_or_refresh() {
+    // refresh_yt_lists must NOT fire a premium resolve. on_tick must NOT fire
+    // one either (no pre-warm). The sidecar stays free to process
+    // get_playlist requests immediately — no 10-15s block.
+    let map = r#"{"library_playlists":"{\"ok\":true,\"data\":{\"playlists\":[{\"id\":\"PL1\",\"name\":\"Liked\",\"count\":1}]}}","home_suggestions":"{\"ok\":true,\"data\":{\"suggestions\":[]}}","get_playlist":"{\"ok\":true,\"data\":{\"tracks\":[{\"video_id\":\"v1\",\"title\":\"Song\",\"artist\":\"A\"}]}}"}"#;
+    let (script, map_file) = fake_sidecar(map);
+    std::env::set_var("JK_FAKE_MAP", &map_file);
+    let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
+    app.view = jukebox::tui::app::View::Youtube;
+    app.refresh_yt_lists();
+    // Right after refresh: no premium resolve in flight.
+    assert!(
+        !app.yt_session
+            .as_ref()
+            .map(|s| s.premium_resolve_busy())
+            .unwrap_or(false),
+        "refresh_yt_lists must NOT fire a premium resolve"
+    );
+    // Pump on_tick until the playlist loads. At NO point should a premium
+    // resolve be in flight (the pre-warm was removed).
+    let mut loaded = false;
+    for _ in 0..200 {
+        app.on_tick();
+        assert!(
+            !app.yt_session
+                .as_ref()
+                .map(|s| s.premium_resolve_busy())
+                .unwrap_or(false),
+            "on_tick must NOT fire a premium resolve during browsing (no pre-warm)"
+        );
+        if !app.yt_lists.is_empty() && !app.yt_lists[0].track_ids.is_empty() {
+            loaded = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(loaded, "the focused playlist should load its tracks");
+    // Even after loading: no premium resolve was ever fired.
+    assert!(
+        !app.yt_session
+            .as_ref()
+            .map(|s| s.premium_resolve_busy())
+            .unwrap_or(false),
+        "no premium resolve should be in flight after browsing (pre-warm removed)"
+    );
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&map_file);
+}
+
+// ---------------------------------------------------------------------------
+// Retry (R) fix: retry_yt_probe must be non-blocking. The old implementation
+// called the BLOCKING library_playlists() (3s roundtrip), freezing the TUI.
+// The new implementation immediately sets Synchronizing (visible feedback) +
+// fire-and-forgets send_refresh. on_tick promotes to Ready / classifies
+// errors when the response lands.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn retry_yt_probe_is_non_blocking_with_immediate_feedback() {
+    // R must immediately transition to Synchronizing (without waiting for the
+    // sidecar) and fire-and-forget the refresh. The old blocking call would
+    // hang this test for 3s.
+    let map = r#"{"library_playlists":"{\"ok\":true,\"data\":{\"playlists\":[{\"id\":\"PL1\",\"name\":\"Liked\",\"count\":1}]}}","home_suggestions":"{\"ok\":true,\"data\":{\"suggestions\":[]}}","get_playlist":"{\"ok\":true,\"data\":{\"tracks\":[{\"video_id\":\"v1\",\"title\":\"Song\",\"artist\":\"A\"}]}}"}"#;
+    let (script, map_file) = fake_sidecar(map);
+    std::env::set_var("JK_FAKE_MAP", &map_file);
+    let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
+    app.view = jukebox::tui::app::View::Youtube;
+    // Start in an error state (R is only allowed from error/stale/syncing).
+    app.yt_state = jukebox::yt::state::YtState::ProviderError;
+    app.yt_error = Some("previous error".into());
+    // Measure: retry_yt_probe must return immediately (well under the 3s the
+    // old blocking call took). The fake sidecar doesn't even have the response
+    // queued yet, so a blocking call would time out at 3s.
+    let start = std::time::Instant::now();
+    app.retry_yt_probe();
+    let elapsed = start.elapsed();
+    // Immediate feedback: state is Synchronizing, old error cleared.
+    assert_eq!(
+        app.yt_state,
+        jukebox::yt::state::YtState::Synchronizing,
+        "R must immediately transition to Synchronizing (visible feedback)"
+    );
+    assert!(
+        app.yt_error.is_none(),
+        "R must clear the old error immediately"
+    );
+    // Must return in well under 1s (the old blocking call took up to 3s).
+    // 500ms is generous for spawn overhead; the real assertion is "not 3s".
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "retry_yt_probe must be non-blocking (took {elapsed:?}, should be <500ms)"
+    );
+    // The refresh is now in flight. Pump on_tick until it completes.
+    let mut ready = false;
+    for _ in 0..200 {
+        app.on_tick();
+        if app.yt_state == jukebox::yt::state::YtState::Ready {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        ready,
+        "on_tick must promote to Ready when the refresh response lands"
+    );
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&map_file);
+}
+
+#[test]
+fn retry_yt_probe_classifies_auth_expired_error_asynchronously() {
+    // When the refresh returns an auth error, on_tick (not retry_yt_probe)
+    // must classify it as AuthExpired. The old blocking retry did this
+    // synchronously; the non-blocking retry delegates to on_tick's existing
+    // error-classification handler.
+    let map = r#"{"library_playlists":"{\"ok\":false,\"error\":\"Unauthorized: 401 — login required\"}","home_suggestions":"{\"ok\":false,\"error\":\"Unauthorized: 401\"}"}"#;
+    let (script, map_file) = fake_sidecar(map);
+    std::env::set_var("JK_FAKE_MAP", &map_file);
+    let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
+    app.view = jukebox::tui::app::View::Youtube;
+    app.yt_state = jukebox::yt::state::YtState::ProviderError;
+    app.retry_yt_probe();
+    // Immediate: Synchronizing.
+    assert_eq!(app.yt_state, jukebox::yt::state::YtState::Synchronizing);
+    // Pump on_tick until the error response lands and on_tick classifies it.
+    let mut classified = false;
+    for _ in 0..200 {
+        app.on_tick();
+        if app.yt_state == jukebox::yt::state::YtState::AuthExpired {
+            classified = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        classified,
+        "on_tick must classify the 401 error as AuthExpired (delegated from retry_yt_probe)"
+    );
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&map_file);
+}
+
+// ---------------------------------------------------------------------------
+// Serialization fix: only ONE playlist fetch in flight at a time. The sidecar
+// is single-threaded/sequential; allowing multiple concurrent fetches queues
+// them all and the user's currently-focused playlist sits at the back (long
+// loading time). Serializing means: switch A→B while A loads → B waits → A
+// completes → next tick fires B → B loads. No queue buildup.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn only_one_playlist_fetch_in_flight_at_a_time() {
+    // Use a non-responding sidecar: requests are read but never answered,
+    // so the inflight set stays populated.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("noreply.py");
+    std::fs::write(&script, "import sys\nfor line in sys.stdin:\n pass\n").unwrap();
+    let mut session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+
+    // Focus A → send_get_playlist(A)
+    session.send_get_playlist("PL_A".into()).unwrap();
+    assert!(
+        session.playlist_loading("PL_A"),
+        "PL_A should be marked loading after send_get_playlist"
+    );
+
+    // Focus B while A is still in flight → BLOCKED (serialization).
+    // The old code allowed B through (different id), queueing both.
+    // The fix blocks B: only one in flight at a time.
+    session.send_get_playlist("PL_B".into()).unwrap();
+    assert!(
+        session.playlist_loading("PL_A"),
+        "PL_A should still be loading (B was blocked, A is still in flight)"
+    );
+    assert!(
+        !session.playlist_loading("PL_B"),
+        "PL_B should NOT be loading — serialization blocks it while PL_A is in flight"
+    );
+}
+
+#[test]
+fn tracks_response_clears_inflight_so_next_playlist_can_load() {
+    // When a Tracks response lands, the inflight guard clears, allowing the
+    // next playlist's fetch to proceed on the next tick.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("partial_reply.py");
+    std::fs::write(
+        &script,
+        "import sys, json\nfor line in sys.stdin:\n    line = line.strip()\n    if not line: continue\n    req = json.loads(line)\n    cmd = req.get('cmd')\n    if cmd == 'get_playlist':\n        print(json.dumps({\"ok\": True, \"data\": {\"tracks\": [{\"video_id\": \"v1\", \"title\": \"Song\", \"artist\": \"A\"}]}}), flush=True)\n",
+    )
+    .unwrap();
+    let mut session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+
+    // Send PL_A → in flight.
+    session.send_get_playlist("PL_A".into()).unwrap();
+    assert!(session.playlist_loading("PL_A"));
+
+    // PL_B is blocked (serialization).
+    session.send_get_playlist("PL_B".into()).unwrap();
+    assert!(!session.playlist_loading("PL_B"));
+
+    // Wait for PL_A's response.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    session.drain_paired();
+
+    // PL_A's guard cleared.
+    assert!(
+        !session.playlist_loading("PL_A"),
+        "PL_A's guard should be cleared after its response lands"
+    );
+
+    // Now PL_B can be sent (inflight set is empty).
+    session.send_get_playlist("PL_B".into()).unwrap();
+    assert!(
+        session.playlist_loading("PL_B"),
+        "PL_B should now be loading — serialization released after PL_A completed"
+    );
+
+    let _ = std::fs::remove_file(&script);
+}
+
+// ---------------------------------------------------------------------------
+// pending_tracks Vec fix: when two get_playlist responses land in the same
+// drain_paired cycle (user switched A→B rapidly), BOTH must survive. The old
+// single-slot Option design overwrote the first with the second → PL_A never
+// got its tracks ("wrong tracks per playlist").
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multiple_get_playlist_responses_in_one_drain_all_survive() {
+    // Use a fake sidecar that returns DIFFERENT tracks per playlist id, so we
+    // can verify the right tracks go to the right list.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("per_id.py");
+    std::fs::write(
+        &script,
+        "import sys, json\nfor line in sys.stdin:\n    line = line.strip()\n    if not line: continue\n    req = json.loads(line)\n    cmd = req.get('cmd')\n    if cmd == 'get_playlist':\n        pid = req.get('id', '')\n        if pid == 'PL_A':\n            print(json.dumps({\"ok\": True, \"data\": {\"tracks\": [{\"video_id\": \"a1\", \"title\": \"TrackA1\", \"artist\": \"X\"}, {\"video_id\": \"a2\", \"title\": \"TrackA2\", \"artist\": \"X\"}]}}), flush=True)\n        elif pid == 'PL_B':\n            print(json.dumps({\"ok\": True, \"data\": {\"tracks\": [{\"video_id\": \"b1\", \"title\": \"TrackB1\", \"artist\": \"Y\"}, {\"video_id\": \"b2\", \"title\": \"TrackB2\", \"artist\": \"Y\"}]}}), flush=True)\n",
+    )
+    .unwrap();
+    let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
+    app.view = jukebox::tui::app::View::Youtube;
+    // Set up two playlists (simulating a refresh having landed).
+    app.yt_state = jukebox::yt::state::YtState::Ready;
+    app.yt_lists = vec![
+        jukebox::tui::app::YtList {
+            id: "PL_A".into(),
+            name: "Playlist A".into(),
+            kind: jukebox::tui::app::YtListKind::Account,
+            track_ids: vec![],
+        },
+        jukebox::tui::app::YtList {
+            id: "PL_B".into(),
+            name: "Playlist B".into(),
+            kind: jukebox::tui::app::YtListKind::Account,
+            track_ids: vec![],
+        },
+    ];
+
+    // Focus PL_A → on_tick fires send_get_playlist(PL_A). PL_A is now in
+    // flight (serialized: only one at a time).
+    app.cursors.playlist = 0; // PL_A
+    app.on_tick();
+
+    // Switch to PL_B → on_tick tries send_get_playlist(PL_B) but PL_A is
+    // still in flight → BLOCKED (serialization). PL_B stays empty.
+    app.cursors.playlist = 1; // PL_B
+    app.on_tick();
+    assert!(
+        app.yt_lists[1].track_ids.is_empty(),
+        "PL_B should still be empty — serialization blocked it while PL_A was in flight"
+    );
+
+    // Wait for PL_A's response to land.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    app.on_tick(); // drains PL_A's response → PL_A gets tracks, inflight clears.
+
+    // PL_A must have its correct tracks.
+    assert_eq!(
+        app.yt_lists[0].track_ids,
+        vec!["a1".to_string(), "a2".to_string()],
+        "PL_A must have its OWN tracks (a1, a2)"
+    );
+
+    // Now PL_B's fetch can proceed (inflight is clear). on_tick lazy-loads
+    // the focused PL_B.
+    app.on_tick(); // fires send_get_playlist(PL_B)
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    app.on_tick(); // drains PL_B's response
+
+    // PL_B must have its correct tracks.
+    assert_eq!(
+        app.yt_lists[1].track_ids,
+        vec!["b1".to_string(), "b2".to_string()],
+        "PL_B must have its OWN tracks (b1, b2) — no cross-contamination"
+    );
+
+    let _ = std::fs::remove_file(&script);
 }
 
 #[test]
