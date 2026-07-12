@@ -62,7 +62,9 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
         }
         Overlay::Command { input, cursor } => render_command(f, area, &input, cursor),
         Overlay::YtAuth { input } => render_yt_auth(f, area, &input),
-        Overlay::Discover { items, cursor } => render_discover(f, area, &items, cursor),
+        Overlay::Discover { items, cursor } => {
+            render_discover(f, area, &items, cursor, app.discover_loading)
+        }
         Overlay::Lyrics {
             content,
             state,
@@ -111,6 +113,7 @@ fn render_discover(
     area: Rect,
     items: &[crate::tui::app::DiscoverItem],
     cursor: usize,
+    loading: bool,
 ) {
     let theme = Theme::default();
     let ascii = is_ascii();
@@ -144,28 +147,21 @@ fn render_discover(
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let lines: Vec<Line> = items
+    let mut lines: Vec<Line> = items
         .iter()
         .enumerate()
         .map(|(i, d)| {
             let (glyph, text) = match d {
                 crate::tui::app::DiscoverItem::Album { artist, album } => {
-                    // MOD-1: `♫` (music note) → `#` in ASCII mode.
                     let g = if ascii { "#" } else { "♫" };
                     (g, format!("{artist} {dash} {album}"))
                 }
                 crate::tui::app::DiscoverItem::Playlist { name, .. } => {
-                    // MOD-1: `✦` (star) → `*` in ASCII mode.
                     let g = if ascii { "*" } else { "✦" };
                     (g, name.clone())
                 }
             };
             let style = if i == cursor {
-                // MOD-5: use selected_style() (REVERSED|BOLD under NO_COLOR,
-                // hi_fg on accent + BOLD in color) so the selected item has a
-                // visible non-color cue in monochrome — consistent with the
-                // main browse views. The old fg(hi_fg).bg(accent) relied on
-                // color alone and left no indicator under NO_COLOR.
                 theme.selected_style()
             } else {
                 Style::default().fg(theme.text)
@@ -173,6 +169,17 @@ fn render_discover(
             Line::from(Span::styled(format!("{glyph} {text}"), style))
         })
         .collect();
+
+    // Show a loading indicator when waiting for YouTube suggestions.
+    if loading {
+        let spinner = if ascii { "..." } else { "⠋" };
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("{spinner} Loading YouTube suggestions..."),
+            Style::default().fg(theme.hi_fg),
+        )));
+    }
+
     f.render_widget(Paragraph::new(lines), inner);
 }
 

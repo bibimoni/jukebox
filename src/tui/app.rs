@@ -408,6 +408,11 @@ pub struct App {
     /// overlay opens instantly with a "loading…" state and populates when the
     /// response lands — `S` no longer blocks the UI for the ~3s roundtrip.
     pub discover_loading: bool,
+    /// Tick counter for the discover loading timeout. Incremented each
+    /// `on_tick` while `discover_loading` is true; after 600 ticks (~10s at
+    /// 60fps, ~30s at 20fps), the loading state is cleared and an error
+    /// message is shown so the overlay doesn't hang forever.
+    pub discover_loading_ticks: u32,
     /// A YouTube playlist id whose tracks were requested by a discover
     /// selection (Enter on a `DiscoverItem::Playlist`). `play_discover_selection`
     /// fires-and-forgets `send_get_playlist(id)` + stores the id here; `on_tick`
@@ -634,6 +639,7 @@ impl App {
             notification_ttl: None,
             last_notification: None,
             discover_loading: false,
+            discover_loading_ticks: 0,
             pending_discover_play: None,
             pending_radio_seed: None,
             audio_switch_handle: None,
@@ -1841,6 +1847,22 @@ impl App {
                 }
             }
 
+            // Discover loading timeout: if the YouTube home-suggestions
+            // request hasn't arrived after 600 ticks (~10-30s depending on
+            // poll rate), clear the loading flag and show an error so the
+            // overlay doesn't hang on "Loading..." forever. The user can
+            // press S again to retry.
+            if self.discover_loading {
+                self.discover_loading_ticks += 1;
+                if self.discover_loading_ticks > 600 {
+                    self.discover_loading = false;
+                    self.discover_loading_ticks = 0;
+                    self.yt_status =
+                        Some("YouTube suggestions timed out — press S to retry".to_string());
+                    session.reset_discover_inflight();
+                }
+            }
+
             // Discover overlay: home-suggestions landed. Populate the open
             // Discover overlay's items (replace prior YT playlists; preserve
             // local albums + cursor) and clear the loading flag. A stale
@@ -1849,6 +1871,7 @@ impl App {
             // (which fired-and-forgot the request + opened the overlay empty).
             if let Some(s) = session.pending_discover.take() {
                 self.discover_loading = false;
+                self.discover_loading_ticks = 0;
                 let new_pl: Vec<DiscoverItem> = s
                     .into_iter()
                     .map(|p| DiscoverItem::Playlist {
@@ -2365,6 +2388,7 @@ impl App {
         // Clear the fire-and-forget hot-path intents so a response that lands
         // after logout doesn't start playback / populate a stale overlay.
         self.discover_loading = false;
+        self.discover_loading_ticks = 0;
         self.pending_discover_play = None;
         self.pending_radio_seed = None;
         // Drop a pending audio format switch handle (the thread detaches
@@ -2580,6 +2604,7 @@ impl App {
             return Vec::new();
         }
         self.discover_loading = true;
+        self.discover_loading_ticks = 0;
         Vec::new()
     }
 
