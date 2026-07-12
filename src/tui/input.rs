@@ -879,7 +879,12 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             app.overlay = Some(Overlay::Home { state });
         }
         // Radio overlay (`:radio`): +/- feedback, s skip, n next, Esc stops.
-        Some(Overlay::Radio { session }) => {
+        // The session is destructured from the overlay and used directly —
+        // `App::reco_radio_next` checks `self.overlay` which is `None` during
+        // key handling (the overlay is `take()`n at the top of this fn), so
+        // we must get the next track from the session ourselves and call
+        // `App::play_radio_track` to switch context + start playback.
+        Some(Overlay::Radio { mut session }) => {
             // The current track is what's playing now (the radio's last pick).
             let track_id = app.now_playing.as_ref().map(|ts| ts.id().to_string());
             match key.code {
@@ -894,16 +899,16 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     if let Some(id) = &track_id {
                         app.apply_reco_feedback(FeedbackAction::HideTrack, id);
                     }
-                    app.next();
+                    advance_radio(app, &mut session);
                 }
                 KeyCode::Char('s') => {
                     if let Some(id) = &track_id {
                         app.apply_reco_feedback(FeedbackAction::RemoveFromMix, id);
                     }
-                    app.next();
+                    advance_radio(app, &mut session);
                 }
                 KeyCode::Char('n') => {
-                    app.next();
+                    advance_radio(app, &mut session);
                 }
                 _ => {}
             }
@@ -1037,6 +1042,22 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             app.overlay = Some(Overlay::Publication { state });
         }
         None => {}
+    }
+}
+
+/// Get the next track from the radio session and play it. The session is
+/// passed directly (not read from `app.overlay`) because the overlay is
+/// taken out during key handling — `App::reco_radio_next` would see `None`
+/// and return nothing. Here we advance the session ourselves and call
+/// `App::play_radio_track` to switch the transport context + start playback.
+fn advance_radio(app: &mut App, session: &mut Option<crate::reco::radio::RadioSession>) {
+    if let Some(s) = session.as_mut() {
+        if s.needs_refill() {
+            s.refill_if_needed(&app.reco_profile, &app.catalog.tracks);
+        }
+        if let Some(c) = s.next_track() {
+            app.play_radio_track(&c.track_id);
+        }
     }
 }
 

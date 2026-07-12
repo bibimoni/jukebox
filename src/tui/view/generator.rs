@@ -1,4 +1,6 @@
 //! Playlist generator overlay — NL input, plan display, constraint editing.
+use std::collections::HashMap;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -21,6 +23,11 @@ pub struct GeneratorState {
     pub cursor: usize,
     /// Whether we're in the input phase or the preview phase.
     pub phase: GeneratorPhase,
+    /// Track id → display title ("Title — Artist"), populated by
+    /// `App::generate_playlist` when the playlist is built. The render
+    /// function looks up each track's display name here so the preview
+    /// shows human-readable titles instead of raw track ids.
+    pub title_map: HashMap<String, String>,
 }
 
 /// Which phase of the generator the user is in.
@@ -132,11 +139,12 @@ pub fn render(_area: Rect, state: &GeneratorState, icons: &IconRenderer) -> Para
                     } else {
                         ""
                     };
-                    lines.push(Line::from(format!(
-                        "  {}. {}{pin_marker}",
-                        i + 1,
-                        track.track_id
-                    )));
+                    let display = state
+                        .title_map
+                        .get(&track.track_id)
+                        .cloned()
+                        .unwrap_or_else(|| track.track_id.clone());
+                    lines.push(Line::from(format!("  {}. {}{pin_marker}", i + 1, display)));
                 }
                 if playlist.tracks.len() > 20 {
                     lines.push(Line::from(Span::styled(

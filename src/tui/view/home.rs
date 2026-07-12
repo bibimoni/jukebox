@@ -221,6 +221,11 @@ pub struct HomeState {
     pub loading: bool,
     /// Whether the user has listening history (affects which sections show).
     pub has_history: bool,
+    /// The sections + items to display. Populated by `App::open_home()` from
+    /// the catalog, reco mixes, yt_lists, etc. Empty on cold start before
+    /// `open_home` runs; the renderer shows the welcome screen only when this
+    /// is empty.
+    pub sections: Vec<(HomeSection, Vec<HomeItem>)>,
 }
 
 impl HomeState {
@@ -231,6 +236,7 @@ impl HomeState {
             cursor: 0,
             loading: true,
             has_history: false,
+            sections: Vec::new(),
         }
     }
 

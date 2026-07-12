@@ -1176,12 +1176,13 @@ fn titled_block(title: &str, theme: &Theme) -> Block<'static> {
 
 /// The YouTube Home overlay. Unlike the other new overlays, Home is a
 /// full-screen view (not a centered popup): it replaces the main browse
-/// content with the multi-section Home layout. The overlay carries only
-/// [`home::HomeState`]; the section data is assembled by the app layer, so
-/// here we render the surfaces derivable from the state alone:
+/// content with the multi-section Home layout. The overlay carries
+/// [`home::HomeState`] (including the section items populated by
+/// `App::open_home`); here we render them:
 /// - `loading` → the header (which already shows a "loading…" status line).
-/// - cold start (no history) → the welcome / getting-started paragraph.
-/// - otherwise → the header (status "ready").
+/// - sections present → the full multi-section layout via `render_compact`.
+/// - no sections (cold start before `open_home` populates them) → the
+///   welcome / getting-started paragraph.
 fn render_home_overlay(f: &mut Frame, area: Rect, state: &home::HomeState) {
     let icons = IconRenderer::auto();
     // Full-screen: clear so the browse chrome (columns / player bar) doesn't
@@ -1191,12 +1192,12 @@ fn render_home_overlay(f: &mut Frame, area: Rect, state: &home::HomeState) {
     if state.loading {
         let lines = home::render_header(area, state, &icons);
         f.render_widget(Paragraph::new(lines), area);
-    } else if !state.has_history {
+    } else if state.sections.is_empty() {
         let p = home::render_empty(&icons);
         f.render_widget(p, area);
     } else {
-        let lines = home::render_header(area, state, &icons);
-        f.render_widget(Paragraph::new(lines), area);
+        let para = home::render_compact(area, &state.sections, state, &icons);
+        f.render_widget(para, area);
     }
 }
 
@@ -1450,10 +1451,66 @@ mod tests {
     }
 
     #[test]
+    fn home_overlay_with_sections_shows_section_titles() {
+        use crate::tui::view::home::{HomeItem, HomeSection};
+
+        let mut state = crate::tui::view::home::HomeState::new();
+        state.loading = false;
+        state.has_history = false;
+        state.sections = vec![
+            (
+                HomeSection::QuickPicks,
+                vec![HomeItem::track(
+                    "t1".into(),
+                    "Song 1".into(),
+                    "Artist A".into(),
+                    true,
+                )],
+            ),
+            (
+                HomeSection::MadeForYou,
+                vec![HomeItem::mix(crate::reco::mixes::MixType::DailyMix)],
+            ),
+            (
+                HomeSection::StartRadio,
+                vec![HomeItem::radio_seed("Track Radio".into())],
+            ),
+        ];
+        let text = overlay_text(80, 24, |f, area| render_home_overlay(f, area, &state));
+        assert!(
+            text.contains("Quick Picks"),
+            "Home with sections must show the Quick Picks title: {text:?}"
+        );
+        assert!(
+            text.contains("Made for You"),
+            "Home with sections must show the Made for You title: {text:?}"
+        );
+        assert!(
+            text.contains("Start Radio"),
+            "Home with sections must show the Start Radio title: {text:?}"
+        );
+        assert!(
+            text.contains("Song 1"),
+            "Home with sections must show track titles from Quick Picks: {text:?}"
+        );
+    }
+
+    #[test]
     fn home_overlay_ready_shows_ready_status() {
         let mut state = crate::tui::view::home::HomeState::new();
         state.loading = false;
         state.has_history = true;
+        // Populate sections (as App::open_home does) so the renderer takes
+        // the render_compact path, which includes render_header → "ready".
+        state.sections = vec![(
+            crate::tui::view::home::HomeSection::QuickPicks,
+            vec![crate::tui::view::home::HomeItem::track(
+                "t1".into(),
+                "Song 1".into(),
+                "Artist A".into(),
+                true,
+            )],
+        )];
         let text = overlay_text(80, 24, |f, area| render_home_overlay(f, area, &state));
         assert!(
             text.contains("ready"),

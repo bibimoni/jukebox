@@ -3273,22 +3273,71 @@ impl App {
     // --- Recommendation engine wiring --------------------------------------
 
     /// Open the YouTube Home view. Populates the generated mixes from the
-    /// reco engine (synchronous from local data) and sets the overlay. The
-    /// view layer computes section items at render time from `reco_mixes` +
-    /// `yt_lists` + `playlists`.
+    /// reco engine and builds the section items (Quick Picks, Made for You,
+    /// Start Radio, Your YouTube Library) from local catalog + reco + yt_lists
+    /// data. The overlay always has content, even on a cold start — Quick
+    /// Picks draws from the local catalog and Made for You uses the catalog
+    /// fallback in the candidate generator.
     pub fn open_home(&mut self) {
-        use crate::tui::view::home::HomeState;
+        use crate::tui::view::home::{HomeItem, HomeSection, HomeState};
+
         // Generate mixes from the reco engine. Always generate (even cold
         // start uses the local catalog) so the "Made for You" section has
         // content.
         self.reco_mixes =
             crate::reco::mixes::generate_all_mixes(&self.reco_profile, &self.catalog.tracks);
+
         let mut state = HomeState::new();
         state.has_history = self.reco_profile.has_history();
         // Local data is synchronous — not loading. YouTube home suggestions
         // (if a session is available) are fetched by the existing discover
         // mechanism and don't block this overlay.
         state.loading = false;
+
+        // Build section items from app data so the overlay shows content.
+        let mut sections = Vec::new();
+
+        // Quick Picks: first 5 tracks from the local catalog.
+        let quick_picks: Vec<HomeItem> = self
+            .catalog
+            .tracks
+            .iter()
+            .take(5)
+            .map(|t| {
+                HomeItem::track(
+                    t.id.clone(),
+                    t.title.clone(),
+                    t.primary_artist.clone(),
+                    true,
+                )
+            })
+            .collect();
+        sections.push((HomeSection::QuickPicks, quick_picks));
+
+        // Made for You: generated mixes (Daily Mix, Discover, etc.).
+        let made_for_you: Vec<HomeItem> = self
+            .reco_mixes
+            .iter()
+            .map(|m| HomeItem::mix(m.mix_type))
+            .collect();
+        sections.push((HomeSection::MadeForYou, made_for_you));
+
+        // Start Radio: radio seed options.
+        let start_radio = vec![
+            HomeItem::radio_seed("Track Radio".into()),
+            HomeItem::radio_seed("Artist Radio".into()),
+        ];
+        sections.push((HomeSection::StartRadio, start_radio));
+
+        // Your YouTube Library: YouTube playlists (if session is available).
+        let library: Vec<HomeItem> = self
+            .yt_lists
+            .iter()
+            .map(|l| HomeItem::playlist(l.id.clone(), l.name.clone(), false))
+            .collect();
+        sections.push((HomeSection::Library, library));
+
+        state.sections = sections;
         self.overlay = Some(Overlay::Home { state });
     }
 
@@ -3313,6 +3362,32 @@ impl App {
         });
     }
 
+    /// Play a specific track id as the next radio track. Switches the
+    /// transport context to a single-track "reco radio" context and starts
+    /// playback. Used by the Radio overlay's `n` / `s` / `-` keys — the
+    /// overlay is taken out during key handling so [`reco_radio_next`] (which
+    /// checks `self.overlay`) can't find the session; instead the handler
+    /// gets the next track from the session directly and calls this method.
+    pub fn play_radio_track(&mut self, track_id: &str) {
+        if let Some(np) = self.now_playing.clone() {
+            self.transport
+                .history
+                .push((np.id().to_string(), self.transport.context.clone()));
+        }
+        let ctx = Context::Search {
+            query: "reco radio".into(),
+            track_ids: vec![track_id.to_string()],
+        };
+        let r = ClonedResolver {
+            playlists: &self.playlists,
+            manual_queue: self.transport.manual_queue.clone(),
+            yt_lists: &self.yt_lists,
+        };
+        self.transport
+            .switch_context(ctx, Some(track_id), &r, &self.catalog);
+        self.start_playback();
+    }
+
     /// Open the playlist generator overlay (NL input phase).
     pub fn open_generator(&mut self) {
         use crate::tui::view::generator::GeneratorState;
@@ -3324,7 +3399,8 @@ impl App {
     /// Generate a playlist from the generator's parsed constraints. Called
     /// when the user presses Enter in the generator input phase. Parses the
     /// NL input into constraints, runs the reco pipeline, and moves to the
-    /// preview phase.
+    /// preview phase. Resolves track IDs to "Title — Artist" display names
+    /// so the preview shows human-readable titles instead of raw IDs.
     pub fn generate_playlist(&mut self) {
         if let Some(Overlay::Generator { state }) = &mut self.overlay {
             state.parse_input(); // parse NL → constraints
@@ -3349,6 +3425,26 @@ impl App {
                                 true,
                             ));
                     }
+                }
+                // Resolve track IDs to display titles ("Title — Artist") so
+                // the preview shows names instead of raw IDs. Falls back to
+                // the raw track_id when the catalog has no match (e.g. a
+                // YouTube video id whose metadata isn't cached yet). Access
+                // `track_index` + `catalog.tracks` directly (disjoint fields
+                // from `overlay`) instead of calling `track_by_id_fast` to
+                // avoid borrowing all of `self` while `state` is mutably
+                // borrowed from `self.overlay`.
+                let dash = crate::tui::view::theme::em_dash();
+                state.title_map.clear();
+                for track in &playlist.tracks {
+                    let display = match self.track_index.get(&track.track_id) {
+                        Some(&i) => {
+                            let t = &self.catalog.tracks[i];
+                            format!("{} {} {}", t.title, dash, t.primary_artist)
+                        }
+                        None => track.track_id.clone(),
+                    };
+                    state.title_map.insert(track.track_id.clone(), display);
                 }
                 state.playlist = Some(playlist);
                 state.generate(); // move to preview phase
@@ -3585,6 +3681,60 @@ mod tests {
     }
 
     #[test]
+    fn open_home_populates_sections_with_content() {
+        let mut app = make_app();
+        app.open_home();
+        match &app.overlay {
+            Some(Overlay::Home { state }) => {
+                assert!(
+                    !state.sections.is_empty(),
+                    "Home overlay must have populated sections"
+                );
+                // Quick Picks should have tracks from the catalog.
+                let qp = state
+                    .sections
+                    .iter()
+                    .find(|(s, _)| *s == crate::tui::view::home::HomeSection::QuickPicks);
+                let qp_items = qp
+                    .map(|(_, items)| items)
+                    .expect("Quick Picks section must exist");
+                assert!(
+                    !qp_items.is_empty(),
+                    "Quick Picks must have tracks from the catalog"
+                );
+                // Made for You should have generated mixes.
+                let mfy = state
+                    .sections
+                    .iter()
+                    .find(|(s, _)| *s == crate::tui::view::home::HomeSection::MadeForYou);
+                let mfy_items = mfy
+                    .map(|(_, items)| items)
+                    .expect("Made for You section must exist");
+                assert!(
+                    !mfy_items.is_empty(),
+                    "Made for You must have generated mixes"
+                );
+                // Start Radio should have radio seed options.
+                let sr = state
+                    .sections
+                    .iter()
+                    .find(|(s, _)| *s == crate::tui::view::home::HomeSection::StartRadio);
+                let sr_items = sr
+                    .map(|(_, items)| items)
+                    .expect("Start Radio section must exist");
+                assert!(!sr_items.is_empty(), "Start Radio must have seed options");
+                // Library section should exist (even if empty, no yt_session).
+                let lib = state
+                    .sections
+                    .iter()
+                    .find(|(s, _)| *s == crate::tui::view::home::HomeSection::Library);
+                assert!(lib.is_some(), "Library section must exist");
+            }
+            other => panic!("expected Home overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn start_radio_from_track_creates_session() {
         let mut app = make_app();
         app.start_radio_from_track("t1");
@@ -3658,6 +3808,44 @@ mod tests {
             assert!(state.playlist.is_some());
             // The playlist should have tracks (the profile has positive scores).
             assert!(!state.playlist.as_ref().unwrap().tracks.is_empty());
+        } else {
+            panic!("expected Generator overlay");
+        }
+    }
+
+    #[test]
+    fn generate_playlist_populates_title_map() {
+        let mut app = make_app();
+        app.open_generator();
+        if let Some(Overlay::Generator { state }) = &mut app.overlay {
+            state.input = "calm mix".into();
+        }
+        app.generate_playlist();
+        if let Some(Overlay::Generator { state }) = &app.overlay {
+            let playlist = state
+                .playlist
+                .as_ref()
+                .expect("playlist should be generated");
+            assert!(!playlist.tracks.is_empty(), "playlist should have tracks");
+            assert!(
+                !state.title_map.is_empty(),
+                "title_map should be populated with display titles"
+            );
+            // Each track should have a display title that contains the track's
+            // title from the catalog ("Song 1", "Song 2", "Song 3").
+            for track in &playlist.tracks {
+                let display = state.title_map.get(&track.track_id);
+                assert!(
+                    display.is_some(),
+                    "title_map must have entry for track {}",
+                    track.track_id
+                );
+                let display = display.unwrap();
+                assert!(
+                    display.contains("Song") || display == &track.track_id,
+                    "display title should contain the track title, got: {display}"
+                );
+            }
         } else {
             panic!("expected Generator overlay");
         }
