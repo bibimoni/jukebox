@@ -1785,9 +1785,29 @@ impl App {
             manual_queue: self.transport.manual_queue.clone(),
             yt_lists: &self.yt_lists,
         };
-        if let Some(id) = self.transport.prev(&r, &self.catalog) {
-            self.load_track(&id);
+        let Some(id) = self.transport.prev(&r, &self.catalog) else {
+            // No previous track at all — no-op.
+            return;
+        };
+        // RC16-DEF-2: when prev() returns the SAME track (no history → replay
+        // current), reloading via load_track re-opens the player pipe and
+        // surfaces "Broken pipe (os error 32)" — especially when the player
+        // has stopped (mpv child exited, socket dead). Instead:
+        //   - Same track + playing → seek to 0 (restart from beginning).
+        //   - Stopped (now_playing None) → no-op (player is dead, can't load).
+        //   - Genuinely different prev track + playing → load_track as usual.
+        let current_id = self.now_playing.as_ref().map(|s| s.id().to_string());
+        if current_id.as_deref() == Some(id.as_str()) {
+            if self.player.is_playing() {
+                let _ = self.player.seek_to(0.0);
+            }
+            return;
         }
+        // Don't load into a dead player (stopped → mpv socket closed).
+        if self.now_playing.is_none() {
+            return;
+        }
+        self.load_track(&id);
     }
 
     /// Auto-advance when the player reports a natural end-of-track. Records
@@ -5951,6 +5971,87 @@ mod tests {
         assert!(
             row0.contains("]"),
             "RC13-DEF-4: toast must have closing bracket: {row0}"
+        );
+    }
+
+    /// RC16-DEF-2: pressing `<` (prev) on the first track must NOT call
+    /// load_track on the same track (which causes "Broken pipe (os error 32)"
+    /// when the player has stopped). Instead, it should seek to 0 (restart)
+    /// when playing, or no-op when stopped.
+    #[test]
+    fn rc16_def2_prev_on_first_track_does_not_reload() {
+        let (_d, mut app) = make_app_with_files();
+        // Play track t1 (the first track in the context).
+        app.cursors.track = 0;
+        app.play_selected();
+        assert!(app.now_playing.is_some(), "track should be playing");
+        let np_id = app.now_playing.as_ref().unwrap().id().to_string();
+        // Press prev — no history, so transport.prev returns the same track.
+        app.prev();
+        // The now_playing should still be the same track (not reloaded into
+        // a dead state). No error should be set.
+        assert!(
+            app.yt_error.is_none(),
+            "RC16-DEF-2: prev on first track must not set an error: {:?}",
+            app.yt_error
+        );
+        assert!(
+            app.now_playing.is_some(),
+            "RC16-DEF-2: prev on first track must keep now_playing"
+        );
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().id(),
+            np_id,
+            "RC16-DEF-2: prev on first track must keep the same track"
+        );
+    }
+
+    /// RC16-DEF-2: pressing `<` when stopped (now_playing None) must be a
+    /// graceful no-op, not a broken pipe error.
+    #[test]
+    fn rc16_def2_prev_when_stopped_is_noop() {
+        let (_d, mut app) = make_app_with_files();
+        // Don't play anything — now_playing is None.
+        assert!(app.now_playing.is_none());
+        // Press prev — should be a no-op, no error.
+        app.prev();
+        assert!(
+            app.yt_error.is_none(),
+            "RC16-DEF-2: prev when stopped must not set an error: {:?}",
+            app.yt_error
+        );
+        assert!(
+            app.now_playing.is_none(),
+            "RC16-DEF-2: prev when stopped must leave now_playing as None"
+        );
+    }
+
+    /// RC16-DEF-2: prev with history (a genuinely different track) must still
+    /// load the previous track via load_track — the fix only short-circuits
+    /// the same-track and stopped cases.
+    #[test]
+    fn rc16_def2_prev_with_history_loads_previous() {
+        let (_d, mut app) = make_app_with_files();
+        // Play track t1, then next to t2, then prev back to t1.
+        app.cursors.track = 0;
+        app.play_selected();
+        let first_id = app.now_playing.as_ref().unwrap().id().to_string();
+        app.next();
+        let second_id = app.now_playing.as_ref().unwrap().id().to_string();
+        assert_ne!(
+            first_id, second_id,
+            "next should have advanced to a different track"
+        );
+        app.prev();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().id(),
+            first_id,
+            "RC16-DEF-2: prev with history must load the previous track"
+        );
+        assert!(
+            app.yt_error.is_none(),
+            "RC16-DEF-2: prev with history must not error: {:?}",
+            app.yt_error
         );
     }
 }

@@ -14,6 +14,7 @@
 //! info line is drawn.
 
 use ratatui::{
+    buffer::CellDiffOption,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -91,6 +92,26 @@ pub fn geometry(area: Rect) -> PlayerBarGeometry {
                 1,
             ),
             progress,
+        }
+    }
+}
+
+/// RC16-DEF-1: mark EVERY cell in `area` as `AlwaysUpdate` so the diff
+/// re-emits them unconditionally. This clears stale CJK double-width glyphs
+/// when the now-playing track switches: a double-width char occupies 2
+/// terminal cells, and when a shorter ASCII title replaces a longer CJK
+/// title, ratatui's diff may skip the continuation cells (treating them as
+/// equal to default spaces), leaving remnant glyphs that interleave with
+/// the new text ("日i本n語g…"). Forcing all player-bar cells on every frame
+/// guarantees the terminal always reflects the buffer. The player bar is
+/// 1–2 rows so the cost is negligible (~100–200 cells).
+fn force_area_update(f: &mut Frame, area: Rect) {
+    let buf = f.buffer_mut();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+            }
         }
     }
 }
@@ -650,6 +671,8 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
             .block(Block::default().borders(Borders::NONE)),
         area,
     );
+    // RC16-DEF-1: force all compact bar cells so stale CJK glyphs are cleared.
+    force_area_update(f, area);
 }
 
 /// Render the player bar into `area` using state from `app`. Two rows:
@@ -678,6 +701,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(line).block(Block::default().borders(Borders::NONE)),
         info_area,
     );
+    // RC16-DEF-1: force all info-area cells so stale CJK glyphs are cleared.
+    force_area_update(f, info_area);
 
     let geo = geometry(area);
     let controls = Style::default()
@@ -725,6 +750,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 .alignment(Alignment::Right),
             flags_area,
         );
+        // RC16-DEF-1: force the gauge row too so stale glyphs on row 2 clear.
+        force_area_update(f, g);
     }
 }
 
@@ -1866,5 +1893,57 @@ mod mod_tests {
             row2.contains(" 0%"),
             "RC14-DEF-4: non-hi-res track should trust player.position() (0%), not wall-clock:\n{row2}"
         );
+    }
+
+    /// RC16-DEF-1: the player bar must mark all its cells as `AlwaysUpdate`
+    /// so stale CJK double-width glyphs are fully cleared when the track
+    /// switches. After rendering, every cell in the bar area should have
+    /// `CellDiffOption::AlwaysUpdate` set (not `None`).
+    #[test]
+    fn rc16_def1_force_area_update_marks_all_cells() {
+        use ratatui::buffer::CellDiffOption;
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        let backend = TestBackend::new(100, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, f.area(), &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        // Every cell in the 100×2 area must be marked AlwaysUpdate.
+        for y in 0..2u16 {
+            for x in 0..100u16 {
+                let cell = &buf[(x, y)];
+                assert_eq!(
+                    cell.diff_option,
+                    CellDiffOption::AlwaysUpdate,
+                    "RC16-DEF-1: cell ({x},{y}) must be AlwaysUpdate, got {:?}",
+                    cell.diff_option
+                );
+            }
+        }
+    }
+
+    /// RC16-DEF-1: the compact bar must also mark all cells as
+    /// `AlwaysUpdate`.
+    #[test]
+    fn rc16_def1_compact_bar_marks_all_cells() {
+        use ratatui::buffer::CellDiffOption;
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        let backend = TestBackend::new(80, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_compact(f, f.area(), &app))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        for x in 0..80u16 {
+            let cell = &buf[(x, 0)];
+            assert_eq!(
+                cell.diff_option,
+                CellDiffOption::AlwaysUpdate,
+                "RC16-DEF-1: compact bar cell ({x},0) must be AlwaysUpdate"
+            );
+        }
     }
 }

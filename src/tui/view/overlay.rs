@@ -33,8 +33,8 @@ use crate::reco::radio::RadioSession;
 use crate::tui::app::{App, Overlay};
 use crate::tui::view::icons::IconRenderer;
 use crate::tui::view::theme::{
-    clip_to_width, down_arrow, ellipsis, em_dash, is_ascii, marker_glyph, right_arrow, sep_dot,
-    up_arrow, Theme, ASCII_BORDER_SET,
+    clip_to_width, disp_width, down_arrow, ellipsis, em_dash, is_ascii, marker_glyph, right_arrow,
+    sep_dot, up_arrow, Theme, ASCII_BORDER_SET,
 };
 use crate::tui::view::{explanation, generator, home, publication, radio};
 
@@ -350,6 +350,33 @@ fn track_label(app: &App, id: &str) -> String {
     id.to_string()
 }
 
+/// RC16-DEF-3: truncate `s` to `max` display columns, appending an ellipsis
+/// when shortened. CJK/wide characters are counted as 2 via [`disp_width`]
+/// so truncation respects terminal alignment for Japanese titles. Consistent
+/// with `player_bar::truncate_title` and the main track columns.
+fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if disp_width(s) <= max {
+        return s.to_string();
+    }
+    let ell = ellipsis();
+    let ell_w = disp_width(ell);
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = disp_width(&c.to_string());
+        if w + cw + ell_w > max {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push_str(ell);
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
@@ -543,6 +570,13 @@ fn render_search(
     // [Y] YouTube) so the user knows where each result comes from. A local
     // catalog track (id in `app.track_index`) → [L]; anything else (a
     // YouTube video id resolved from `track_cache`) → [Y].
+    // RC16-DEF-3: truncate long titles with an ellipsis (…) so the cut is
+    // clean and consistent with the main track columns (which use …). The
+    // old code hard-cut at the panel edge with no marker, leaving the user
+    // unable to tell the title continues.
+    let list_width = rows[2].width as usize;
+    let badge_prefix = 4; // "[L] " or "[Y] "
+    let label_max = list_width.saturating_sub(badge_prefix);
     let items: Vec<ListItem> = results
         .iter()
         .map(|id| {
@@ -551,7 +585,9 @@ fn render_search(
             } else {
                 "[Y]"
             };
-            ListItem::new(format!("{badge} {}", track_label(app, id)))
+            let label = track_label(app, id);
+            let truncated = truncate_with_ellipsis(&label, label_max);
+            ListItem::new(format!("{badge} {truncated}"))
         })
         .collect();
     let mut state = ListState::default();
@@ -637,6 +673,23 @@ pub fn help_lines(sep_width: usize, ascii: bool) -> Vec<Line<'static>> {
 
     vec![
         Line::from(""),
+        // RC16-DEF-1: Discovery & Radio + Source badges at the TOP so the
+        // most important new features (H, :radio, :gen, :publish) are visible
+        // immediately when help opens — no scrolling needed.
+        section("Discovery & Radio"),
+        entry("H", "YouTube Home (Quick Picks, mixes, radio)"),
+        entry("S", "discover overlay (albums / YT mixes)"),
+        entry(":home", "open YouTube Home"),
+        entry(":gen", "playlist generator (natural language)"),
+        entry(":radio", "start radio from selected track"),
+        entry(":radio artist <name>", "start radio from artist"),
+        entry(":publish <name>", "publish playlist to YouTube"),
+        sep(),
+        section("Source badges"),
+        entry("[L]", "local track"),
+        entry("[Y]", "YouTube track"),
+        entry("[Y!]", "expired / unavailable"),
+        sep(),
         section("Navigation"),
         entry(nav_key, nav_desc),
         entry("gg / G", "top / bottom of column"),
@@ -676,23 +729,8 @@ pub fn help_lines(sep_width: usize, ascii: bool) -> Vec<Line<'static>> {
         entry("R", "resume last track (when stopped) / retry YT"),
         entry(":yt auth", "paste cookies"),
         entry(":yt auth browser", "<chrome|firefox|safari|edge|brave>"),
-        entry(":yt logout", "clear cookies"),
         entry(":yt setup", "install deps"),
         entry(":queue clear", "empty the play-next queue"),
-        sep(),
-        section("Source badges"),
-        entry("[L]", "local track"),
-        entry("[Y]", "YouTube track"),
-        entry("[Y!]", "expired / unavailable"),
-        sep(),
-        section("Discovery & Radio"),
-        entry("H", "YouTube Home (Quick Picks, mixes, radio)"),
-        entry("S", "discover overlay (albums / YT mixes)"),
-        entry(":home", "open YouTube Home"),
-        entry(":gen", "playlist generator (natural language)"),
-        entry(":radio", "start radio from selected track"),
-        entry(":radio artist <name>", "start radio from artist"),
-        entry(":publish <name>", "publish playlist to YouTube"),
         sep(),
         section("Generator overlay"),
         entry("Enter", "generate / save playlist"),
@@ -1855,6 +1893,126 @@ mod tests {
         assert!(
             text.contains("[Y!]"),
             "RC13-DEF-3: help must list [Y!] expired badge: {text:?}"
+        );
+    }
+
+    /// RC16-DEF-1: the "Discovery & Radio" section must appear BEFORE
+    /// "Navigation" in help_lines so H, :radio, :gen, :publish are visible
+    /// in the first screen of help without scrolling.
+    #[test]
+    fn rc16_def1_discovery_section_before_navigation() {
+        let lines = help_lines(80, false);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = text.join("\n");
+        let discovery_idx = joined
+            .find("Discovery & Radio")
+            .expect("help must contain 'Discovery & Radio' section");
+        let nav_idx = joined
+            .find("Navigation")
+            .expect("help must contain 'Navigation' section");
+        assert!(
+            discovery_idx < nav_idx,
+            "RC16-DEF-1: Discovery & Radio must appear BEFORE Navigation in help"
+        );
+        // Source badges must also be before Navigation.
+        let badge_idx = joined
+            .find("Source badges")
+            .expect("help must contain 'Source badges' section");
+        assert!(
+            badge_idx < nav_idx,
+            "RC16-DEF-1: Source badges must appear BEFORE Navigation in help"
+        );
+        // H, :radio, :gen, :publish must all be present.
+        assert!(joined.contains(":radio"), "help must list :radio");
+        assert!(joined.contains(":gen"), "help must list :gen");
+        assert!(joined.contains(":publish"), "help must list :publish");
+        assert!(joined.contains("YouTube Home"), "help must list H for Home");
+    }
+
+    /// RC16-DEF-3: search results must truncate long titles with an ellipsis
+    /// (…) instead of a hard cut, consistent with the main track columns.
+    #[test]
+    fn rc16_def3_search_results_truncate_with_ellipsis() {
+        // Direct helper test: a string exceeding the budget gets …
+        let long = "A Very Long Track Title That Should Be Truncated When Displayed";
+        let truncated = truncate_with_ellipsis(long, 40);
+        assert!(
+            truncated.ends_with('…') || truncated.ends_with("..."),
+            "RC16-DEF-3: truncated title must end with ellipsis: {truncated:?}"
+        );
+        assert!(
+            disp_width(&truncated) <= 40,
+            "RC16-DEF-3: truncated title must fit within budget: {truncated:?} ({} cols)",
+            disp_width(&truncated)
+        );
+        // A short title is unchanged.
+        let short = "Freedom — Ado";
+        assert_eq!(
+            truncate_with_ellipsis(short, 40),
+            short,
+            "RC16-DEF-3: short title must not be truncated"
+        );
+        // Render check: the search overlay's result list must show … for a
+        // long title. Build a catalog with a long-titled track.
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({
+            "version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+            "tracks":[
+              {"id":"long1","artists":["Artist"],"primary_artist":"Artist",
+               "title":"A Very Long Track Title That Should Be Truncated When Displayed In The UI",
+               "album":"Alb","bit_depth":16,"sample_rate_hz":44100,
+               "source_path":"lossless/A/01.flac","symlinked_into_artists":["Artist"]}
+            ]
+        })
+        .to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        let cat = Catalog::load(&p).unwrap();
+        let app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let results = vec!["long1".to_string()];
+        terminal
+            .draw(|f| {
+                render_search(
+                    f,
+                    f.area(),
+                    &app,
+                    "Very Long",
+                    &results,
+                    0,
+                    SearchScope::Local,
+                    &None,
+                    false,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Scan all rows for an ellipsis character.
+        let mut found_ellipsis = false;
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                let sym = buf[(x, y)].symbol();
+                if sym.contains('…') || sym.contains("...") {
+                    found_ellipsis = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_ellipsis,
+            "RC16-DEF-3: search results must show ellipsis for long titles"
         );
     }
 }
