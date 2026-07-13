@@ -28,10 +28,21 @@ pub struct PublicationState {
     pub account: String,
     /// The track ids to publish (YouTube video_ids only — local-only excluded).
     pub publishable_ids: Vec<String>,
+    /// Display titles for `publishable_ids` ("Title — Artist"). RC15-DEF-3:
+    /// the render layer resolves the raw video IDs to human-readable titles
+    /// so the user sees "Midnight City — M83" instead of "v001". Populated by
+    /// `App::open_publication` from the catalog (local ids) or the YT
+    /// session's track_cache (remote ids). Falls back to the raw id when
+    /// metadata isn't cached yet.
+    pub publishable_titles: Vec<String>,
     /// Local-only track ids (can't be published).
     pub local_only: Vec<String>,
+    /// Display titles for `local_only` ("Title — Artist").
+    pub local_only_titles: Vec<String>,
     /// Unavailable track ids.
     pub unavailable: Vec<String>,
+    /// Display titles for `unavailable` ("Title — Artist").
+    pub unavailable_titles: Vec<String>,
     /// Whether the user has confirmed.
     pub confirmed: bool,
     /// The confirmation step the user is on (0-9).
@@ -53,8 +64,11 @@ impl PublicationState {
             privacy: "PRIVATE".into(),
             account: String::new(),
             publishable_ids: Vec::new(),
+            publishable_titles: Vec::new(),
             local_only: Vec::new(),
+            local_only_titles: Vec::new(),
             unavailable: Vec::new(),
+            unavailable_titles: Vec::new(),
             confirmed: false,
             step: 0,
             field: PubField::Name,
@@ -122,8 +136,18 @@ pub fn render(_area: Rect, state: &PublicationState, icons: &IconRenderer) -> Pa
             Style::default().fg(Color::DarkGray),
         )));
     } else {
+        // RC15-DEF-3: resolve each track ID to a "Title — Artist" display
+        // string so the user sees human-readable names, not raw video IDs.
+        // `publishable_titles` is populated by `App::open_publication` from
+        // the catalog or the YT session's track_cache. Falls back to the raw
+        // id when metadata isn't cached.
         for (i, id) in state.publishable_ids.iter().take(5).enumerate() {
-            lines.push(Line::from(format!("   {}. {id}", i + 1)));
+            let label = state
+                .publishable_titles
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| id.clone());
+            lines.push(Line::from(format!("   {}. {label}", i + 1)));
         }
         if state.publishable_ids.len() > 5 {
             lines.push(Line::from(Span::styled(
@@ -154,9 +178,14 @@ pub fn render(_area: Rect, state: &PublicationState, icons: &IconRenderer) -> Pa
             ),
             Style::default().fg(Color::Yellow),
         )));
-        for id in state.local_only.iter().take(5) {
+        for (i, id) in state.local_only.iter().take(5).enumerate() {
+            let label = state
+                .local_only_titles
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| id.clone());
             lines.push(Line::from(Span::styled(
-                format!("   {id} (local)",),
+                format!("   {label} (local)",),
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -174,9 +203,14 @@ pub fn render(_area: Rect, state: &PublicationState, icons: &IconRenderer) -> Pa
             format!("3. Unavailable ({}):", state.unavailable.len()),
             Style::default().fg(Color::Red),
         )));
-        for id in state.unavailable.iter().take(5) {
+        for (i, id) in state.unavailable.iter().take(5).enumerate() {
+            let label = state
+                .unavailable_titles
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| id.clone());
             lines.push(Line::from(Span::styled(
-                format!("   {id} (unavailable)",),
+                format!("   {label} (unavailable)",),
                 Style::default().fg(Color::DarkGray),
             )));
         }

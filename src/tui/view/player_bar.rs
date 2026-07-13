@@ -368,9 +368,54 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
     // title — artist (always shown — highest priority)
     match &np {
         Some(v) => {
-            spans.push(Span::styled(v.title.clone(), text));
-            spans.push(Span::styled(format!(" {} ", em_dash()), dim));
-            spans.push(Span::styled(v.artist.clone(), text));
+            // RC15-DEF-5 (ACC-02): at 80×24 the compact bar hard-cut long titles
+            // mid-word with no ellipsis. Compute the available width for
+            // title + " — " + artist, reserving space for the progress label
+            // and the trailing essentials (MODE + YT indicator + source
+            // badge). Truncate title (and artist) with `…` so the cut is
+            // clean. Mirrors `build_info_line`'s title_budget approach.
+            let prefix_w = spans_width(&spans);
+            let sep_str = format!(" {} ", em_dash());
+            let sep_w = disp_width(&sep_str);
+            let (_pct, plabel) = progress(app);
+            let progress_w = disp_width(&format!("  {plabel}"));
+            let mode_str = app.source_mode.as_str();
+            let mode_w = disp_width(&format!("  MODE {mode_str}"));
+            let yt_w = compact_yt_indicator_width(app);
+            let badge_w = compact_src_badge_width(app);
+            let reserved = mode_w + yt_w + badge_w + progress_w;
+            // Reserve a minimum 4-col slot for the artist so long titles
+            // still show "Title… — Ar…" (not just "Title…").
+            let artist_min = 4usize.min(disp_width(&v.artist));
+            let title_budget =
+                (area.width as usize).saturating_sub(prefix_w + sep_w + artist_min + reserved + 2);
+            if title_budget >= 1 {
+                let title_w = disp_width(&v.title);
+                let artist_w = disp_width(&v.artist);
+                let (title_disp, artist_disp) = if title_w + sep_w + artist_w
+                    <= (area.width as usize).saturating_sub(prefix_w + reserved)
+                {
+                    (v.title.clone(), v.artist.clone())
+                } else if title_w <= title_budget {
+                    let artist_max =
+                        (area.width as usize).saturating_sub(prefix_w + title_w + sep_w + reserved);
+                    (v.title.clone(), truncate_title(&v.artist, artist_max))
+                } else {
+                    (
+                        truncate_title(&v.title, title_budget),
+                        truncate_title(&v.artist, artist_min),
+                    )
+                };
+                spans.push(Span::styled(title_disp, text));
+                spans.push(Span::styled(sep_str.clone(), dim));
+                spans.push(Span::styled(artist_disp, text));
+            } else {
+                // Extremely narrow — just the title, truncated.
+                let budget = (area.width as usize)
+                    .saturating_sub(prefix_w + reserved)
+                    .max(1);
+                spans.push(Span::styled(truncate_title(&v.title, budget), text));
+            }
         }
         None => {
             // RC11-DEF-015: show "Buffering [title]…" when a cold-miss YouTube

@@ -812,29 +812,67 @@ fn render_artists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             artist_area,
         );
     } else {
-        // DEF-053: truncate artist names with ellipsis.
+        // RC15-DEF-2 (ACC-01): in no-color mode, the List widget's
+        // highlight_style emits a stray `\x1b[;m` reset between the highlight
+        // SGR and the text for the Artists column (the focused column with the
+        // Thick border), cancelling the REVERSED+BOLD before the text is
+        // drawn — selection is invisible. Albums/Tracks don't reproduce this
+        // (the REPORT confirms their SGR is clean). Switching the Artists
+        // column from List+highlight_style to Paragraph+per-line styles (the
+        // same pattern used by the Tracks column and the narrow Artists
+        // path) avoids the stray reset entirely — each line's style is
+        // applied inline with no intermediate reset. A `▸` marker glyph on
+        // the selected row adds a third non-color cue (matching Tracks).
         let col_w = artist_area.width.saturating_sub(2) as usize;
-        let items: Vec<ListItem> = app
+        let filtered: Vec<&String> = app
             .artists
             .iter()
             .filter(|a| app.filter_matches(a))
-            .map(|a| ListItem::new(truncate_ellipsis(a, col_w)))
             .collect();
-        if items.is_empty() {
+        if filtered.is_empty() {
             let text = filter_text_on(app, 0).unwrap_or("");
             f.render_widget(
                 dim_centered(format!("no matches for '{text}'"), theme).block(col1_block),
                 artist_area,
             );
         } else {
-            let mut state = ListState::default();
-            state.select(Some(app.cursors.artist.min(items.len().saturating_sub(1))));
-            f.render_stateful_widget(
-                List::new(items)
-                    .block(col1_block)
-                    .highlight_style(theme.selected_style()),
+            let cursor = app.cursors.artist.min(filtered.len().saturating_sub(1));
+            // Reserve 2 cols for the `▸ ` / `  ` prefix so truncation leaves
+            // room for the marker without overflowing the right border.
+            let name_w = col_w.saturating_sub(2);
+            let lines: Vec<Line> = filtered
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let name = truncate_ellipsis(a, name_w);
+                    if i == cursor {
+                        let marker = marker_glyph();
+                        Line::from(Span::styled(
+                            format!("{marker} {name}"),
+                            theme.selected_style(),
+                        ))
+                    } else {
+                        Line::from(Span::styled(
+                            format!("  {name}"),
+                            Style::default().fg(theme.text),
+                        ))
+                    }
+                })
+                .collect();
+            // Scroll-to-cursor: keep the selected artist visible when the
+            // list is longer than the pane (Paragraph doesn't auto-scroll
+            // like List+ListState). Mirrors the Tracks column pattern.
+            let visible_h = artist_area.height.saturating_sub(2) as usize;
+            let scroll = if cursor >= visible_h {
+                cursor - visible_h + 1
+            } else {
+                0
+            };
+            f.render_widget(
+                Paragraph::new(lines)
+                    .scroll((scroll as u16, 0))
+                    .block(col1_block),
                 artist_area,
-                &mut state,
             );
         }
     }

@@ -605,32 +605,38 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         // (handled above) closes; j/k/↑/↓ scroll a line, PgUp/PgDn half a page,
         // g/G jump to top/bottom. Any other key is a no-op.
         Some(Overlay::Help) => {
-            // Upper bound is the content length; over-scrolling just shows
-            // blank space, so a generous bound is safe. Derive from
-            // `help_lines` so the cap tracks content growth (the old fixed
-            // `31` was stale after Batches A–H added sections — Radio c/q/>,
-            // Source badges, Generator s — leaving the bottom sections
-            // unreachable).
+            // Upper bound is the content length. RC15-DEF-1: cap at
+            // `help_lines_count - 1` (not `help_lines_count`) so `G` lands on
+            // the last PAGE of content, not a full page past it. The
+            // render_help clamp (overlay.rs) is the source of truth — it
+            // additionally clamps to `lines.len() - inner_height` so the popup
+            // never shows blank lines. This input-side cap prevents the scroll
+            // value from drifting far above what render_help can display.
             let help_lines_count = crate::tui::view::overlay::help_lines(0, false).len() as u16;
+            let max_scroll = help_lines_count.saturating_sub(1);
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
-                    app.help_scroll = app.help_scroll.saturating_add(1).min(help_lines_count);
+                    app.help_scroll = app.help_scroll.saturating_add(1).min(max_scroll);
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     app.help_scroll = app.help_scroll.saturating_sub(1);
                 }
                 KeyCode::PageDown => {
-                    app.help_scroll = app.help_scroll.saturating_add(10).min(help_lines_count);
+                    app.help_scroll = app.help_scroll.saturating_add(10).min(max_scroll);
                 }
                 KeyCode::PageUp => {
                     app.help_scroll = app.help_scroll.saturating_sub(10);
                 }
+                // RC15-DEF-1: `G` jumps to the last PAGE of content (clamped
+                // by render_help to `lines.len() - inner_height`), not a full
+                // page past it. The old `help_lines_count` value scrolled past
+                // all content, leaving the popup blank.
                 KeyCode::Char('g') => app.help_scroll = 0,
-                KeyCode::Char('G') => app.help_scroll = help_lines_count,
+                KeyCode::Char('G') => app.help_scroll = max_scroll,
                 // Home/End jump to top/bottom (mirrors g/G) — DEF-018: End was
                 // missing.
                 KeyCode::Home => app.help_scroll = 0,
-                KeyCode::End => app.help_scroll = help_lines_count,
+                KeyCode::End => app.help_scroll = max_scroll,
                 _ => {}
             }
             app.overlay = Some(Overlay::Help);

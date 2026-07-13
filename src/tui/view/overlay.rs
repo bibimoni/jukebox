@@ -781,10 +781,17 @@ fn render_help(f: &mut Frame, area: Rect, scroll: u16) {
     // Compute the inner width (popup width minus 2 for borders) and pass it
     // to help_lines so the `─` separators reach the right border.
     let sep_width = popup.width.saturating_sub(2) as usize;
+    let lines = help_lines(sep_width, ascii);
+    // RC15-DEF-1: clamp scroll so the popup never shows blank lines past the
+    // last content row. The inner height (popup height minus 2 borders) is the
+    // max visible rows; `max_scroll` = content_height - visible_rows. Without
+    // this clamp, `G` (which sets scroll = help_lines.len()) scrolls a full
+    // page past the content, leaving the popup entirely blank.
+    let inner_h = popup.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(inner_h);
+    let clamped = (scroll as usize).min(max_scroll) as u16;
     f.render_widget(
-        Paragraph::new(help_lines(sep_width, ascii))
-            .scroll((scroll, 0))
-            .block(block),
+        Paragraph::new(lines).scroll((clamped, 0)).block(block),
         popup,
     );
 }

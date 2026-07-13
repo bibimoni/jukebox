@@ -477,6 +477,15 @@ pub struct App {
     /// format lands (AC-M9.2.4).
     audio_switch_handle: Option<std::thread::JoinHandle<()>>,
 
+    /// RC15-DEF-4: pending background `:yt setup` (non-blocking). The
+    /// blocking venv+pip install (~30s) runs on a detached thread so the
+    /// TUI stays responsive and the "Setting up YouTube deps…" toast is
+    /// visible immediately. `on_tick` polls `is_finished()`; on completion
+    /// it joins, applies the result (updates `yt_python`, sets
+    /// `yt_status` to "YT setup OK · venv: …" or `yt_error`), and respawns
+    /// the sidecar against the new venv python.
+    pub yt_setup_handle: Option<std::thread::JoinHandle<Result<String, String>>>,
+
     /// User listening profile for recommendations.
     pub reco_profile: crate::reco::profile::UserProfile,
     /// Listening event log.
@@ -764,6 +773,7 @@ impl App {
             pending_discover_play: None,
             pending_radio_seed: None,
             audio_switch_handle: None,
+            yt_setup_handle: None,
             reco_profile: crate::reco::profile::UserProfile::default(),
             reco_events: crate::reco::events::EventLog::new(),
             reco_mixes: Vec::new(),
@@ -1978,50 +1988,34 @@ impl App {
     /// `:yt setup` — create the jukebox venv and install the YT deps into it,
     /// so the sidecar runs against a python that has them. Blocks (~30s,
     /// one-time). On success, respawn the sidecar against the new venv python.
+    ///
+    /// RC15-DEF-4: the blocking `run_setup` call (~30s venv+pip install) now
+    /// runs on a detached thread so the TUI stays responsive and the
+    /// "Setting up YouTube deps…" toast is visible immediately (the old
+    /// synchronous call set `yt_status` but no render happened before the
+    /// block, so the user saw nothing for 30s). `on_tick` polls the handle
+    /// and applies the result when the thread finishes.
     pub fn yt_setup(&mut self) {
         self.yt_error = None;
-        self.yt_status = Some("YT setup: installing deps…".into());
+        // Immediately show the "setting up" toast so the user sees feedback
+        // within one frame — the render loop runs between this key handler
+        // return and the next tick.
+        self.yt_status = Some("Setting up YouTube deps — installing venv + pip…".into());
         let reqs = self.yt_script.parent().map(|p| p.join("requirements.txt"));
         let Some(reqs) = reqs else {
             self.yt_error = Some("setup: could not find requirements.txt".into());
             self.yt_status = None;
             return;
         };
-        match crate::yt::session::run_setup(&reqs) {
-            Ok(msg) => {
-                self.yt_python = crate::yt::session::venv_python();
-                self.yt_status = Some(msg);
-                // RC11-DEF-017: surface the full install-log path via the
-                // diagnostics overlay so the user can find the log without
-                // the footer truncating the path. The footer shows the
-                // prominent "YT setup OK · venv: …" confirmation; the log
-                // path goes to `:diag` (which has room for the full text).
-                self.diagnostics.push(format!(
-                    "YT setup complete · log: {}",
-                    crate::yt::session::setup_log_path().display()
-                ));
-                // Respawn the sidecar against the new venv python, preserving
-                // any browser/pasted auth.
-                if let Some(session) = self.yt_session.as_mut() {
-                    if let Some(browser) = session.browser.clone() {
-                        match crate::yt::session::Session::spawn_browser(
-                            &self.yt_python,
-                            &self.yt_script,
-                            browser,
-                        ) {
-                            Ok(new) => {
-                                *self.yt_session.as_mut().unwrap() = new;
-                            }
-                            Err(e) => self.yt_error = Some(format!("respawn after setup: {e}")),
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                self.yt_error = Some(format!("setup failed: {e}"));
-                self.yt_status = None;
-            }
-        }
+        // Spawn the blocking setup on a background thread. The handle is
+        // polled on `on_tick`; when it finishes, the result is applied
+        // (yt_python updated, yt_status set to the success/error message,
+        // sidecar respawned). This keeps the input loop responsive.
+        let reqs = reqs.clone();
+        let handle = std::thread::spawn(move || {
+            crate::yt::session::run_setup(&reqs).map_err(|e| e.to_string())
+        });
+        self.yt_setup_handle = Some(handle);
     }
 
     /// Per-tick housekeeping (called from the event loop's poll):
@@ -2041,19 +2035,79 @@ impl App {
                 self.audio_switch_handle = Some(handle);
             }
         }
+        // RC15-DEF-4: drain a completed background `:yt setup` thread. The
+        // blocking venv+pip install runs on a detached thread (spawned by
+        // `yt_setup`); `on_tick` polls `is_finished()` (non-blocking) and,
+        // when the thread is done, joins + applies the result. On success:
+        // update `yt_python` to the new venv python, set `yt_status` to the
+        // "YT setup OK · venv: …" confirmation, log to diagnostics, and respawn
+        // the sidecar against the new venv (preserving browser/pasted auth).
+        // On error: set `yt_error` and clear `yt_status`. The "Setting up…"
+        // toast (set synchronously in `yt_setup`) stays visible until the
+        // thread finishes — the TTL suppression below is skipped while the
+        // handle is in flight (the toast is NOT a transient notification yet).
+        if let Some(handle) = self.yt_setup_handle.take() {
+            if !handle.is_finished() {
+                self.yt_setup_handle = Some(handle);
+            } else {
+                // Thread is done — join and apply the result.
+                let result = handle
+                    .join()
+                    .unwrap_or_else(|_| Err("setup thread panicked".to_string()));
+                match result {
+                    Ok(msg) => {
+                        self.yt_python = crate::yt::session::venv_python();
+                        self.yt_status = Some(msg);
+                        self.diagnostics.push(format!(
+                            "YT setup complete · log: {}",
+                            crate::yt::session::setup_log_path().display()
+                        ));
+                        // Respawn the sidecar against the new venv python,
+                        // preserving any browser/pasted auth.
+                        if let Some(session) = self.yt_session.as_mut() {
+                            if let Some(browser) = session.browser.clone() {
+                                match crate::yt::session::Session::spawn_browser(
+                                    &self.yt_python,
+                                    &self.yt_script,
+                                    browser,
+                                ) {
+                                    Ok(new) => {
+                                        *self.yt_session.as_mut().unwrap() = new;
+                                    }
+                                    Err(e) => {
+                                        self.yt_error = Some(format!("respawn after setup: {e}"))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.yt_error = Some(format!("setup failed: {e}"));
+                        self.yt_status = None;
+                    }
+                }
+            }
+        }
         // Notification TTL (Slice 7): clear a stale transient `yt_status` after
         // 5s so the footer returns to the hint bar / state label instead of
         // lingering on a one-shot message (e.g. "upgraded to AAC 256k",
         // "queue cleared"). The TTL is (re)started below when a NEW status is
         // detected; an identical repeat does NOT refresh the window (dedup via
         // `last_notification`).
-        if let Some(t) = self.notification_ttl {
-            if t.elapsed() > Duration::from_secs(5) && self.yt_status.is_some() {
-                self.yt_status = None;
-                self.notification_ttl = None;
-                // Reset dedup so a later re-assertion of the same message
-                // counts as a fresh notification (gets a new 5s window).
-                self.last_notification = None;
+        //
+        // RC15-DEF-4: suppress the TTL while `:yt setup` is in flight — the
+        // "Setting up…" toast must persist for the full ~30s install, not
+        // expire after 5s. The TTL restarts naturally when `on_tick` applies
+        // the result (a NEW `yt_status` message replaces "Setting up…").
+        if self.yt_setup_handle.is_none() {
+            if let Some(t) = self.notification_ttl {
+                if t.elapsed() > Duration::from_secs(5) && self.yt_status.is_some() {
+                    self.yt_status = None;
+                    self.notification_ttl = None;
+                    // Reset dedup so a later re-assertion of the same message
+                    // counts as a fresh notification (gets a new 5s window).
+                    self.last_notification = None;
+                }
             }
         }
         // Detect a NEW yt_status (set since the last tick by a key handler /
@@ -4350,11 +4404,21 @@ impl App {
         //   "unavailable", which blocked publication entirely (the overlay
         //   always showed "0 tracks to publish"). The sidecar resolves the
         //   metadata at publish time; we don't need it upfront.
+        // RC15-DEF-3: resolve each id to a "Title — Artist" display string so
+        // the publish overlay shows human-readable names instead of raw video
+        // IDs. Local catalog ids resolve via `track_by_id_fast`; YouTube
+        // video ids resolve via the session's `track_cache`. Falls back to
+        // the raw id when metadata isn't cached yet (the sidecar resolves at
+        // publish time).
         for id in &track_ids {
             if self.track_index.contains_key(id) {
                 state.local_only.push(id.clone());
+                state.local_only_titles.push(self.resolve_publish_title(id));
             } else {
                 state.publishable_ids.push(id.clone());
+                state
+                    .publishable_titles
+                    .push(self.resolve_publish_title(id));
             }
         }
 
@@ -4371,6 +4435,28 @@ impl App {
         }
 
         self.overlay = Some(Overlay::Publication { state });
+    }
+
+    /// RC15-DEF-3: resolve a track id to a "Title — Artist" display string
+    /// for the publish overlay. Local catalog ids resolve via
+    /// `track_by_id_fast`; YouTube video ids resolve via the session's
+    /// `track_cache`. Falls back to the raw id when metadata isn't cached
+    /// (the sidecar resolves at publish time).
+    fn resolve_publish_title(&self, id: &str) -> String {
+        let dash = crate::tui::view::theme::em_dash();
+        if let Some(t) = self.track_by_id_fast(id) {
+            if t.primary_artist.is_empty() {
+                return t.title.clone();
+            }
+            return format!("{} {} {}", t.title, dash, t.primary_artist);
+        }
+        if let Some(rt) = self.yt_session.as_ref().and_then(|s| s.track_for(id)) {
+            if rt.artist.is_empty() {
+                return rt.title.clone();
+            }
+            return format!("{} {} {}", rt.title, dash, rt.artist);
+        }
+        id.to_string()
     }
 
     /// Record a listen event and rebuild the user profile. `event_type` is a

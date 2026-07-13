@@ -142,22 +142,13 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
         ]);
     }
 
-    // Suppress YT status when in Local mode and not viewing the YT library.
-    let yt_relevant = {
-        use crate::mode::SourceMode;
-        use crate::tui::app::View;
-        app.source_mode != SourceMode::Local || app.view == View::Youtube
-    };
-    if !yt_relevant {
-        // RC11-DEF-020: still show the compact YT indicator so the user can
-        // see at a glance whether YT is connected without switching views.
-        return Line::from(vec![badge, Span::raw(" "), yt_badge]);
-    }
-
-    // Prominent transient message (yt_status) — shown regardless of yt_state
-    // so feedback like "Opening chrome — waiting for token…" (RC11-DEF-019)
-    // or "YT setup OK · venv: …" (RC11-DEF-017) reaches the user even when the
-    // state is not Ready (e.g. Authenticating, AuthenticatedNotSynced, Failed).
+    // RC15-DEF-4: a prominent transient message (yt_status) is shown
+    // regardless of `yt_relevant` (view/mode) so feedback like "Setting up
+    // YouTube deps…" (from `:yt setup` while in Local mode) or "Opening
+    // chrome — waiting for token…" (from `:yt auth browser` while in Local
+    // mode) reaches the user even when the current view is Artists/Playlists
+    // and source_mode is Local. The old code gated `yt_status` behind
+    // `yt_relevant`, so `:yt setup` from Local mode showed nothing for 30s.
     // Truncated to fit the footer so long paths get a clean `…` instead of a
     // mid-word cut (RC11-DEF-017).
     if let Some(msg) = &app.yt_status {
@@ -175,6 +166,20 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
             Span::raw(format!(" {} ", sep_dot())),
             Span::styled(m, Style::default().fg(color)),
         ]);
+    }
+
+    // Suppress YT state/error details when in Local mode and not viewing the
+    // YT library — only the compact `[Y …]` badge is shown. (Transient
+    // `yt_status` messages are already handled above, regardless of mode.)
+    let yt_relevant = {
+        use crate::mode::SourceMode;
+        use crate::tui::app::View;
+        app.source_mode != SourceMode::Local || app.view == View::Youtube
+    };
+    if !yt_relevant {
+        // RC11-DEF-020: still show the compact YT indicator so the user can
+        // see at a glance whether YT is connected without switching views.
+        return Line::from(vec![badge, Span::raw(" "), yt_badge]);
     }
 
     if app.yt_state == YtState::Ready {
