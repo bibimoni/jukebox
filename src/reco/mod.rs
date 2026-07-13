@@ -1,10 +1,9 @@
 //! Recommendation engine: listening events, candidate generation, ranking,
-//! diversity, identity, validation, mixes, radio, autoplay, feedback,
-//! generator, explanations, evaluation.
+//! diversity, identity, validation, mixes, radio, feedback, generator,
+//! explanations, evaluation.
 //! Built on local processing (Level 2) with optional ytmusicapi enrichment
 //! (Level 3).
 
-pub mod autoplay;
 pub mod candidates;
 pub mod diversity;
 pub mod evaluation;

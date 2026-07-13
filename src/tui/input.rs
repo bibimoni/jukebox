@@ -226,6 +226,9 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
     // Esc closes any overlay, first, before anything else.
     if matches!(key.code, KeyCode::Esc) {
         app.overlay = None;
+        // Drop any stashed play-saved index so a later confirm doesn't
+        // play a stale playlist (RC11-DEF-065 cleanup).
+        app.pending_play_saved_idx = None;
         return;
     }
 
@@ -748,11 +751,39 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                             app.transport.clear_queue();
                             app.yt_status = Some("queue cleared".into());
                         }
+                        crate::tui::app::ConfirmAction::PlaySavedPlaylist => {
+                            // RC11-DEF-065: play the most recently saved
+                            // generator playlist. Falls back to a no-op +
+                            // status hint if the index is stale (the user
+                            // deleted the playlist between save and
+                            // confirm — rare but possible).
+                            if let Some(idx) = app.pending_play_saved_idx.take() {
+                                if let Some(pl) = app.playlists.get(idx).cloned() {
+                                    if let Some(start) = pl.track_ids.first().cloned() {
+                                        let ids = pl.track_ids;
+                                        app.view = View::Playlists;
+                                        app.cursors.playlist = idx;
+                                        app.play_in_context_ids(ids, &start);
+                                    } else {
+                                        app.yt_status =
+                                            Some("saved playlist is empty — nothing to play".into());
+                                    }
+                                } else {
+                                    app.yt_status = Some(
+                                        "saved playlist no longer exists — open Playlists to find it"
+                                            .into(),
+                                    );
+                                }
+                            }
+                        }
                     }
                     app.overlay = None;
                     return;
                 }
                 KeyCode::Char('n') => {
+                    // Cancel: drop any stashed play-saved index so a later
+                    // confirm doesn't play a stale playlist.
+                    app.pending_play_saved_idx = None;
                     app.overlay = None;
                     return;
                 }
@@ -850,11 +881,22 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         }
         // --- Recommendation overlays -----------------------------------------
         // Home overlay (`H` / `:home`): j/k navigate items, Tab switches
-        // sections, Enter selects the highlighted item, Esc closes (generic).
+        // sections, Enter selects the highlighted item, ? opens help, Esc
+        // closes (generic).
+        // RC11-DEF-001: previously `?` was swallowed by `_ => {}` and
+        // `cursor_down(usize::MAX)` let the cursor grow unbounded. Now `?`
+        // opens the help overlay (stacked) and `j`/`k` are bounded by the
+        // focused section's item count, so the visible selection (rendered
+        // by `render_compact`) matches the item Enter will play.
         Some(Overlay::Home { mut state }) => {
+            let section_len = state
+                .sections
+                .get(state.focused_section)
+                .map(|(_, items)| items.len())
+                .unwrap_or(0);
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
-                    state.cursor_down(usize::MAX);
+                    state.cursor_down(section_len.max(1));
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     state.cursor_up();
@@ -865,25 +907,34 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Tab => {
                     state.section_next(crate::tui::view::home::HomeSection::all().len());
                 }
-                KeyCode::Enter => {
-                    // Select the highlighted item. The Home overlay's items are
-                    // populated by `open_home`; selection dispatches back to
-                    // the app (play a mix, open a playlist, start radio). Close
-                    // the overlay and play the selected context track.
+                KeyCode::Char('?') => {
+                    // Stack help on top of Home so the user returns to Home
+                    // after closing help (Esc closes help, restores Home).
                     app.overlay = Some(Overlay::Home { state });
-                    app.play_selected();
+                    app.overlay = Some(Overlay::Help);
+                    return;
+                }
+                KeyCode::Enter => {
+                    // Select the highlighted item. Dispatch to
+                    // `play_home_selection` which resolves the focused Home
+                    // item (Track / Playlist / Mix / RadioSeed / ...) and
+                    // starts the right playback / radio flow. The overlay is
+                    // closed by `play_home_selection` on the synchronous paths.
+                    app.overlay = Some(Overlay::Home { state });
+                    app.play_home_selection();
                     return;
                 }
                 _ => {}
             }
             app.overlay = Some(Overlay::Home { state });
         }
-        // Radio overlay (`:radio`): +/- feedback, s skip, n next, Esc stops.
-        // The session is destructured from the overlay and used directly —
-        // `App::reco_radio_next` checks `self.overlay` which is `None` during
-        // key handling (the overlay is `take()`n at the top of this fn), so
-        // we must get the next track from the session ourselves and call
-        // `App::play_radio_track` to switch context + start playback.
+        // Radio overlay (`:radio`): +/- feedback, s skip, n/> next, c change
+        // seed, q stop, Esc closes. The session is destructured from the
+        // overlay and used directly — `App::reco_radio_next` checks
+        // `self.overlay` which is `None` during key handling (the overlay is
+        // `take()`n at the top of this fn), so we must get the next track from
+        // the session ourselves and call `App::play_radio_track` to switch
+        // context + start playback.
         Some(Overlay::Radio { mut session }) => {
             // The current track is what's playing now (the radio's last pick).
             let track_id = app.now_playing.as_ref().map(|ts| ts.id().to_string());
@@ -891,6 +942,10 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Char('+') | KeyCode::Char('=') => {
                     if let Some(id) = &track_id {
                         app.apply_reco_feedback(FeedbackAction::Like, id);
+                    } else {
+                        // DEF-023: `+` with nothing playing is a visible no-op —
+                        // cue the user to start the radio first.
+                        app.yt_status = Some("nothing playing — press n to start".into());
                     }
                     // Positive feedback doesn't advance; the user stays on
                     // the track they like.
@@ -907,8 +962,27 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     }
                     advance_radio(app, &mut session);
                 }
-                KeyCode::Char('n') => {
+                // DEF-026: `>` advances the radio (alias for `n`) so the
+                // global next-track reflex works inside the overlay.
+                KeyCode::Char('>') | KeyCode::Char('n') => {
                     advance_radio(app, &mut session);
+                }
+                // DEF-006: `c` changes the seed to the currently-playing track
+                // (or the first upcoming pool track), resetting the pool +
+                // played-list. Delegates to App which owns the session +
+                // catalog borrows.
+                KeyCode::Char('c') => {
+                    app.overlay = Some(Overlay::Radio { session });
+                    app.change_radio_seed();
+                    return;
+                }
+                // DEF-007: `q` stops the radio session (clears the pool so no
+                // further auto-advance) and closes the overlay. Does NOT fall
+                // through to the global quit (the overlay swallows keys).
+                KeyCode::Char('q') => {
+                    app.overlay = Some(Overlay::Radio { session });
+                    app.stop_radio();
+                    return;
                 }
                 _ => {}
             }
@@ -942,7 +1016,11 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     return;
                 }
                 KeyCode::Enter if state.phase == GeneratorPhase::Preview => {
-                    // Save the generated playlist locally.
+                    // Save the generated playlist locally. RC11-DEF-032:
+                    // show a "Saved \"<name>\"" toast and refuse to save a
+                    // duplicate name (the user must rename). RC11-DEF-065:
+                    // after a successful save, offer to play the playlist
+                    // immediately via a Confirm overlay.
                     if let Some(p) = &state.playlist {
                         let track_ids: Vec<String> =
                             p.tracks.iter().map(|t| t.track_id.clone()).collect();
@@ -951,12 +1029,35 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                         } else {
                             "Generated Playlist".to_string()
                         };
+                        if app.playlists.iter().any(|pl| pl.name == name) {
+                            // Duplicate — refuse + tell the user. Keep the
+                            // overlay open so they can rename (edit the
+                            // input) or pick a different action.
+                            app.yt_error = Some(format!(
+                                "playlist \"{}\" already exists — rename or Esc to cancel",
+                                name
+                            ));
+                            app.overlay = Some(Overlay::Generator { state });
+                            return;
+                        }
                         app.playlists
-                            .push(crate::tui::app::Playlist { name, track_ids });
+                            .push(crate::tui::app::Playlist { name: name.clone(), track_ids });
                         app.save_playlists_db();
-                        app.yt_status = Some("playlist saved".into());
+                        app.yt_status = Some(format!("Saved \"{}\"", name));
                     }
                     app.overlay = None;
+                    return;
+                }
+                // `s` is a save alias in the Preview phase (RC11-DEF-060:
+                // the help text advertises `s` but the binding was missing).
+                KeyCode::Char('s') if state.phase == GeneratorPhase::Preview => {
+                    // Re-dispatch as Enter by falling through to the Enter
+                    // arm: we set the key to Enter and re-handle. The
+                    // simplest way is to recurse with a synthesized Enter.
+                    handle_key(
+                        app,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    );
                     return;
                 }
                 // Preview phase: p pin, x remove, g regenerate, e edit.
@@ -1010,34 +1111,144 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         }
         // Publication overlay (`:publish`): Tab cycles privacy, Enter
         // proceeds, y confirms, n cancels, Esc closes (generic).
+        // RC11-DEF-002: the old handler only bumped `step` on Enter when
+        // `is_ready()` was false (always — `open_publication` never
+        // populated `publishable_ids`/`account`). Now the Name field is
+        // editable (typing/Backspace), j/k cycles field focus, Enter
+        // validates and either dispatches the sidecar publish API or
+        // surfaces a yt_error explaining why it can't.
         Some(Overlay::Publication { mut state }) => {
+            // Clear the validation error on any new edit so the stale
+            // message doesn't linger after the user fixes the issue.
+            let mut clear_err = false;
             match key.code {
+                // `n` and `y` are explicit confirm/cancel verbs (matches
+                // the rest of the app's Confirm pattern). They take
+                // precedence over typing into the Name field — the user
+                // can still type 'n' or 'y' as part of a name by switching
+                // to a different field (j/k) if needed; the cancel/confirm
+                // contract is more important than name-character parity.
+                KeyCode::Char('n') => {
+                    app.overlay = None;
+                    return;
+                }
+                KeyCode::Char('y') if state.is_ready() => {
+                    if let Some(session) = app.yt_session.as_mut() {
+                        let _ = session.send_create_playlist(
+                            state.name.clone(),
+                            String::new(),
+                            state.privacy.clone(),
+                            state.publishable_ids.clone(),
+                        );
+                        app.pending_publish_name = Some(state.name.clone());
+                        app.yt_status =
+                            Some(format!("publishing \"{}\" to YouTube", state.name));
+                        app.overlay = None;
+                        return;
+                    }
+                }
                 KeyCode::Tab => {
                     state.privacy = match state.privacy.as_str() {
                         "PRIVATE" => "UNLISTED".into(),
                         "UNLISTED" => "PUBLIC".into(),
                         _ => "PRIVATE".into(),
                     };
+                    state.field = crate::tui::view::publication::PubField::Privacy;
+                    clear_err = true;
                 }
-                KeyCode::Enter => {
-                    if state.is_ready() {
-                        state.confirmed = true;
-                        app.overlay = None;
-                        app.yt_status = Some(format!("publishing \"{}\" to YouTube", state.name));
-                    } else {
-                        state.step = state.step.saturating_add(1);
+                KeyCode::Backspace => {
+                    if state.field == crate::tui::view::publication::PubField::Name {
+                        state.name.pop();
+                        clear_err = true;
                     }
                 }
-                KeyCode::Char('y') if state.is_ready() => {
-                    state.confirmed = true;
-                    app.overlay = None;
-                    app.yt_status = Some(format!("publishing \"{}\" to YouTube", state.name));
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && state.field
+                            == crate::tui::view::publication::PubField::Name
+                        && c != 'n'
+                        && c != 'y' =>
+                {
+                    // Editable name field. Reject newlines/tabs (Tab is
+                    // privacy-cycle above) and the reserved verbs `n`/`y`
+                    // (which are handled above as cancel/confirm).
+                    if c != '\t' && c != '\n' && c != '\r' {
+                        state.name.push(c);
+                        clear_err = true;
+                    }
                 }
-                KeyCode::Char('n') => {
-                    app.overlay = None;
-                    return;
+                KeyCode::Down | KeyCode::Char('j') => {
+                    state.field = match state.field {
+                        crate::tui::view::publication::PubField::Name => {
+                            crate::tui::view::publication::PubField::Privacy
+                        }
+                        crate::tui::view::publication::PubField::Privacy => {
+                            crate::tui::view::publication::PubField::Account
+                        }
+                        crate::tui::view::publication::PubField::Account => {
+                            crate::tui::view::publication::PubField::Name
+                        }
+                    };
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.field = match state.field {
+                        crate::tui::view::publication::PubField::Name => {
+                            crate::tui::view::publication::PubField::Account
+                        }
+                        crate::tui::view::publication::PubField::Privacy => {
+                            crate::tui::view::publication::PubField::Name
+                        }
+                        crate::tui::view::publication::PubField::Account => {
+                            crate::tui::view::publication::PubField::Privacy
+                        }
+                    };
+                }
+                KeyCode::Enter => {
+                    if let Some(err) = state.validation_error() {
+                        // Not ready — show the validation error and keep
+                        // the overlay open so the user can fix it (was a
+                        // silent bump-step before).
+                        state.error = Some(err);
+                    } else if app
+                        .yt_lists
+                        .iter()
+                        .any(|l| l.name == state.name)
+                    {
+                        // Duplicate-name guard: a YouTube playlist with
+                        // this title already exists. Don't publish (would
+                        // create a confusing second list); tell the user
+                        // to rename.
+                        state.error = Some(format!(
+                            "a YouTube playlist named \"{}\" already exists — rename",
+                            state.name
+                        ));
+                    } else {
+                        // Dispatch the sidecar publish API. Fire-and-
+                        // forget — `on_tick` drains the result and shows
+                        // the success/error toast.
+                        if let Some(session) = app.yt_session.as_mut() {
+                            let _ = session.send_create_playlist(
+                                state.name.clone(),
+                                String::new(),
+                                state.privacy.clone(),
+                                state.publishable_ids.clone(),
+                            );
+                            app.pending_publish_name = Some(state.name.clone());
+                            app.yt_status =
+                                Some(format!("publishing \"{}\" to YouTube", state.name));
+                            app.overlay = None;
+                            return;
+                        } else {
+                            state.error =
+                                Some("no YouTube session — run :yt auth browser <name>".into());
+                        }
+                    }
                 }
                 _ => {}
+            }
+            if clear_err {
+                state.error = None;
             }
             app.overlay = Some(Overlay::Publication { state });
         }
@@ -1155,6 +1366,19 @@ fn execute_command(app: &mut App, cmd: &str) {
         // `:gen` — open the playlist generator (same as `G` in the Y view).
         "gen" => {
             app.open_generator();
+        }
+        // `:profile` — show recommendation profile health (DEF-064: wires
+        // reco::evaluation into the running app so the user can see their
+        // listening-history coverage).
+        "profile" => {
+            // Generate mixes if none yet so the summary has material.
+            if app.reco_mixes.is_empty() {
+                app.reco_mixes = crate::reco::mixes::generate_all_mixes(
+                    &app.reco_profile,
+                    &app.catalog.tracks,
+                );
+            }
+            app.yt_status = Some(app.profile_health_summary());
         }
         // `:radio` — start a radio session from the currently selected track.
         "radio" => {

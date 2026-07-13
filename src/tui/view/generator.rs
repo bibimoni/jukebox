@@ -68,10 +68,14 @@ impl GeneratorState {
         }
     }
 
-    /// Remove a track from the playlist.
+    /// Remove a track from the playlist. Also drops it from `pinned` so the
+    /// pinned list doesn't keep a stale id (RC11-DEF-031: pin survives `g`
+    /// regenerate, but `x` on a pinned track unpins + removes it — the user
+    /// explicitly asked to drop it).
     pub fn remove_track(&mut self, track_id: &str) {
         if let Some(p) = &mut self.playlist {
             p.tracks.retain(|c| c.track_id != track_id);
+            p.pinned.retain(|id| id != track_id);
         }
     }
 }
@@ -139,12 +143,34 @@ pub fn render(_area: Rect, state: &GeneratorState, icons: &IconRenderer) -> Para
                     } else {
                         ""
                     };
+                    // Source tag: [L] for local catalog tracks, [Y] for
+                    // YouTube tracks (RC11-DEF-010). `Candidate.is_local`
+                    // is the source-of-truth flag set by the candidate
+                    // generator + the catalog fallback in
+                    // `App::generate_playlist`.
+                    let source_tag = if track.is_local { "[L]" } else { "[Y]" };
                     let display = state
                         .title_map
                         .get(&track.track_id)
                         .cloned()
                         .unwrap_or_else(|| track.track_id.clone());
-                    lines.push(Line::from(format!("  {}. {}{pin_marker}", i + 1, display)));
+                    // Truncate long titles with an ellipsis so a 3-line wrap
+                    // doesn't break the numbered-list rhythm (RC11-DEF-039).
+                    // 60 chars is the preview's usable width inside a 70-wide
+                    // popup (after the indent + source tag + number).
+                    let max_title = 60;
+                    let display_truncated = if display.chars().count() > max_title {
+                        let truncated: String = display.chars().take(max_title - 1).collect();
+                        format!("{}{}", truncated, ellipsis())
+                    } else {
+                        display
+                    };
+                    lines.push(Line::from(format!(
+                        "  {}. {} {}{pin_marker}",
+                        i + 1,
+                        source_tag,
+                        display_truncated
+                    )));
                 }
                 if playlist.tracks.len() > 20 {
                     lines.push(Line::from(Span::styled(
@@ -155,7 +181,7 @@ pub fn render(_area: Rect, state: &GeneratorState, icons: &IconRenderer) -> Para
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "Enter save {} p pin {} x remove {} g regenerate {} Esc cancel",
+                        "Enter or s save {} p pin {} x remove {} g regenerate {} Esc cancel",
                         sep_dot(),
                         sep_dot(),
                         sep_dot(),

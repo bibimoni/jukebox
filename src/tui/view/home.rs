@@ -11,11 +11,14 @@
 
 use crate::reco::mixes::MixType;
 use crate::tui::view::icons::{Icon, IconRenderer};
-use crate::tui::view::theme::{bullet, ellipsis, em_dash, h_line, is_ascii, play_glyph, sep_dot};
-use ratatui::layout::{Alignment, Rect};
+use crate::tui::view::theme::{
+    bullet, ellipsis, em_dash, h_line, is_ascii, marker_glyph, play_glyph, sep_dot, Theme,
+};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::Frame;
 
 /// A section in the YouTube Home view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -372,30 +375,51 @@ pub fn render_section(
 
 /// Render the Home view as a single scrollable paragraph (for narrow terminals
 /// where multi-section layout doesn't fit).
+///
+/// RC11-DEF-001: the focused item (the one at `state.cursor` within the
+/// `focused_section`) now carries selection styling (`theme.selected_style()`
+/// = REVERSED|BOLD, surviving NO_COLOR) plus a `▸` cursor glyph so the
+/// selection is visible at all terminal sizes and color modes. Previously
+/// every item was a plain `Line::from(format!(...))` with no selection
+/// styling, so `j`/`k` moved the (invisible) cursor and `Enter` played an
+/// unpredictable item.
 pub fn render_compact(
+    f: &mut Frame,
     area: Rect,
     sections: &[(HomeSection, Vec<HomeItem>)],
     state: &HomeState,
     icons: &IconRenderer,
-) -> Paragraph<'static> {
+) {
+    let theme = Theme::default();
+    let dash = em_dash();
+    let marker = marker_glyph();
     let mut lines = Vec::new();
 
     // Header
     lines.extend(render_header(area, state, icons));
 
+    // Track the absolute row index of each section's first item so we can
+    // map `state.cursor` (within the focused section) to the flat line list.
+    // This is used both for the selection glyph and (below) for scrolling.
+    let mut item_line_offsets: Vec<(usize, usize)> = Vec::new();
+    let mut current_line: usize = lines.len();
+
     // Each section
-    for (section, items) in sections {
+    for (s_idx, (section, items)) in sections.iter().enumerate() {
         // Section header
         lines.push(Line::from(""));
+        current_line += 1;
         let hl = h_line();
         lines.push(Line::from(Span::styled(
             format!("{hl}{hl} {} {hl}{hl}", section.title()),
             Style::default().add_modifier(Modifier::BOLD),
         )));
+        current_line += 1;
         lines.push(Line::from(Span::styled(
             section.description().to_string(),
             Style::default().fg(Color::DarkGray),
         )));
+        current_line += 1;
 
         if items.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -405,8 +429,10 @@ pub fn render_compact(
                 ),
                 Style::default().fg(Color::DarkGray),
             )));
+            current_line += 1;
         } else {
-            for item in items {
+            let first_item_line = current_line;
+            for (i, item) in items.iter().enumerate() {
                 let icon = match &item.kind {
                     HomeItemKind::Playlist { is_local, .. } => {
                         if *is_local {
@@ -430,11 +456,23 @@ pub fn render_compact(
                 };
                 let glyph = icons.glyph(icon);
                 let subtitle = item.subtitle.as_deref().unwrap_or("");
-                lines.push(Line::from(format!(
-                    "  {glyph} {} {} {subtitle}",
-                    item.title,
-                    em_dash()
-                )));
+
+                // RC11-DEF-001: apply selection styling + cursor glyph to the
+                // focused item (state.cursor within the focused section).
+                let is_focused = s_idx == state.focused_section && i == state.cursor;
+                let prefix = if is_focused {
+                    format!("{marker} ")
+                } else {
+                    "  ".to_string()
+                };
+                let text = format!("{prefix}{glyph} {} {} {subtitle}", item.title, dash);
+                let style = if is_focused {
+                    theme.selected_style()
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(text, style)));
+                current_line += 1;
 
                 if let Some(expl) = &item.explanation {
                     lines.push(Line::from(Span::styled(
@@ -444,12 +482,56 @@ pub fn render_compact(
                         ),
                         Style::default().fg(Color::DarkGray),
                     )));
+                    current_line += 1;
                 }
             }
+            let last_item_line = current_line;
+            item_line_offsets.push((first_item_line, last_item_line));
         }
     }
 
-    Paragraph::new(lines).wrap(Wrap { trim: true })
+    // RC11-DEF-024: at 80×24 the Home overlay can overflow. Show a persistent
+    // bottom hint bar so the user knows how to navigate / scroll / close,
+    // matching the help + lyrics overlays' persistent footer pattern.
+    // Reserve the last row for the hint; the Paragraph above scrolls within
+    // the remaining area.
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    let body_area = chunks[0];
+    let hint_area = chunks[1];
+
+    // RC11-DEF-001: scroll the focused item into view. Paragraph doesn't
+    // auto-scroll like List+ListState, so without this the focused item can
+    // move below the visible area on small terminals (80×24).
+    let visible_h = body_area.height as usize;
+    let focused_line = item_line_offsets
+        .get(state.focused_section)
+        .map(|(first, _)| first + state.cursor)
+        .unwrap_or(0);
+    let scroll = if focused_line >= visible_h {
+        (focused_line - visible_h + 1) as u16
+    } else {
+        0
+    };
+
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).scroll((scroll, 0)).wrap(Wrap { trim: true }),
+        body_area,
+    );
+
+    // Persistent hint bar — visible at all terminal sizes so the close /
+    // navigate / section-switch keys are discoverable (RC11-DEF-001).
+    let dot = sep_dot();
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                "j/k navigate {dot} Tab sections {dot} Enter play {dot} ? help {dot} Esc close"
+            ),
+            Style::default().fg(theme.dim),
+        )))
+        .alignment(Alignment::Center),
+        hint_area,
+    );
 }
 
 /// Render the empty Home (cold start — no history, no playlists).
@@ -700,8 +782,10 @@ mod tests {
 
     #[test]
     fn render_compact_with_sections() {
+        use ratatui::{backend::TestBackend, Terminal};
         let icons = IconRenderer::new(FontMode::Unicode);
-        let state = HomeState::new();
+        let mut state = HomeState::new();
+        state.loading = false;
         let sections = vec![
             (
                 HomeSection::MadeForYou,
@@ -709,8 +793,203 @@ mod tests {
             ),
             (HomeSection::Explore, vec![HomeItem::explore("Jazz".into())]),
         ];
-        let para = render_compact(Rect::new(0, 0, 80, 24), &sections, &state, &icons);
-        let _ = para;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_compact(f, f.area(), &sections, &state, &icons))
+            .unwrap();
+    }
+
+    /// RC11-DEF-001: the focused item (at `state.cursor` within the focused
+    /// section) must carry selection styling (REVERSED|BOLD under NO_COLOR, or
+    /// accent bg in color mode) so the cursor is visible at all terminal
+    /// sizes and color modes.
+    #[test]
+    fn render_compact_focused_item_has_selection_style() {
+        use ratatui::{
+            backend::TestBackend,
+            style::{Color, Modifier},
+            Terminal,
+        };
+        let icons = IconRenderer::new(FontMode::Unicode);
+        let mut state = HomeState::new();
+        state.loading = false;
+        state.focused_section = 0;
+        state.cursor = 1;
+        let sections = vec![(
+            HomeSection::QuickPicks,
+            vec![
+                HomeItem::track("t1".into(), "Song 1".into(), "Artist A".into(), true),
+                HomeItem::track("t2".into(), "Song 2".into(), "Artist B".into(), true),
+            ],
+        )];
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_compact(f, f.area(), &sections, &state, &icons))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Find the row containing "Song 2" (the focused item) and verify it
+        // carries the selection style: REVERSED modifier (NO_COLOR) or Cyan
+        // background (color mode) — matching `Theme::selected_style`.
+        let mut found_selection = false;
+        let mut found_song2 = false;
+        for y in 0..24u16 {
+            let mut row = String::new();
+            let mut row_has_selection = false;
+            for x in 0..80u16 {
+                let cell = &buf[(x, y)];
+                row.push(cell.symbol().chars().next().unwrap_or(' '));
+                if cell.modifier.contains(Modifier::REVERSED) || cell.bg == Color::Cyan {
+                    row_has_selection = true;
+                }
+            }
+            if row.contains("Song 2") {
+                found_song2 = true;
+                assert!(
+                    row_has_selection,
+                    "DEF-001: focused Home item 'Song 2' must have selection style: {row:?}"
+                );
+                found_selection = true;
+            }
+        }
+        assert!(found_song2, "DEF-001: 'Song 2' must render in the Home overlay");
+        assert!(
+            found_selection,
+            "DEF-001: focused Home item must carry selection style"
+        );
+    }
+
+    /// RC11-DEF-001: exactly one Home item carries the selection style (the
+    /// focused one), not all items.
+    #[test]
+    fn render_compact_exactly_one_focused_item() {
+        use ratatui::{
+            backend::TestBackend,
+            style::{Color, Modifier},
+            Terminal,
+        };
+        let icons = IconRenderer::new(FontMode::Unicode);
+        let mut state = HomeState::new();
+        state.loading = false;
+        state.focused_section = 0;
+        state.cursor = 0;
+        let sections = vec![(
+            HomeSection::QuickPicks,
+            vec![
+                HomeItem::track("t1".into(), "Song 1".into(), "Artist A".into(), true),
+                HomeItem::track("t2".into(), "Song 2".into(), "Artist B".into(), true),
+                HomeItem::track("t3".into(), "Song 3".into(), "Artist C".into(), true),
+            ],
+        )];
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_compact(f, f.area(), &sections, &state, &icons))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Count rows carrying the selection style (REVERSED or Cyan bg).
+        // Only the focused item (cursor=0 → "Song 1") should carry it — not
+        // the section header, not the other items, not the hint bar.
+        let mut selected_rows = 0;
+        for y in 0..24u16 {
+            let mut row_has_selection = false;
+            for x in 0..80u16 {
+                let cell = &buf[(x, y)];
+                if cell.modifier.contains(Modifier::REVERSED) || cell.bg == Color::Cyan {
+                    row_has_selection = true;
+                }
+            }
+            if row_has_selection {
+                selected_rows += 1;
+            }
+        }
+        assert_eq!(
+            selected_rows, 1,
+            "DEF-001: exactly one Home row should carry selection style (the focused item), got {selected_rows}"
+        );
+    }
+
+    /// RC11-DEF-001: the focused item carries a `▸` cursor glyph (text-visible
+    /// cue that survives NO_COLOR).
+    #[test]
+    fn render_compact_focused_item_has_cursor_glyph() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let icons = IconRenderer::new(FontMode::Unicode);
+        let mut state = HomeState::new();
+        state.loading = false;
+        state.focused_section = 0;
+        state.cursor = 0;
+        let sections = vec![(
+            HomeSection::QuickPicks,
+            vec![HomeItem::track(
+                "t1".into(),
+                "Song 1".into(),
+                "Artist A".into(),
+                true,
+            )],
+        )];
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_compact(f, f.area(), &sections, &state, &icons))
+            .unwrap();
+        let mut buf = String::new();
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                let c = &terminal.backend().buffer()[(x, y)];
+                buf.push(c.symbol().chars().next().unwrap_or(' '));
+            }
+            buf.push('\n');
+        }
+        assert!(
+            buf.contains('▸'),
+            "DEF-001: focused Home item must show the ▸ cursor glyph: {buf}"
+        );
+    }
+
+    /// RC11-DEF-024: the Home overlay shows a persistent bottom hint bar at
+    /// 80×24 so the user knows how to navigate / scroll / close.
+    #[test]
+    fn render_compact_shows_bottom_hint_bar() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let icons = IconRenderer::new(FontMode::Unicode);
+        let mut state = HomeState::new();
+        state.loading = false;
+        state.sections = vec![(
+            HomeSection::QuickPicks,
+            vec![HomeItem::track(
+                "t1".into(),
+                "Song 1".into(),
+                "Artist A".into(),
+                true,
+            )],
+        )];
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_compact(f, f.area(), &state.sections, &state, &icons))
+            .unwrap();
+        let mut buf = String::new();
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                let c = &terminal.backend().buffer()[(x, y)];
+                buf.push(c.symbol().chars().next().unwrap_or(' '));
+            }
+            buf.push('\n');
+        }
+        assert!(
+            buf.contains("Enter play"),
+            "DEF-024: Home hint bar must mention Enter play: {buf}"
+        );
+        assert!(
+            buf.contains("? help"),
+            "DEF-001: Home hint bar must mention ? help: {buf}"
+        );
+        assert!(
+            buf.contains("Esc close"),
+            "DEF-024: Home hint bar must mention Esc close: {buf}"
+        );
     }
 
     #[test]

@@ -90,8 +90,9 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
         // main browse content with the multi-section Home layout.
         Overlay::Home { state } => render_home_overlay(f, area, &state),
         // Radio session — centered popup; `None` shows a "no active session"
-        // placeholder.
-        Overlay::Radio { session } => render_radio_overlay(f, area, session.as_ref()),
+        // placeholder. Passes `app` so the seed + upcoming tracks resolve to
+        // display titles (DEF-061/DEF-063).
+        Overlay::Radio { session } => render_radio_overlay(f, area, app, session.as_ref()),
         // Playlist generator (NL input → plan → preview) — centered popup.
         Overlay::Generator { state } => render_generator_overlay(f, area, &state),
         // Recommendation explanation — centered popup.
@@ -1248,24 +1249,41 @@ fn render_home_overlay(f: &mut Frame, area: Rect, state: &home::HomeState) {
         let p = home::render_empty(&icons);
         f.render_widget(p, area);
     } else {
-        let para = home::render_compact(area, &state.sections, state, &icons);
-        f.render_widget(para, area);
+        home::render_compact(f, area, &state.sections, state, &icons);
     }
 }
 
 /// The radio session overlay — a centered popup showing the seed, pool, and
 /// history when a session is active, or a "no active session" placeholder.
-fn render_radio_overlay(f: &mut Frame, area: Rect, session: Option<&RadioSession>) {
+/// Resolves the seed id + upcoming pool track ids to display titles via the
+/// catalog + YouTube `track_cache` (DEF-061/DEF-063).
+fn render_radio_overlay(f: &mut Frame, area: Rect, app: &mut App, session: Option<&RadioSession>) {
     let theme = Theme::default();
     let icons = IconRenderer::auto();
-    let popup = centered(area, 60, 60);
+    // DEF-062: a wider popup (70% instead of 60%) reduces the surrounding
+    // bleed region so less of the main view shows on the sides. Clear is
+    // still called on the popup rect below.
+    let popup = centered(area, 70, 70);
     f.render_widget(Clear, popup);
     let block = titled_block(" radio ", &theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
     let para = if let Some(s) = session {
-        radio::render(popup, s, &icons)
+        // DEF-061: resolve the seed to a display title. For a Track seed the
+        // raw video_id is replaced with "Title — Artist"; other seed kinds
+        // (Artist/Album/Playlist/...) already carry a human-readable label.
+        let seed_title = match &s.seed {
+            crate::reco::radio::RadioSeed::Track(id) => track_label(app, id),
+            other => other.description(),
+        };
+        // DEF-063: resolve the next 8 upcoming pool tracks to display titles.
+        let upcoming: Vec<String> = s
+            .upcoming(8)
+            .into_iter()
+            .map(|c| track_label(app, &c.track_id))
+            .collect();
+        radio::render(popup, s, &icons, &seed_title, &upcoming)
     } else {
         Paragraph::new(Line::from(Span::styled(
             "No active radio session.".to_string(),
@@ -1476,6 +1494,32 @@ mod tests {
         out
     }
 
+    /// Like `overlay_text` but passes a mutable `App` to the render closure
+    /// (for overlays like `render_radio_overlay` that resolve titles via the
+    /// catalog / YouTube track_cache).
+    fn overlay_text_with_app<F>(app: &mut App, width: u16, height: u16, render_fn: F) -> String
+    where
+        F: FnOnce(&mut Frame, Rect, &mut App),
+    {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_fn(f, area, app);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                out.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     #[test]
     fn home_overlay_loading_shows_header() {
         let state = crate::tui::view::home::HomeState::new(); // loading = true
@@ -1572,9 +1616,11 @@ mod tests {
 
     #[test]
     fn radio_overlay_with_session_shows_seed() {
+        let (_d, cat) = one_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
         let session = RadioSession::new(crate::reco::radio::RadioSeed::Track("t1".into()));
-        let text = overlay_text(80, 24, |f, area| {
-            render_radio_overlay(f, area, Some(&session))
+        let text = overlay_text_with_app(&mut app, 80, 24, |f, area, app| {
+            render_radio_overlay(f, area, app, Some(&session))
         });
         assert!(
             text.contains("Radio Session"),
@@ -1588,7 +1634,12 @@ mod tests {
 
     #[test]
     fn radio_overlay_no_session_shows_placeholder() {
-        let text = overlay_text(80, 24, |f, area| render_radio_overlay(f, area, None));
+        let (_d, cat) = one_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        let text =
+            overlay_text_with_app(&mut app, 80, 24, |f, area, app| {
+                render_radio_overlay(f, area, app, None)
+            });
         assert!(
             text.contains("No active radio session"),
             "radio overlay with no session must show the placeholder: {text:?}"

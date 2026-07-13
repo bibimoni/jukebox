@@ -1,16 +1,28 @@
 //! Responsive layout tests — 4 terminal sizes × 4 font/color modes.
 use jukebox::tui::view::home::{HomeSection, HomeState};
 use jukebox::tui::view::icons::{FontMode, Icon, IconRenderer};
+use ratatui::{backend::TestBackend, Terminal};
 
 fn render_at(width: u16, height: u16, mode: FontMode) {
     let icons = IconRenderer::new(mode);
-    let state = HomeState::new();
+    let mut state = HomeState::new();
+    state.loading = false;
     let sections = vec![
         (HomeSection::MadeForYou, vec![]),
         (HomeSection::Explore, vec![]),
     ];
     let area = ratatui::layout::Rect::new(0, 0, width, height);
-    let _ = jukebox::tui::view::home::render_compact(area, &sections, &state, &icons);
+    // `render_compact` now renders directly into the Frame (sibling-batch
+    // change for DEF-001: selection styling requires a Frame, not a
+    // returned Paragraph). Drive it through a TestBackend so the test
+    // still exercises the same code paths at each terminal size.
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            jukebox::tui::view::home::render_compact(f, area, &sections, &state, &icons);
+        })
+        .unwrap();
 }
 
 #[test]

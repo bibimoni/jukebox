@@ -99,6 +99,18 @@ fn radio_stop_clears_pool() {
 fn radio_overlay_renders() {
     let session = RadioSession::new(RadioSeed::Track("t1".into()));
     let icons = jukebox::tui::view::icons::IconRenderer::new(FontMode::Unicode);
-    let para = radio::render(ratatui::layout::Rect::new(0, 0, 80, 24), &session, &icons);
+    // Sibling-batch change: `radio::render` now takes a resolved
+    // `seed_title` + `upcoming` slice so the view layer doesn't own
+    // catalog/track_cache lookups. Pass empty/minimal values — the test
+    // only verifies render doesn't panic.
+    let seed_title = "t1";
+    let upcoming: Vec<String> = Vec::new();
+    let para = radio::render(
+        ratatui::layout::Rect::new(0, 0, 80, 24),
+        &session,
+        &icons,
+        seed_title,
+        &upcoming,
+    );
     let _ = para;
 }

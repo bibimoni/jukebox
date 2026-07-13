@@ -169,6 +169,17 @@ fn main() -> anyhow::Result<()> {
                 app.command_history = hist;
             }
 
+            // DEF-034: load the listening-event history from state.db so the
+            // recommendation profile survives restarts. Best-effort: a missing
+            // or corrupt DB falls back to an empty profile (cold start). After
+            // loading, enable per-event persistence so new events are saved.
+            if let Ok(events) = state::load_events(10_000) {
+                app.reco_events.extend_from(events);
+                let evs: Vec<_> = app.reco_events.recent(app.reco_events.len()).into_iter().cloned().collect();
+                app.reco_profile = jukebox::reco::profile::UserProfile::build_from_events(&evs);
+            }
+            app.persist_events = true;
+
             // Load cached YT lists from state.db so a launch while offline
             // shows cached playlists immediately. load_yt_lists_from_cache
             // also marks the state ReadyStale when the sidecar couldn't start

@@ -9,7 +9,20 @@ use crate::tui::view::icons::{Icon, IconRenderer};
 use crate::tui::view::theme::{ellipsis, sep_dot};
 
 /// Render the radio session overlay.
-pub fn render(_area: Rect, session: &RadioSession, icons: &IconRenderer) -> Paragraph<'static> {
+///
+/// `seed_title` is the resolved display title for the seed (DEF-061: the raw
+/// track id is replaced with "Title — Artist"). `upcoming` is the list of
+/// resolved display titles for the next pool tracks (DEF-063: shows the
+/// upcoming 5-10 tracks, not just a count). Both are resolved by the caller
+/// (which has access to the catalog + YouTube `track_cache`); the view layer
+/// only formats them.
+pub fn render(
+    _area: Rect,
+    session: &RadioSession,
+    icons: &IconRenderer,
+    seed_title: &str,
+    upcoming: &[String],
+) -> Paragraph<'static> {
     let mut lines = Vec::new();
 
     lines.push(Line::from(Span::styled(
@@ -22,7 +35,8 @@ pub fn render(_area: Rect, session: &RadioSession, icons: &IconRenderer) -> Para
         "Seed:".to_string(),
         Style::default().fg(Color::Cyan),
     )));
-    lines.push(Line::from(format!("  {}", session.seed.description())));
+    // DEF-061: show the resolved seed title instead of the raw track id.
+    lines.push(Line::from(format!("  {}", seed_title)));
     lines.push(Line::from(""));
 
     lines.push(Line::from(Span::styled(
@@ -35,6 +49,19 @@ pub fn render(_area: Rect, session: &RadioSession, icons: &IconRenderer) -> Para
             format!("  (refilling{})", ellipsis()),
             Style::default().fg(Color::DarkGray),
         )));
+    }
+
+    // DEF-063: show the next few upcoming tracks (titles resolved by the
+    // caller) so the user can see what's coming, not just a count.
+    if !upcoming.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Up next:".to_string(),
+            Style::default().fg(Color::Cyan),
+        )));
+        for (i, title) in upcoming.iter().take(8).enumerate() {
+            lines.push(Line::from(format!("  {}. {}", i + 1, title)));
+        }
     }
 
     lines.push(Line::from(""));
@@ -78,7 +105,7 @@ mod tests {
     fn render_radio_session_produces_content() {
         let session = RadioSession::new(RadioSeed::Track("t1".into()));
         let icons = IconRenderer::new(FontMode::Unicode);
-        let para = render(Rect::new(0, 0, 80, 24), &session, &icons);
+        let para = render(Rect::new(0, 0, 80, 24), &session, &icons, "track t1", &[]);
         let _ = para;
     }
 
@@ -86,7 +113,41 @@ mod tests {
     fn render_radio_shows_seed_description() {
         let session = RadioSession::new(RadioSeed::Artist("Test Artist".into()));
         let icons = IconRenderer::new(FontMode::Unicode);
-        let para = render(Rect::new(0, 0, 80, 24), &session, &icons);
+        let para = render(
+            Rect::new(0, 0, 80, 24),
+            &session,
+            &icons,
+            "artist Test Artist",
+            &[],
+        );
+        let _ = para;
+    }
+
+    #[test]
+    fn render_radio_shows_resolved_seed_title() {
+        // DEF-061: the seed title is the resolved display string, not the raw id.
+        let session = RadioSession::new(RadioSeed::Track("rzVKfAQp2No".into()));
+        let icons = IconRenderer::new(FontMode::Unicode);
+        let para = render(
+            Rect::new(0, 0, 80, 24),
+            &session,
+            &icons,
+            "Ado — あのバンド",
+            &[],
+        );
+        let _ = para;
+    }
+
+    #[test]
+    fn render_radio_shows_upcoming_list() {
+        // DEF-063: upcoming tracks are listed, not just a count.
+        let session = RadioSession::new(RadioSeed::Track("t1".into()));
+        let icons = IconRenderer::new(FontMode::Unicode);
+        let upcoming = vec![
+            "Song A — Artist A".to_string(),
+            "Song B — Artist B".to_string(),
+        ];
+        let para = render(Rect::new(0, 0, 80, 24), &session, &icons, "track t1", &upcoming);
         let _ = para;
     }
 }

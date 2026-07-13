@@ -126,6 +126,10 @@ impl Candidate {
 pub struct CandidateGenerator<'a> {
     profile: &'a UserProfile,
     catalog: &'a [Track],
+    /// YouTube video ids available as candidates when the provider is
+    /// connected (DEF-010/DEF-011). Empty by default (local-only behavior
+    /// preserved for existing callers); set via [`with_yt_track_ids`].
+    yt_track_ids: &'a [String],
 }
 
 #[allow(clippy::wrong_self_convention)]
@@ -133,7 +137,21 @@ impl<'a> CandidateGenerator<'a> {
     /// Create a new generator. `profile` is the user's listening profile;
     /// `catalog` is the local music catalog (for local-track candidates).
     pub fn new(profile: &'a UserProfile, catalog: &'a [Track]) -> Self {
-        Self { profile, catalog }
+        Self {
+            profile,
+            catalog,
+            yt_track_ids: &[],
+        }
+    }
+
+    /// Blend YouTube video ids into the candidate pool (DEF-010/DEF-011).
+    /// Each id becomes a non-local candidate tagged
+    /// [`CandidateSource::ExperimentalHome`]. Call this only when the
+    /// YouTube provider is connected (`YtState::is_ready`); the empty
+    /// default keeps existing callers local-only.
+    pub fn with_yt_track_ids(mut self, ids: &'a [String]) -> Self {
+        self.yt_track_ids = ids;
+        self
     }
 
     /// Generate all candidates from all applicable sources. Returns a deduped
@@ -150,6 +168,9 @@ impl<'a> CandidateGenerator<'a> {
         self.from_rediscovery(&mut candidates, &mut seen);
         self.from_existing_playlists(&mut candidates, &mut seen);
         self.from_local_metadata(&mut candidates, &mut seen);
+        // YouTube tracks (when connected) — blended after local sources so
+        // local affinity still drives ranking, but the pool isn't local-only.
+        self.from_yt_tracks(&mut candidates, &mut seen);
 
         // Cold-start fallback: when the profile is empty (no listening
         // history), seed candidates from the local catalog so the
@@ -159,6 +180,29 @@ impl<'a> CandidateGenerator<'a> {
         }
 
         candidates
+    }
+
+    /// Generate candidates from YouTube video ids (the connected provider's
+    /// track_cache + playlist track_ids). Each id becomes a weak non-local
+    /// candidate so the ranking/diversity stages can blend local + YouTube
+    /// tracks (DEF-010/DEF-011). Eligibility reuses the profile's hidden /
+    /// blocked-artist filters; YouTube tracks have no catalog entry so the
+    /// blocked-artist check is skipped for them.
+    fn from_yt_tracks(&self, candidates: &mut Vec<Candidate>, seen: &mut HashSet<String>) {
+        for id in self.yt_track_ids {
+            if seen.contains(id) || self.profile.is_hidden(id) {
+                continue;
+            }
+            seen.insert((*id).clone());
+            candidates.push(Candidate::new(
+                (*id).clone(),
+                CandidateSource::ExperimentalHome,
+                // Weak affinity so local profile signal still ranks above
+                // unprofiled YouTube tracks; the diversity stage spreads them.
+                self.profile.track_score(id).max(0.05),
+                false,
+            ));
+        }
     }
 
     /// Cold-start fallback: seed candidates from the entire local catalog
@@ -615,5 +659,46 @@ mod tests {
         let gen = CandidateGenerator::new(&profile, &catalog);
         let candidates = gen.generate();
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn yt_track_ids_blend_into_pool() {
+        // DEF-010/DEF-011: when YouTube track ids are provided, they appear
+        // in the candidate pool as non-local candidates.
+        let profile = UserProfile::new();
+        let catalog = vec![make_track("t1", "Artist A", "Song A")];
+        let yt_ids = vec!["yt1".to_string(), "yt2".to_string()];
+        let gen = CandidateGenerator::new(&profile, &catalog).with_yt_track_ids(&yt_ids);
+        let candidates = gen.generate();
+        let yt_candidates: Vec<_> = candidates.iter().filter(|c| !c.is_local).collect();
+        assert_eq!(yt_candidates.len(), 2, "both YouTube ids should be candidates");
+        assert!(yt_candidates.iter().all(|c| matches!(c.source, CandidateSource::ExperimentalHome)));
+    }
+
+    #[test]
+    fn yt_tracks_default_empty_preserves_local_only() {
+        // Existing callers (no with_yt_track_ids) get no YouTube candidates.
+        let profile = UserProfile::new();
+        let catalog = vec![make_track("t1", "Artist A", "Song A")];
+        let gen = CandidateGenerator::new(&profile, &catalog);
+        let candidates = gen.generate();
+        assert!(candidates.iter().all(|c| c.is_local), "default pool is local-only");
+    }
+
+    #[test]
+    fn yt_hidden_tracks_excluded() {
+        let mut profile = UserProfile::new();
+        crate::reco::feedback::apply_feedback(
+            &crate::reco::feedback::FeedbackAction::HideTrack,
+            "yt1",
+            None,
+            &mut profile,
+        );
+        let catalog: Vec<Track> = vec![];
+        let yt_ids = vec!["yt1".to_string(), "yt2".to_string()];
+        let gen = CandidateGenerator::new(&profile, &catalog).with_yt_track_ids(&yt_ids);
+        let candidates = gen.generate();
+        assert!(!candidates.iter().any(|c| c.track_id == "yt1"), "hidden yt1 excluded");
+        assert!(candidates.iter().any(|c| c.track_id == "yt2"), "yt2 still present");
     }
 }

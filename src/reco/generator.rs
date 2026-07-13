@@ -266,7 +266,20 @@ pub fn generate(
     profile: &UserProfile,
     catalog: &[Track],
 ) -> GeneratedPlaylist {
-    let gen = CandidateGenerator::new(profile, catalog);
+    generate_with_yt(constraints, profile, catalog, &[])
+}
+
+/// Generate a playlist from constraints, blending YouTube video ids into the
+/// candidate pool when the provider is connected (DEF-010). `yt_track_ids`
+/// are video ids from the session's `track_cache` + playlist `track_ids`;
+/// pass `&[]` for local-only generation.
+pub fn generate_with_yt(
+    constraints: &GeneratorConstraints,
+    profile: &UserProfile,
+    catalog: &[Track],
+    yt_track_ids: &[String],
+) -> GeneratedPlaylist {
+    let gen = CandidateGenerator::new(profile, catalog).with_yt_track_ids(yt_track_ids);
     let mut candidates = gen.generate();
 
     // Apply energy-based weighting
@@ -284,9 +297,19 @@ pub fn generate(
     };
     let diverse = apply_diversity(&candidates, catalog, &diversity_config, &[]);
 
+    // Source preference (DEF-010): Local keeps only local tracks; Youtube
+    // keeps only YouTube tracks; Hybrid keeps both. Filtering happens AFTER
+    // diversity so the blend ratio reflects the ranked+diversified pool, not
+    // the raw candidate order.
+    let tracks: Vec<Candidate> = match constraints.sources {
+        SourcePreference::Local => diverse.into_iter().filter(|c| c.is_local).collect(),
+        SourcePreference::Youtube => diverse.into_iter().filter(|c| !c.is_local).collect(),
+        SourcePreference::Hybrid => diverse,
+    };
+
     // Cap at max tracks
     let max = constraints.max_tracks.min(50);
-    let tracks: Vec<Candidate> = diverse.into_iter().take(max).collect();
+    let tracks: Vec<Candidate> = tracks.into_iter().take(max).collect();
 
     GeneratedPlaylist {
         constraints: constraints.clone(),

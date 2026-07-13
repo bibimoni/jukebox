@@ -70,6 +70,9 @@ pub struct RadioSession {
     pub max_pool_size: usize,
     /// Refill threshold (refill when pool < this).
     pub refill_threshold: usize,
+    /// YouTube video ids blended into the candidate pool when the provider is
+    /// connected (DEF-011). Empty by default (local-only radio preserved).
+    pub yt_track_ids: Vec<String>,
 }
 
 impl RadioSession {
@@ -86,7 +89,13 @@ impl RadioSession {
             generation: 0,
             max_pool_size: 50,
             refill_threshold: 10,
+            yt_track_ids: Vec::new(),
         }
+    }
+
+    /// Set the YouTube track ids to blend into the candidate pool (DEF-011).
+    pub fn set_yt_track_ids(&mut self, ids: Vec<String>) {
+        self.yt_track_ids = ids;
     }
 
     /// Generate the initial pool of candidates. Uses the full pipeline.
@@ -106,7 +115,8 @@ impl RadioSession {
     /// Generate candidates for this session. Uses the profile + catalog, and
     /// excludes tracks already played/skipped/excluded.
     fn generate_candidates(&self, profile: &UserProfile, catalog: &[Track]) -> Vec<Candidate> {
-        let gen = CandidateGenerator::new(profile, catalog);
+        let gen = CandidateGenerator::new(profile, catalog)
+            .with_yt_track_ids(&self.yt_track_ids);
         let mut candidates = gen.generate();
 
         // If the seed is a track, boost that track's neighbors.
@@ -231,6 +241,12 @@ impl RadioSession {
     /// Get the session history (tracks played).
     pub fn history(&self) -> &[String] {
         &self.session_history
+    }
+
+    /// Get the next `n` upcoming candidates (not yet played) for display
+    /// (DEF-063). Returns references in pool order.
+    pub fn upcoming(&self, n: usize) -> Vec<&Candidate> {
+        self.candidate_pool.iter().take(n).collect()
     }
 }
 
