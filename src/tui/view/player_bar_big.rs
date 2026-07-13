@@ -24,8 +24,9 @@ use ratatui::{
 use crate::tui::app::App;
 use crate::tui::queue::{ContinueMode, RepeatMode, ShuffleMode};
 use crate::tui::view::theme::{
-    disp_width, ellipsis, em_dash, empty_block, filled_block, is_ascii, next_glyph, pause_glyph,
-    play_glyph, prev_glyph, quality_color, sep_dot, stop_glyph, Theme, ASCII_BORDER_SET,
+    disp_width, ellipsis, em_dash, empty_block, filled_block, is_ascii, marker_glyph, next_glyph,
+    pause_glyph, play_glyph, prev_glyph, quality_color, sep_dot, stop_glyph, Theme,
+    ASCII_BORDER_SET,
 };
 
 /// Player bar mode: the 2-row mini bar (current) or the 10-row big rectangle.
@@ -275,6 +276,10 @@ fn render_progress_bar(f: &mut Frame, area: Rect, app: &App) {
 
 /// `SHUF · RPT · CONT · MODE` flags line for row 9. Mirrors
 /// `player_bar::build_flags_line` but local so mini mode stays untouched.
+/// RC18-D4: appends `· SRC {actual}` when the now-playing track's source
+/// differs from `source_mode` (e.g. a YouTube track plays while MODE=local)
+/// so the flags line never contradicts the actual playing source — mirrors
+/// the mini bar's DEF-013 fix.
 fn build_flags_line(app: &App) -> Line<'static> {
     let theme = Theme::default();
     let dim = Style::default().fg(theme.dim);
@@ -296,7 +301,7 @@ fn build_flags_line(app: &App) -> Line<'static> {
         ContinueMode::YouTube => "youtube",
     };
     let mode = app.source_mode.as_str();
-    Line::from(vec![
+    let mut spans: Vec<Span<'static>> = vec![
         Span::styled(format!("SHUF {shuf}"), dim),
         Span::raw(format!(" {sd} ")),
         Span::styled(format!("RPT {rpt}"), dim),
@@ -304,7 +309,26 @@ fn build_flags_line(app: &App) -> Line<'static> {
         Span::styled(format!("CONT {cont}"), dim),
         Span::raw(format!(" {sd} ")),
         Span::styled(format!("MODE {mode}"), dim),
-    ])
+    ];
+    // RC18-D4: SRC badge when the playing source differs from the mode.
+    if let Some(np) = &app.now_playing {
+        let playing_src = if np.is_remote() { "youtube" } else { "local" };
+        if playing_src != mode {
+            let color = if crate::tui::view::theme::no_color() {
+                Color::Reset
+            } else if np.is_remote() {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
+            spans.push(Span::raw(format!(" {sd} ")));
+            spans.push(Span::styled(
+                format!("SRC {playing_src}"),
+                Style::default().fg(color),
+            ));
+        }
+    }
+    Line::from(spans)
 }
 
 /// A 4×4 album-art placeholder grid derived from a deterministic hash of
@@ -491,10 +515,26 @@ pub fn render_big(f: &mut Frame, area: Rect, app: &App) {
             ),
             Span::styled(v.title.clone(), accent.add_modifier(Modifier::BOLD)),
         ]),
-        None => Line::from(Span::styled(
-            format!("{state_glyph} nothing playing {dash}", dash = em_dash()),
-            dim,
-        )),
+        None => {
+            // RC18-D14: when stopped with a saved last-played track, show the
+            // resume hint ("▸ resume: {title} at {M:SS} · R to resume") so the
+            // user knows `R` will resume. Mirrors `player_bar::build_info_line`
+            // / `render_compact` — the mini bar already renders this hint, but
+            // the big bar didn't, so users with `big_pref=true` (persisted)
+            // never saw the offer and `R` looked broken. The hint clears on
+            // the first successful play (note_play_started).
+            if let Some(hint) = app.resume_hint.as_ref() {
+                Line::from(Span::styled(
+                    format!("{} {}", marker_glyph(), hint),
+                    accent.add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(Span::styled(
+                    format!("{state_glyph} nothing playing {dash}", dash = em_dash()),
+                    dim,
+                ))
+            }
+        }
     };
     f.render_widget(Paragraph::new(title_line), rows[0]);
 

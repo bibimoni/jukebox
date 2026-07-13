@@ -1537,6 +1537,14 @@ fn execute_command(app: &mut App, cmd: &str) {
         "gen" => {
             app.open_generator();
         }
+        // RC18-D8: `:gen <description>` — open the generator with the NL
+        // prompt pre-filled (mirrors `:publish <name>`). The user can edit
+        // or press Enter to parse. Falls through to plain `:gen` when the
+        // argument is empty/whitespace.
+        other if other.starts_with("gen ") => {
+            let prompt = other.trim_start_matches("gen ").trim().to_string();
+            app.open_generator_with_prompt(prompt);
+        }
         // `:profile` — show recommendation profile health (DEF-064: wires
         // reco::evaluation into the running app so the user can see their
         // listening-history coverage).

@@ -4375,6 +4375,22 @@ impl App {
         });
     }
 
+    /// RC18-D8: open the generator with the NL input pre-filled (e.g. from
+    /// `:gen chill vibes for focusing`). Mirrors `:publish <name>` which
+    /// pre-fills the publication name. The cursor sits at the end so the
+    /// user can immediately edit/extend the prompt or press Enter to
+    /// parse it. An empty `prompt` falls back to the plain `open_generator`
+    /// behavior (empty input).
+    pub fn open_generator_with_prompt(&mut self, prompt: String) {
+        use crate::tui::view::generator::GeneratorState;
+        let mut state = GeneratorState::new();
+        if !prompt.is_empty() {
+            state.input = prompt;
+            state.cursor = state.input.len();
+        }
+        self.overlay = Some(Overlay::Generator { state });
+    }
+
     /// Generate a playlist from the generator's parsed constraints. Called
     /// when the user presses Enter in the generator input phase. Parses the
     /// NL input into constraints, runs the reco pipeline, and moves to the

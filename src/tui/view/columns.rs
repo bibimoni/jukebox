@@ -1490,14 +1490,23 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
                 ""
             };
             let dash = em_dash();
-            let left = if is_yt {
-                if artist.is_empty() {
-                    format!("{badge}{glyph} {num} {title}")
-                } else {
-                    format!("{badge}{glyph} {num} {title} {dash} {artist} {album}")
-                }
+            // RC18-D6: narrow (non-table) track rows show `Title — Artist`
+            // (falling back to `Title — Album` when the artist is empty) so
+            // the track list matches every other surface (player bar, search,
+            // generator, radio). The old form was `Title — Album` for local
+            // tracks and `Title — Artist Album` for YouTube tracks, which
+            // disagreed with the player bar's `Title — Artist`.
+            let subtitle = if !artist.is_empty() {
+                artist.clone()
+            } else if !album.is_empty() {
+                album.clone()
             } else {
-                format!("{badge}{glyph} {num} {title} {dash} {album}")
+                String::new()
+            };
+            let left = if subtitle.is_empty() {
+                format!("{badge}{glyph} {num} {title}")
+            } else {
+                format!("{badge}{glyph} {num} {title} {dash} {subtitle}")
             };
             let line = {
                 let lw = disp_width(&left);
@@ -1534,6 +1543,10 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
 /// **Issue 4:** Source badge `[Y]` is ONLY shown in Mixed mode (the only time
 /// the source is ambiguous per-row). In YouTube view every row is YT — `[Y]`
 /// is redundant. Badge also stays off on narrow panes (width ≤ 60).
+///
+/// RC18-D6: narrow (non-table) rows show `Title — Artist` (matching every
+/// other surface) instead of `Title — Artist Album`. The album still appears
+/// in the table layout (wide terminals) as its own column.
 pub(crate) fn yt_track_rows(
     app: &App,
     ids: &[String],
@@ -1623,10 +1636,13 @@ pub(crate) fn yt_track_rows(
         } else {
             let badge = if show_badge { "[Y] " } else { "" };
             let dash = em_dash();
+            // RC18-D6: `Title — Artist` (drop the album) so the YouTube track
+            // list matches the player bar / search / generator surfaces. The
+            // album still appears in the table layout as its own column.
             let left = if artist.is_empty() {
                 format!("{badge}{glyph} {num} {title}")
             } else {
-                format!("{badge}{glyph} {num} {title} {dash} {artist} {album}")
+                format!("{badge}{glyph} {num} {title} {dash} {artist}")
             };
             let line = {
                 let lw = disp_width(&left);

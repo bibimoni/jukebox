@@ -111,13 +111,21 @@ fn rendered_cols(app: &mut App, w: u16, h: u16) -> String {
 /// Serializes tests that set/unset JUKEBOX_FONT_MODE.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// Lock the env + reset the font mode cache so the env var the test is
+/// about to set actually takes effect. RC18-D1: the cache is process-stable
+/// in production; tests that mutate `JUKEBOX_FONT_MODE` must reset it.
+fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    jukebox::tui::view::theme::reset_font_mode_cache();
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // ---------------------------------------------------------------------------
 // MOD-1: ASCII mode — discover overlay still uses Unicode
 // ---------------------------------------------------------------------------
 
 #[test]
 fn mod1_discover_overlay_uses_ascii_border_in_ascii_mode() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = lock_env();
     std::env::set_var("JUKEBOX_FONT_MODE", "ascii");
     let (_d, cat) = one_track_cat();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
@@ -155,7 +163,7 @@ fn mod1_discover_overlay_uses_ascii_border_in_ascii_mode() {
 
 #[test]
 fn mod1_discover_overlay_uses_unicode_border_by_default() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = lock_env();
     std::env::set_var("JUKEBOX_FONT_MODE", "unicode");
     let (_d, cat) = one_track_cat();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
@@ -177,7 +185,7 @@ fn mod1_discover_overlay_uses_unicode_border_by_default() {
 
 #[test]
 fn mod1_discover_overlay_ascii_uses_ascii_glyphs() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = lock_env();
     std::env::set_var("JUKEBOX_FONT_MODE", "ascii");
     let (_d, cat) = one_track_cat();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);

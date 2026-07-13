@@ -43,6 +43,8 @@
 //! A [`Theme::high_contrast`] constructor provides a pure black-on-white /
 //! white-on-black palette for users who need maximum contrast.
 
+use std::cell::RefCell;
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 
@@ -51,6 +53,47 @@ use crate::tui::view::icons::{FontMode, Icon};
 /// True when NO_COLOR is set (no-color.org). Colors must not be the only signal.
 pub fn no_color() -> bool {
     std::env::var_os("NO_COLOR").is_some()
+}
+
+// RC18-D1: thread-local cache of the startup font mode. The previous
+// `is_ascii()` path constructed a fresh `Theme::default()` on every call,
+// which in turn called `FontMode::auto_detect()` on every call — reading
+// `JUKEBOX_FONT_MODE` / `TERM` / `TERM_FONT` env vars each time. The result
+// was deterministic for a given env, but the reviewer observed "flaky
+// Unicode/ASCII rendering between launches" because the PTY driver passed
+// `--ascii` for some runs (test 17-ascii) and not others, and any process
+// that mutated the env mid-session could flip the glyph vocabulary. We
+// now read the env ONCE per thread at the first `is_ascii()` call and
+// freeze it for the thread's lifetime, so the glyph vocabulary is stable
+// within a session regardless of later env changes. The TUI event loop
+// is single-threaded, so thread-local == process-stable in production.
+// Tests that mutate `JUKEBOX_FONT_MODE` call [`reset_font_mode_cache`] so
+// the next read on their thread re-reads the env.
+thread_local! {
+    static FONT_MODE: RefCell<Option<FontMode>> = const { RefCell::new(None) };
+}
+
+/// Read the cached startup font mode, initializing it from
+/// `FontMode::auto_detect()` on first call (per thread). Public so callers
+/// that need the raw (uncached) detection can still reach
+/// `FontMode::auto_detect()`.
+pub fn cached_font_mode() -> FontMode {
+    FONT_MODE.with(|cell| {
+        if let Some(m) = *cell.borrow() {
+            return m;
+        }
+        let m = FontMode::auto_detect();
+        *cell.borrow_mut() = Some(m);
+        m
+    })
+}
+
+/// Reset the cached font mode for the calling thread so the next
+/// [`cached_font_mode`] / [`is_ascii`] call re-reads the env vars. Intended
+/// for tests that mutate `JUKEBOX_FONT_MODE` / `TERM` / `TERM_FONT` between
+/// assertions (the cache is thread-stable in production).
+pub fn reset_font_mode_cache() {
+    FONT_MODE.with(|cell| *cell.borrow_mut() = None);
 }
 
 /// True when `JUKEBOX_HIGH_CONTRAST` is set (any value). When set,
@@ -530,8 +573,11 @@ pub const ASCII_BORDER_SET: border::Set = border::Set {
 /// True when the active font mode is ASCII (`JUKEBOX_FONT_MODE=ascii`).
 /// D2: `NO_COLOR` no longer triggers ASCII mode — it only disables colors
 /// (see `theme::no_color`). Use `JUKEBOX_FONT_MODE=ascii` for ASCII glyphs.
+/// RC18-D1: reads the cached startup font mode (see [`FONT_MODE`]) so the
+/// glyph vocabulary is stable for the process lifetime — never flaky
+/// between calls.
 pub fn is_ascii() -> bool {
-    Theme::default().font_mode == FontMode::Ascii
+    cached_font_mode() == FontMode::Ascii
 }
 
 /// The horizontal line character for the current font mode: `─` (Unicode) or

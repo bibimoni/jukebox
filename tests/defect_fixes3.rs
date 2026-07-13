@@ -363,7 +363,7 @@ fn def025_help_lines_unicode_mode_uses_unicode_separator() {
 
 #[test]
 fn def025_help_overlay_renders_ascii_border_in_ascii_mode() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = lock_env();
     std::env::set_var("JUKEBOX_FONT_MODE", "ascii");
     let (_d, cat) = one_track_cat();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
@@ -391,7 +391,7 @@ fn def025_help_overlay_renders_ascii_border_in_ascii_mode() {
 
 #[test]
 fn def025_help_overlay_renders_unicode_border_by_default() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = lock_env();
     std::env::set_var("JUKEBOX_FONT_MODE", "unicode");
     let (_d, cat) = one_track_cat();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
@@ -411,6 +411,10 @@ fn def025_help_overlay_renders_unicode_border_by_default() {
 /// Lock the env var, recovering from a poisoned mutex (a prior test may have
 /// panicked while holding the lock).
 fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    // RC18-D1: reset the process-stable font mode cache so the env var
+    // the test is about to set actually takes effect on the next
+    // `is_ascii()` / `cached_font_mode()` call.
+    jukebox::tui::view::theme::reset_font_mode_cache();
     ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 

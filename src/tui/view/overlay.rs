@@ -1431,9 +1431,24 @@ fn render_home_overlay(f: &mut Frame, area: Rect, state: &home::HomeState) {
 /// history when a session is active, or a "no active session" placeholder.
 /// Resolves the seed id + upcoming pool track ids to display titles via the
 /// catalog + YouTube `track_cache` (DEF-061/DEF-063).
+///
+/// RC18-D7: clear the FULL `area` (not just the popup rect) so the sidebar
+/// and browse columns don't bleed through around the popup. Mirrors the
+/// search/help/discover overlays which already clear the full area.
 fn render_radio_overlay(f: &mut Frame, area: Rect, app: &mut App, session: Option<&RadioSession>) {
     let theme = Theme::default();
     let icons = IconRenderer::auto();
+    // RC18-D7: clear the full area AND paint a dim backdrop so the sidebar
+    // rail + Miller columns don't show through the margins around the
+    // popup. `Clear` alone sets cells to default (space + Reset style) which
+    // ratatui's diff may skip if the previous frame had a coincidental match;
+    // the opaque backdrop makes the cleared cells non-default so the diff
+    // always emits them. Mirrors `render_search`.
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(Color::Black)),
+        area,
+    );
     // DEF-062: a wider popup (70% instead of 60%) reduces the surrounding
     // bleed region so less of the main view shows on the sides. Clear is
     // still called on the popup rect below.
@@ -1472,9 +1487,16 @@ fn render_radio_overlay(f: &mut Frame, area: Rect, app: &mut App, session: Optio
 }
 
 /// The playlist generator overlay (NL input → plan → preview). Centered popup.
+/// RC18-D7: clear the full `area` + paint a dim backdrop so the sidebar
+/// doesn't bleed through (Clear alone may be skipped by the diff).
 fn render_generator_overlay(f: &mut Frame, area: Rect, state: &generator::GeneratorState) {
     let theme = Theme::default();
     let icons = IconRenderer::auto();
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(Color::Black)),
+        area,
+    );
     let popup = centered(area, 60, 70);
     f.render_widget(Clear, popup);
     let block = titled_block(" generator ", &theme);
@@ -1485,9 +1507,16 @@ fn render_generator_overlay(f: &mut Frame, area: Rect, state: &generator::Genera
 }
 
 /// The recommendation explanation overlay. Centered popup.
+/// RC18-D7: clear the full `area` + paint a dim backdrop so the sidebar
+/// doesn't bleed through.
 fn render_explanation_overlay(f: &mut Frame, area: Rect, explanation: &Explanation) {
     let theme = Theme::default();
     let icons = IconRenderer::auto();
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(Color::Black)),
+        area,
+    );
     let popup = centered(area, 60, 50);
     f.render_widget(Clear, popup);
     let block = titled_block(" explanation ", &theme);
@@ -1498,9 +1527,16 @@ fn render_explanation_overlay(f: &mut Frame, area: Rect, explanation: &Explanati
 }
 
 /// The publication confirmation overlay. Centered popup.
+/// RC18-D7: clear the full `area` + paint a dim backdrop so the sidebar
+/// doesn't bleed through.
 fn render_publication_overlay(f: &mut Frame, area: Rect, state: &publication::PublicationState) {
     let theme = Theme::default();
     let icons = IconRenderer::auto();
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(Color::Black)),
+        area,
+    );
     let popup = centered(area, 60, 70);
     f.render_widget(Clear, popup);
     let block = titled_block(" publish ", &theme);
