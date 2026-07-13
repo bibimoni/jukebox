@@ -1628,6 +1628,86 @@ impl App {
         }
     }
 
+    /// Play the focused item from a `HomeState` (used by the in-pane YT Home
+    /// tab, which doesn't use the overlay). Mirrors `play_home_selection` but
+    /// reads from `state` instead of `self.overlay`.
+    pub fn play_home_selection_from(&mut self, state: &crate::tui::view::home::HomeState) {
+        use crate::tui::view::home::HomeItemKind;
+
+        let Some((_, items)) = state.sections.get(state.focused_section).cloned() else {
+            return;
+        };
+        let Some(item) = items.get(state.cursor).cloned() else {
+            return;
+        };
+        match item.kind.clone() {
+            HomeItemKind::Track { id, .. } => {
+                self.play_in_context_ids(vec![id.clone()], &id);
+            }
+            HomeItemKind::Playlist { id, is_local, .. } => {
+                if is_local {
+                    if let Some(pl) = self.playlists.iter().find(|p| p.name == id).cloned() {
+                        if let Some(start) = pl.track_ids.first().cloned() {
+                            self.play_in_context_ids(pl.track_ids, &start);
+                        } else {
+                            self.yt_status = Some("playlist is empty — nothing to play".into());
+                        }
+                    } else {
+                        self.yt_status = Some("playlist not found".into());
+                    }
+                } else if let Some(session) = self.yt_session.as_mut() {
+                    let _ = session.send_get_playlist(id.clone());
+                    self.pending_discover_play = Some(id);
+                    self.yt_status = Some("Loading playlist…".into());
+                } else {
+                    self.yt_status = Some("can't load playlist — no YouTube session".into());
+                }
+            }
+            HomeItemKind::Mix { mix_type } => {
+                if let Some(mix) = self
+                    .reco_mixes
+                    .iter()
+                    .find(|m| m.mix_type == mix_type)
+                    .cloned()
+                {
+                    let ids: Vec<String> = mix.tracks.iter().map(|c| c.track_id.clone()).collect();
+                    if let Some(start) = ids.first().cloned() {
+                        self.play_in_context_ids(ids, &start);
+                    } else {
+                        self.yt_status = Some(format!(
+                            "{} is empty — listen more to build it",
+                            mix_type.label()
+                        ));
+                    }
+                } else {
+                    self.yt_status = Some(format!("{} not generated yet", mix_type.label()));
+                }
+            }
+            HomeItemKind::RadioSeed { .. } => {
+                let seed_id = self
+                    .now_playing
+                    .as_ref()
+                    .map(|ts| ts.id().to_string())
+                    .or_else(|| self.catalog.tracks.first().map(|t| t.id.clone()))
+                    .unwrap_or_default();
+                if seed_id.is_empty() {
+                    self.yt_status = Some("no track to seed radio — play a track first".into());
+                } else {
+                    self.start_radio_from_track(&seed_id);
+                }
+            }
+            HomeItemKind::LikedSongs => {
+                self.yt_status = Some("Liked Songs — sign in to YouTube to view".into());
+            }
+            HomeItemKind::Explore { category } => {
+                self.yt_status = Some(format!("Explore {category} — coming soon"));
+            }
+            HomeItemKind::Subscription { name, .. } => {
+                self.yt_status = Some(format!("{name} — open the YouTube view to browse"));
+            }
+        }
+    }
+
     /// Test helper: play within an explicit id list (for the dead-track test).
     pub fn play_in_context_ids(&mut self, ids: Vec<String>, start: &str) {
         let ctx = Context::Search {

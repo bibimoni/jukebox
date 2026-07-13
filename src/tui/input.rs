@@ -91,6 +91,45 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             app.open_discover();
             return;
         }
+        // Home tab navigation: j/k move cursor within the focused section,
+        // Tab/Shift+Tab switch sections, Enter plays the selected item.
+        // ? opens help (stacked). These only apply when the Home tab is active
+        // and the sections are populated (not the welcome/cold-start screen).
+        if app.yt_view.tab == YtTab::Home && !app.yt_view.home.sections.is_empty() {
+            let section_len = app
+                .yt_view
+                .home
+                .sections
+                .get(app.yt_view.home.focused_section)
+                .map(|(_, items)| items.len())
+                .unwrap_or(0);
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.yt_view.home.cursor_down(section_len.max(1));
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.yt_view.home.cursor_up();
+                    return;
+                }
+                KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    app.yt_view.home.section_prev();
+                    return;
+                }
+                KeyCode::Tab => {
+                    app.yt_view
+                        .home
+                        .section_next(crate::tui::view::home::HomeSection::all().len());
+                    return;
+                }
+                KeyCode::Enter => {
+                    let home = app.yt_view.home.clone();
+                    app.play_home_selection_from(&home);
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
 
     match (key.code, key.modifiers) {
