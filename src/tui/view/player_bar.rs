@@ -1270,4 +1270,60 @@ mod mod_tests {
             );
         }
     }
+
+    /// RC11-DEF-003: the player bar state label must reflect the player's
+    /// `is_playing()` flag. When playing → `[PLAYING]`; after `play_pause`
+    /// (paused) → `[PAUSED]`. The root cause was AfplayPlayer::is_playing()
+    /// ignoring the `paused` flag (fixed in player.rs); this test guards the
+    /// label logic in the bar itself using StubPlayer (which correctly
+    /// toggles `playing`), so a regression in either layer is caught.
+    #[test]
+    fn def003_player_bar_shows_paused_label_when_player_paused() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        // Playing → [PLAYING].
+        let bar = rendered_bar(&app, 100, 2);
+        assert!(
+            bar.contains("[PLAYING]"),
+            "DEF-003: playing track must show [PLAYING]: {bar}"
+        );
+        // Pause → [PAUSED].
+        let _ = app.player.play_pause();
+        let bar = rendered_bar(&app, 100, 2);
+        assert!(
+            bar.contains("[PAUSED]"),
+            "DEF-003: paused track must show [PAUSED] (not [PLAYING]): {bar}"
+        );
+        assert!(
+            !bar.contains("[PLAYING]"),
+            "DEF-003: paused track must NOT show [PLAYING]: {bar}"
+        );
+        // Resume → [PLAYING] again.
+        let _ = app.player.play_pause();
+        let bar = rendered_bar(&app, 100, 2);
+        assert!(
+            bar.contains("[PLAYING]"),
+            "DEF-003: resumed track must show [PLAYING] again: {bar}"
+        );
+    }
+
+    /// RC11-DEF-003: the compact 1-row bar must also reflect the paused
+    /// state (the narrow path has the same label logic).
+    #[test]
+    fn def003_compact_bar_shows_paused_label_when_player_paused() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        let _ = app.player.play_pause();
+        let bar = rendered_compact(&app, 80, 1);
+        assert!(
+            bar.contains("[PAUSED]"),
+            "DEF-003: compact bar must show [PAUSED] when paused: {bar}"
+        );
+        assert!(
+            !bar.contains("[PLAYING]"),
+            "DEF-003: compact bar must NOT show [PLAYING] when paused: {bar}"
+        );
+    }
 }

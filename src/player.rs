@@ -187,12 +187,15 @@ impl Player for AfplayPlayer {
         None
     }
     fn is_playing(&self) -> bool {
-        // `Child::try_wait` needs `&mut`, so the child is wrapped in a RefCell
-        // to allow this read probe through the trait's `&self` signature.
-        self.child
-            .as_ref()
-            .map(|c| c.borrow_mut().try_wait().ok().flatten().is_none())
-            .unwrap_or(false)
+        // RC11-DEF-003: a SIGSTOP-paused afplay child is still "running" from
+        // the kernel's view (`try_wait` returns `Ok(None)`), so the old check
+        // (`try_wait().is_none()`) reported `true` while paused — the player
+        // bar kept showing `[PLAYING]` instead of `[PAUSED]`. Consult the
+        // `paused` flag set by `play_pause` so the label reflects the real
+        // state. `track_ended` still reaps a naturally-exited child via its
+        // own `try_wait` probe (not gated on `is_playing`), so a paused track
+        // is not mistaken for a finished one.
+        self.child.is_some() && !self.paused
     }
     fn track_ended(&mut self) -> bool {
         // afplay exits when the track finishes. If the child is present and
@@ -233,6 +236,11 @@ pub struct MpvPlayer {
     /// stale duration can't bleed into the next track).
     position: Option<f64>,
     duration: Option<f64>,
+    /// RC11-DEF-003: mpv's `pause` property, mirrored locally so
+    /// `is_playing()` can report the paused state without a synchronous IPC
+    /// round-trip. Toggled optimistically in `play_pause` and corrected by the
+    /// `pause` property-change events drained in `track_ended`.
+    paused: bool,
 }
 impl MpvPlayer {
     pub fn spawn(socket: &Path) -> Result<Self> {
@@ -277,6 +285,7 @@ impl MpvPlayer {
                     line_buf: String::new(),
                     position: None,
                     duration: None,
+                    paused: false,
                 };
                 // Subscribe to time-pos + duration so the TUI can render a
                 // progress bar without request/response round-trips. mpv
@@ -284,6 +293,11 @@ impl MpvPlayer {
                 // changes; we parse them in track_ended's read loop.
                 let _ = player.send(&["observe_property".into(), 1.into(), "time-pos".into()]);
                 let _ = player.send(&["observe_property".into(), 2.into(), "duration".into()]);
+                // RC11-DEF-003: observe the `pause` property so `is_playing()`
+                // mirrors mpv's true pause state (correcting the optimistic
+                // toggle in `play_pause` if mpv pauses/unpauses for any other
+                // reason).
+                let _ = player.send(&["observe_property".into(), 3.into(), "pause".into()]);
                 Ok(player)
             }
             None => {
@@ -342,6 +356,10 @@ impl Player for MpvPlayer {
         // new track's.
         self.position = None;
         self.duration = None;
+        // RC11-DEF-003: a fresh load starts playing (mpv `loadfile` un-pauses
+        // by default), so clear the mirrored pause flag so `is_playing()`
+        // reports `[PLAYING]` until a property-change event says otherwise.
+        self.paused = false;
         // mpv's `start` option seeks to a position at playback start, so the
         // new stream begins at `start_secs` directly — no from-0 replay before
         // a `seek` lands (the old load+seek path audibly restarted). It
@@ -357,6 +375,10 @@ impl Player for MpvPlayer {
     }
     fn play_pause(&mut self) -> Result<()> {
         // mpv's `set` expects a boolean for the `pause` property; `cycle` toggles it.
+        // RC11-DEF-003: mirror the toggle locally so `is_playing()` can report
+        // the paused state without waiting for the `pause` property-change
+        // event to arrive (the event corrects this if it disagrees).
+        self.paused = !self.paused;
         self.send(&["cycle".into(), "pause".into()])?;
         Ok(())
     }
@@ -398,7 +420,10 @@ impl Player for MpvPlayer {
         self.duration
     }
     fn is_playing(&self) -> bool {
-        self.child.borrow_mut().try_wait().ok().flatten().is_none()
+        // RC11-DEF-003: the mpv child stays alive while paused (`--idle`), so
+        // `try_wait().is_none()` alone reports `true` when paused. Consult the
+        // mirrored `pause` flag so the player bar shows `[PAUSED]`.
+        self.child.borrow_mut().try_wait().ok().flatten().is_none() && !self.paused
     }
     fn track_ended(&mut self) -> bool {
         use std::io::Read;
@@ -434,6 +459,15 @@ impl Player for MpvPlayer {
                                     }
                                     Some("duration") => {
                                         self.duration = data.and_then(|d| d.as_f64())
+                                    }
+                                    // RC11-DEF-003: mirror mpv's `pause`
+                                    // property so `is_playing()` reflects the
+                                    // real state (corrects the optimistic
+                                    // toggle in `play_pause` and tracks
+                                    // external pause changes).
+                                    Some("pause") => {
+                                        self.paused =
+                                            data.and_then(|d| d.as_bool()).unwrap_or(self.paused)
                                     }
                                     _ => {}
                                 }
@@ -474,5 +508,70 @@ pub fn launch(kind: PlayerKind, socket: &Path) -> Box<dyn Player> {
             Err(_) => Box::new(AfplayPlayer::new()),
         },
         PlayerKind::Afplay => Box::new(AfplayPlayer::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RC11-DEF-003: `AfplayPlayer::is_playing()` must consult `self.paused`,
+    /// not just `try_wait().is_none()`. A SIGSTOP-paused afplay child is still
+    /// running from the kernel's view, so the old check reported `true` while
+    /// paused — the player bar kept showing `[PLAYING]`. With the fix, a
+    /// paused child reports `is_playing() == false`.
+    #[test]
+    fn def003_afplay_is_playing_consults_paused_flag() {
+        let mut p = AfplayPlayer::new();
+        // No child → not playing regardless of `paused`.
+        assert!(!p.is_playing(), "no child: not playing");
+        // Spawn a long-running child (simulates afplay) and pause it.
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        p.child = Some(RefCell::new(child));
+        p.paused = false;
+        assert!(p.is_playing(), "child running + not paused: playing");
+        // SIGSTOP-paused child: still running, but `paused` is true → not playing.
+        p.paused = true;
+        assert!(
+            !p.is_playing(),
+            "DEF-003: paused child must report is_playing() == false so the bar shows [PAUSED]"
+        );
+        // Resume: paused=false → playing again.
+        p.paused = false;
+        assert!(p.is_playing(), "resumed child: playing");
+        // Clean up so the sleep child doesn't outlive the test.
+        p.kill_current();
+    }
+
+    /// RC11-DEF-003: `MpvPlayer::is_playing()` must consult `self.paused`.
+    /// The mpv child stays alive while paused (`--idle`), so `try_wait()`
+    /// alone reports `true` when paused. With the fix, a paused mpv reports
+    /// `is_playing() == false`. Constructs the struct directly (no socket /
+    /// mpv binary needed) since the fields are accessible from the same
+    /// module.
+    #[test]
+    fn def003_mpv_is_playing_consults_paused_flag() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut p = MpvPlayer {
+            child: RefCell::new(child),
+            sock: std::path::PathBuf::from("/tmp/jk-test-mpv-sock-dummy"),
+            conn: None,
+            line_buf: String::new(),
+            position: None,
+            duration: None,
+            paused: false,
+        };
+        assert!(p.is_playing(), "mpv child running + not paused: playing");
+        p.paused = true;
+        assert!(
+            !p.is_playing(),
+            "DEF-003: paused mpv must report is_playing() == false so the bar shows [PAUSED]"
+        );
+        p.paused = false;
+        assert!(p.is_playing(), "resumed mpv: playing");
+        // Reap the sleep child so it doesn't outlive the test.
+        let mut child = p.child.borrow_mut();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
