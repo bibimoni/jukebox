@@ -743,12 +743,22 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Char('G') => scroll = u16::MAX,
                 // RC11-DEF-009: pass `>` / `<` through to global playback while
                 // the lyrics overlay is open, then re-fetch lyrics for the new
-                // track. Keep the overlay open (request_lyrics updates it to
-                // Loading with the new track_id). Return early so the trailing
-                // overlay re-set below doesn't clobber the new Loading state.
+                // track. Keep the overlay open. `handle_overlay_key` takes the
+                // overlay (line 247), so we must re-set it before calling
+                // `request_lyrics` — otherwise `request_lyrics` sees
+                // `self.overlay == None` and never updates it. Return early so
+                // the trailing overlay re-set below doesn't clobber the new
+                // state.
                 KeyCode::Char('>') => {
                     app.next();
                     if let Some(np) = app.now_playing.clone() {
+                        app.overlay = Some(Overlay::Lyrics {
+                            content,
+                            state,
+                            scroll,
+                            track_id,
+                            gen,
+                        });
                         app.request_lyrics(np.id());
                     } else {
                         app.overlay = None;
@@ -758,6 +768,13 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Char('<') => {
                     app.prev();
                     if let Some(np) = app.now_playing.clone() {
+                        app.overlay = Some(Overlay::Lyrics {
+                            content,
+                            state,
+                            scroll,
+                            track_id,
+                            gen,
+                        });
                         app.request_lyrics(np.id());
                     } else {
                         app.overlay = None;

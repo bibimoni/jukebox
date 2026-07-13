@@ -76,8 +76,9 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
             content,
             state,
             scroll,
+            track_id,
             ..
-        } => render_lyrics_overlay(f, area, app, content.as_ref(), &state, scroll),
+        } => render_lyrics_overlay(f, area, app, content.as_ref(), &state, scroll, &track_id),
         Overlay::Diagnostics => {
             crate::tui::view::diagnostics::render(f, area, &app.diagnostics);
         }
@@ -935,6 +936,7 @@ fn render_lyrics_overlay(
     content: Option<&crate::lyrics::Lyrics>,
     state: &crate::tui::app::LyricsState,
     scroll: u16,
+    track_id: &str,
 ) {
     use crate::tui::app::LyricsState;
     use ratatui::widgets::{Block, Borders, Padding, Paragraph, Scrollbar, ScrollbarOrientation};
@@ -1037,11 +1039,17 @@ fn render_lyrics_overlay(
             v
         }
         LyricsState::NotFound => {
+            // RC11-DEF-046: local tracks have no YouTube video_id, so the
+            // sidecar can't fetch lyrics for them. Explain that instead of
+            // the generic "No lyrics found" which implies a retry might help.
+            let is_local = app.track_by_id_fast(track_id).is_some();
+            let main_msg = if is_local {
+                "Lyrics are searched on YouTube; local tracks without a YouTube match have no lyrics."
+            } else {
+                "No lyrics found for this track."
+            };
             vec![
-                Line::from(Span::styled(
-                    "No lyrics found for this track.",
-                    Style::default().fg(theme.text),
-                )),
+                Line::from(Span::styled(main_msg, Style::default().fg(theme.text))),
                 Line::from(""),
                 Line::from(Span::styled(
                     format!("R retry lyrics for this track  {sd}  L or Esc close"),
