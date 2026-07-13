@@ -25,4 +25,4 @@ expression: s
     ┗━━━━━━━━━━━━━━━━━━━━━━┛└──────────────────────────────────────────────────────────────────────────────────────────┘
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 [STOPPED] ■ — nothing playing —  --:-- / --:--  ▸ Enter to play  --  MODE local · YT~ · CONT off · SHUF off · RPT off
-VIEW: youtube · SOURCE: local · [stale] YT: offline — showing cached (press R to retry)
+VIEW: youtube · SOURCE: local [Y err] · [stale] YT: offline — showing cached (press R to retry)

@@ -25,4 +25,4 @@ expression: s
     ┗━━━━━━━━━━━━━━━━━━━━━━┛└──────────────────────────────────────────────────────────────────────────────────────────┘
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 [STOPPED] ■ — nothing playing —  --:-- / --:--  ▸ Enter to play  --  MODE local · YT… · CONT off · SHUF off · RPT off
-VIEW: youtube · SOURCE: local · [!] YT: signed out — run :yt auth to reconnect
+VIEW: youtube · SOURCE: local [Y —] · [!] YT: signed out — run :yt auth to reconnect

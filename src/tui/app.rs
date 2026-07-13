@@ -1850,6 +1850,15 @@ impl App {
             Ok(msg) => {
                 self.yt_python = crate::yt::session::venv_python();
                 self.yt_status = Some(msg);
+                // RC11-DEF-017: surface the full install-log path via the
+                // diagnostics overlay so the user can find the log without
+                // the footer truncating the path. The footer shows the
+                // prominent "YT setup OK · venv: …" confirmation; the log
+                // path goes to `:diag` (which has room for the full text).
+                self.diagnostics.push(format!(
+                    "YT setup complete · log: {}",
+                    crate::yt::session::setup_log_path().display()
+                ));
                 // Respawn the sidecar against the new venv python, preserving
                 // any browser/pasted auth.
                 if let Some(session) = self.yt_session.as_mut() {
@@ -2739,6 +2748,13 @@ impl App {
     /// the Keychain. This is the fix for the "repeated login" root cause: the
     /// user presses R instead of re-authenticating.
     pub fn retry_yt_probe(&mut self) {
+        // RC11-DEF-018: always clear the visible error on `R`, even when no
+        // retry is performed. A command error (e.g. `:yt foobar`) sets
+        // `yt_error` while `yt_state` stays `Ready` (which is not retryable),
+        // so the early returns below would leave the `[ERR]` lingering. The
+        // user pressed `R` expecting feedback to clear; leaving the error
+        // visible would be misleading.
+        self.yt_error = None;
         let Some(session) = self.yt_session.as_mut() else {
             // No session — nothing to retry. The footer's state hint tells the
             // user to auth (`:yt auth browser`), not to press R.
@@ -2749,11 +2765,10 @@ impl App {
             // (already healthy) or Unconfigured/SignedOut (need auth, not retry).
             return;
         }
-        // Immediate visual feedback: clear the old error, transition to
-        // Synchronizing. The footer renders "synchronizing…" on the next frame
-        // (within ~150ms — the poll timeout), so the user sees the retry is
-        // in progress without waiting for the sidecar roundtrip.
-        self.yt_error = None;
+        // Immediate visual feedback: transition to Synchronizing. The footer
+        // renders "synchronizing…" on the next frame (within ~150ms — the poll
+        // timeout), so the user sees the retry is in progress without waiting
+        // for the sidecar roundtrip.
         self.yt_state = crate::yt::state::YtState::Synchronizing;
         // Fire-and-forget: send_refresh queues LibraryPlaylists + HomeSuggestions.
         // on_tick drains the responses and:
@@ -3217,10 +3232,21 @@ impl App {
             return;
         };
         self.yt_error = None;
-        self.yt_lists_loading = true;
-        // Transition to Synchronizing — a data fetch is in flight. on_tick will
-        // promote to Ready when playlists land, or ProviderError on error.
-        self.yt_state = crate::yt::state::YtState::Synchronizing;
+        // RC11-DEF-055: when the Y view already has cached lists (re-entry
+        // via `4`), skip the `[~]` flash — keep `yt_state` at its current
+        // value (Ready / ReadyStale) and don't set `yt_lists_loading`. The
+        // background `send_refresh` still fires so the lists stay fresh, but
+        // the user sees `[ok]` (or `[stale]`) immediately instead of a
+        // meaningless `[~]` on every re-entry. Only the first entry (empty
+        // `yt_lists`) goes through the full loading → ready cycle.
+        let already_loaded = !self.yt_lists.is_empty();
+        if !already_loaded {
+            self.yt_lists_loading = true;
+            // Transition to Synchronizing — a data fetch is in flight. on_tick
+            // will promote to Ready when playlists land, or ProviderError on
+            // error.
+            self.yt_state = crate::yt::state::YtState::Synchronizing;
+        }
         if let Err(e) = session.send_refresh() {
             self.yt_lists_loading = false;
             self.yt_error = Some(format!("refresh: {e}"));

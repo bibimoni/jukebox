@@ -177,15 +177,18 @@ pub fn run_setup(requirements: &std::path::Path) -> Result<String> {
             log_path.display()
         );
     }
-    Ok(format!(
-        "installed YT deps into {} (log: {})",
-        dir.display(),
-        log_path.display()
-    ))
+    // RC11-DEF-017: compact, prominent confirmation that fits a 100-col
+    // footer. The full install log path is surfaced via `:diag` by
+    // `App::yt_setup` (calling `setup_log_path()`), so it doesn't need to
+    // share the single-line footer with the venv path.
+    Ok(format!("YT setup OK · venv: {}", dir.display()))
 }
 
 /// Where `:yt setup` writes venv/pip output so it doesn't hit the terminal.
-fn setup_log_path() -> std::path::PathBuf {
+/// Public so `App::yt_setup` can surface the path via the diagnostics overlay
+/// (RC11-DEF-017): the footer only shows the venv path, the log path goes in
+/// `:diag` so a long home directory doesn't truncate the status message.
+pub fn setup_log_path() -> std::path::PathBuf {
     let cache = dirs::cache_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
     cache.join("jukebox").join("yt-setup.log")
 }

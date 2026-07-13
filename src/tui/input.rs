@@ -729,6 +729,29 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 }
                 KeyCode::Char('g') => scroll = 0,
                 KeyCode::Char('G') => scroll = u16::MAX,
+                // RC11-DEF-009: pass `>` / `<` through to global playback while
+                // the lyrics overlay is open, then re-fetch lyrics for the new
+                // track. Keep the overlay open (request_lyrics updates it to
+                // Loading with the new track_id). Return early so the trailing
+                // overlay re-set below doesn't clobber the new Loading state.
+                KeyCode::Char('>') => {
+                    app.next();
+                    if let Some(np) = app.now_playing.clone() {
+                        app.request_lyrics(np.id());
+                    } else {
+                        app.overlay = None;
+                    }
+                    return;
+                }
+                KeyCode::Char('<') => {
+                    app.prev();
+                    if let Some(np) = app.now_playing.clone() {
+                        app.request_lyrics(np.id());
+                    } else {
+                        app.overlay = None;
+                    }
+                    return;
+                }
                 KeyCode::Char('L') => {
                     app.overlay = None;
                     return;
@@ -1437,6 +1460,14 @@ fn execute_command(app: &mut App, cmd: &str) {
                         .into(),
                 );
             } else {
+                // RC11-DEF-019: immediate feedback before the (possibly slow)
+                // sidecar spawn + Keychain read. `apply_yt_browser` overwrites
+                // `yt_status` only on the auto-setup path; in the common case
+                // (venv already exists) this message stays visible until the
+                // first sidecar response lands (or the 5s TTL clears it).
+                app.yt_error = None;
+                app.yt_status = Some(format!("Opening {browser} — waiting for token…"));
+                app.yt_state = crate::yt::state::YtState::Authenticating;
                 app.apply_yt_browser(browser);
             }
         }

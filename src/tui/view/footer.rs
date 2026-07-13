@@ -103,13 +103,14 @@ fn mode_badge(app: &App, theme: &Theme) -> Span<'static> {
     )
 }
 
-/// The status line (footer row 1): mode badge + YT provider status from
-/// `yt_state`, or just the mode badge when Ready. YT status is suppressed in
-/// pure Local mode (non-YouTube view) so unrelated provider errors don't
-/// alarm the user — only the mode badge is shown.
+/// The status line (footer row 1): mode badge + compact YT indicator (always
+/// visible — RC11-DEF-020) + YT provider status from `yt_state`. YT status is
+/// suppressed in pure Local mode (non-YouTube view) so unrelated provider
+/// errors don't alarm the user — only the compact `[Y …]` badge is shown.
 fn status_line(app: &App, theme: &Theme) -> Line<'static> {
     use crate::yt::state::YtState;
     let badge = mode_badge(app, theme);
+    let yt_badge = compact_yt_badge(app, theme);
 
     // Suppress YT status when in Local mode and not viewing the YT library.
     let yt_relevant = {
@@ -118,29 +119,46 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
         app.source_mode != SourceMode::Local || app.view == View::Youtube
     };
     if !yt_relevant {
-        return Line::from(badge);
+        // RC11-DEF-020: still show the compact YT indicator so the user can
+        // see at a glance whether YT is connected without switching views.
+        return Line::from(vec![badge, Span::raw(" "), yt_badge]);
+    }
+
+    // Prominent transient message (yt_status) — shown regardless of yt_state
+    // so feedback like "Opening chrome — waiting for token…" (RC11-DEF-019)
+    // or "YT setup OK · venv: …" (RC11-DEF-017) reaches the user even when the
+    // state is not Ready (e.g. Authenticating, AuthenticatedNotSynced, Failed).
+    // Truncated to fit the footer so long paths get a clean `…` instead of a
+    // mid-word cut (RC11-DEF-017).
+    if let Some(msg) = &app.yt_status {
+        let color = if no_color() {
+            Color::Reset
+        } else {
+            theme.accent
+        };
+        let budget = footer_msg_budget(app, msg);
+        let m = truncate_footer_msg(msg, budget);
+        return Line::from(vec![
+            badge,
+            Span::raw(" "),
+            yt_badge,
+            Span::raw(format!(" {} ", sep_dot())),
+            Span::styled(m, Style::default().fg(color)),
+        ]);
     }
 
     if app.yt_state == YtState::Ready {
-        if let Some(msg) = &app.yt_status {
-            let color = if no_color() {
-                Color::Reset
-            } else {
-                theme.accent
-            };
-            return Line::from(vec![
-                badge,
-                Span::raw(format!(" {} ", sep_dot())),
-                Span::styled(msg.clone(), Style::default().fg(color)),
-            ]);
-        }
         // DEF-003: show yt_error when Ready (e.g., "Unknown command: foobar").
         if let Some(err) = &app.yt_error {
             let err_style = theme.error_style();
+            let budget = footer_msg_budget(app, err);
+            let m = truncate_footer_msg(err, budget);
             return Line::from(vec![
                 badge,
+                Span::raw(" "),
+                yt_badge,
                 Span::raw(format!(" {} ", sep_dot())),
-                Span::styled(format!("[ERR] {err}"), err_style),
+                Span::styled(format!("[ERR] {m}"), err_style),
             ]);
         }
         // Ready + no transient: "✓ YT connected" alongside the mode badge.
@@ -151,6 +169,8 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
         };
         return Line::from(vec![
             badge,
+            Span::raw(" "),
+            yt_badge,
             Span::raw(format!(" {} ", sep_dot())),
             Span::styled("[ok] YT connected", Style::default().fg(color)),
         ]);
@@ -187,9 +207,66 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
     // error is captured in the diagnostics overlay (press `D`).
     Line::from(vec![
         badge,
+        Span::raw(" "),
+        yt_badge,
         Span::raw(format!(" {} ", sep_dot())),
         Span::styled(yt_label, style),
     ])
+}
+
+/// Compact, persistent YT state indicator (RC11-DEF-020): always visible in
+/// the footer next to the mode badge, in ALL views at ALL terminal sizes.
+/// 4-glyph vocabulary so it's glanceable on a single line:
+/// - `[Y ok]`  — Ready
+/// - `[Y ~]`   — transient (Authenticating / AuthenticatedNotSynced /
+///   Synchronizing)
+/// - `[Y err]` — error (ProviderError / AuthExpired / RateLimited / Failed /
+///   ReadyStale)
+/// - `[Y —]`   — not connected (Unconfigured / SignedOut)
+///
+/// Color follows severity (Green / Dim / Red / Dim). Under NO_COLOR all
+/// colors collapse to Reset — the text labels distinguish states without
+/// color.
+fn compact_yt_badge(app: &App, theme: &Theme) -> Span<'static> {
+    use crate::yt::state::YtState;
+    let txt = match app.yt_state {
+        YtState::Ready => "[Y ok]",
+        YtState::Authenticating | YtState::AuthenticatedNotSynced | YtState::Synchronizing => {
+            "[Y ~]"
+        }
+        YtState::ReadyStale
+        | YtState::ProviderError
+        | YtState::AuthExpired
+        | YtState::RateLimited
+        | YtState::Failed => "[Y err]",
+        YtState::Unconfigured | YtState::SignedOut => "[Y —]",
+    };
+    let color = if no_color() {
+        Color::Reset
+    } else {
+        match app.yt_state {
+            YtState::Ready => Color::Green,
+            YtState::ReadyStale
+            | YtState::ProviderError
+            | YtState::AuthExpired
+            | YtState::RateLimited
+            | YtState::Failed => Color::Red,
+            _ => theme.dim,
+        }
+    };
+    Span::styled(txt.to_string(), Style::default().fg(color))
+}
+
+/// Budget (in display columns) for a footer status/error message, after
+/// reserving space for the mode badge, the compact YT badge, the separators,
+/// and a small margin. Used so long `yt_status` / `yt_error` strings get a
+/// clean `…` truncation instead of a mid-word cut at the terminal width
+/// (RC11-DEF-017). Sized for the 100-col standard test terminal: the mode
+/// badge (~28 chars) + YT badge (~7) + separators (~6) + margin (~2) leave 57
+/// chars for the message — enough for typical venv paths on macOS/Linux. At
+/// wider terminals the unused space is harmless (no truncation needed).
+fn footer_msg_budget(_app: &App, _msg: &str) -> usize {
+    57
 }
 
 /// Build the footer line: a YT provider status (from `yt_state`) when the
@@ -209,24 +286,32 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
 /// communicate, and the player bar already shows the MODE label).
 pub fn footer_line(app: &App, theme: &Theme, dim: &Style, width: u16) -> Line<'static> {
     use crate::yt::state::YtState;
+    // A transient yt_status (e.g. "Opening chrome — waiting for token…",
+    // "YT setup OK · venv: …") is now shown by `status_line` regardless of
+    // state (RC11-DEF-019 / RC11-DEF-017), so delegate to it whenever one is
+    // set instead of falling through to the hint bar.
+    if app.yt_status.is_some() {
+        return status_line(app, theme);
+    }
     // Ready + no transient: check yt_error first (DEF-003: unknown commands
     // set yt_error while yt_state stays Ready — the old footer only showed
     // yt_status/yt_state, never yt_error, so the user got no feedback).
-    if app.yt_state == YtState::Ready && app.yt_status.is_none() {
-        if let Some(err) = &app.yt_error {
-            let badge = mode_badge(app, theme);
-            let err_style = theme.error_style();
-            let msg = truncate_footer_msg(err, width.saturating_sub(20) as usize);
-            return Line::from(vec![
-                badge,
-                Span::raw(format!(" {} ", sep_dot())),
-                Span::styled(format!("[ERR] {msg}"), err_style),
-            ]);
+    if app.yt_state == YtState::Ready {
+        if app.yt_error.is_some() {
+            return status_line(app, theme);
         }
-        return hint_line(app, dim, width);
+        // Ready + no transient + no error: hint line, prefixed with the
+        // compact YT indicator so it stays visible in the 1-row footer too
+        // (RC11-DEF-020 — the badge must be visible in ALL views at ALL
+        // terminal sizes, including the narrow 1-row footer).
+        let badge = mode_badge(app, theme);
+        let yt_badge = compact_yt_badge(app, theme);
+        let hint = hint_line(app, dim, width);
+        let mut spans = vec![badge, Span::raw(" "), yt_badge, Span::raw("  ")];
+        spans.extend(hint.spans);
+        return Line::from(spans);
     }
-    // Non-Ready or Ready+msg: mirror status_line so the 1-row footer shows
-    // the same VIEW/PLAYBACK separation as the 2-row footer (Issue 2).
+    // Non-Ready + no yt_status: state label (with the compact YT badge).
     status_line(app, theme)
 }
 

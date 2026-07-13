@@ -341,11 +341,15 @@ fn refresh_yt_lists_releases_playlist_inflight_so_a_refocus_can_refetch() {
         "playlist_inflight must clear on a successful get_playlist"
     );
     // Simulate a re-focus (Tab away and back, or re-entering Y view): refresh
-    // replaces the lists + clears loaded_yt_lists.
+    // replaces the lists + clears loaded_yt_lists. RC11-DEF-055: a re-entry
+    // with already-loaded lists no longer sets `yt_lists_loading` (silent
+    // background refresh), so wait for the refresh response to land by
+    // watching `yt_lists[0].track_ids` go from non-empty → empty (the
+    // refreshed YtList starts with empty track_ids until on_tick re-fetches).
     app.refresh_yt_lists();
     for _ in 0..100 {
         app.on_tick();
-        if !app.yt_lists.is_empty() && !app.yt_lists_loading {
+        if !app.yt_lists.is_empty() && app.yt_lists[0].track_ids.is_empty() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));

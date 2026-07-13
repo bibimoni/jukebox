@@ -535,7 +535,7 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         .get(app.cursors.playlist)
         .map(|l| l.track_ids.clone())
         .unwrap_or_default();
-    let body = yt_status_line(app, ids.is_empty());
+    let body = yt_status_line(app, app.yt_lists.is_empty(), ids.is_empty());
     if ids.is_empty() {
         // Error states (ProviderError / AuthExpired / RateLimited / Failed)
         // with no tracks to show get a compact error card: icon + headline +
@@ -599,10 +599,12 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
 }
 
 /// The Y-view col2 status line, derived from the truthful `yt_state` machine.
-/// Each state gets a distinct, actionable message. `ids_empty` distinguishes
+/// Each state gets a distinct, actionable message. `lists_empty` distinguishes
+/// "no playlists in the account" (RC11-DEF-054: show a distinct empty-account
+/// CTA) from "lists present but none selected" — and `ids_empty` distinguishes
 /// "no list selected" (select a list) from "list selected but empty" (the
 /// fetch returned, just empty). Exposed for unit testing.
-fn yt_status_line(app: &App, ids_empty: bool) -> String {
+fn yt_status_line(app: &App, lists_empty: bool, ids_empty: bool) -> String {
     use crate::yt::state::YtState;
     // An error detail takes precedence over the generic state label so a
     // specific failure (e.g. "retry failed: …") is visible in the Y view too.
@@ -632,7 +634,12 @@ fn yt_status_line(app: &App, ids_empty: bool) -> String {
             }
         }
         YtState::Ready => {
-            if ids_empty {
+            if lists_empty {
+                // RC11-DEF-054: when the account has 0 playlists, show a
+                // distinct CTA instead of the generic "select a list" hint
+                // (which is misleading when there's nothing to select).
+                "No playlists in this account".to_string()
+            } else if ids_empty {
                 "select a list to load its tracks".to_string()
             } else {
                 String::new()
