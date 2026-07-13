@@ -76,6 +76,7 @@ pub fn save_yt_lists_at(path: &std::path::Path, lists: &[YtList]) -> Result<()> 
             kind: match l.kind {
                 crate::tui::app::YtListKind::Account => "account",
                 crate::tui::app::YtListKind::Suggested => "suggested",
+                crate::tui::app::YtListKind::Generated => "generated",
             }
             .to_string(),
             track_ids: l.track_ids.clone(),
@@ -116,6 +117,7 @@ pub fn load_yt_lists_at(path: &std::path::Path) -> Result<Vec<YtList>> {
                     name: c.name,
                     kind: match c.kind.as_str() {
                         "suggested" => crate::tui::app::YtListKind::Suggested,
+                        "generated" => crate::tui::app::YtListKind::Generated,
                         _ => crate::tui::app::YtListKind::Account,
                     },
                     track_ids: c.track_ids,

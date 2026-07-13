@@ -504,11 +504,18 @@ fn render_search(
                     dim,
                 ))
             } else if submitted.as_deref() == Some(input) && !results.is_empty() {
+                // RC11-DEF-059: show the result count so the user knows how
+                // many matches the search returned (a fixture-bound sidecar
+                // may return a single result; the count makes that visible
+                // rather than looking like a truncated list).
                 Line::from(Span::styled(
                     format!(
-                        "{}{} select   {}   Enter plays   {}   Tab {} local",
+                        "{}{} select   {}   {} result{}   {}   Enter plays   {}   Tab {} local",
                         up_arrow(),
                         down_arrow(),
+                        sep_dot(),
+                        results.len(),
+                        if results.len() == 1 { "" } else { "s" },
                         sep_dot(),
                         sep_dot(),
                         right_arrow()
@@ -530,9 +537,20 @@ fn render_search(
     f.render_widget(status, rows[1]);
 
     // Results list.
+    // RC11-DEF-052: prefix each result with a source badge ([L] local,
+    // [Y] YouTube) so the user knows where each result comes from. A local
+    // catalog track (id in `app.track_index`) → [L]; anything else (a
+    // YouTube video id resolved from `track_cache`) → [Y].
     let items: Vec<ListItem> = results
         .iter()
-        .map(|id| ListItem::new(track_label(app, id)))
+        .map(|id| {
+            let badge = if app.track_index.contains_key(id) {
+                "[L]"
+            } else {
+                "[Y]"
+            };
+            ListItem::new(format!("{badge} {}", track_label(app, id)))
+        })
         .collect();
     let mut state = ListState::default();
     state.select(Some(cursor));
@@ -770,11 +788,25 @@ fn render_playlist_picker(f: &mut Frame, area: Rect, app: &App, track_id: &str, 
     let popup = centered(area, 50, 50);
     f.render_widget(Clear, popup);
 
-    let title = format!(
-        " add \"{}\" to playlist {} Enter confirm ",
-        track_label(app, track_id),
-        sep_dot()
-    );
+    // RC11-DEF-040: truncate the track label with ellipsis so the title
+    // "add \"<track>\" to playlist · Enter confirm" fits the popup width
+    // instead of being cut off mid-track-name. The suffix ("to playlist ·
+    // Enter confirm") is reserved first; the track name gets the remaining
+    // budget.
+    let suffix = " to playlist · Enter confirm ";
+    let suffix_w = crate::tui::view::theme::disp_width(suffix);
+    // ` add "` prefix + track label + `"` + suffix + leading/trailing space.
+    let prefix_w: usize = 6; // ` add "` + `"`
+    let budget = popup.width.saturating_sub((suffix_w + prefix_w + 2) as u16) as usize; // +2 borders
+    let label = track_label(app, track_id);
+    let truncated = if crate::tui::view::theme::disp_width(&label) > budget {
+        let mut t = crate::tui::view::theme::clip_to_width(&label, budget.saturating_sub(1));
+        t.push('\u{2026}'); // …
+        t
+    } else {
+        label
+    };
+    let title = format!(" add \"{truncated}\"{suffix}");
     let block = if is_ascii() {
         Block::default()
             .borders(Borders::ALL)

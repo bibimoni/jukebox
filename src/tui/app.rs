@@ -42,6 +42,12 @@ pub enum YtListKind {
     #[default]
     Account,
     Suggested,
+    /// RC11-DEF-030: a generated mix (Daily Mix, Discover Mix, ...). Displayed
+    /// with a ◆ glyph to distinguish it from account (♫) and suggested (✦)
+    /// playlists. Not yet populated by `refresh_yt_lists` (the mixes live in
+    /// `reco_mixes` / the Home + Discover overlays); the variant exists so
+    /// future wiring (Batch I tab system) can surface mixes in the YT view.
+    Generated,
 }
 
 /// A user-defined playlist: name + ordered track ids.
@@ -4270,17 +4276,37 @@ impl App {
 
     /// Apply a feedback action to the user profile. Looks up the track's
     /// artist from the catalog for artist-scoped actions (HideArtist,
-    /// BlockArtist).
+    /// BlockArtist). Records the corresponding [`ListenEvent`] in
+    /// `reco_events` so a later profile rebuild (e.g. from `record_listen_event`
+    /// during playback) preserves the feedback — without this, the direct
+    /// profile mutation would be wiped when the profile is rebuilt from the
+    /// event log (DEF-034 regression).
     pub fn apply_reco_feedback(
         &mut self,
         action: crate::reco::feedback::FeedbackAction,
         track_id: &str,
     ) {
-        use crate::reco::feedback::apply_feedback;
         // Look up the artist from the catalog first (immutable borrow ends
         // before the mutable borrow of reco_profile).
         let artist = self.track_by_id(track_id).map(|t| t.primary_artist.clone());
-        apply_feedback(&action, track_id, artist.as_deref(), &mut self.reco_profile);
+        let event = action.to_event(track_id, artist.as_deref());
+        // Record the event so the profile rebuild stays consistent.
+        if self.persist_events {
+            let _ = crate::state::save_event(&event);
+        }
+        self.reco_events.record(event);
+        // Rebuild the profile from the full event log so the feedback is
+        // reflected AND preserved across later rebuilds (e.g. when
+        // `record_listen_event` fires during playback). Without recording
+        // the event, a direct profile mutation would be wiped on the next
+        // rebuild (DEF-034 regression).
+        let events: Vec<crate::reco::events::ListenEvent> = self
+            .reco_events
+            .recent(self.reco_events.len())
+            .into_iter()
+            .cloned()
+            .collect();
+        self.reco_profile = crate::reco::profile::UserProfile::build_from_events(&events);
     }
 
     /// If a [`Overlay::Radio`] session is active, return the next track id

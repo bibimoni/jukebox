@@ -734,12 +734,11 @@ fn radio_artist_command_starts_radio() {
 /// Home overlay: j moves the cursor down.
 #[test]
 fn home_overlay_j_moves_cursor_down() {
-    use jukebox::tui::view::home::HomeState;
     let (_d, cat) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
-    app.overlay = Some(Overlay::Home {
-        state: HomeState::new(),
-    });
+    // RC11-DEF-001: open_home populates sections so j is bounded by the
+    // focused section's item count (was cursor_down(usize::MAX) — unbounded).
+    app.open_home();
     handle_key(&mut app, key('j'));
     match &app.overlay {
         Some(Overlay::Home { state }) => {
@@ -1059,7 +1058,10 @@ fn tab_completes_gen_command() {
 // as None. The fix uses the session directly from the destructured overlay.)
 // ---------------------------------------------------------------------------
 
-/// `n` in the Radio overlay should start playback of the next radio track.
+/// `n` in the Radio overlay should advance to the next radio track.
+/// (DEF-056: `start_radio_from_track` now auto-starts the first track, so
+/// `now_playing` is already Some before `n` is pressed; `n` advances to the
+/// next track.)
 #[test]
 fn radio_overlay_n_key_starts_playback() {
     let (_d, cat) = cat_album();
@@ -1067,14 +1069,30 @@ fn radio_overlay_n_key_starts_playback() {
     focus_track_col(&mut app);
     app.start_radio_from_track("t1");
     assert!(matches!(app.overlay, Some(Overlay::Radio { .. })));
-    // Nothing is playing yet — the radio session is created but no track
-    // has been played.
-    assert!(app.now_playing.is_none());
-    // Press 'n' — should advance to the next radio track and start playing.
+    // DEF-056: the radio auto-starts, so a track is already playing.
+    assert!(
+        app.now_playing.is_some(),
+        "start_radio_from_track should auto-start playback"
+    );
+    let first_id = app
+        .now_playing
+        .as_ref()
+        .map(|s| s.id().to_string())
+        .expect("a track should be playing after auto-start");
+    // Press 'n' — should advance to the next radio track.
     handle_key(&mut app, key('n'));
     assert!(
         app.now_playing.is_some(),
-        "pressing 'n' in Radio overlay must start playback"
+        "pressing 'n' in Radio overlay must keep playback going"
+    );
+    let next_id = app
+        .now_playing
+        .as_ref()
+        .map(|s| s.id().to_string())
+        .expect("a track should be playing after 'n'");
+    assert_ne!(
+        next_id, first_id,
+        "'n' should advance to a different radio track"
     );
     // The overlay must still be open.
     assert!(matches!(app.overlay, Some(Overlay::Radio { .. })));
@@ -1088,13 +1106,12 @@ fn radio_overlay_minus_key_feedback_and_advance() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     focus_track_col(&mut app);
     app.start_radio_from_track("t1");
-    // Start playback first.
-    handle_key(&mut app, key('n'));
+    // DEF-056: auto-start already plays the first radio track.
     let first_id = app
         .now_playing
         .as_ref()
         .map(|s| s.id().to_string())
-        .expect("a track should be playing after 'n'");
+        .expect("a track should be playing after auto-start");
     // Press '-' — should hide the current track and advance.
     handle_key(&mut app, key('-'));
     assert!(
