@@ -1096,18 +1096,32 @@ impl App {
     /// Resolve an opaque id to a playable source under the active mode:
     /// - Local: catalog track → local file; unknown id → None.
     /// - YouTube: sidecar `resolve_url` → stream URL + fmt; no session/error
-    ///   → None (degrade to dead).
+    ///   → None (degrade to dead). RC13-DEF-1: a local catalog id played in
+    ///   YouTube mode (e.g. a generated mix's tracks) that the sidecar can't
+    ///   resolve as a real video id falls back to local playback instead of
+    ///   hanging in a Pending cold-miss that never succeeds — the user
+    ///   explicitly selected the track, so it should play.
     /// - Mixed: catalog track present → local; else remote stream.
     fn resolve_source(&mut self, id: &str) -> Option<Resolved> {
         // Local catalog match first (Local + Mixed both prefer it when present).
-        if let Some(t) = self.track_by_id(id) {
+        // Capture the track's local-source data up front so YouTube mode can
+        // use it as a fallback without holding an immutable borrow across the
+        // mutable session borrow (RC13-DEF-1).
+        let local_track_data = self.track_by_id(id).map(|t| {
+            (
+                t.resolve_source(&self.catalog.source_root),
+                t.sample_rate_hz,
+                t.bit_depth,
+            )
+        });
+        if let Some((path, sample_rate_hz, bit_depth)) = &local_track_data {
             // In YouTube mode, catalog tracks are never played locally — only
             // streamed. So only take the local path in Local/Mixed.
             if self.source_mode != crate::mode::SourceMode::Youtube {
                 return Some(Resolved::Local {
-                    path: t.resolve_source(&self.catalog.source_root),
-                    sample_rate_hz: t.sample_rate_hz,
-                    bit_depth: t.bit_depth,
+                    path: path.clone(),
+                    sample_rate_hz: *sample_rate_hz,
+                    bit_depth: *bit_depth,
                 });
             }
         }
@@ -1119,7 +1133,24 @@ impl App {
         //     swaps up to 256k once the premium URL lands. This is fully
         //     non-blocking — the old track keeps playing and the spinner
         //     signals the swap, so a cold miss never freezes the UI.
-        let session = self.yt_session.as_mut()?;
+        let session = match self.yt_session.as_mut() {
+            Some(s) => s,
+            None => {
+                // RC13-DEF-1: no YouTube session — a local catalog id in
+                // YouTube mode falls back to local playback (the id is a
+                // catalog track, not a real video id). Without this, the
+                // `?` on `as_mut()` returns None → the track is marked dead
+                // and "nothing playing" shows.
+                if let Some((path, sample_rate_hz, bit_depth)) = local_track_data {
+                    return Some(Resolved::Local {
+                        path,
+                        sample_rate_hz,
+                        bit_depth,
+                    });
+                }
+                return None;
+            }
+        };
         if let Some(url) = session.url_for(id) {
             // The url_cache entry's own fmt is the tier source of truth (premium
             // wins when present). track_cache's fmt can lag — a track cached by
@@ -1140,6 +1171,18 @@ impl App {
                 url,
                 fmt,
                 video_id: id.to_string(),
+            });
+        }
+        // RC13-DEF-1: a local catalog id in YouTube mode that the sidecar
+        // can't resolve (url_for returned None) is NOT a real YouTube video
+        // id — a cold-miss resolve will never succeed and the player hangs
+        // in Pending ("nothing playing"). Fall back to local playback so
+        // explicit user selections (Home mixes, Quick Picks) still play.
+        if let Some((path, sample_rate_hz, bit_depth)) = local_track_data {
+            return Some(Resolved::Local {
+                path,
+                sample_rate_hz,
+                bit_depth,
             });
         }
         // Cache miss → arm both tiers fire-and-forget and defer the swap to
@@ -1531,8 +1574,38 @@ impl App {
                     // feature.
                     match self.transport.continue_mode {
                         ContinueMode::Off => {
-                            self.player.stop().ok();
-                            self.now_playing = None;
+                            // RC13-DEF-5: a radio session drives its own
+                            // continuation. When `:radio` started a session,
+                            // auto-advance to the next radio track on track
+                            // completion regardless of CONT — the user
+                            // starting a radio explicitly asked for continuous
+                            // playback, so CONT off shouldn't silently stop
+                            // after the first track. Without this, the radio
+                            // stops after one track and the user must press
+                            // `c c` (CONT=radio) before `:radio` — undiscoverable.
+                            if let Some(vid) = self.reco_radio_next() {
+                                if let Some(np) = self.now_playing.clone() {
+                                    self.transport.history.push((
+                                        np.id().to_string(),
+                                        self.transport.context.clone(),
+                                    ));
+                                }
+                                let ctx = Context::Search {
+                                    query: "reco radio".into(),
+                                    track_ids: vec![vid.clone()],
+                                };
+                                let r = ClonedResolver {
+                                    playlists: &self.playlists,
+                                    manual_queue: self.transport.manual_queue.clone(),
+                                    yt_lists: &self.yt_lists,
+                                };
+                                self.transport
+                                    .switch_context(ctx, Some(&vid), &r, &self.catalog);
+                                self.start_playback();
+                            } else {
+                                self.player.stop().ok();
+                                self.now_playing = None;
+                            }
                         }
                         ContinueMode::NextAlbum => {
                             if self.switch_to_next_album() {
@@ -4233,23 +4306,19 @@ impl App {
 
         // Classify each track id:
         // - in `track_index` → local-only (can't be published to YouTube).
-        // - not in `track_index` AND cached in `yt_session.track_cache` →
-        //   publishable (a known YouTube video_id).
-        // - not in `track_index` AND not in the cache → unavailable (the
-        //   id looks like a YT video_id but its metadata isn't loaded; we
-        //   still list it so the user sees it).
+        // - not in `track_index` → publishable (a YouTube video_id). RC13-DEF-2:
+        //   a local playlist only contains catalog ids or YouTube video ids —
+        //   any non-catalog id is a YouTube video id by construction, so it goes
+        //   into `publishable_ids` even when its metadata isn't cached in the
+        //   session's `track_cache` yet. The old code marked uncached ids as
+        //   "unavailable", which blocked publication entirely (the overlay
+        //   always showed "0 tracks to publish"). The sidecar resolves the
+        //   metadata at publish time; we don't need it upfront.
         for id in &track_ids {
             if self.track_index.contains_key(id) {
                 state.local_only.push(id.clone());
-            } else if self
-                .yt_session
-                .as_ref()
-                .map(|s| s.track_for(id).is_some())
-                .unwrap_or(false)
-            {
-                state.publishable_ids.push(id.clone());
             } else {
-                state.unavailable.push(id.clone());
+                state.publishable_ids.push(id.clone());
             }
         }
 
@@ -5325,6 +5394,222 @@ mod tests {
             after_len,
             before_len - 1,
             "DEF-029: x must remove the focused Discover item"
+        );
+    }
+
+    // --- RC13 regression tests ------------------------------------------------
+
+    /// RC13-DEF-1: in MODE youtube, a local catalog id (e.g. a generated
+    /// mix's track) that the sidecar can't resolve as a real video id falls
+    /// back to local playback instead of hanging in a Pending cold-miss.
+    /// Before the fix, `resolve_source` returned Pending for catalog ids in
+    /// youtube mode, so the player showed "[PLAYING] ▶ — nothing playing —".
+    #[test]
+    fn rc13_def1_youtube_mode_local_catalog_fallback() {
+        let (_d, mut app) = make_app_with_files();
+        app.source_mode = crate::mode::SourceMode::Youtube;
+        // No yt_session → the remote path's `?` returns None, which would mark
+        // the track dead. But with the fallback, the local path is used.
+        // Even with a session, a catalog id that url_for can't resolve falls
+        // back to local. Test the no-session path first (simplest).
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        assert!(
+            app.now_playing.is_some(),
+            "RC13-DEF-1: local catalog track in youtube mode should play locally, not hang"
+        );
+        let np = app.now_playing.as_ref().unwrap();
+        assert_eq!(np.id(), "t1");
+        assert!(
+            !app.dead.contains("t1"),
+            "RC13-DEF-1: track should not be marked dead"
+        );
+    }
+
+    /// RC13-DEF-2: `open_publication` classifies non-catalog ids as
+    /// publishable (YouTube video ids), not unavailable. Before the fix,
+    /// YouTube video ids in a local playlist were marked "unavailable"
+    /// because they weren't in the session's track_cache, blocking
+    /// publication entirely.
+    #[test]
+    fn rc13_def2_publication_classifies_youtube_ids_as_publishable() {
+        let mut app = make_app();
+        // Create a local playlist with a local track + a YouTube video id.
+        app.playlists.push(crate::tui::app::Playlist {
+            name: "My Mix".into(),
+            track_ids: vec!["t1".into(), "v001".into(), "v002".into()],
+        });
+        app.open_publication("My Mix");
+        let state = match &app.overlay {
+            Some(Overlay::Publication { state }) => state,
+            _ => panic!("expected Publication overlay"),
+        };
+        assert_eq!(
+            state.local_only.len(),
+            1,
+            "t1 (catalog) should be local-only"
+        );
+        assert_eq!(state.local_only[0], "t1");
+        assert_eq!(
+            state.publishable_ids.len(),
+            2,
+            "RC13-DEF-2: v001 and v002 (YouTube video ids) should be publishable, not unavailable"
+        );
+        assert!(state.publishable_ids.contains(&"v001".to_string()));
+        assert!(state.publishable_ids.contains(&"v002".to_string()));
+        assert!(
+            state.unavailable.is_empty(),
+            "RC13-DEF-2: no tracks should be unavailable — non-catalog ids are publishable"
+        );
+    }
+
+    /// RC13-DEF-5: when a radio session is active and CONT is off, the radio
+    /// auto-advances to the next track on track completion. Before the fix,
+    /// CONT off stopped playback after the first track even during a radio
+    /// session — the user had to press `c c` (CONT=radio) before `:radio`.
+    #[test]
+    fn rc13_def5_radio_auto_advances_with_cont_off() {
+        let (_d, mut app) = make_app_with_files();
+        app.transport.continue_mode = ContinueMode::Off;
+        // Start a radio session — this opens the overlay + auto-starts.
+        app.start_radio_from_track("t1");
+        // The radio auto-starts playback. Verify something is playing.
+        assert!(app.now_playing.is_some(), "radio should auto-start");
+        let first_id = app.now_playing.as_ref().unwrap().id().to_string();
+        // Simulate track completion: call next() which is the auto-advance
+        // path on end-of-track. With CONT off + a radio session active, the
+        // radio should drive continuation instead of stopping.
+        app.next();
+        assert!(
+            app.now_playing.is_some(),
+            "RC13-DEF-5: radio should auto-advance even with CONT off"
+        );
+        let second_id = app.now_playing.as_ref().unwrap().id().to_string();
+        assert_ne!(
+            first_id, second_id,
+            "RC13-DEF-5: radio should advance to a different track"
+        );
+    }
+
+    /// RC13-DEF-5: when NO radio session is active and CONT is off, playback
+    /// still stops at the end of the context (the fix only affects radio).
+    #[test]
+    fn rc13_def5_no_radio_stops_with_cont_off() {
+        let (_d, mut app) = make_app_with_files();
+        app.transport.continue_mode = ContinueMode::Off;
+        // Play a single-track context (no radio).
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        assert!(app.now_playing.is_some());
+        // next() with CONT off + no radio → stop.
+        app.next();
+        assert!(
+            app.now_playing.is_none(),
+            "RC13-DEF-5: without a radio session, CONT off should still stop"
+        );
+    }
+
+    /// RC13-DEF-4: a long track title still shows the artist (truncated),
+    /// not just the title. Before the fix, the artist was dropped entirely
+    /// when the title was too long for the title budget.
+    #[test]
+    fn rc13_def4_long_title_keeps_artist() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = make_app();
+        // Set a long-title track as now-playing.
+        let long_title =
+            "A Very Long Track Title That Should Be Truncated When Displayed In Narrow Terminals";
+        let long_artist = "Long Artist Name That Tests Truncation In The UI Display";
+        app.now_playing = Some(crate::source::TrackSource::Local {
+            track_id: "t1".into(),
+        });
+        // Override the catalog track with long names via a direct edit.
+        app.catalog.tracks[0].title = long_title.into();
+        app.catalog.tracks[0].primary_artist = long_artist.into();
+        let backend = TestBackend::new(100, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::tui::view::player_bar::render(f, f.area(), &app))
+            .unwrap();
+        let mut buf = String::new();
+        for y in 0..2u16 {
+            for x in 0..100u16 {
+                let c = &terminal.backend().buffer()[(x, y)];
+                buf.push(c.symbol().chars().next().unwrap_or(' '));
+            }
+            buf.push('\n');
+        }
+        // The artist name (or a truncated form) must appear in the player bar.
+        // Before the fix, only the title showed and the artist was dropped.
+        assert!(
+            buf.contains("Long Ar"),
+            "RC13-DEF-4: artist must be visible (truncated) even with a long title: {buf}"
+        );
+        // The em-dash separator between title and artist must be present.
+        assert!(
+            buf.contains('—'),
+            "RC13-DEF-4: title-artist separator must be present: {buf}"
+        );
+    }
+
+    /// RC13-DEF-4: the resume hint is truncated to the title slot so it
+    /// doesn't push the quality/volume/transport controls off-screen.
+    #[test]
+    fn rc13_def4_resume_hint_truncated_to_title_slot() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = make_app();
+        app.now_playing = None;
+        app.resume_hint =
+            Some("resume: Midnight Journey at 0:03 · R to resume — a very long hint".into());
+        let backend = TestBackend::new(100, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::tui::view::player_bar::render(f, f.area(), &app))
+            .unwrap();
+        let mut row0 = String::new();
+        for x in 0..100u16 {
+            let c = &terminal.backend().buffer()[(x, 0)];
+            row0.push(c.symbol().chars().next().unwrap_or(' '));
+        }
+        // The transport controls live in the rightmost 14 cols. The hint
+        // must not push past column 86 (100 - 14). Verify the hint is
+        // truncated (ends with …) and the transport area is intact.
+        assert!(
+            row0.contains('…'),
+            "RC13-DEF-4: resume hint must be truncated with ellipsis: {row0}"
+        );
+        // The transport glyphs (▶) should be present at the right edge.
+        assert!(
+            row0.contains('▶'),
+            "RC13-DEF-4: transport controls must be present: {row0}"
+        );
+    }
+
+    /// RC13-DEF-4: the toast is wrapped in brackets so it reads as a
+    /// transient message, not part of the track name.
+    #[test]
+    fn rc13_def4_toast_wrapped_in_brackets() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = make_app();
+        app.now_playing = Some(crate::source::TrackSource::Local {
+            track_id: "t1".into(),
+        });
+        app.toast = Some("Added to queue".into());
+        let backend = TestBackend::new(100, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::tui::view::player_bar::render(f, f.area(), &app))
+            .unwrap();
+        let mut row0 = String::new();
+        for x in 0..100u16 {
+            let c = &terminal.backend().buffer()[(x, 0)];
+            row0.push(c.symbol().chars().next().unwrap_or(' '));
+        }
+        assert!(
+            row0.contains("[Added"),
+            "RC13-DEF-4: toast must be wrapped in brackets: {row0}"
+        );
+        assert!(
+            row0.contains("]"),
+            "RC13-DEF-4: toast must have closing bracket: {row0}"
         );
     }
 }

@@ -138,9 +138,17 @@ fn buffering_title(app: &App) -> Option<String> {
 /// (precedence over the `Next:` preview) with an accent style so it's visible
 /// regardless of `yt_state` (the `yt_status` toast was gated on Ready, so
 /// local-only users never saw "added to queue").
+///
+/// RC13-DEF-4: the toast is wrapped in brackets `[...]` so it reads as a
+/// transient message, not part of the track name. Without brackets, "Added…"
+/// appeared inline between the artist and the bitrate, clobbering the
+/// now-playing line.
 fn toast_preview(app: &App, max: usize) -> Option<String> {
     let toast = app.toast.as_ref()?;
-    Some(truncate_title(toast, max))
+    // Reserve 2 cols for the brackets, truncate the inner text, then wrap.
+    let inner_max = max.saturating_sub(2);
+    let truncated = truncate_title(toast, inner_max);
+    Some(format!("[{truncated}]"))
 }
 
 /// RC11-DEF-043: pick the up-next slot's content + style. A transient toast
@@ -866,15 +874,48 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
                 spans.push(Span::styled(sep, dim));
                 spans.push(Span::styled(v.artist.clone(), text));
             } else {
-                let t = truncate_title(&v.title, title_budget.max(1));
-                spans.push(Span::styled(t, accent));
+                // RC13-DEF-4: always show title + artist, both truncated to
+                // fit. The old code dropped the artist entirely when the
+                // title was too long, so a long-titled track showed only
+                // "A Very Long Track Title That Shoul…" with no artist.
+                // Reserve a minimum slot for the artist (truncated) so the
+                // format is always "Title… — Arti…" at any width.
+                let artist_min = 8usize.min(artist_w);
+                let title_max = title_budget.saturating_sub(sep_w + artist_min);
+                if title_max >= 1 {
+                    let (title_disp, artist_disp) = if title_w <= title_max {
+                        let artist_max = title_budget.saturating_sub(title_w + sep_w);
+                        (v.title.clone(), truncate_title(&v.artist, artist_max))
+                    } else {
+                        (
+                            truncate_title(&v.title, title_max),
+                            truncate_title(&v.artist, artist_min),
+                        )
+                    };
+                    spans.push(Span::styled(title_disp, accent));
+                    spans.push(Span::styled(sep, dim));
+                    spans.push(Span::styled(artist_disp, text));
+                } else {
+                    // Extremely narrow — just the title, truncated.
+                    let t = truncate_title(&v.title, title_budget.max(1));
+                    spans.push(Span::styled(t, accent));
+                }
             }
 
             // Up-next preview — DEF-057: shows during PLAYING too.
             // Budget against max_trailing_w so up-next won't steal trailing room.
+            // RC13-DEF-4: when a toast is active, it takes precedence over
+            // the trailing quality/volume (the toast is a transient ~1.2s
+            // confirmation; briefly hiding quality is fine). Don't reserve
+            // max_trailing_w for the toast path so it gets enough room.
             if width > 60 {
                 let used = spans_width(&spans);
-                let avail = width.saturating_sub(used + max_trailing_w + 2);
+                let reserve = if app.toast.is_some() {
+                    0
+                } else {
+                    max_trailing_w
+                };
+                let avail = width.saturating_sub(used + reserve + 2);
                 let threshold = if app.toast.is_some() { 4 } else { 10 };
                 if avail >= threshold {
                     if let Some((next, nstyle)) = next_or_toast(app, avail) {
@@ -901,17 +942,28 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
             spans.extend(trailing);
         }
         None => {
+            // RC13-DEF-4: the resume hint can be long ("resume: Midnight
+            // Journey at 0:03 · R to resume" = ~40 chars). Truncate it to the
+            // title budget so it doesn't push the quality/volume/transport
+            // controls off-screen — the bar layout stays identical to the
+            // normal STOPPED state, with the hint filling the title slot.
+            let trailing_w = q_w + v_w;
+            let title_budget = width.saturating_sub(prefix_w + trailing_w);
             if buffering {
                 let title = buffering_title(app).unwrap_or_else(|| "Loading stream".to_string());
+                let label = format!("Buffering {title}{}", ellipsis());
+                let label = truncate_title(&label, title_budget);
                 spans.push(Span::styled(
-                    format!("Buffering {title}{}", ellipsis()),
+                    label,
                     Style::default()
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ));
             } else if let Some(hint) = app.resume_hint.as_ref() {
+                let label = format!("{} {}", marker_glyph(), hint);
+                let label = truncate_title(&label, title_budget);
                 spans.push(Span::styled(
-                    format!("{} {}", marker_glyph(), hint),
+                    label,
                     Style::default()
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
@@ -922,7 +974,6 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
                     dim,
                 ));
             }
-            let trailing_w = q_w + v_w;
             // DEF-057: up-next hint when nothing is playing too.
             if width > 60 {
                 let used = spans_width(&spans);

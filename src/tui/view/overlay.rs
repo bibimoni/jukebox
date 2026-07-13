@@ -1794,4 +1794,56 @@ mod tests {
             "publication overlay must show the publish title: {text:?}"
         );
     }
+
+    /// RC13-DEF-3: the help overlay must list H (Home), :radio, :gen,
+    /// :publish, R (resume/retry), and the source badge legend ([L], [Y],
+    /// [Y!]). These were missing in RC-12; Batch H added them. This test
+    /// verifies they're present in `help_lines` so they can't regress.
+    #[test]
+    fn rc13_def3_help_lists_all_required_entries() {
+        let lines = help_lines(80, false);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        // H = Home
+        assert!(
+            text.contains("H") && text.contains("YouTube Home"),
+            "RC13-DEF-3: help must list H for Home: {text:?}"
+        );
+        // :radio
+        assert!(
+            text.contains(":radio"),
+            "RC13-DEF-3: help must list :radio: {text:?}"
+        );
+        // :gen
+        assert!(
+            text.contains(":gen"),
+            "RC13-DEF-3: help must list :gen: {text:?}"
+        );
+        // :publish
+        assert!(
+            text.contains(":publish"),
+            "RC13-DEF-3: help must list :publish: {text:?}"
+        );
+        // R = resume/retry
+        assert!(
+            text.contains("R") && text.contains("resume"),
+            "RC13-DEF-3: help must list R for resume: {text:?}"
+        );
+        // Source badges: [L], [Y], [Y!]
+        assert!(
+            text.contains("[L]"),
+            "RC13-DEF-3: help must list [L] source badge: {text:?}"
+        );
+        assert!(
+            text.contains("[Y]"),
+            "RC13-DEF-3: help must list [Y] source badge: {text:?}"
+        );
+        assert!(
+            text.contains("[Y!]"),
+            "RC13-DEF-3: help must list [Y!] expired badge: {text:?}"
+        );
+    }
 }
