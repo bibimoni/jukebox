@@ -671,8 +671,14 @@ mod tests {
         let gen = CandidateGenerator::new(&profile, &catalog).with_yt_track_ids(&yt_ids);
         let candidates = gen.generate();
         let yt_candidates: Vec<_> = candidates.iter().filter(|c| !c.is_local).collect();
-        assert_eq!(yt_candidates.len(), 2, "both YouTube ids should be candidates");
-        assert!(yt_candidates.iter().all(|c| matches!(c.source, CandidateSource::ExperimentalHome)));
+        assert_eq!(
+            yt_candidates.len(),
+            2,
+            "both YouTube ids should be candidates"
+        );
+        assert!(yt_candidates
+            .iter()
+            .all(|c| matches!(c.source, CandidateSource::ExperimentalHome)));
     }
 
     #[test]
@@ -682,7 +688,10 @@ mod tests {
         let catalog = vec![make_track("t1", "Artist A", "Song A")];
         let gen = CandidateGenerator::new(&profile, &catalog);
         let candidates = gen.generate();
-        assert!(candidates.iter().all(|c| c.is_local), "default pool is local-only");
+        assert!(
+            candidates.iter().all(|c| c.is_local),
+            "default pool is local-only"
+        );
     }
 
     #[test]
@@ -698,7 +707,13 @@ mod tests {
         let yt_ids = vec!["yt1".to_string(), "yt2".to_string()];
         let gen = CandidateGenerator::new(&profile, &catalog).with_yt_track_ids(&yt_ids);
         let candidates = gen.generate();
-        assert!(!candidates.iter().any(|c| c.track_id == "yt1"), "hidden yt1 excluded");
-        assert!(candidates.iter().any(|c| c.track_id == "yt2"), "yt2 still present");
+        assert!(
+            !candidates.iter().any(|c| c.track_id == "yt1"),
+            "hidden yt1 excluded"
+        );
+        assert!(
+            candidates.iter().any(|c| c.track_id == "yt2"),
+            "yt2 still present"
+        );
     }
 }

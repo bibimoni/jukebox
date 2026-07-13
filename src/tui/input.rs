@@ -606,7 +606,10 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             app.overlay = Some(Overlay::Help);
         }
         // Help overlay: any non-Esc key is a no-op (overlay stays open until Esc).
-        Some(Overlay::Discover { items, mut cursor }) => {
+        Some(Overlay::Discover {
+            mut items,
+            mut cursor,
+        }) => {
             // j/k mirror ↑↓ so the help-text keymap ("h j k l · ↑↓←→ move")
             // holds in the discover overlay too (DEF-026). Without this the
             // `_` arm swallowed j/k, leaving the cursor unchanged while the
@@ -619,6 +622,20 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     cursor = cursor
                         .checked_sub(1)
                         .unwrap_or(items.len().saturating_sub(1));
+                }
+                // RC11-DEF-029: dismiss/hide the focused suggestion. Removes
+                // the item from the list so the user can curate their
+                // discovery surface. (A future wiring to `reco::feedback`
+                // would feed the dismissal back to the reco engine; for now
+                // the item is just removed from the overlay.)
+                KeyCode::Char('x') | KeyCode::Char('d') if !items.is_empty() => {
+                    items.remove(cursor);
+                    if cursor >= items.len() && !items.is_empty() {
+                        cursor = items.len() - 1;
+                    }
+                    if items.is_empty() {
+                        cursor = 0;
+                    }
                 }
                 KeyCode::Enter => {
                     app.overlay = Some(Overlay::Discover { items, cursor });
@@ -765,8 +782,9 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                                         app.cursors.playlist = idx;
                                         app.play_in_context_ids(ids, &start);
                                     } else {
-                                        app.yt_status =
-                                            Some("saved playlist is empty — nothing to play".into());
+                                        app.yt_status = Some(
+                                            "saved playlist is empty — nothing to play".into(),
+                                        );
                                     }
                                 } else {
                                     app.yt_status = Some(
@@ -1040,8 +1058,10 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                             app.overlay = Some(Overlay::Generator { state });
                             return;
                         }
-                        app.playlists
-                            .push(crate::tui::app::Playlist { name: name.clone(), track_ids });
+                        app.playlists.push(crate::tui::app::Playlist {
+                            name: name.clone(),
+                            track_ids,
+                        });
                         app.save_playlists_db();
                         app.yt_status = Some(format!("Saved \"{}\"", name));
                     }
@@ -1054,10 +1074,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     // Re-dispatch as Enter by falling through to the Enter
                     // arm: we set the key to Enter and re-handle. The
                     // simplest way is to recurse with a synthesized Enter.
-                    handle_key(
-                        app,
-                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                    );
+                    handle_key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                     return;
                 }
                 // Preview phase: p pin, x remove, g regenerate, e edit.
@@ -1141,8 +1158,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                             state.publishable_ids.clone(),
                         );
                         app.pending_publish_name = Some(state.name.clone());
-                        app.yt_status =
-                            Some(format!("publishing \"{}\" to YouTube", state.name));
+                        app.yt_status = Some(format!("publishing \"{}\" to YouTube", state.name));
                         app.overlay = None;
                         return;
                     }
@@ -1156,27 +1172,27 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     state.field = crate::tui::view::publication::PubField::Privacy;
                     clear_err = true;
                 }
-                KeyCode::Backspace => {
-                    if state.field == crate::tui::view::publication::PubField::Name {
-                        state.name.pop();
-                        clear_err = true;
-                    }
+                KeyCode::Backspace
+                    if state.field == crate::tui::view::publication::PubField::Name =>
+                {
+                    state.name.pop();
+                    clear_err = true;
                 }
                 KeyCode::Char(c)
                     if !key.modifiers.contains(KeyModifiers::CONTROL)
                         && !key.modifiers.contains(KeyModifiers::ALT)
-                        && state.field
-                            == crate::tui::view::publication::PubField::Name
+                        && state.field == crate::tui::view::publication::PubField::Name
                         && c != 'n'
-                        && c != 'y' =>
+                        && c != 'y'
+                        && c != '\t'
+                        && c != '\n'
+                        && c != '\r' =>
                 {
                     // Editable name field. Reject newlines/tabs (Tab is
                     // privacy-cycle above) and the reserved verbs `n`/`y`
                     // (which are handled above as cancel/confirm).
-                    if c != '\t' && c != '\n' && c != '\r' {
-                        state.name.push(c);
-                        clear_err = true;
-                    }
+                    state.name.push(c);
+                    clear_err = true;
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     state.field = match state.field {
@@ -1210,11 +1226,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                         // the overlay open so the user can fix it (was a
                         // silent bump-step before).
                         state.error = Some(err);
-                    } else if app
-                        .yt_lists
-                        .iter()
-                        .any(|l| l.name == state.name)
-                    {
+                    } else if app.yt_lists.iter().any(|l| l.name == state.name) {
                         // Duplicate-name guard: a YouTube playlist with
                         // this title already exists. Don't publish (would
                         // create a confusing second list); tell the user
@@ -1373,10 +1385,8 @@ fn execute_command(app: &mut App, cmd: &str) {
         "profile" => {
             // Generate mixes if none yet so the summary has material.
             if app.reco_mixes.is_empty() {
-                app.reco_mixes = crate::reco::mixes::generate_all_mixes(
-                    &app.reco_profile,
-                    &app.catalog.tracks,
-                );
+                app.reco_mixes =
+                    crate::reco::mixes::generate_all_mixes(&app.reco_profile, &app.catalog.tracks);
             }
             app.yt_status = Some(app.profile_health_summary());
         }

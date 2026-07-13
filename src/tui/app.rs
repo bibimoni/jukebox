@@ -264,6 +264,16 @@ pub enum DiscoverItem {
     Album { artist: String, album: String },
     /// A YouTube mood/suggested playlist (YouTube / Mixed).
     Playlist { id: String, name: String },
+    /// A generated mix from `reco::mixes` (RC11-DEF-013). Carries the mix's
+    /// local-catalog track ids (so Enter plays immediately via
+    /// `play_in_context_ids` — no sidecar roundtrip), the display name, and
+    /// an optional "why recommended" explanation (RC11-DEF-028).
+    Mix {
+        mix_type: crate::reco::mixes::MixType,
+        name: String,
+        track_ids: Vec<String>,
+        explanation: Option<String>,
+    },
 }
 
 /// The central TUI state struct.
@@ -431,6 +441,13 @@ pub struct App {
     /// 60fps, ~30s at 20fps), the loading state is cleared and an error
     /// message is shown so the overlay doesn't hang forever.
     pub discover_loading_ticks: u32,
+    /// RC11-DEF-035: the name of the mix/playlist a Discover Enter is
+    /// currently loading. Set by `play_discover_selection` when the overlay
+    /// stays open to show "Loading [name]..."; cleared when playback starts
+    /// (on_tick) or on error. Rendered by `render_discover` so the user
+    /// sees a persistent loading state inside the overlay instead of a
+    /// silent close.
+    pub discover_play_loading: Option<String>,
     /// A YouTube playlist id whose tracks were requested by a discover
     /// selection (Enter on a `DiscoverItem::Playlist`). `play_discover_selection`
     /// fires-and-forgets `send_get_playlist(id)` + stores the id here; `on_tick`
@@ -680,6 +697,7 @@ impl App {
             publication_journal: crate::yt::publication::PublicationJournal::new(),
             discover_loading: false,
             discover_loading_ticks: 0,
+            discover_play_loading: None,
             pending_discover_play: None,
             pending_radio_seed: None,
             audio_switch_handle: None,
@@ -970,8 +988,10 @@ impl App {
                     }
                     match self.player.load(&path) {
                         Ok(()) => {
-                            self.now_playing =
-                                Some(crate::source::TrackSource::Local { track_id: id });
+                            self.now_playing = Some(crate::source::TrackSource::Local {
+                                track_id: id.clone(),
+                            });
+                            self.note_play_started(&id);
                             self.preload_next_url();
                         }
                         Err(e) => {
@@ -1323,7 +1343,12 @@ impl App {
                 // track_ids are local catalog ids — play immediately via
                 // `play_in_context_ids` (no sidecar roundtrip).
                 self.overlay = None;
-                if let Some(mix) = self.reco_mixes.iter().find(|m| m.mix_type == mix_type).cloned() {
+                if let Some(mix) = self
+                    .reco_mixes
+                    .iter()
+                    .find(|m| m.mix_type == mix_type)
+                    .cloned()
+                {
                     let ids: Vec<String> = mix.tracks.iter().map(|c| c.track_id.clone()).collect();
                     if let Some(start) = ids.first().cloned() {
                         self.play_in_context_ids(ids, &start);
@@ -1481,8 +1506,12 @@ impl App {
                                         manual_queue: self.transport.manual_queue.clone(),
                                         yt_lists: &self.yt_lists,
                                     };
-                                    self.transport
-                                        .switch_context(ctx, Some(&vid), &r, &self.catalog);
+                                    self.transport.switch_context(
+                                        ctx,
+                                        Some(&vid),
+                                        &r,
+                                        &self.catalog,
+                                    );
                                     self.start_playback();
                                 } else if self.transport.order.len() > 1 {
                                     // Wrap: restart the current context from the
@@ -2479,9 +2508,25 @@ impl App {
         // `play_in_context_ids(ids, start)`.
         if let Some((ids, start)) = pending_discover_start {
             // Close the discover overlay on success so the user sees the
-            // now-playing bar, not the overlay (DEF-007).
+            // now-playing bar, not the overlay (DEF-007). Clear the loading
+            // state too (RC11-DEF-035).
             self.overlay = None;
+            self.discover_play_loading = None;
             self.play_in_context_ids(ids, &start);
+        }
+
+        // RC11-DEF-035: for the synchronous Mix path, `play_discover_selection`
+        // started playback directly (not via `pending_discover_start`) and
+        // kept the overlay open with a "Loading [name]..." state. Once
+        // `now_playing` is set, the loading is complete — close the overlay
+        // + clear the loading state. (If playback failed — dead tracks —
+        // `now_playing` stays None; the loading state lingers until the user
+        // presses Esc. A future improvement could clear it on a timeout.)
+        if let Some(_name) = self.discover_play_loading.clone() {
+            if self.now_playing.is_some() && self.pending_discover_play.is_none() {
+                self.overlay = None;
+                self.discover_play_loading = None;
+            }
         }
 
         // CONT=YouTube radio auto-advance: the watch_playlist response
@@ -2789,12 +2834,51 @@ impl App {
     /// `S` — open the discover overlay: local smart-album suggestions (Local /
     /// Mixed) or YouTube mood playlists (YouTube / Mixed-with-session).
     pub fn open_discover(&mut self) {
+        // RC11-DEF-013: ensure the reco mixes are generated before building
+        // the Discover overlay — `S` may be pressed before `H` (which would
+        // generate them via `open_home`). A cold profile still produces mixes
+        // via the catalog fallback (DailyMix, Discover, LocalYtBlend).
+        if self.reco_mixes.is_empty() {
+            self.reco_mixes =
+                crate::reco::mixes::generate_all_mixes(&self.reco_profile, &self.catalog.tracks);
+        }
+        // RC11-DEF-013: in YouTube / mixed mode, the Discover overlay shows
+        // the generated mixes (Daily Mix, Discover Mix, ...) from `reco::mixes`
+        // — NOT local smart albums. The mixes carry local-catalog track ids,
+        // so Enter plays them immediately (no sidecar roundtrip). Local smart
+        // albums are still shown in local mode (the old behavior). The
+        // sidecar's `home_suggestions` fetch still runs in YT/mixed mode to
+        // populate additional YouTube playlists alongside the mixes.
+        let mix_items: Vec<DiscoverItem> = self
+            .reco_mixes
+            .iter()
+            .map(|m| {
+                let track_ids: Vec<String> = m.tracks.iter().map(|c| c.track_id.clone()).collect();
+                // RC11-DEF-028: per-mix "why recommended" explanation. Use the
+                // mix type's description as the human-readable reason (the
+                // reco engine's per-track explanations live in Home's Made
+                // for You; here we surface the mix-level description).
+                let explanation = Some(m.mix_type.description().to_string());
+                DiscoverItem::Mix {
+                    mix_type: m.mix_type,
+                    name: m.mix_type.label().to_string(),
+                    track_ids,
+                    explanation,
+                }
+            })
+            .collect();
+
         let items = match self.source_mode {
-            crate::mode::SourceMode::Youtube => self.yt_discover_items(),
+            crate::mode::SourceMode::Youtube => {
+                let mut items = mix_items;
+                items.extend(self.yt_discover_items());
+                items
+            }
             crate::mode::SourceMode::Mixed => {
-                let mut albums = self.local_smart_albums();
-                albums.extend(self.yt_discover_items());
-                albums
+                let mut items = mix_items;
+                items.extend(self.local_smart_albums());
+                items.extend(self.yt_discover_items());
+                items
             }
             _ => {
                 let mut albums = self.local_smart_albums();
@@ -2986,56 +3070,73 @@ impl App {
         name.to_lowercase().contains(&f.text.to_lowercase())
     }
 
-    /// Apply a discover-overlay selection (Enter): start the album/playlist.
-    /// The overlay is ALWAYS closed on Enter — the selection is committed, and
-    /// loading/error state is surfaced via `yt_status` in the footer rather
-    /// than a stuck modal (DEF-028). Previously the overlay stayed open on the
-    /// error paths (empty album, no YouTube session, empty mix response),
-    /// leaving the user to manually press Escape to dismiss it.
+    /// Apply a discover-overlay selection (Enter): start the album/mix/playlist.
+    ///
+    /// RC11-DEF-035: the overlay is NO LONGER closed immediately on Enter for
+    /// the Mix / Playlist variants. Instead it stays open showing a persistent
+    /// "Loading [name]..." indicator (`discover_play_loading`) so the user
+    /// sees feedback while the tracks resolve / the sidecar roundtrip is in
+    /// flight. `on_tick` closes the overlay + clears the loading state when
+    /// playback starts (for the synchronous Mix path) or when
+    /// `pending_discover_play` resolves (for the async Playlist path). The
+    /// Album variant still closes immediately (synchronous, instant).
     pub fn play_discover_selection(&mut self) {
         let Some(Overlay::Discover { items, cursor }) = self.overlay.clone() else {
             return;
         };
-        // Close the overlay immediately: the user pressed Enter, committing
-        // their selection. The footer's yt_status carries the "Loading mix…"
-        // / error message so the user isn't left staring at a modal that
-        // already consumed the keypress. (on_tick still clears the overlay
-        // on the async success path — a harmless no-op now.)
-        self.overlay = None;
         let Some(item) = items.get(cursor).cloned() else {
+            // Empty selection — close the overlay.
+            self.overlay = None;
             return;
         };
         match item {
             DiscoverItem::Album { album, .. } => {
+                // Synchronous + instant — close the overlay immediately.
+                self.overlay = None;
+                self.discover_play_loading = None;
                 let ids = self.tracks_for_album(&album);
                 if let Some(start) = ids.first().cloned() {
                     self.transport.continue_mode = ContinueMode::NextAlbum;
                     self.play_in_context_ids(ids, &start);
                 } else {
-                    // Empty album (no tracks resolved) — surface a clear
-                    // error in the footer instead of silently doing nothing
-                    // with the overlay closed.
                     self.yt_status = Some("no tracks found for this album".into());
                 }
             }
-            DiscoverItem::Playlist { id, .. } => {
-                // Fire-and-forget: the old blocking `get_playlist(&id)` froze
-                // the UI ~4s on every Enter. Now we ask the sidecar
-                // (non-blocking) and defer the playback start to `on_tick`,
-                // which starts the playlist when `pending_tracks` lands with
-                // a matching id (see `pending_discover_play`). A cold cache
-                // hit isn't possible here (discover lists never have
-                // pre-fetched tracks), so we always go through the async
-                // path. If there's no session, fall back to a clean no-op
-                // with an error message (DEF-007).
+            DiscoverItem::Playlist { id, name, .. } => {
+                // RC11-DEF-035: keep the overlay open with a loading state.
                 if let Some(session) = self.yt_session.as_mut() {
-                    // `send_get_playlist` is a no-op if this exact id is
-                    // already in flight, so a double-Enter doesn't flood.
                     let _ = session.send_get_playlist(id.clone());
                     self.pending_discover_play = Some(id);
-                    self.yt_status = Some("Loading mix…".into());
+                    self.discover_play_loading = Some(name.clone());
+                    self.yt_status = Some(format!("Loading \"{name}\"…"));
+                    // Keep the overlay open — on_tick closes it when the
+                    // pending_discover_play resolves (or on error/timeout).
                 } else {
+                    // No session — surface an error and close.
+                    self.overlay = None;
+                    self.discover_play_loading = None;
                     self.yt_status = Some("can't load mix — no YouTube session".into());
+                }
+            }
+            DiscoverItem::Mix {
+                track_ids, name, ..
+            } => {
+                // RC11-DEF-013 / DEF-035: a generated mix from `reco::mixes`.
+                // Plays immediately from local-catalog track ids — no sidecar
+                // roundtrip. Keep the overlay open with a "Loading [name]..."
+                // state for one frame so the user sees feedback; on_tick
+                // closes the overlay + clears the loading state once
+                // `now_playing` is set.
+                if let Some(start) = track_ids.first().cloned() {
+                    self.discover_play_loading = Some(name.clone());
+                    self.yt_status = Some(format!("Loading \"{name}\"…"));
+                    self.transport.continue_mode = ContinueMode::NextAlbum;
+                    self.play_in_context_ids(track_ids, &start);
+                    // Overlay stays open — on_tick clears it.
+                } else {
+                    self.overlay = None;
+                    self.discover_play_loading = None;
+                    self.yt_status = Some(format!("mix \"{name}\" has no tracks"));
                 }
             }
         }
@@ -3681,7 +3782,11 @@ impl App {
                     .or_else(|| s.upcoming(1).first().map(|c| c.track_id.clone()))
                     .unwrap_or_default();
                 if !seed_id.is_empty() {
-                    s.change_seed(RadioSeed::Track(seed_id), &self.reco_profile, &self.catalog.tracks);
+                    s.change_seed(
+                        RadioSeed::Track(seed_id),
+                        &self.reco_profile,
+                        &self.catalog.tracks,
+                    );
                     s.set_yt_track_ids(yt.clone());
                     did_change = true;
                 }
@@ -3733,7 +3838,7 @@ impl App {
     /// `track_cache` (metadata-resolved tracks) and every loaded `yt_lists`
     /// entry's `track_ids`. Returns an empty vec when the provider isn't
     /// ready, so callers degrade to local-only.
-    fn yt_track_ids(&self) -> Vec<String> {
+    pub fn yt_track_ids(&self) -> Vec<String> {
         if !self.yt_state.is_ready() {
             return Vec::new();
         }
@@ -3811,7 +3916,10 @@ impl App {
             // Capture pinned track ids + the pinned candidates themselves
             // before parse_input overwrites state.playlist. The new playlist
             // gets these prepended (and re-pinned) so `g` doesn't drop them.
-            let (pinned_ids, pinned_candidates): (Vec<String>, Vec<crate::reco::candidates::Candidate>) = {
+            let (pinned_ids, pinned_candidates): (
+                Vec<String>,
+                Vec<crate::reco::candidates::Candidate>,
+            ) = {
                 let mut ids = Vec::new();
                 let mut cands = Vec::new();
                 if let Some(p) = &state.playlist {
@@ -3867,9 +3975,7 @@ impl App {
                     }
                     playlist.pinned = pinned_ids
                         .iter()
-                        .filter(|id| {
-                            playlist.tracks.iter().any(|t| t.track_id == *id.as_str())
-                        })
+                        .filter(|id| playlist.tracks.iter().any(|t| t.track_id == *id.as_str()))
                         .cloned()
                         .collect();
                 }
@@ -4134,12 +4240,9 @@ impl App {
     fn event_context(&self) -> crate::reco::events::EventContext {
         use crate::reco::events::EventContext;
         match &self.transport.context {
-            crate::tui::context::Context::Album { .. } | crate::tui::context::Context::Artist { .. } => {
-                EventContext::Album
-            }
-            crate::tui::context::Context::Playlist { name } => {
-                EventContext::Playlist(name.clone())
-            }
+            crate::tui::context::Context::Album { .. }
+            | crate::tui::context::Context::Artist { .. } => EventContext::Album,
+            crate::tui::context::Context::Playlist { name } => EventContext::Playlist(name.clone()),
             crate::tui::context::Context::Youtube { name, .. } => {
                 EventContext::Playlist(name.clone())
             }
@@ -4900,6 +5003,126 @@ mod tests {
         assert!(
             matches!(app.overlay, Some(Overlay::Help)),
             "DEF-001: '?' from Home should open the Help overlay"
+        );
+    }
+
+    /// RC11-DEF-013: in YouTube mode, the Discover overlay (`S`) shows the
+    /// generated mixes (Daily Mix, Discover Mix, ...) from `reco::mixes`, not
+    /// local smart albums.
+    #[test]
+    fn open_discover_yt_mode_shows_generated_mixes() {
+        let mut app = make_app();
+        app.source_mode = crate::mode::SourceMode::Youtube;
+        app.open_discover();
+        let items = match &app.overlay {
+            Some(Overlay::Discover { items, .. }) => items,
+            _ => panic!("expected Discover overlay"),
+        };
+        let has_mix = items.iter().any(|d| matches!(d, DiscoverItem::Mix { .. }));
+        assert!(
+            has_mix,
+            "DEF-013: YT-mode Discover must show generated mixes (Daily Mix, etc.): {items:?}"
+        );
+    }
+
+    /// RC11-DEF-013: in mixed mode, the Discover overlay also shows the
+    /// generated mixes.
+    #[test]
+    fn open_discover_mixed_mode_shows_generated_mixes() {
+        let mut app = make_app();
+        app.source_mode = crate::mode::SourceMode::Mixed;
+        app.open_discover();
+        let items = match &app.overlay {
+            Some(Overlay::Discover { items, .. }) => items,
+            _ => panic!("expected Discover overlay"),
+        };
+        let has_mix = items.iter().any(|d| matches!(d, DiscoverItem::Mix { .. }));
+        assert!(
+            has_mix,
+            "DEF-013: mixed-mode Discover must show generated mixes: {items:?}"
+        );
+    }
+
+    /// RC11-DEF-013: in local mode, the Discover overlay shows local smart
+    /// albums (the old behavior), NOT generated mixes.
+    #[test]
+    fn open_discover_local_mode_shows_albums_not_mixes() {
+        let mut app = make_app();
+        app.source_mode = crate::mode::SourceMode::Local;
+        app.open_discover();
+        let items = match &app.overlay {
+            Some(Overlay::Discover { items, .. }) => items,
+            _ => panic!("expected Discover overlay"),
+        };
+        let has_mix = items.iter().any(|d| matches!(d, DiscoverItem::Mix { .. }));
+        assert!(
+            !has_mix,
+            "DEF-013: local-mode Discover should show albums, not mixes: {items:?}"
+        );
+    }
+
+    /// RC11-DEF-028: each Discover mix carries a "why recommended" explanation.
+    #[test]
+    fn discover_mix_items_carry_explanation() {
+        let mut app = make_app();
+        app.source_mode = crate::mode::SourceMode::Youtube;
+        app.open_discover();
+        let items = match &app.overlay {
+            Some(Overlay::Discover { items, .. }) => items,
+            _ => panic!("expected Discover overlay"),
+        };
+        for d in items {
+            if let DiscoverItem::Mix { explanation, .. } = d {
+                assert!(
+                    explanation.is_some(),
+                    "DEF-028: each Discover mix must carry an explanation"
+                );
+            }
+        }
+    }
+
+    /// RC11-DEF-035: Enter on a Discover mix sets `discover_play_loading` so
+    /// the overlay can show a persistent "Loading [name]..." state instead of
+    /// closing silently.
+    #[test]
+    fn discover_enter_on_mix_sets_loading_state() {
+        let (_d, mut app) = make_app_with_files();
+        app.source_mode = crate::mode::SourceMode::Youtube;
+        app.open_discover();
+        app.play_discover_selection();
+        assert!(
+            app.discover_play_loading.is_some(),
+            "DEF-035: Enter on a Discover mix must set discover_play_loading"
+        );
+    }
+
+    /// RC11-DEF-029: `x` in the Discover overlay removes the focused item.
+    #[test]
+    fn discover_x_dismisses_focused_item() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app();
+        app.source_mode = crate::mode::SourceMode::Youtube;
+        app.open_discover();
+        let before_len = match &app.overlay {
+            Some(Overlay::Discover { items, .. }) => items.len(),
+            _ => panic!("expected Discover overlay"),
+        };
+        assert!(
+            before_len > 1,
+            "test needs >1 discover item, got {before_len}"
+        );
+        crate::tui::input::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        let after_len = match &app.overlay {
+            Some(Overlay::Discover { items, .. }) => items.len(),
+            _ => panic!("Discover overlay should stay open after x"),
+        };
+        assert_eq!(
+            after_len,
+            before_len - 1,
+            "DEF-029: x must remove the focused Discover item"
         );
     }
 }

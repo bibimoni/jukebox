@@ -175,7 +175,12 @@ fn main() -> anyhow::Result<()> {
             // loading, enable per-event persistence so new events are saved.
             if let Ok(events) = state::load_events(10_000) {
                 app.reco_events.extend_from(events);
-                let evs: Vec<_> = app.reco_events.recent(app.reco_events.len()).into_iter().cloned().collect();
+                let evs: Vec<_> = app
+                    .reco_events
+                    .recent(app.reco_events.len())
+                    .into_iter()
+                    .cloned()
+                    .collect();
                 app.reco_profile = jukebox::reco::profile::UserProfile::build_from_events(&evs);
             }
             app.persist_events = true;

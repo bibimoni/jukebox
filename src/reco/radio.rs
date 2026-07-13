@@ -115,8 +115,7 @@ impl RadioSession {
     /// Generate candidates for this session. Uses the profile + catalog, and
     /// excludes tracks already played/skipped/excluded.
     fn generate_candidates(&self, profile: &UserProfile, catalog: &[Track]) -> Vec<Candidate> {
-        let gen = CandidateGenerator::new(profile, catalog)
-            .with_yt_track_ids(&self.yt_track_ids);
+        let gen = CandidateGenerator::new(profile, catalog).with_yt_track_ids(&self.yt_track_ids);
         let mut candidates = gen.generate();
 
         // If the seed is a track, boost that track's neighbors.

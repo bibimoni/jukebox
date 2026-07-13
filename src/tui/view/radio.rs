@@ -147,7 +147,13 @@ mod tests {
             "Song A — Artist A".to_string(),
             "Song B — Artist B".to_string(),
         ];
-        let para = render(Rect::new(0, 0, 80, 24), &session, &icons, "track t1", &upcoming);
+        let para = render(
+            Rect::new(0, 0, 80, 24),
+            &session,
+            &icons,
+            "track t1",
+            &upcoming,
+        );
         let _ = para;
     }
 }

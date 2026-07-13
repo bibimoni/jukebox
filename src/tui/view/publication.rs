@@ -76,7 +76,10 @@ impl PublicationState {
     /// pointless — show the user why nothing will happen).
     pub fn validation_error(&self) -> Option<String> {
         if self.publishable_ids.is_empty() {
-            return Some("0 tracks to publish — open the overlay on a playlist with YouTube tracks".to_string());
+            return Some(
+                "0 tracks to publish — open the overlay on a playlist with YouTube tracks"
+                    .to_string(),
+            );
         }
         if self.account.is_empty() {
             return Some("no account — run :yt auth browser <name> first".to_string());
@@ -115,8 +118,7 @@ pub fn render(_area: Rect, state: &PublicationState, icons: &IconRenderer) -> Pa
     )));
     if state.publishable_ids.is_empty() {
         lines.push(Line::from(Span::styled(
-            "   (no YouTube tracks — only local-only tracks can't be published)"
-                .to_string(),
+            "   (no YouTube tracks — only local-only tracks can't be published)".to_string(),
             Style::default().fg(Color::DarkGray),
         )));
     } else {
@@ -234,8 +236,7 @@ pub fn render(_area: Rect, state: &PublicationState, icons: &IconRenderer) -> Pa
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            "Type a name, Tab to set privacy, Enter to publish  ·  Esc to cancel"
-                .to_string(),
+            "Type a name, Tab to set privacy, Enter to publish  ·  Esc to cancel".to_string(),
             Style::default().fg(Color::Yellow),
         )));
     }

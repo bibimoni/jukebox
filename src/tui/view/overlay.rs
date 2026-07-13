@@ -69,6 +69,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
             cursor,
             app.discover_loading,
             app.discover_loading_ticks,
+            app.discover_play_loading.as_deref(),
+            app.source_mode,
         ),
         Overlay::Lyrics {
             content,
@@ -121,6 +123,8 @@ fn render_discover(
     cursor: usize,
     loading: bool,
     loading_ticks: u32,
+    play_loading: Option<&str>,
+    source_mode: crate::mode::SourceMode,
 ) {
     let theme = Theme::default();
     let ascii = is_ascii();
@@ -135,10 +139,15 @@ fn render_discover(
     let popup = centered(area, 55, 45);
     f.render_widget(Clear, popup);
 
-    // MOD-1: in ASCII font mode, use ASCII border characters (+, -, |) instead
-    // of Unicode box-drawing (┌─┐│└┘). The title's em-dash is replaced via
-    // `em_dash()` so it reads `--` in ASCII mode.
-    let title = format!(" discover {dash} press Enter to play ");
+    // RC11-DEF-013: disambiguate the title. In YouTube / mixed mode the
+    // overlay shows generated mixes (Daily Mix, Discover Mix, ...) so the
+    // title reads "Discover Mixes"; in local mode it shows local smart
+    // albums so the title reads "Discover" (the old label).
+    let title_label = match source_mode {
+        crate::mode::SourceMode::Youtube | crate::mode::SourceMode::Mixed => "Discover Mixes",
+        crate::mode::SourceMode::Local => "Discover",
+    };
+    let title = format!(" {title_label} {dash} press Enter to play ");
     let block = if ascii {
         Block::default()
             .borders(Borders::ALL)
@@ -158,14 +167,23 @@ fn render_discover(
         .iter()
         .enumerate()
         .map(|(i, d)| {
-            let (glyph, text) = match d {
+            let (glyph, text, explanation) = match d {
                 crate::tui::app::DiscoverItem::Album { artist, album } => {
                     let g = if ascii { "#" } else { "♫" };
-                    (g, format!("{artist} {dash} {album}"))
+                    (g, format!("{artist} {dash} {album}"), None)
                 }
                 crate::tui::app::DiscoverItem::Playlist { name, .. } => {
                     let g = if ascii { "*" } else { "✦" };
-                    (g, name.clone())
+                    (g, name.clone(), None)
+                }
+                // RC11-DEF-013/DEF-028: generated mix with a per-mix
+                // "why recommended" explanation. The ◆ glyph distinguishes
+                // generated mixes from ✦ suggested playlists.
+                crate::tui::app::DiscoverItem::Mix {
+                    name, explanation, ..
+                } => {
+                    let g = if ascii { "+" } else { "◆" };
+                    (g, name.clone(), explanation.clone())
                 }
             };
             let style = if i == cursor {
@@ -173,7 +191,17 @@ fn render_discover(
             } else {
                 Style::default().fg(theme.text)
             };
-            Line::from(Span::styled(format!("{glyph} {text}"), style))
+            // RC11-DEF-028: render the explanation on a second line under the
+            // mix name (dim, indented with └) so the user sees WHY each mix
+            // was recommended. The explanation is part of the same `Line` so
+            // the selection style covers both the name + the explanation.
+            let mut spans = vec![Span::styled(format!("{glyph} {text}"), style)];
+            if let Some(expl) = explanation {
+                let corner = if ascii { "\\" } else { "└" };
+                spans.push(Span::raw(format!("\n  {corner} ")));
+                spans.push(Span::styled(expl, Style::default().fg(theme.dim)));
+            }
+            Line::from(spans)
         })
         .collect();
 
@@ -189,6 +217,36 @@ fn render_discover(
         lines.push(Line::from(Span::styled(
             format!("{frame} Loading YouTube suggestions..."),
             Style::default().fg(theme.hi_fg),
+        )));
+    }
+
+    // RC11-DEF-035: persistent "Loading [name]..." indicator when a
+    // Discover Enter is in flight (the overlay stays open until playback
+    // starts or the sidecar responds). Rendered after the items so it
+    // anchors the bottom of the popup.
+    let dot = sep_dot();
+    if let Some(name) = play_loading {
+        let frames: &[&str] = if ascii {
+            &["|", "/", "-", "\\"]
+        } else {
+            &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        };
+        let frame = frames[(loading_ticks as usize) % frames.len()];
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("{frame} Loading \"{name}\"{dash}"),
+            Style::default().fg(theme.hi_fg),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("Esc cancel {dot} wait for playback to start"),
+            Style::default().fg(theme.dim),
+        )));
+    } else {
+        // RC11-DEF-029: hint for the dismiss key so the user knows they can
+        // hide a suggestion they don't want.
+        lines.push(Line::from(Span::styled(
+            format!("j/k navigate {dot} Enter play {dot} x dismiss {dot} Esc close"),
+            Style::default().fg(theme.dim),
         )));
     }
 
@@ -1636,10 +1694,9 @@ mod tests {
     fn radio_overlay_no_session_shows_placeholder() {
         let (_d, cat) = one_track_cat();
         let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
-        let text =
-            overlay_text_with_app(&mut app, 80, 24, |f, area, app| {
-                render_radio_overlay(f, area, app, None)
-            });
+        let text = overlay_text_with_app(&mut app, 80, 24, |f, area, app| {
+            render_radio_overlay(f, area, app, None)
+        });
         assert!(
             text.contains("No active radio session"),
             "radio overlay with no session must show the placeholder: {text:?}"

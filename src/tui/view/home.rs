@@ -515,7 +515,9 @@ pub fn render_compact(
 
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines).scroll((scroll, 0)).wrap(Wrap { trim: true }),
+        Paragraph::new(lines)
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: true }),
         body_area,
     );
 
@@ -853,7 +855,10 @@ mod tests {
                 found_selection = true;
             }
         }
-        assert!(found_song2, "DEF-001: 'Song 2' must render in the Home overlay");
+        assert!(
+            found_song2,
+            "DEF-001: 'Song 2' must render in the Home overlay"
+        );
         assert!(
             found_selection,
             "DEF-001: focused Home item must carry selection style"
