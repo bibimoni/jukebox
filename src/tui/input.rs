@@ -604,28 +604,31 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         // g/G jump to top/bottom. Any other key is a no-op.
         Some(Overlay::Help) => {
             // Upper bound is the content length; over-scrolling just shows
-            // blank space, so a generous constant is safe and avoids needing
-            // the rendered height here.
-            const HELP_LINES: u16 = 31;
+            // blank space, so a generous bound is safe. Derive from
+            // `help_lines` so the cap tracks content growth (the old fixed
+            // `31` was stale after Batches A–H added sections — Radio c/q/>,
+            // Source badges, Generator s — leaving the bottom sections
+            // unreachable).
+            let help_lines_count = crate::tui::view::overlay::help_lines(0, false).len() as u16;
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
-                    app.help_scroll = app.help_scroll.saturating_add(1).min(HELP_LINES);
+                    app.help_scroll = app.help_scroll.saturating_add(1).min(help_lines_count);
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     app.help_scroll = app.help_scroll.saturating_sub(1);
                 }
                 KeyCode::PageDown => {
-                    app.help_scroll = app.help_scroll.saturating_add(10).min(HELP_LINES);
+                    app.help_scroll = app.help_scroll.saturating_add(10).min(help_lines_count);
                 }
                 KeyCode::PageUp => {
                     app.help_scroll = app.help_scroll.saturating_sub(10);
                 }
                 KeyCode::Char('g') => app.help_scroll = 0,
-                KeyCode::Char('G') => app.help_scroll = HELP_LINES,
+                KeyCode::Char('G') => app.help_scroll = help_lines_count,
                 // Home/End jump to top/bottom (mirrors g/G) — DEF-018: End was
                 // missing.
                 KeyCode::Home => app.help_scroll = 0,
-                KeyCode::End => app.help_scroll = HELP_LINES,
+                KeyCode::End => app.help_scroll = help_lines_count,
                 _ => {}
             }
             app.overlay = Some(Overlay::Help);
