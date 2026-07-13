@@ -156,10 +156,18 @@ fn render_rail(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         })
         .collect();
 
-    f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::NONE)),
-        area,
-    );
+    // DEF-044: right border so 1/2/3/4 digits read as intentional panel.
+    let rail_block = if is_ascii() {
+        Block::default()
+            .borders(Borders::RIGHT)
+            .border_set(ASCII_BORDER_SET)
+            .border_style(Style::default().fg(theme.dim))
+    } else {
+        Block::default()
+            .borders(Borders::RIGHT)
+            .border_style(Style::default().fg(theme.dim))
+    };
+    f.render_widget(Paragraph::new(lines).block(rail_block), area);
 }
 
 // --- YouTube view ----------------------------------------------------------
@@ -472,6 +480,8 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         mixed_tag(app)
     );
     let col1_block = border(&yt_title, app.focus_col == 0, theme);
+    // DEF-053: truncate YT list names with ellipsis.
+    let yt_col_w = cols[0].width.saturating_sub(2) as usize;
     let items: Vec<ListItem> = app
         .yt_lists
         .iter()
@@ -502,7 +512,10 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                     }
                 }
             };
-            ListItem::new(format!("{glyph} {}", l.name))
+            ListItem::new(format!(
+                "{glyph} {}",
+                truncate_ellipsis(&l.name, yt_col_w.saturating_sub(2))
+            ))
         })
         .collect();
     if items.is_empty() && !app.yt_lists.is_empty() && filter_text_on(app, 0).is_some() {
@@ -799,11 +812,13 @@ fn render_artists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             artist_area,
         );
     } else {
+        // DEF-053: truncate artist names with ellipsis.
+        let col_w = artist_area.width.saturating_sub(2) as usize;
         let items: Vec<ListItem> = app
             .artists
             .iter()
             .filter(|a| app.filter_matches(a))
-            .map(|a| ListItem::new(a.clone()))
+            .map(|a| ListItem::new(truncate_ellipsis(a, col_w)))
             .collect();
         if items.is_empty() {
             let text = filter_text_on(app, 0).unwrap_or("");
@@ -835,9 +850,11 @@ fn render_artists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         .get(&artist)
         .cloned()
         .unwrap_or_default();
+    // DEF-053: truncate album titles with ellipsis.
+    let album_col_w = album_area.width.saturating_sub(2) as usize;
     let album_items: Vec<ListItem> = albums
         .iter()
-        .map(|a| ListItem::new(a.title.clone()))
+        .map(|a| ListItem::new(truncate_ellipsis(&a.title, album_col_w)))
         .collect();
     let mut album_state = ListState::default();
     album_state.select(Some(app.cursors.album));
@@ -906,11 +923,13 @@ fn render_playlists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             cols[0],
         );
     } else {
+        // DEF-053: truncate playlist names with ellipsis.
+        let pl_col_w = cols[0].width.saturating_sub(2) as usize;
         let items: Vec<ListItem> = app
             .playlists
             .iter()
             .filter(|p| app.filter_matches(&p.name))
-            .map(|p| ListItem::new(p.name.clone()))
+            .map(|p| ListItem::new(truncate_ellipsis(&p.name, pl_col_w)))
             .collect();
         if items.is_empty() {
             let text = filter_text_on(app, 0).unwrap_or("");
@@ -1061,7 +1080,8 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
     // Source badge only in Mixed mode (Issue 4: the only time the source is
     // ambiguous per-row). In Local mode every row is local — [L] is redundant
     // clutter. Badge also stays off on very narrow panes (width <= 60).
-    let show_badge = width > 60 && app.source_mode == SourceMode::Mixed;
+    // DEF-049: threshold lowered from 60 to 20 so [L]/[Y] shows in narrow cols.
+    let show_badge = width > 20 && app.source_mode == SourceMode::Mixed;
     // Both "[L] " and "[Y] " are 4 bytes; the badge prefix length is fixed so
     // the `rest` slice can be taken after the badge span is split out.
     let badge_len = if show_badge { 4 } else { 0 };
@@ -1197,7 +1217,8 @@ fn yt_track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<
     let nc = no_color();
     // Source badge only in Mixed mode (Issue 4). In YouTube view every row is
     // YouTube — [Y] is redundant clutter. Badge stays off on narrow panes.
-    let show_badge = width > 60 && app.source_mode == SourceMode::Mixed;
+    // DEF-049: threshold lowered from 60 to 20 so [L]/[Y] shows in narrow cols.
+    let show_badge = width > 20 && app.source_mode == SourceMode::Mixed;
 
     ids.iter()
         .enumerate()

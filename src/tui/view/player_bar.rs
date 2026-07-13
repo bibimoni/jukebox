@@ -582,6 +582,16 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
+    // DEF-051: strip trailing separator so MODE mixed doesn't end with dot.
+    let sd = sep_dot();
+    while let Some(last) = spans.last() {
+        let trimmed = last.content.trim();
+        if trimmed == sd || trimmed.is_empty() {
+            spans.pop();
+        } else {
+            break;
+        }
+    }
     f.render_widget(
         Paragraph::new(Line::from(spans).alignment(Alignment::Left))
             .block(Block::default().borders(Borders::NONE)),
@@ -645,10 +655,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         // was used, but the layout solver may round differently at odd widths
         // and panic debug builds.)
         render_progress_bar(f, geo.progress, app);
+        // DEF-048: 1-col gap so progress time label never runs into SHUF.
         let flags_area = Rect::new(
-            geo.progress.right(),
+            geo.progress.right() + 1,
             g.y,
-            g.width.saturating_sub(geo.progress.width),
+            g.width.saturating_sub(geo.progress.width + 1),
             g.height,
         );
         f.render_widget(
@@ -754,12 +765,10 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
 
     spans.push(Span::styled(format!("{state_glyph} "), glyph_style));
 
-    // Pre-compute the quality + volume spans (they come after the up-next
-    // preview) so we can budget the up-next title to fit the remaining width
-    // (MOD-1: a long next-track title used to push quality/volume under the
-    // transport controls, creating garbled overlap).
-    let mut trailing: Vec<Span<'static>> = Vec::new();
-    trailing.push(Span::raw("   "));
+    // DEF-004: build quality and volume as SEPARATE Vecs so the title can be
+    // truncated and trailing dropped in priority order (volume, then quality).
+    let mut quality_part: Vec<Span<'static>> = Vec::new();
+    quality_part.push(Span::raw("   "));
     match &np {
         Some(v) if v.source.is_remote() => {
             let label = v
@@ -768,33 +777,31 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
                 .map(|f| f.yt_label())
                 .unwrap_or_else(|| "YT".to_string());
             let color = if nc { Color::Reset } else { Color::Yellow };
-            trailing.push(Span::styled(label, Style::default().fg(color)));
+            quality_part.push(Span::styled(label, Style::default().fg(color)));
         }
         Some(v) => {
             let q_color = quality_color(v.bit_depth, v.sample_rate_hz);
             let q_text = format!("{}-bit / {} kHz", v.bit_depth, khz(v.sample_rate_hz));
-            trailing.push(Span::styled(q_text, Style::default().fg(q_color)));
+            quality_part.push(Span::styled(q_text, Style::default().fg(q_color)));
             if app.switch_sample_rate {
-                trailing.push(Span::styled(
+                quality_part.push(Span::styled(
                     format!(" {} bit-perfect", sep_dot()),
                     Style::default().fg(q_color),
                 ));
             }
         }
         None => {
-            trailing.push(Span::styled("--bit / -- kHz", dim));
+            quality_part.push(Span::styled("--bit / -- kHz", dim));
         }
     }
+    let q_w = spans_width(&quality_part);
+
+    let mut volume_part: Vec<Span<'static>> = Vec::new();
     if width >= 70 {
-        trailing.push(Span::raw("   "));
-        trailing.push(Span::styled("vol ", dim));
-        // RC11-DEF-022: when muted, show a "MUTED" text label alongside the
-        // bar so the state is unambiguous (the bar dims to 0% but the
-        // underlying volume is still 70%, which read as "volume 0" not
-        // "muted"). The label uses the dim color so it reads as a state flag,
-        // not a value.
+        volume_part.push(Span::raw("   "));
+        volume_part.push(Span::styled("vol ", dim));
         if app.muted {
-            trailing.push(Span::styled("MUTED ", Style::default().fg(theme.dim)));
+            volume_part.push(Span::styled("MUTED ", Style::default().fg(theme.dim)));
         }
         let blocks = 4u32;
         let filled = ((u32::from(app.volume) * blocks + 50) / 100).min(blocks);
@@ -808,37 +815,66 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
         }
         let vol_pct = if app.muted { 0 } else { app.volume };
         let vol_color = if app.muted { theme.dim } else { theme.text };
-        trailing.push(Span::styled(
+        volume_part.push(Span::styled(
             format!("{vol_bar} {vol_pct}%"),
             Style::default().fg(vol_color),
         ));
     }
-    let trailing_w = spans_width(&trailing);
+    let v_w = spans_width(&volume_part);
+    let prefix_w = spans_width(&spans);
 
     // Now-playing: title — artist · album (or a dim placeholder).
     // Title is the visual hero (accent color — bright + prominent).
     match &np {
         Some(v) => {
-            spans.push(Span::styled(v.title.clone(), accent));
-            spans.push(Span::styled(format!(" {} ", em_dash()), dim));
-            spans.push(Span::styled(v.artist.clone(), text));
-            if let Some(album) = &v.album {
-                if !album.is_empty() && width > 60 {
-                    spans.push(Span::styled(format!(" {} ", sep_dot()), dim));
-                    spans.push(Span::styled(album.clone(), text));
+            // DEF-004: compute full now-playing width, decide which trailing
+            // segments fit. Drop volume first, then quality. Truncate title
+            // last (highest priority — always visible).
+            let title_w = disp_width(&v.title);
+            let sep = format!(" {} ", em_dash());
+            let sep_w = disp_width(&sep);
+            let artist_w = disp_width(&v.artist);
+            let show_album = v
+                .album
+                .as_ref()
+                .map(|a| !a.is_empty() && width > 60)
+                .unwrap_or(false);
+            let album = v.album.as_deref().unwrap_or("");
+            let album_sep = format!(" {} ", sep_dot());
+            let album_sep_w = disp_width(&album_sep);
+            let album_w = disp_width(album);
+            let np_full_w =
+                title_w + sep_w + artist_w + (if show_album { album_sep_w + album_w } else { 0 });
+
+            // DEF-004: truncate title to fit with max trailing reserved,
+            // then compute actual trailing inclusion AFTER up-next so the
+            // total never exceeds width (the up-next preview can push the
+            // total over, so trailing is re-evaluated based on real used).
+            let max_trailing_w = q_w + v_w;
+            let title_budget = width.saturating_sub(prefix_w + max_trailing_w);
+
+            if np_full_w <= title_budget {
+                spans.push(Span::styled(v.title.clone(), accent));
+                spans.push(Span::styled(sep, dim));
+                spans.push(Span::styled(v.artist.clone(), text));
+                if show_album {
+                    spans.push(Span::styled(album_sep, dim));
+                    spans.push(Span::styled(album.to_string(), text));
                 }
+            } else if title_w + sep_w + artist_w <= title_budget {
+                spans.push(Span::styled(v.title.clone(), accent));
+                spans.push(Span::styled(sep, dim));
+                spans.push(Span::styled(v.artist.clone(), text));
+            } else {
+                let t = truncate_title(&v.title, title_budget.max(1));
+                spans.push(Span::styled(t, accent));
             }
-            // Up-next preview right after the now-playing text — grouped
-            // with the playback context. Only when there's room (width > 60).
-            // The title is truncated to fit the remaining width after the
-            // now-playing text and the trailing quality+volume (MOD-1).
-            // The "(end)" hint is fixed-length — only add if it fits.
+
+            // Up-next preview — DEF-057: shows during PLAYING too.
+            // Budget against max_trailing_w so up-next won't steal trailing room.
             if width > 60 {
                 let used = spans_width(&spans);
-                // 2 cols "  " prefix + 8 cols "▸ Next: " prefix + trailing.
-                let avail = width.saturating_sub(used + trailing_w + 2);
-                // RC11-DEF-043: a toast shows even in a crowded bar (truncated
-                // to fit); the up-next preview needs more room (8-col prefix).
+                let avail = width.saturating_sub(used + max_trailing_w + 2);
                 let threshold = if app.toast.is_some() { 4 } else { 10 };
                 if avail >= threshold {
                     if let Some((next, nstyle)) = next_or_toast(app, avail) {
@@ -849,14 +885,22 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
                     }
                 }
             }
+
+            // DEF-004: compute actual trailing based on real used width
+            // (after up-next was added). Drop volume first, then quality.
+            let used = spans_width(&spans);
+            let trailing = if used + q_w + v_w <= width {
+                let mut t = quality_part.clone();
+                t.extend(volume_part.clone());
+                t
+            } else if used + q_w <= width {
+                quality_part.clone()
+            } else {
+                Vec::new()
+            };
+            spans.extend(trailing);
         }
         None => {
-            // RC11-DEF-015: when buffering (cold-miss YouTube pick), show
-            // "Buffering [title]…" instead of "— nothing playing —" so the
-            // user knows a track is loading. Falls back to "Loading stream…"
-            // when the pending track's metadata isn't cached yet. Else
-            // RC11-DEF-014: show the "resume" hint when a last-played track is
-            // saved; else the dim "nothing playing" placeholder.
             if buffering {
                 let title = buffering_title(app).unwrap_or_else(|| "Loading stream".to_string());
                 spans.push(Span::styled(
@@ -878,12 +922,11 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
                     dim,
                 ));
             }
-            // Up-next hint when nothing is playing.
+            let trailing_w = q_w + v_w;
+            // DEF-057: up-next hint when nothing is playing too.
             if width > 60 {
                 let used = spans_width(&spans);
                 let avail = width.saturating_sub(used + trailing_w + 2);
-                // RC11-DEF-043: a toast shows even in a crowded bar (truncated);
-                // the up-next preview needs more room (8-col prefix).
                 let threshold = if app.toast.is_some() { 4 } else { 10 };
                 if avail >= threshold {
                     if let Some((next, nstyle)) = next_or_toast(app, avail) {
@@ -894,11 +937,11 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
                     }
                 }
             }
+            let mut trailing = quality_part.clone();
+            trailing.extend(volume_part.clone());
+            spans.extend(trailing);
         }
     }
-
-    // Quality readout + volume (pre-computed above).
-    spans.extend(trailing);
 
     Line::from(spans).alignment(Alignment::Left)
 }
@@ -1472,6 +1515,109 @@ mod mod_tests {
         assert!(
             !bar.contains("[PLAYING]"),
             "DEF-003: compact bar must NOT show [PLAYING] when paused: {bar}"
+        );
+    }
+
+    /// DEF-004: long title must not collide with transport controls.
+    #[test]
+    fn def004_long_title_no_collision_with_transport() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.play_in_context_ids(vec!["t2".into()], "t2");
+        let bar = rendered_bar(&app, 100, 2);
+        let row0 = bar.lines().next().unwrap();
+        let controls_area: String = row0.chars().skip(86).collect();
+        assert!(
+            controls_area.contains("◀◀"),
+            "DEF-004: transport prev must be in controls area: {bar}"
+        );
+        let info_leak: String = controls_area
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect();
+        assert!(
+            info_leak.is_empty(),
+            "DEF-004: info text leaked into transport controls: {info_leak:?}
+{bar}"
+        );
+    }
+
+    /// DEF-004: volume bar intact at 120 cols with a short title (room for all).
+    #[test]
+    fn def004_volume_bar_intact_at_120_cols() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        let bar = rendered_bar(&app, 120, 2);
+        assert!(bar.contains("vol "), "DEF-004: vol label missing: {bar}");
+        assert!(bar.contains("70%"), "DEF-004: vol pct missing: {bar}");
+    }
+
+    /// DEF-004: volume bar dropped (not corrupted) when title is very long.
+    #[test]
+    fn def004_volume_dropped_not_corrupted_with_long_title() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.play_in_context_ids(vec!["t2".into()], "t2");
+        let bar = rendered_bar(&app, 120, 2);
+        let row0 = bar.lines().next().unwrap();
+        // Transport controls must still be present and intact.
+        assert!(
+            row0.contains("◀◀"),
+            "DEF-004: transport prev missing: {bar}"
+        );
+        // No info text should leak into the transport control area.
+        let controls_area: String = row0.chars().skip(106).collect();
+        let info_leak: String = controls_area
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect();
+        assert!(
+            info_leak.is_empty(),
+            "DEF-004: info leaked into transport at 120 cols: {info_leak:?}
+{bar}"
+        );
+    }
+
+    /// DEF-051: no trailing dot in mixed mode compact bar.
+    #[test]
+    fn def051_no_trailing_dot_in_mixed_mode() {
+        let (_d, cat) = two_track_cat();
+        for yt_state in [
+            YtState::Unconfigured,
+            YtState::Ready,
+            YtState::SignedOut,
+            YtState::Authenticating,
+        ] {
+            for w in [70u16, 80, 100] {
+                let mut app = App::new(cat.clone(), Box::new(StubPlayer::default()), None, None);
+                app.source_mode = SourceMode::Mixed;
+                app.yt_state = yt_state;
+                let bar = rendered_compact(&app, w, 1);
+                let line = bar.lines().next().unwrap();
+                let trimmed = line.trim_end();
+                assert!(
+                    !trimmed.ends_with('·'),
+                    "DEF-051: trailing dot yt={:?} w={}: {:?}",
+                    yt_state,
+                    w,
+                    trimmed
+                );
+            }
+        }
+    }
+
+    /// DEF-057: Next: cue visible while playing.
+    #[test]
+    fn def057_next_cue_visible_while_playing() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.play_in_context_ids(vec!["t1".into(), "t2".into()], "t1");
+        assert!(app.player.is_playing());
+        let bar = rendered_bar(&app, 120, 2);
+        assert!(
+            bar.contains("Next:"),
+            "DEF-057: Next: cue must be visible while playing: {bar}"
         );
     }
 }

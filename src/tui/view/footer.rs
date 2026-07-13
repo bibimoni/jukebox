@@ -76,10 +76,17 @@ pub fn render(f: &mut Frame, area: &ratatui::layout::Rect, app: &App) {
 fn mode_badge(app: &App, theme: &Theme) -> Span<'static> {
     use crate::tui::app::View;
     let view_src = match app.view {
-        View::Artists | View::Playlists | View::Queue => "local",
+        View::Artists | View::Playlists => "local",
+        // DEF-050: Queue is a distinct view — show "queue".
+        View::Queue => "queue",
         View::Youtube => "youtube",
     };
-    let mode = app.source_mode.as_str();
+    // DEF-021: SOURCE reflects the playing track's source, not mode pref.
+    let source = app
+        .now_playing
+        .as_ref()
+        .map(|np| if np.is_remote() { "youtube" } else { "local" })
+        .unwrap_or_else(|| app.source_mode.as_str());
     // High-contrast indicator: when `JUKEBOX_HIGH_CONTRAST` is set the theme
     // collapses to pure white/black. Surface the mode in the status line so
     // the user can verify the toggle is active (judge: accessibility mode
@@ -98,7 +105,7 @@ fn mode_badge(app: &App, theme: &Theme) -> Span<'static> {
         theme.accent
     };
     Span::styled(
-        format!("VIEW: {view_src} {} SOURCE: {mode}{hc}", sep_dot()),
+        format!("VIEW: {view_src} {} SOURCE: {source}{hc}", sep_dot()),
         Style::default().fg(color),
     )
 }
@@ -344,14 +351,50 @@ pub fn footer_line(app: &App, theme: &Theme, dim: &Style, width: u16) -> Line<'s
     status_line(app, theme)
 }
 
+/// DEF-036: a description of the current async operation, if one is in
+/// flight. Checked by `hint_line` so the footer shows a persistent loading
+/// indicator (with the item name + op type) until completion/failure.
+fn async_loading_text(app: &App) -> Option<String> {
+    use crate::tui::view::theme::ellipsis;
+    if let Some(name) = &app.discover_play_loading {
+        return Some(format!("Loading {name}{}", ellipsis()));
+    }
+    if app.discover_loading {
+        return Some(format!("Loading suggestions{}", ellipsis()));
+    }
+    if app.pending_discover_play.is_some() {
+        return Some(format!("Loading playlist{}", ellipsis()));
+    }
+    if app.pending_play.is_some() {
+        let title = app
+            .yt_session
+            .as_ref()
+            .and_then(|s| s.track_for(app.pending_play.as_ref().unwrap()))
+            .map(|t| t.title.clone())
+            .unwrap_or_else(|| "stream".to_string());
+        return Some(format!("Resolving {title}{}", ellipsis()));
+    }
+    if app.pending_radio_seed.is_some() {
+        return Some(format!("Refilling radio{}", ellipsis()));
+    }
+    if app.yt_lists_loading {
+        return Some(format!("Loading YT lists{}", ellipsis()));
+    }
+    if app.is_resolving() {
+        return Some(format!("Resolving{}", ellipsis()));
+    }
+    None
+}
+
 /// The key-hint bar, ordered by priority so the most discoverable keys survive
-/// narrow terminals. Priority: `Enter play` > `q quit` > `? help` >
-/// `1-4 view` > `> < next prev` > `M mode` > `/ search`. Below 60 cols only the
-/// top 3 are shown so `Enter play · q quit · ? help` always fits. The
-/// `1-4 view` hint tells the user they can press `1`–`4` to switch between
-/// Artists / Playlists / Queue / YouTube views — so an empty queue or an
-/// empty playlist pane doesn't become a dead end (GLM:
-/// empty-queue-no-quick-navigation).
+/// narrow terminals. Below 60 cols only the top 3 are shown.
+///
+/// DEF-036: when an async op is in flight, shows a persistent loading indicator
+/// (with item name + op type) instead of key hints.
+///
+/// DEF-066: context-aware — "Space pause" while playing, "Space resume" while
+/// paused, view-specific hints (x remove in Queue, S discover in YouTube),
+/// "Esc close" when an overlay is active.
 fn hint_line(app: &App, dim: &Style, width: u16) -> Line<'static> {
     let theme = Theme::default();
     let accent = Style::default().fg(if no_color() {
@@ -360,10 +403,19 @@ fn hint_line(app: &App, dim: &Style, width: u16) -> Line<'static> {
         theme.accent
     });
 
-    // When a search overlay is active, show prominent segmented scope tabs
-    // "[Local] [YouTube]" so the search scope is visible at a glance (T5:
-    // search scope was muted — add segmented tabs). The active scope is
-    // accent-colored; the inactive is dim.
+    // DEF-036: persistent loading indicator.
+    if let Some(loading) = async_loading_text(app) {
+        let style = Style::default()
+            .fg(if no_color() {
+                Color::Reset
+            } else {
+                theme.accent
+            })
+            .add_modifier(Modifier::BOLD);
+        return Line::from(Span::styled(loading, style));
+    }
+
+    // Search overlay: segmented scope tabs.
     if let Some(Overlay::Search { scope, .. }) = &app.overlay {
         let local_st = if *scope == SearchScope::Local {
             accent
@@ -393,17 +445,39 @@ fn hint_line(app: &App, dim: &Style, width: u16) -> Line<'static> {
     }
 
     let sep = format!(" {} ", sep_dot());
-    let search_hint = "/ search";
+
+    // DEF-066: context-aware first hint.
+    let playing = app.player.is_playing() && app.now_playing.is_some();
+    let has_track = app.now_playing.is_some();
+    let first_hint = if playing {
+        "Space pause"
+    } else if has_track {
+        "Space resume"
+    } else {
+        "Enter play"
+    };
+
     let mut parts: Vec<String> = vec![
-        "Enter play".to_string(),
+        first_hint.to_string(),
         "q quit".to_string(),
         "? help".to_string(),
     ];
+
+    // DEF-066: "Esc close" when an overlay is active.
+    if app.overlay.is_some() {
+        parts.insert(1, "Esc close".to_string());
+    }
+
     if width >= 60 {
         parts.push("1-4 view".to_string());
         parts.push("> < next prev".to_string());
         parts.push("M mode".to_string());
-        parts.push(search_hint.to_string());
+        // DEF-066: view-specific hints.
+        match app.view {
+            crate::tui::app::View::Queue => parts.push("x remove".to_string()),
+            crate::tui::app::View::Youtube => parts.push("S discover".to_string()),
+            _ => parts.push("/ search".to_string()),
+        }
     }
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, s) in parts.iter().enumerate() {
