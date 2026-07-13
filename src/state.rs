@@ -223,6 +223,48 @@ pub struct LayoutState {
     pub last_cursor_track: usize,
     #[serde(default)]
     pub last_cursor_playlist: usize,
+    #[serde(default)]
+    pub player_bar_mode: String,
+    #[serde(default)]
+    pub track_layout_mode: String,
+    #[serde(default = "default_sidebar_visible")]
+    pub sidebar_visible: bool,
+    #[serde(default)]
+    pub playlist_col: PlaylistColState,
+}
+
+fn default_sidebar_visible() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PlaylistColState {
+    #[serde(default = "default_playlist_col_width")]
+    pub width: u16,
+    #[serde(default = "default_playlist_col_group")]
+    pub group_by_type: bool,
+    #[serde(default = "default_playlist_col_counts")]
+    pub show_counts: bool,
+}
+
+fn default_playlist_col_width() -> u16 {
+    32
+}
+fn default_playlist_col_group() -> bool {
+    true
+}
+fn default_playlist_col_counts() -> bool {
+    true
+}
+
+impl Default for PlaylistColState {
+    fn default() -> Self {
+        PlaylistColState {
+            width: 32,
+            group_by_type: true,
+            show_counts: true,
+        }
+    }
 }
 
 fn default_focus() -> String {
@@ -258,6 +300,10 @@ impl Default for LayoutState {
             last_cursor_album: 0,
             last_cursor_track: 0,
             last_cursor_playlist: 0,
+            player_bar_mode: "mini".to_string(),
+            track_layout_mode: "table".to_string(),
+            sidebar_visible: true,
+            playlist_col: PlaylistColState::default(),
         }
     }
 }
@@ -325,6 +371,10 @@ pub struct LayoutSave<'a> {
     pub last_cursor_album: usize,
     pub last_cursor_track: usize,
     pub last_cursor_playlist: usize,
+    pub player_bar_mode: &'a str,
+    pub track_layout_mode: &'a str,
+    pub sidebar_visible: bool,
+    pub playlist_col: &'a crate::tui::app::PlaylistColumnState,
 }
 
 /// Save the layout (focus + widths + volume + shuffle/repeat) to `path`.
@@ -367,6 +417,14 @@ pub fn save_layout_at(path: &Path, input: &LayoutSave) -> Result<()> {
         last_cursor_album: input.last_cursor_album,
         last_cursor_track: input.last_cursor_track,
         last_cursor_playlist: input.last_cursor_playlist,
+        player_bar_mode: input.player_bar_mode.to_string(),
+        track_layout_mode: input.track_layout_mode.to_string(),
+        sidebar_visible: input.sidebar_visible,
+        playlist_col: PlaylistColState {
+            width: input.playlist_col.width,
+            group_by_type: input.playlist_col.group_by_type,
+            show_counts: input.playlist_col.show_counts,
+        },
     })?;
     conn.execute(
         "INSERT INTO state (key, value) VALUES ('layout', ?1)

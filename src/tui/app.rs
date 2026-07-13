@@ -26,6 +26,56 @@ pub enum View {
     Youtube,
 }
 
+/// Which YouTube sub-tab is active inside `View::Youtube` (I.4 tab system).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum YtTab {
+    #[default]
+    Home,
+    Library,
+    Search,
+    Discover,
+    Radio,
+}
+
+impl YtTab {
+    pub fn all() -> [(&'static str, YtTab); 5] {
+        [
+            ("1:Home", YtTab::Home),
+            ("2:Library", YtTab::Library),
+            ("3:Search", YtTab::Search),
+            ("4:Discover", YtTab::Discover),
+            ("5:Radio", YtTab::Radio),
+        ]
+    }
+    pub fn next(self) -> YtTab {
+        match self {
+            YtTab::Home => YtTab::Library,
+            YtTab::Library => YtTab::Search,
+            YtTab::Search => YtTab::Discover,
+            YtTab::Discover => YtTab::Radio,
+            YtTab::Radio => YtTab::Home,
+        }
+    }
+    pub fn prev(self) -> YtTab {
+        match self {
+            YtTab::Home => YtTab::Radio,
+            YtTab::Library => YtTab::Home,
+            YtTab::Search => YtTab::Library,
+            YtTab::Discover => YtTab::Search,
+            YtTab::Radio => YtTab::Discover,
+        }
+    }
+}
+
+/// Per-tab state for the YouTube view (I.4 + I.1).
+#[derive(Clone, Debug, Default)]
+pub struct YtViewState {
+    pub tab: YtTab,
+    pub home: crate::tui::view::home::HomeState,
+    pub library_cursor: usize,
+    pub library_section: usize,
+}
+
 /// A YouTube playlist/mood list shown in the Y view. `track_ids` are the
 /// video_ids of the list's tracks, fetched lazily (via the sidecar) when the
 /// user focuses the list.
@@ -37,7 +87,7 @@ pub struct YtList {
     pub track_ids: Vec<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum YtListKind {
     #[default]
     Account,
@@ -67,6 +117,61 @@ pub struct ColumnCursors {
     pub playlist: usize,
     pub queue: usize,
     pub search: usize,
+}
+
+/// I.7: Variable-width playlist column state. Persisted in `LayoutState.playlist_col`.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlaylistColumnState {
+    #[serde(default = "default_playlist_col_width")]
+    pub width: u16,
+    #[serde(default = "default_playlist_col_group")]
+    pub group_by_type: bool,
+    #[serde(default = "default_playlist_col_counts")]
+    pub show_counts: bool,
+}
+
+fn default_playlist_col_width() -> u16 {
+    32
+}
+fn default_playlist_col_group() -> bool {
+    true
+}
+fn default_playlist_col_counts() -> bool {
+    true
+}
+
+impl Default for PlaylistColumnState {
+    fn default() -> Self {
+        PlaylistColumnState {
+            width: 32,
+            group_by_type: true,
+            show_counts: true,
+        }
+    }
+}
+
+impl PlaylistColumnState {
+    pub fn default_for_width(tw: u16) -> Self {
+        if tw >= 100 {
+            PlaylistColumnState::default()
+        } else {
+            PlaylistColumnState {
+                width: 24,
+                group_by_type: false,
+                show_counts: false,
+            }
+        }
+    }
+    pub fn clamp_width(&mut self, tw: u16) {
+        let min = 16;
+        let max = (tw / 2).max(min);
+        if self.width < min {
+            self.width = min;
+        }
+        if self.width > max {
+            self.width = max;
+        }
+    }
 }
 
 /// Column widths for the three-pane browse layout.
@@ -338,6 +443,7 @@ pub struct App {
     /// Empty until `refresh_yt_lists` populates them.
     pub yt_lists: Vec<YtList>,
     pub yt_lists_loading: bool,
+    pub yt_view: YtViewState,
     /// Playlist ids whose tracks have been fetched (even if empty), so a
     /// genuinely-empty list isn't re-fetched every tick while focused.
     pub loaded_yt_lists: HashSet<String>,
@@ -570,6 +676,9 @@ pub struct App {
     /// When the current `status_toast` was set; used by `on_tick` to clear it
     /// after the TTL. `None` when no status toast is active.
     pub status_toast_at: Option<std::time::Instant>,
+    pub player_bar_state: crate::tui::view::player_bar_big::PlayerBarState,
+    pub sidebar_visible: bool,
+    pub playlist_col: PlaylistColumnState,
 }
 
 /// Inline filter state for the `f` filter-on-focused-column (spec §5.4).
@@ -744,6 +853,7 @@ impl App {
             device_rate: crate::source::device_rate::DeviceRateState::default(),
             yt_lists: Vec::new(),
             yt_lists_loading: false,
+            yt_view: YtViewState::default(),
             yt_error: None,
             yt_status: None,
             yt_state: crate::yt::state::YtState::default(),
@@ -793,6 +903,9 @@ impl App {
             toast_at: None,
             status_toast: None,
             status_toast_at: None,
+            player_bar_state: crate::tui::view::player_bar_big::PlayerBarState::default(),
+            sidebar_visible: true,
+            playlist_col: PlaylistColumnState::default(),
         }
     }
 
@@ -3161,6 +3274,15 @@ impl App {
                 albums
             }
         };
+        let open_in_tab = matches!(
+            self.source_mode,
+            crate::mode::SourceMode::Youtube | crate::mode::SourceMode::Mixed
+        );
+        if open_in_tab {
+            self.view = View::Youtube;
+            self.focus_col = 0;
+            self.yt_view.tab = YtTab::Discover;
+        }
         self.overlay = Some(Overlay::Discover { items, cursor: 0 });
     }
 
@@ -3258,7 +3380,6 @@ impl App {
     /// Artists (col 2) where there's no jump target — only the list columns are
     /// filterable, so an accidental `f` elsewhere doesn't open a dead filter.
     pub fn toggle_filter(&mut self) {
-        // Queue has nothing to filter.
         if self.view == View::Queue {
             return;
         }
@@ -3271,6 +3392,32 @@ impl App {
                 })
             }
         }
+    }
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar_visible = !self.sidebar_visible;
+    }
+    pub fn adjust_playlist_col_width(&mut self, delta: i16) {
+        if !self.playlist_col_focused() {
+            return;
+        }
+        let (w, _) = crossterm::terminal::size().unwrap_or((0, 0));
+        self.playlist_col.width = (self.playlist_col.width as i16 + delta).max(0) as u16;
+        self.playlist_col.clamp_width(w.max(1));
+    }
+    pub fn toggle_playlist_group(&mut self) {
+        if self.playlist_col_focused() {
+            self.playlist_col.group_by_type = !self.playlist_col.group_by_type;
+        }
+    }
+    pub fn toggle_playlist_counts(&mut self) {
+        if self.playlist_col_focused() {
+            self.playlist_col.show_counts = !self.playlist_col.show_counts;
+        }
+    }
+    pub fn playlist_col_focused(&self) -> bool {
+        self.view == View::Youtube
+            && self.yt_view.tab == crate::tui::app::YtTab::Library
+            && self.focus_col == 0
     }
 
     /// `Enter` while a filter is active: jump the real cursor to the first
@@ -4056,6 +4203,10 @@ impl App {
         sections.push((HomeSection::Library, library));
 
         state.sections = sections;
+        self.view = View::Youtube;
+        self.focus_col = 0;
+        self.yt_view.tab = YtTab::Home;
+        self.yt_view.home = state.clone();
         self.overlay = Some(Overlay::Home { state });
     }
 
@@ -4068,6 +4219,9 @@ impl App {
         let mut session = RadioSession::new(RadioSeed::Track(track_id.to_string()));
         session.set_yt_track_ids(self.yt_track_ids());
         session.initialize(&self.reco_profile, &self.catalog.tracks);
+        self.view = View::Youtube;
+        self.focus_col = 0;
+        self.yt_view.tab = YtTab::Radio;
         self.overlay = Some(Overlay::Radio {
             session: Some(session),
         });
@@ -4082,6 +4236,9 @@ impl App {
         let mut session = RadioSession::new(RadioSeed::Artist(artist.to_string()));
         session.set_yt_track_ids(self.yt_track_ids());
         session.initialize(&self.reco_profile, &self.catalog.tracks);
+        self.view = View::Youtube;
+        self.focus_col = 0;
+        self.yt_view.tab = YtTab::Radio;
         self.overlay = Some(Overlay::Radio {
             session: Some(session),
         });
@@ -4793,6 +4950,112 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, Track};
     use crate::player::StubPlayer;
+    /// I.7: PlaylistColumnState defaults to width=32, grouping+counts on.
+    #[test]
+    fn playlist_col_state_default() {
+        let s = PlaylistColumnState::default();
+        assert_eq!(s.width, 32);
+        assert!(s.group_by_type);
+        assert!(s.show_counts);
+    }
+
+    /// I.7: default_for_width narrows + disables at <100 cols.
+    #[test]
+    fn playlist_col_state_default_for_width() {
+        let s = PlaylistColumnState::default_for_width(80);
+        assert_eq!(s.width, 24);
+        assert!(!s.group_by_type);
+        assert!(!s.show_counts);
+        let s2 = PlaylistColumnState::default_for_width(100);
+        assert_eq!(s2.width, 32);
+        assert!(s2.group_by_type);
+    }
+
+    /// I.7: clamp_width keeps width in [16, term/2].
+    #[test]
+    fn playlist_col_state_clamp_width() {
+        let mut s = PlaylistColumnState::default();
+        s.width = 0;
+        s.clamp_width(100);
+        assert_eq!(s.width, 16, "min is 16");
+        s.width = 200;
+        s.clamp_width(100);
+        assert_eq!(s.width, 50, "max is term/2");
+    }
+
+    /// I.7: playlist_col_focused is true only in YT Library tab col 0.
+    #[test]
+    fn playlist_col_focused_gating() {
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({"version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),"tracks":[{"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"F","album":"A","bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/A/01.flac","symlinked_into_artists":["Ado"]}]}).to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        let cat = Catalog::load(&p).unwrap();
+        std::mem::forget(d);
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.view = View::Youtube;
+        app.yt_view.tab = crate::tui::app::YtTab::Library;
+        app.focus_col = 0;
+        assert!(app.playlist_col_focused(), "focused in YT Library col 0");
+        app.focus_col = 1;
+        assert!(!app.playlist_col_focused(), "not focused in col 1");
+        app.view = View::Artists;
+        app.focus_col = 0;
+        assert!(!app.playlist_col_focused(), "not focused in Artists view");
+    }
+
+    /// I.7: toggle_playlist_group only when focused.
+    #[test]
+    fn toggle_playlist_group_gated() {
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({"version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),"tracks":[{"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"F","album":"A","bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/A/01.flac","symlinked_into_artists":["Ado"]}]}).to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        let cat = Catalog::load(&p).unwrap();
+        std::mem::forget(d);
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        let initial = app.playlist_col.group_by_type;
+        // Not focused — no-op.
+        app.view = View::Artists;
+        app.toggle_playlist_group();
+        assert_eq!(
+            app.playlist_col.group_by_type, initial,
+            "no toggle when not focused"
+        );
+        // Focused — toggles.
+        app.view = View::Youtube;
+        app.yt_view.tab = crate::tui::app::YtTab::Library;
+        app.focus_col = 0;
+        app.toggle_playlist_group();
+        assert_ne!(
+            app.playlist_col.group_by_type, initial,
+            "toggles when focused"
+        );
+    }
+
+    /// I.6: toggle_sidebar flips sidebar_visible.
+    #[test]
+    fn toggle_sidebar_flips_flag() {
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({"version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),"tracks":[{"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"F","album":"A","bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/A/01.flac","symlinked_into_artists":["Ado"]}]}).to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        let cat = Catalog::load(&p).unwrap();
+        std::mem::forget(d);
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        let initial = app.sidebar_visible;
+        app.toggle_sidebar();
+        assert_ne!(app.sidebar_visible, initial, "B flips sidebar_visible");
+    }
 
     fn make_track(id: &str, artist: &str, album: &str, title: &str) -> Track {
         Track {

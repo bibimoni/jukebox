@@ -26,28 +26,275 @@ use ratatui::{
 
 use crate::tui::app::{App, View};
 use crate::tui::view::theme::{
-    ascii_sanitize, disp_width, ellipsis, em_dash, is_ascii, left_arrow, marker_glyph, no_color,
-    pad_between, play_glyph, sep_dot, Theme, ASCII_BORDER_SET,
+    ascii_sanitize, disp_width, ellipsis, em_dash, h_line, is_ascii, left_arrow, marker_glyph,
+    no_color, pad_between, play_glyph, sep_dot, Theme, ASCII_BORDER_SET,
 };
+
+// --- I.5: Multi-column track list (DEF-069) -------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct TrackColumns {
+    pub show_num: bool,
+    pub show_title: bool,
+    pub show_artist: bool,
+    pub show_album: bool,
+    pub show_duration: bool,
+    pub show_quality: bool,
+    pub show_source: bool,
+}
+
+impl TrackColumns {
+    pub fn is_table(&self) -> bool {
+        self.show_artist || self.show_quality
+    }
+}
+
+pub fn columns_for_width(width: u16, view: View, mixed: bool) -> TrackColumns {
+    let _ = view;
+    if width < 80 {
+        TrackColumns {
+            show_num: true,
+            show_title: true,
+            show_artist: false,
+            show_album: false,
+            show_duration: false,
+            show_quality: false,
+            show_source: false,
+        }
+    } else if width < 100 {
+        TrackColumns {
+            show_num: true,
+            show_title: true,
+            show_artist: true,
+            show_album: false,
+            show_duration: false,
+            show_quality: true,
+            show_source: false,
+        }
+    } else {
+        TrackColumns {
+            show_num: true,
+            show_title: true,
+            show_artist: true,
+            show_album: true,
+            show_duration: true,
+            show_quality: true,
+            show_source: mixed,
+        }
+    }
+}
+
+pub fn track_header_height(width: u16) -> usize {
+    if width >= 80 {
+        2
+    } else {
+        0
+    }
+}
+
+fn track_header(cols: &TrackColumns, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    if !cols.is_table() {
+        return Vec::new();
+    }
+    let hs = theme.header_style();
+    let dim = Style::default().fg(theme.dim);
+    let cells = build_header_cells(cols, width);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, (text, _w)) in cells.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(text.clone(), hs));
+    }
+    vec![
+        Line::from(spans),
+        Line::from(Span::styled(h_line().repeat(width.saturating_sub(1)), dim)),
+    ]
+}
+
+fn build_header_cells(cols: &TrackColumns, width: usize) -> Vec<(String, usize)> {
+    let num_w = 3usize;
+    let dur_w = 6usize;
+    let qual_w = 8usize;
+    let src_w = if cols.show_source { 4usize } else { 0 };
+    let mut n = 0usize;
+    if cols.show_num {
+        n += 1;
+    }
+    if cols.show_title {
+        n += 1;
+    }
+    if cols.show_artist {
+        n += 1;
+    }
+    if cols.show_album {
+        n += 1;
+    }
+    if cols.show_duration {
+        n += 1;
+    }
+    if cols.show_quality {
+        n += 1;
+    }
+    if cols.show_source {
+        n += 1;
+    }
+    let gaps = n.saturating_sub(1);
+    let fixed = (if cols.show_num { num_w } else { 0 })
+        + (if cols.show_duration { dur_w } else { 0 })
+        + (if cols.show_quality { qual_w } else { 0 })
+        + src_w;
+    let rem = width.saturating_sub(fixed + gaps);
+    let title_w = if cols.show_title { rem * 3 / 7 } else { 0 };
+    let artist_w = if cols.show_artist { rem * 2 / 7 } else { 0 };
+    let album_w = if cols.show_album {
+        rem.saturating_sub(title_w + artist_w)
+    } else {
+        0
+    };
+    let mut cells = Vec::new();
+    if cols.show_num {
+        cells.push(("#".into(), num_w));
+    }
+    if cols.show_title {
+        cells.push(("Title".into(), title_w));
+    }
+    if cols.show_artist {
+        cells.push(("Artist".into(), artist_w));
+    }
+    if cols.show_album {
+        cells.push(("Album".into(), album_w));
+    }
+    if cols.show_duration {
+        cells.push(("Dur".into(), dur_w));
+    }
+    if cols.show_quality {
+        cells.push(("Qual".into(), qual_w));
+    }
+    if cols.show_source {
+        cells.push(("Src".into(), src_w));
+    }
+    cells
+}
+
+fn fmt_duration(secs: Option<f64>) -> String {
+    match secs {
+        Some(s) => {
+            let t = s.max(0.0) as u64;
+            let h = t / 3600;
+            let m = (t % 3600) / 60;
+            let sc = t % 60;
+            if h > 0 {
+                format!("{h}:{m:02}:{sc:02}")
+            } else {
+                format!("{m}:{sc:02}")
+            }
+        }
+        None => "--:--".to_string(),
+    }
+}
+
+fn track_duration(app: &App, id: &str) -> Option<f64> {
+    if app.track_by_id_fast(id).is_some() {
+        None
+    } else {
+        app.yt_session
+            .as_ref()
+            .and_then(|s| s.track_for(id))
+            .and_then(|rt| rt.dur)
+    }
+}
+
+fn pad_field(s: &str, w: usize) -> String {
+    let dw = disp_width(s);
+    if dw == w {
+        return s.to_string();
+    }
+    if dw > w {
+        if w == 0 {
+            return String::new();
+        }
+        if w == 1 {
+            return ellipsis().to_string();
+        }
+        let mut out = String::new();
+        let mut width = 0;
+        for c in s.chars() {
+            let cw = disp_width(&c.to_string());
+            if width + cw > w - 1 {
+                break;
+            }
+            out.push(c);
+            width += cw;
+        }
+        out.push_str(ellipsis());
+        out
+    } else {
+        format!("{s}{}", " ".repeat(w - dw))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_table_row(
+    glyph: &str,
+    num: &str,
+    title: &str,
+    artist: &str,
+    album: &str,
+    duration: &str,
+    quality: &str,
+    source_badge: Option<&str>,
+    cols: &TrackColumns,
+    width: usize,
+    style: Style,
+    badge_style: Option<Style>,
+) -> Line<'static> {
+    let cells = build_header_cells(cols, width);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, (label, w)) in cells.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let v = match label.as_str() {
+            "#" => format!("{glyph}{num:>2}"),
+            "Title" => pad_field(title, *w),
+            "Artist" => pad_field(artist, *w),
+            "Album" => pad_field(album, *w),
+            "Dur" => pad_field(duration, *w),
+            "Qual" => pad_field(quality, *w),
+            "Src" => source_badge.unwrap_or("").to_string(),
+            _ => String::new(),
+        };
+        let is_src = label == "Src" && source_badge.is_some();
+        if is_src {
+            spans.push(Span::styled(v, badge_style.unwrap_or(style)));
+        } else {
+            spans.push(Span::styled(v, style));
+        }
+    }
+    Line::from(spans)
+}
 
 /// Render the rail + columns into `area` using state from `app`.
 pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = Theme::default();
-    let split = Layout::horizontal([
-        Constraint::Length(app.column_widths.rail),
-        Constraint::Min(1),
-    ])
-    .split(area);
-    let rail_area = split[0];
-    let main_area = split[1];
-
-    render_rail(f, rail_area, app, &theme);
+    let main_area = if app.sidebar_visible {
+        area
+    } else {
+        let split = Layout::horizontal([
+            Constraint::Length(app.column_widths.rail),
+            Constraint::Min(1),
+        ])
+        .split(area);
+        render_rail(f, split[0], app, &theme);
+        split[1]
+    };
 
     match app.view {
         View::Artists => render_artists(f, main_area, app, &theme),
         View::Playlists => render_playlists(f, main_area, app, &theme),
         View::Queue => render_queue(f, main_area, app, &theme),
-        View::Youtube => render_youtube(f, main_area, app, &theme),
+        View::Youtube => super::yt_view::render_yt_view(f, main_area, app),
     }
 }
 
@@ -441,6 +688,7 @@ pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
 /// When the provider is in an error state and the focused list has no
 /// tracks, col2 renders a compact error card (icon + headline + detail +
 /// "R retry · 1 local" hint) instead of a bare status line (Issue 3).
+#[allow(dead_code)]
 fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let cw = &app.column_widths;
     // Split off a 3-row Up-Next pane at the bottom when there are suggested
@@ -572,10 +820,12 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         // without this the cursor moves below the visible area and disappears
         // when the track list is longer than the pane. Keep the cursor row
         // visible by scrolling down once it passes the last visible row.
-        let visible_h = cols[1].height.saturating_sub(2) as usize; // minus top+bottom border
+        let visible_h = cols[1].height.saturating_sub(2) as usize;
         let cursor = app.cursors.track;
-        let scroll = if cursor >= visible_h {
-            cursor - visible_h + 1
+        let pane_w = cols[1].width.saturating_sub(2) as usize;
+        let header_h = track_header_height(pane_w as u16);
+        let scroll = if cursor + header_h >= visible_h {
+            cursor + header_h - visible_h + 1
         } else {
             0
         };
@@ -617,7 +867,14 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
 /// CTA) from "lists present but none selected" — and `ids_empty` distinguishes
 /// "no list selected" (select a list) from "list selected but empty" (the
 /// fetch returned, just empty). Exposed for unit testing.
+#[allow(dead_code)]
 fn yt_status_line(app: &App, lists_empty: bool, ids_empty: bool) -> String {
+    yt_status_line_impl(app, lists_empty, ids_empty)
+}
+pub(crate) fn yt_status_line_pub(app: &App, lists_empty: bool, ids_empty: bool) -> String {
+    yt_status_line_impl(app, lists_empty, ids_empty)
+}
+fn yt_status_line_impl(app: &App, lists_empty: bool, ids_empty: bool) -> String {
     use crate::yt::state::YtState;
     // An error detail takes precedence over the generic state label so a
     // specific failure (e.g. "retry failed: …") is visible in the Y view too.
@@ -688,7 +945,7 @@ fn yt_status_line(app: &App, lists_empty: bool, ids_empty: bool) -> String {
 /// state glyph (`[err]`, `[reauth]`, `[fail]`, `[!]`, `[~]`, `[stale]`,
 /// `[throttle]`); `Ready` has no icon so it falls back to `"[ok]"` — the only
 /// state that legitimately claims "ok".
-fn yt_header_tag(state: crate::yt::state::YtState) -> &'static str {
+pub(crate) fn yt_header_tag(state: crate::yt::state::YtState) -> &'static str {
     state.icon().unwrap_or("[ok]")
 }
 
@@ -696,7 +953,7 @@ fn yt_header_tag(state: crate::yt::state::YtState) -> &'static str {
 /// cut. Wide (CJK) characters are kept whole. Trailing separators (—, ·, -,
 /// spaces) are stripped before the ellipsis so it doesn't follow dangling
 /// punctuation. When the text fits, it is returned unchanged.
-fn truncate_ellipsis(s: &str, width: usize) -> String {
+pub(crate) fn truncate_ellipsis(s: &str, width: usize) -> String {
     if disp_width(s) <= width {
         return s.to_string();
     }
@@ -739,7 +996,14 @@ fn truncate_ellipsis(s: &str, width: usize) -> String {
 /// empty pane with no clear recovery action). Under `NO_COLOR` the alert
 /// color collapses to `Reset`; the icon glyph + text labels distinguish the
 /// error without color.
+#[allow(dead_code)]
 fn yt_error_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
+    yt_error_lines_impl(app, theme)
+}
+pub(crate) fn yt_error_lines_pub(app: &App, theme: &Theme) -> Vec<Line<'static>> {
+    yt_error_lines_impl(app, theme)
+}
+fn yt_error_lines_impl(app: &App, theme: &Theme) -> Vec<Line<'static>> {
     let dim = Style::default().fg(theme.dim);
     let accent = Style::default().fg(theme.accent);
     let err_color = if no_color() { Color::Reset } else { Color::Red };
@@ -921,10 +1185,12 @@ fn render_artists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     );
     // Scroll-to-cursor: keep the selected track visible when the list is
     // longer than the pane (Paragraph doesn't auto-scroll like List).
-    let visible_h = track_area.height.saturating_sub(2) as usize; // minus top+bottom border
+    let visible_h = track_area.height.saturating_sub(2) as usize;
     let cursor = app.cursors.track;
-    let scroll = if cursor >= visible_h {
-        cursor - visible_h + 1
+    let pane_w = track_area.width.saturating_sub(2) as usize;
+    let header_h = track_header_height(pane_w as u16);
+    let scroll = if cursor + header_h >= visible_h {
+        cursor + header_h - visible_h + 1
     } else {
         0
     };
@@ -999,10 +1265,12 @@ fn render_playlists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let lines = track_rows(app, &ids, cols[1].width.saturating_sub(2) as usize, theme);
     // Scroll-to-cursor: keep the selected track visible when the list is
     // longer than the pane (Paragraph doesn't auto-scroll like List).
-    let visible_h = cols[1].height.saturating_sub(2) as usize; // minus top+bottom border
+    let visible_h = cols[1].height.saturating_sub(2) as usize;
     let cursor = app.cursors.track;
-    let scroll = if cursor >= visible_h {
-        cursor - visible_h + 1
+    let pane_w = cols[1].width.saturating_sub(2) as usize;
+    let header_h = track_header_height(pane_w as u16);
+    let scroll = if cursor + header_h >= visible_h {
+        cursor + header_h - visible_h + 1
     } else {
         0
     };
@@ -1064,10 +1332,12 @@ fn render_queue(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         let lines = track_rows(app, &ids, area.width.saturating_sub(2) as usize, theme);
         // Scroll-to-cursor: keep the selected queue entry visible when the
         // queue is longer than the pane (Paragraph doesn't auto-scroll).
-        let visible_h = area.height.saturating_sub(2) as usize; // minus top+bottom border
+        let visible_h = area.height.saturating_sub(2) as usize;
         let cursor = app.cursors.queue;
-        let scroll = if cursor >= visible_h {
-            cursor - visible_h + 1
+        let pane_w = area.width.saturating_sub(2) as usize;
+        let header_h = track_header_height(pane_w as u16);
+        let scroll = if cursor + header_h >= visible_h {
+            cursor + header_h - visible_h + 1
         } else {
             0
         };
@@ -1115,79 +1385,120 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
     use crate::mode::SourceMode;
     let dim = Style::default().fg(theme.dim);
     let nc = no_color();
-    // Source badge only in Mixed mode (Issue 4: the only time the source is
-    // ambiguous per-row). In Local mode every row is local — [L] is redundant
-    // clutter. Badge also stays off on very narrow panes (width <= 60).
-    // DEF-049: threshold lowered from 60 to 20 so [L]/[Y] shows in narrow cols.
     let show_badge = width > 20 && app.source_mode == SourceMode::Mixed;
-    // Both "[L] " and "[Y] " are 4 bytes; the badge prefix length is fixed so
-    // the `rest` slice can be taken after the badge span is split out.
     let badge_len = if show_badge { 4 } else { 0 };
-
-    ids.iter()
-        .enumerate()
-        .map(|(i, id)| {
-            let np = app.now_playing.as_ref().map(|s| s.id()) == Some(id.as_str());
-            let selected = i == app.cursors.track;
-            let glyph = if np {
-                play_glyph()
-            } else if selected {
-                marker_glyph()
+    let cols = columns_for_width(
+        width as u16,
+        View::Artists,
+        app.source_mode == SourceMode::Mixed,
+    );
+    let table = cols.is_table();
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(ids.len() + 2);
+    if table {
+        out.extend(track_header(&cols, width, theme));
+    }
+    for (i, id) in ids.iter().enumerate() {
+        let np = app.now_playing.as_ref().map(|s| s.id()) == Some(id.as_str());
+        let selected = i == app.cursors.track;
+        let glyph = if np {
+            play_glyph()
+        } else if selected {
+            marker_glyph()
+        } else {
+            " "
+        };
+        let num = format!("{:>2}", i + 1);
+        let (title, artist, album, quality, is_yt) = if let Some(t) = app.track_by_id_fast(id) {
+            (
+                t.title.clone(),
+                t.primary_artist.clone(),
+                t.album.clone().unwrap_or_default(),
+                t.quality_label(),
+                false,
+            )
+        } else {
+            match app.yt_session.as_ref().and_then(|s| s.track_for(id)) {
+                Some(rt) => (
+                    rt.title.clone(),
+                    rt.artist.clone(),
+                    rt.album.clone().unwrap_or_default(),
+                    rt.fmt
+                        .as_ref()
+                        .map(|f| f.yt_label())
+                        .unwrap_or_else(|| "YT".to_string()),
+                    true,
+                ),
+                None => (
+                    format!("Loading{}", ellipsis()),
+                    String::new(),
+                    String::new(),
+                    "YT".to_string(),
+                    true,
+                ),
+            }
+        };
+        let zebra_bg = if !nc && i % 2 == 0 && !selected {
+            theme.surface
+        } else {
+            Color::Reset
+        };
+        let style = if selected {
+            theme.selected_style()
+        } else if np {
+            theme.playing_style().bg(zebra_bg)
+        } else {
+            dim.bg(zebra_bg)
+        };
+        let badge_style = if selected {
+            theme.selected_style()
+        } else if np {
+            theme.playing_style()
+        } else if is_yt {
+            Style::default().fg(theme.source_yt).bg(zebra_bg)
+        } else {
+            Style::default().fg(theme.source_local).bg(zebra_bg)
+        };
+        if table {
+            let duration = fmt_duration(track_duration(app, id));
+            let badge = if show_badge {
+                Some(if is_yt { "[Y]" } else { "[L]" })
             } else {
-                " "
+                None
             };
-            let num = format!("{:>2}", i + 1);
-            // DEF-023: resolve local catalog tracks first, then YouTube video
-            // ids via the session's track_cache. The manual queue (and Mixed-
-            // mode playlists) can contain both id kinds; the old filter_map
-            // dropped any id missing from the local catalog, making YouTube
-            // tracks invisible in the Queue view. A YouTube track whose
-            // metadata isn't cached yet renders as "Loading…" (visible, not
-            // dropped) so the lazy-load on_tick can fill it in shortly.
-            let (left, quality, is_yt) = if let Some(t) = app.track_by_id_fast(id) {
-                let album = t.album.as_deref().unwrap_or("");
-                let badge = if show_badge { "[L] " } else { "" };
-                let dash = em_dash();
-                (
-                    format!("{badge}{glyph} {num} {} {dash} {album}", t.title),
-                    t.quality_label(),
-                    false,
-                )
+            out.push(build_table_row(
+                glyph,
+                &num,
+                &title,
+                &artist,
+                &album,
+                &duration,
+                &quality,
+                badge,
+                &cols,
+                width,
+                style,
+                Some(badge_style),
+            ));
+        } else {
+            let badge = if show_badge {
+                if is_yt {
+                    "[Y] "
+                } else {
+                    "[L] "
+                }
             } else {
-                let (title, artist, album, yt_quality) =
-                    match app.yt_session.as_ref().and_then(|s| s.track_for(id)) {
-                        Some(rt) => (
-                            rt.title.clone(),
-                            rt.artist.clone(),
-                            rt.album.clone(),
-                            rt.fmt
-                                .as_ref()
-                                .map(|f| f.yt_label())
-                                .unwrap_or_else(|| "YT".to_string()),
-                        ),
-                        None => (
-                            format!("Loading{}", ellipsis()).to_string(),
-                            String::new(),
-                            None,
-                            "YT".to_string(),
-                        ),
-                    };
-                let album_s = album.as_deref().unwrap_or("");
-                let badge = if show_badge { "[Y] " } else { "" };
-                let dash = em_dash();
-                let left = if artist.is_empty() {
+                ""
+            };
+            let dash = em_dash();
+            let left = if is_yt {
+                if artist.is_empty() {
                     format!("{badge}{glyph} {num} {title}")
                 } else {
-                    format!("{badge}{glyph} {num} {title} {dash} {artist} {album_s}")
-                };
-                (left, yt_quality, true)
+                    format!("{badge}{glyph} {num} {title} {dash} {artist} {album}")
+                }
+            } else {
+                format!("{badge}{glyph} {num} {title} {dash} {album}")
             };
-            // MOD-3: ensure at least 1 space between the track info (left) and
-            // the quality tag (right). `pad_between` produces 0 padding when
-            // `left + right >= width`, which concatenates them without a
-            // separator ("Album16bit…"). Fall back to a manual join with a
-            // space so the quality tag — if visible at all — is always
-            // separated from the album name.
             let line = {
                 let lw = disp_width(&left);
                 let rw = disp_width(&quality);
@@ -1198,45 +1509,19 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
                 }
             };
             let line = truncate_ellipsis(&line, width);
-            // Zebra striping: consistent on ALL non-selected rows. Playing
-            // rows get zebra under their playing_style (which only sets fg,
-            // not bg) so the stripe pattern stays uniform. Selected rows
-            // skip zebra (selected_style sets its own bg).
-            let zebra_bg = if !nc && i % 2 == 0 && !selected {
-                theme.surface
-            } else {
-                Color::Reset
-            };
-            // T1.1/T8.1: selected = full reverse video via selected_style().
-            // T8.2: playing (not selected) = theme.playing color + ▶ glyph
-            // via playing_style(). Selected+playing: selected wins for
-            // style, ▶ wins for glyph (now-playing takes precedence).
-            let style = if selected {
-                theme.selected_style()
-            } else if np {
-                theme.playing_style().bg(zebra_bg)
-            } else {
-                dim.bg(zebra_bg)
-            };
             let mut spans: Vec<Span<'static>> = Vec::new();
             if show_badge {
-                let badge_style = if selected {
-                    theme.selected_style()
-                } else if np {
-                    theme.playing_style()
-                } else if is_yt {
-                    Style::default().fg(theme.source_yt).bg(zebra_bg)
-                } else {
-                    Style::default().fg(theme.source_local).bg(zebra_bg)
-                };
-                let badge_text = if is_yt { "[Y] " } else { "[L] " };
-                spans.push(Span::styled(badge_text, badge_style));
+                spans.push(Span::styled(
+                    if is_yt { "[Y] " } else { "[L] " },
+                    badge_style,
+                ));
             }
             let rest = &line[badge_len..];
             spans.push(Span::styled(rest.to_string(), style));
-            Line::from(spans)
-        })
-        .collect()
+            out.push(Line::from(spans));
+        }
+    }
+    out
 }
 
 /// YouTube track rows: resolve each video_id via the session's `track_cache`
@@ -1249,65 +1534,100 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
 /// **Issue 4:** Source badge `[Y]` is ONLY shown in Mixed mode (the only time
 /// the source is ambiguous per-row). In YouTube view every row is YT — `[Y]`
 /// is redundant. Badge also stays off on narrow panes (width ≤ 60).
-fn yt_track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Line<'static>> {
+pub(crate) fn yt_track_rows(
+    app: &App,
+    ids: &[String],
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     use crate::mode::SourceMode;
     let dim = Style::default().fg(theme.dim);
     let nc = no_color();
-    // Source badge only in Mixed mode (Issue 4). In YouTube view every row is
-    // YouTube — [Y] is redundant clutter. Badge stays off on narrow panes.
-    // DEF-049: threshold lowered from 60 to 20 so [L]/[Y] shows in narrow cols.
     let show_badge = width > 20 && app.source_mode == SourceMode::Mixed;
-
-    ids.iter()
-        .enumerate()
-        .map(|(i, id)| {
-            let np = app.now_playing.as_ref().map(|s| s.id()) == Some(id.as_str());
-            let selected = i == app.cursors.track;
-            let glyph = if np {
-                play_glyph()
-            } else if selected {
-                marker_glyph()
-            } else {
-                " "
+    let badge_len = if show_badge { 4 } else { 0 };
+    let cols = columns_for_width(
+        width as u16,
+        View::Youtube,
+        app.source_mode == SourceMode::Mixed,
+    );
+    let table = cols.is_table();
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(ids.len() + 2);
+    if table {
+        out.extend(track_header(&cols, width, theme));
+    }
+    for (i, id) in ids.iter().enumerate() {
+        let np = app.now_playing.as_ref().map(|s| s.id()) == Some(id.as_str());
+        let selected = i == app.cursors.track;
+        let glyph = if np {
+            play_glyph()
+        } else if selected {
+            marker_glyph()
+        } else {
+            " "
+        };
+        let num = format!("{:>2}", i + 1);
+        let (title, artist, album, quality) =
+            match app.yt_session.as_ref().and_then(|s| s.track_for(id)) {
+                Some(rt) => (
+                    rt.title.clone(),
+                    rt.artist.clone(),
+                    rt.album.clone().unwrap_or_default(),
+                    rt.fmt
+                        .as_ref()
+                        .map(|f| f.yt_label())
+                        .unwrap_or_else(|| "YT".to_string()),
+                ),
+                None => (
+                    format!("Loading{}", ellipsis()),
+                    String::new(),
+                    String::new(),
+                    "YT".to_string(),
+                ),
             };
-            let num = format!("{:>2}", i + 1);
-            let (title, artist, album, quality) =
-                match app.yt_session.as_ref().and_then(|s| s.track_for(id)) {
-                    Some(rt) => (
-                        rt.title.clone(),
-                        rt.artist.clone(),
-                        rt.album.clone(),
-                        rt.fmt
-                            .as_ref()
-                            .map(|f| f.yt_label())
-                            .unwrap_or_else(|| "YT".to_string()),
-                    ),
-                    // No metadata yet (track_cache miss — e.g. just loaded from
-                    // disk cache with track_ids cleared, or cache eviction).
-                    // Show format!("Loading{}", ellipsis()) instead of the raw video ID, which looks
-                    // like random characters (e.g. "jNQXAC9IVRw"). The lazy-load
-                    // at on_tick will fetch the metadata shortly.
-                    None => (
-                        format!("Loading{}", ellipsis()).to_string(),
-                        String::new(),
-                        None,
-                        "YT".to_string(),
-                    ),
-                };
-            let album_s = album.as_deref().unwrap_or("");
+        let zebra_bg = if !nc && i % 2 == 0 && !selected {
+            theme.surface
+        } else {
+            Color::Reset
+        };
+        let style = if selected {
+            theme.selected_style()
+        } else if np {
+            theme.playing_style().bg(zebra_bg)
+        } else {
+            dim.bg(zebra_bg)
+        };
+        let badge_style = if selected {
+            theme.selected_style()
+        } else if np {
+            theme.playing_style()
+        } else {
+            Style::default().fg(theme.source_yt).bg(zebra_bg)
+        };
+        if table {
+            let duration = fmt_duration(track_duration(app, id));
+            let badge = if show_badge { Some("[Y]") } else { None };
+            out.push(build_table_row(
+                glyph,
+                &num,
+                &title,
+                &artist,
+                &album,
+                &duration,
+                &quality,
+                badge,
+                &cols,
+                width,
+                style,
+                Some(badge_style),
+            ));
+        } else {
             let badge = if show_badge { "[Y] " } else { "" };
             let dash = em_dash();
             let left = if artist.is_empty() {
                 format!("{badge}{glyph} {num} {title}")
             } else {
-                format!("{badge}{glyph} {num} {title} {dash} {artist} {album_s}")
+                format!("{badge}{glyph} {num} {title} {dash} {artist} {album}")
             };
-            // MOD-3: ensure at least 1 space between the track info (left) and
-            // the quality tag (right). `pad_between` produces 0 padding when
-            // `left + right >= width`, which concatenates them without a
-            // separator ("Album16bit…"). Fall back to a manual join with a
-            // space so the quality tag — if visible at all — is always
-            // separated from the album name.
             let line = {
                 let lw = disp_width(&left);
                 let rw = disp_width(&quality);
@@ -1318,40 +1638,14 @@ fn yt_track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<
                 }
             };
             let line = truncate_ellipsis(&line, width);
-            // Zebra striping: consistent on ALL non-selected rows. Playing
-            // rows get zebra under their playing_style (which only sets fg,
-            // not bg) so the stripe pattern stays uniform. Selected rows
-            // skip zebra (selected_style sets its own bg).
-            let zebra_bg = if !nc && i % 2 == 0 && !selected {
-                theme.surface
-            } else {
-                Color::Reset
-            };
-            // T1.1/T8.1: selected = full reverse video via selected_style().
-            // T8.2: playing (not selected) = theme.playing color + ▶ glyph
-            // via playing_style(). Selected+playing: selected wins for
-            // style, ▶ wins for glyph.
-            let style = if selected {
-                theme.selected_style()
-            } else if np {
-                theme.playing_style().bg(zebra_bg)
-            } else {
-                dim.bg(zebra_bg)
-            };
             let mut spans: Vec<Span<'static>> = Vec::new();
             if show_badge {
-                let badge_style = if selected {
-                    theme.selected_style()
-                } else if np {
-                    theme.playing_style()
-                } else {
-                    Style::default().fg(theme.source_yt).bg(zebra_bg)
-                };
                 spans.push(Span::styled("[Y] ", badge_style));
             }
-            let rest = &line[badge.len()..];
+            let rest = &line[badge_len..];
             spans.push(Span::styled(rest.to_string(), style));
-            Line::from(spans)
-        })
-        .collect()
+            out.push(Line::from(spans));
+        }
+    }
+    out
 }

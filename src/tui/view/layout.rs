@@ -29,7 +29,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{columns, footer, overlay, player_bar};
+use super::{columns, footer, overlay, player_bar, player_bar_big};
 use crate::tui::app::{App, View};
 use crate::tui::view::theme::{self, h_line, v_sep, Theme};
 
@@ -151,6 +151,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // row for the browse area on narrow terminals — the player bar's
     // distinct styling provides enough visual separation.
     let compact = area.height <= MIN_HEIGHT;
+    let big_mode = app.player_bar_state.effective_mode(area.width, area.height)
+        == player_bar_big::PlayerBarMode::Big;
+    app.player_bar_state.mode = if big_mode {
+        player_bar_big::PlayerBarMode::Big
+    } else {
+        player_bar_big::PlayerBarMode::Mini
+    };
     let footer_h = if compact {
         FOOTER_HEIGHT_NARROW
     } else {
@@ -160,6 +167,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         BAR_SEPARATOR_HEIGHT
     } else {
         0
+    };
+    let bar_h = if compact {
+        1u16
+    } else if big_mode {
+        player_bar_big::BIG_BAR_HEIGHT
+    } else {
+        PLAYER_BAR_HEIGHT
     };
 
     if compact {
@@ -188,7 +202,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 Constraint::Length(1),
                 Constraint::Min(3),
                 Constraint::Length(sep_h),
-                Constraint::Length(PLAYER_BAR_HEIGHT),
+                Constraint::Length(bar_h),
                 Constraint::Length(footer_h),
             ])
             .split(area);
@@ -197,7 +211,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if sep_h > 0 {
             render_separator_rule(f, outer[2], app);
         }
-        player_bar::render(f, outer[3], app);
+        if big_mode {
+            player_bar_big::render_big(f, outer[3], app);
+        } else {
+            player_bar::render(f, outer[3], app);
+        }
         footer::render(f, &outer[4], app);
     }
 

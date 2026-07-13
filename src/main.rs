@@ -122,6 +122,19 @@ fn main() -> anyhow::Result<()> {
                 app.cursors.album = layout.last_cursor_album;
                 app.cursors.track = layout.last_cursor_track;
                 app.cursors.playlist = layout.last_cursor_playlist;
+                app.player_bar_state.big_pref = layout.player_bar_mode == "big";
+                app.player_bar_state.track_layout =
+                    jukebox::tui::view::player_bar_big::TrackLayoutMode::parse(
+                        &layout.track_layout_mode,
+                    );
+                app.sidebar_visible = layout.sidebar_visible;
+                app.playlist_col = jukebox::tui::app::PlaylistColumnState {
+                    width: layout.playlist_col.width,
+                    group_by_type: layout.playlist_col.group_by_type,
+                    show_counts: layout.playlist_col.show_counts,
+                };
+                let (tw, _) = crossterm::terminal::size().unwrap_or((0, 0));
+                app.playlist_col.clamp_width(tw.max(1));
                 // RC11-DEF-014: restore the last-played track + position so a
                 // "resume" hint can show and `resume_last()` (R / Enter on the
                 // restored cursor) can seek to the saved position. The hint
@@ -130,6 +143,13 @@ fn main() -> anyhow::Result<()> {
                 // yet, no hint is shown.
                 app.last_played_track_id = layout.last_played_track_id.clone();
                 app.last_played_position = layout.last_played_position;
+                app.player_bar_state.big_pref =
+                    crate::tui::view::player_bar_big::PlayerBarMode::parse(&layout.player_bar_mode)
+                        == crate::tui::view::player_bar_big::PlayerBarMode::Big;
+                app.player_bar_state.track_layout =
+                    crate::tui::view::player_bar_big::TrackLayoutMode::parse(
+                        &layout.track_layout_mode,
+                    );
                 if let Some(id) = &layout.last_played_track_id {
                     let title = app
                         .track_by_id_fast(id)
@@ -284,6 +304,14 @@ fn main() -> anyhow::Result<()> {
                 last_cursor_album: app.cursors.album,
                 last_cursor_track: app.cursors.track,
                 last_cursor_playlist: app.cursors.playlist,
+                player_bar_mode: if app.player_bar_state.big_pref {
+                    "big"
+                } else {
+                    "mini"
+                },
+                track_layout_mode: app.player_bar_state.track_layout.as_str(),
+                sidebar_visible: app.sidebar_visible,
+                playlist_col: &app.playlist_col,
             });
             let _ = state::save_playlists(&app.playlists);
             let _ = state::save_command_history(&app.command_history);

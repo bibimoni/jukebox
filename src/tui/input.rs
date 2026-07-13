@@ -15,7 +15,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 use crate::reco::feedback::FeedbackAction;
-use crate::tui::app::{App, Overlay, View};
+use crate::tui::app::{App, Overlay, View, YtTab};
 
 // ---------------------------------------------------------------------------
 // Key dispatch
@@ -59,6 +59,40 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         app.pending_g = false;
     }
 
+    if app.view == View::Youtube && app.overlay.is_none() {
+        if let Some(tab) = match key.code {
+            KeyCode::Char('1') => Some(YtTab::Home),
+            KeyCode::Char('2') => Some(YtTab::Library),
+            KeyCode::Char('3') => Some(YtTab::Search),
+            KeyCode::Char('4') => Some(YtTab::Discover),
+            KeyCode::Char('5') => Some(YtTab::Radio),
+            _ => None,
+        } {
+            app.yt_view.tab = tab;
+            return;
+        }
+        if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
+            app.yt_view.tab = app.yt_view.tab.next();
+            return;
+        }
+        if matches!(key.code, KeyCode::Char('/')) {
+            app.yt_view.tab = YtTab::Search;
+        }
+        if matches!(key.code, KeyCode::Char('H')) {
+            app.open_home();
+            return;
+        }
+        if matches!(key.code, KeyCode::Char('S'))
+            && matches!(
+                app.source_mode,
+                crate::mode::SourceMode::Youtube | crate::mode::SourceMode::Mixed
+            )
+        {
+            app.open_discover();
+            return;
+        }
+    }
+
     match (key.code, key.modifiers) {
         // --- Navigation -----------------------------------------------------
         (KeyCode::Char('h'), m) if m == KeyModifiers::NONE => move_left(app),
@@ -70,9 +104,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyCode::Down, m) if m == KeyModifiers::NONE => move_down(app),
         (KeyCode::Up, m) if m == KeyModifiers::NONE => move_up(app),
 
-        // `gg` top of column; first `g` arms, second `g` jumps.
         (KeyCode::Char('g'), _) => {
-            if was_pending_g {
+            if app.playlist_col_focused() {
+                app.toggle_playlist_group();
+            } else if was_pending_g {
                 top_of_column(app);
                 app.pending_g = false;
             } else {
@@ -108,8 +143,20 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             // tracking stays in sync (used by the hi-res progress fallback).
             app.toggle_pause();
         }
-        (KeyCode::Char('>'), _) => app.next(),
-        (KeyCode::Char('<'), _) => app.prev(),
+        (KeyCode::Char('>'), _) => {
+            if app.playlist_col_focused() {
+                app.adjust_playlist_col_width(1);
+            } else {
+                app.next();
+            }
+        }
+        (KeyCode::Char('<'), _) => {
+            if app.playlist_col_focused() {
+                app.adjust_playlist_col_width(-1);
+            } else {
+                app.prev();
+            }
+        }
         (KeyCode::Char(','), _) => {
             let _ = app.player.seek(-5.0);
         }
@@ -125,10 +172,28 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('Z'), _) => app.reshuffle(),
         (KeyCode::Char('r'), _) => app.cycle_repeat(),
         // `c` cycles continue mode (mode-dependent: see App::cycle_continue).
-        (KeyCode::Char('c'), _) => app.cycle_continue(),
+        (KeyCode::Char('c'), _) => {
+            if app.playlist_col_focused() {
+                app.toggle_playlist_counts();
+            } else {
+                app.cycle_continue();
+            }
+        }
         // `M` cycles the source mode Local → YouTube → Mixed → Local (never
         // stops playback).
         (KeyCode::Char('M'), _) => app.cycle_mode(),
+        // I.2: `P` toggles the big player bar preference.
+        (KeyCode::Char('P'), _) => {
+            app.player_bar_state.big_pref = !app.player_bar_state.big_pref;
+        }
+        // I.5: `T` toggles the track-list layout (table <-> cards).
+        (KeyCode::Char('T'), _) => {
+            use crate::tui::view::player_bar_big::TrackLayoutMode;
+            app.player_bar_state.track_layout = match app.player_bar_state.track_layout {
+                TrackLayoutMode::Table => TrackLayoutMode::Cards,
+                TrackLayoutMode::Cards => TrackLayoutMode::Table,
+            };
+        }
         // `s` instant random track in context; `S` discover overlay (spec §5.5).
         (KeyCode::Char('s'), _) => app.instant_random(),
         (KeyCode::Char('S'), _) => app.open_discover(),
@@ -225,6 +290,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // `H` opens the YouTube Home view (recommendation discovery). Also
         // reachable via `:home`.
         (KeyCode::Char('H'), _) => app.open_home(),
+        (KeyCode::Char('B'), _) => app.toggle_sidebar(),
 
         // --- Quit -----------------------------------------------------------
         (KeyCode::Char('q'), _) => app.quit(),
