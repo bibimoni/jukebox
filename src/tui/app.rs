@@ -504,6 +504,36 @@ pub struct App {
     /// false so tests (which construct `App` without a DB) don't touch the
     /// real state DB; `main.rs` sets it true after loading prior events.
     pub persist_events: bool,
+
+    // --- RC11 Batch D: resume + toast ----------------------------------------
+    /// RC11-DEF-014: the last-played track id, restored on launch so the
+    /// cursor can return to it and a "resume" hint can show. Updated as
+    /// playback progresses (on_tick) and saved to `state.db` on exit.
+    pub last_played_track_id: Option<String>,
+    /// RC11-DEF-014: the last-played track's position in seconds, restored on
+    /// launch so `resume_last()` can seek to it. afplay can't seek so resume
+    /// only re-seeks on mpv/StubPlayer; afplay restarts from 0.
+    pub last_played_position: f64,
+    /// RC11-DEF-014: a one-shot (track_id, position) captured on launch from
+    /// `state.db`. The first successful load of the matching track uses
+    /// `load_at(pos)` to resume at the saved position, then clears this.
+    /// `None` after the resume is consumed (or on a fresh launch with no
+    /// saved playback).
+    pub pending_resume: Option<(String, f64)>,
+    /// RC11-DEF-014: a "resume" hint shown in the player bar when stopped
+    /// with a saved last-played track. Set on launch from `state.db`;
+    /// cleared on the first successful play so it doesn't linger. The bar
+    /// renders `▸ resume: [title] at [M:SS] · Enter to resume`.
+    pub resume_hint: Option<String>,
+    /// RC11-DEF-043: a transient confirmation toast (e.g. "Added to queue")
+    /// shown in the player bar's up-next slot. Set by `enqueue_selected`;
+    /// cleared by `on_tick` after ~1.2s so it's visible long enough to read
+    /// but doesn't linger. Rendered regardless of `yt_state` so local-only
+    /// users see the feedback (the `yt_status` toast was gated on Ready).
+    pub toast: Option<String>,
+    /// When the current `toast` was set; used by `on_tick` to clear it after
+    /// the TTL. `None` when no toast is active.
+    pub toast_at: Option<std::time::Instant>,
 }
 
 /// Inline filter state for the `f` filter-on-focused-column (spec §5.4).
@@ -715,6 +745,12 @@ impl App {
             threshold_fired_for: None,
             last_natural_end: None,
             persist_events: false,
+            last_played_track_id: None,
+            last_played_position: 0.0,
+            pending_resume: None,
+            resume_hint: None,
+            toast: None,
+            toast_at: None,
         }
     }
 
@@ -992,7 +1028,7 @@ impl App {
                         self.audio_switch_handle =
                             Some(crate::audio::set_output_format_async(sr, bd));
                     }
-                    match self.player.load(&path) {
+                    match self.load_with_resume(&path, &id) {
                         Ok(()) => {
                             self.now_playing = Some(crate::source::TrackSource::Local {
                                 track_id: id.clone(),
@@ -1177,7 +1213,7 @@ impl App {
                 ) {
                     self.audio_switch_handle = Some(crate::audio::set_output_format_async(sr, bd));
                 }
-                match self.player.load(&path) {
+                match self.load_with_resume(&path, id) {
                     Ok(()) => {
                         self.now_playing = Some(crate::source::TrackSource::Local {
                             track_id: id.to_string(),
@@ -1227,7 +1263,7 @@ impl App {
             self.audio_switch_handle = Some(crate::audio::set_output_format_async(sr, bd));
         }
         let p = std::path::PathBuf::from(&url);
-        match self.player.load(&p) {
+        match self.load_with_resume(&p, &video_id) {
             Ok(()) => {
                 self.now_playing = Some(crate::source::TrackSource::Remote {
                     video_id: video_id.clone(),
@@ -2630,6 +2666,33 @@ impl App {
             self.spinner_frame = 0;
         }
 
+        // RC11-DEF-043: decay the transient confirmation toast after ~1.2s so
+        // it's readable but doesn't linger (the `yt_status` toast is gated on
+        // yt_state==Ready and deduped; this dedicated toast is always
+        // rendered in the player bar and refreshes on each set).
+        if let Some(t) = self.toast_at {
+            if t.elapsed() > Duration::from_millis(1200) {
+                self.toast = None;
+                self.toast_at = None;
+            }
+        }
+
+        // RC11-DEF-014: track the now-playing track's position so it can be
+        // saved to state.db on exit and restored on the next launch. Only
+        // update when the player reports a real position (mpv); afplay
+        // reports None so the saved position stays 0 (resume restarts from 0
+        // on afplay, which can't seek anyway). Cap at the duration so a
+        // paused-at-end state doesn't save a position past the track.
+        if let Some(np) = self.now_playing.as_ref() {
+            if let Some(pos) = self.player.position() {
+                let dur = self.player.duration().unwrap_or(f64::INFINITY);
+                if pos < dur {
+                    self.last_played_track_id = Some(np.id().to_string());
+                    self.last_played_position = pos;
+                }
+            }
+        }
+
         // Diagnostics capture (Slice 7): when `yt_error` changes, push a line
         // into the diagnostics buffer so the user can review what happened via
         // the diagnostics overlay (the footer only shows the latest error).
@@ -3567,9 +3630,38 @@ impl App {
             // DEF-034: record the enqueue intent as a mild positive signal.
             self.record_listen_event(&id, "added_to_queue");
             self.yt_status = Some("added to queue".into());
+            // RC11-DEF-043: also set a dedicated toast rendered in the player
+            // bar regardless of yt_state, so local-only users (yt_state !=
+            // Ready, where yt_status is hidden) see the confirmation. The
+            // toast clears after ~1.2s via on_tick.
+            self.set_toast("Added to queue".to_string());
         } else {
             self.yt_status = Some("no track selected".into());
         }
+    }
+
+    /// RC11-DEF-043: set a transient confirmation toast shown in the player
+    /// bar. Resets the TTL so re-setting the same message (e.g. pressing `e`
+    /// twice) refreshes the window instead of being deduped away.
+    pub fn set_toast(&mut self, msg: String) {
+        self.toast = Some(msg);
+        self.toast_at = Some(std::time::Instant::now());
+    }
+
+    /// RC11-DEF-014: resume the last-played track at its saved position.
+    /// Captures a one-shot `pending_resume` so the next load of the matching
+    /// track uses `load_at(pos)`; clears the `resume_hint` so it doesn't
+    /// linger. No-op when there's no saved track. Used by the `R` key when
+    /// stopped with a resume hint.
+    pub fn resume_last(&mut self) {
+        let Some(id) = self.last_played_track_id.clone() else {
+            return;
+        };
+        let pos = self.last_played_position;
+        self.pending_resume = Some((id.clone(), pos));
+        self.resume_hint = None;
+        // Play the single track as its own context so `>`/`<` stay coherent.
+        self.play_in_context_ids(vec![id.clone()], &id);
     }
 
     /// `x` (Queue view) — remove the track under the cursor from the manual
@@ -4272,6 +4364,30 @@ impl App {
         // New track → threshold not yet fired for it.
         self.threshold_fired_for = None;
         self.record_listen_event(track_id, "track_started");
+        // RC11-DEF-014: record the now-playing track as the last-played so it
+        // can be restored on the next launch, and clear the resume hint (a
+        // play has started — the offer is consumed). Position is tracked
+        // separately in on_tick while playback advances.
+        self.last_played_track_id = Some(track_id.to_string());
+        self.last_played_position = 0.0;
+        self.resume_hint = None;
+    }
+
+    /// RC11-DEF-014: load `path` into the player, resuming at the saved
+    /// position when this is the one-shot resume target. Consumes
+    /// `pending_resume` on the first call (any track): if the id matches the
+    /// captured resume target and the position is > 0, use `load_at(pos)` so
+    /// mpv/StubPlayer begin at the saved offset (afplay can't seek so it
+    /// restarts from 0 — acceptable fallback). Otherwise a plain `load`.
+    fn load_with_resume(&mut self, path: &std::path::Path, track_id: &str) -> anyhow::Result<()> {
+        let resume_pos = match self.pending_resume.take() {
+            Some((rid, pos)) if rid == track_id && pos > 0.0 => Some(pos),
+            _ => None,
+        };
+        match resume_pos {
+            Some(pos) => self.player.load_at(path, pos),
+            None => self.player.load(path),
+        }
     }
 
     /// Apply a feedback action to the user profile. Looks up the track's
