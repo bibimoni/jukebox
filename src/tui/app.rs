@@ -4974,8 +4974,10 @@ mod tests {
     /// I.7: clamp_width keeps width in [16, term/2].
     #[test]
     fn playlist_col_state_clamp_width() {
-        let mut s = PlaylistColumnState::default();
-        s.width = 0;
+        let mut s = PlaylistColumnState {
+            width: 0,
+            ..Default::default()
+        };
         s.clamp_width(100);
         assert_eq!(s.width, 16, "min is 16");
         s.width = 200;

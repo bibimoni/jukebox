@@ -818,8 +818,10 @@ mod tests {
     /// `big_pref` is true.
     #[test]
     fn effective_mode_forces_mini_below_min() {
-        let mut s = PlayerBarState::default();
-        s.big_pref = true;
+        let mut s = PlayerBarState {
+            big_pref: true,
+            ..Default::default()
+        };
         assert_eq!(s.effective_mode(80, 24), PlayerBarMode::Mini);
         assert_eq!(s.effective_mode(100, 24), PlayerBarMode::Mini);
         assert_eq!(s.effective_mode(99, 30), PlayerBarMode::Mini);

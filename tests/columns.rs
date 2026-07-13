@@ -117,6 +117,7 @@ fn render_artists_uses_column_widths_like_hit_testing() {
     // asserts the column boundary follows column_widths, not the old values.
     let (_d, cat) = two_artist_cat();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.sidebar_visible = false;
     app.column_widths = jukebox::tui::app::ColumnWidths {
         rail: 4,
         col1: 30,
@@ -154,7 +155,9 @@ fn render_artists_uses_column_widths_like_hit_testing() {
 fn youtube_view_renders_account_and_suggested_lists() {
     let (_d, cat) = cat_albums_for_yt();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.sidebar_visible = false;
     app.view = jukebox::tui::app::View::Youtube;
+    app.yt_view.tab = jukebox::tui::app::YtTab::Library;
     app.yt_lists = vec![
         jukebox::tui::app::YtList {
             id: "PL1".into(),
@@ -241,8 +244,12 @@ fn clone_for_render(app: &App) -> App {
     let cat = Catalog::load(&p).unwrap();
     let mut a = App::new(cat, Box::new(StubPlayer::default()), None, None);
     a.view = app.view;
+    a.focus_col = app.focus_col;
+    a.yt_view = app.yt_view.clone();
     a.yt_lists = app.yt_lists.clone();
     a.yt_error = app.yt_error.clone();
+    a.sidebar_visible = app.sidebar_visible;
+    a.playlist_col = app.playlist_col.clone();
     a.yt_session = None; // tests have no session
     a
 }
@@ -343,7 +350,10 @@ fn youtube_track_rows_show_loading_when_no_metadata() {
     // (e.g. "jNQXAC9IVRw" — "random characters"). Fix: show "Loading…" instead.
     let (_d, cat) = cat_albums_for_yt();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.sidebar_visible = false;
     app.view = jukebox::tui::app::View::Youtube;
+    app.yt_view.tab = jukebox::tui::app::YtTab::Library;
+    app.focus_col = 1;
     app.yt_state = jukebox::yt::state::YtState::Ready;
     app.yt_lists = vec![jukebox::tui::app::YtList {
         id: "PL1".into(),

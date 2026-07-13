@@ -57,6 +57,8 @@ fn def030_yt_view_account_playlist_uses_song_glyph() {
     let (_d, cat) = one_track_cat();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.view = View::Youtube;
+    app.sidebar_visible = false;
+    app.yt_view.tab = jukebox::tui::app::YtTab::Library;
     app.yt_lists = vec![YtList {
         id: "PL1".into(),
         name: "My Playlist".into(),
@@ -75,6 +77,8 @@ fn def030_yt_view_suggested_playlist_uses_star_glyph() {
     let (_d, cat) = one_track_cat();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.view = View::Youtube;
+    app.sidebar_visible = false;
+    app.yt_view.tab = jukebox::tui::app::YtTab::Library;
     app.yt_lists = vec![YtList {
         id: "RD1".into(),
         name: "Suggested Mix".into(),
@@ -93,6 +97,8 @@ fn def030_yt_view_generated_playlist_uses_diamond_glyph() {
     let (_d, cat) = one_track_cat();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.view = View::Youtube;
+    app.sidebar_visible = false;
+    app.yt_view.tab = jukebox::tui::app::YtTab::Library;
     app.yt_lists = vec![YtList {
         id: "GEN1".into(),
         name: "Daily Mix".into(),

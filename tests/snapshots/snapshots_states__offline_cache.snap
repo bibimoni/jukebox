@@ -1,28 +1,29 @@
 ---
 source: tests/snapshots_states.rs
+assertion_line: 98
 expression: s
 ---
-1  │┏YouTube [stale]━━━━━━━┓┌Tracks────────────────────────────────────────────────────────────────────────────────────┐
-2  │┃♫ Liked Music         ┃│▸  1 Loading…                                                                           YT│
-3  │┃♫ Chill               ┃│   2 Loading…                                                                           YT│
-4  │┃✦ Mood: Focus         ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┗━━━━━━━━━━━━━━━━━━━━━━┛└──────────────────────────────────────────────────────────────────────────────────────────┘
-   │┌Suggested / Up Next───────────────────────────────────────────────────────────────────────────────────────────────┐
-   ││▶ Mood: Focus →                                                                                                   │
-   │└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+VIEWS                      │1:Home │ 2:Library │ 3:Search │ 4:Discover │ 5:Radio                         YouTube [stale]
+›   1 Artists              │
+›   2 Playlists            │                                       ⌕ YouTube Home
+›   3 Queue                │
+›   4 YouTube              │                         Welcome! Your Home will grow as you listen.
+────────────────────────   │
+DISCOVER                   │                                       To get started:
+♫   H Home                 │                  • Play a local track (browse with h j k l, Enter to play)
+✦   S Discover             │            • Authenticate YouTube (:yt auth browser <name>) for YouTube content
+◎ :radio Radio             │                                 • Search with / in any view
+◆ :gen Generator           │                     • Open the Discover overlay with S for suggestions
+────────────────────────   │
+TOOLS                      │                             As you listen, this Home will show:
+/   / Search               │                Continue Listening · Quick Picks · Made for You · Start Radio
+!   D Diagnostics          │                      New and Relevant · Your YouTube Library · Explore
+?   ? Help                 │
+                           │
+                           │
+                           │
+                           │
+                           │
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 [PLAYING] ▶ Song1 — 40mP  0:00 / 3:00  ▸ Next: (end)  24bit/96  MODE local · YT~ · CONT off · SHUF off · RPT off
 VIEW: youtube · SOURCE: local [Y err] · [stale] YT: offline — showing cached (press R to retry)

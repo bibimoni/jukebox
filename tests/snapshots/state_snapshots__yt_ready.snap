@@ -1,28 +1,29 @@
 ---
 source: tests/state_snapshots.rs
+assertion_line: 88
 expression: s
 ---
-1  │┏YouTube [ok]━━━━━━━━━━┓┌Tracks────────────────────────────────────────────────────────────────────────────────────┐
-2  │┃♫ Liked Songs         ┃│select a list to load its tracks                                                          │
-3  │┃✦ Focus Flow          ┃│                                                                                          │
-4  │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┃                      ┃│                                                                                          │
-   │┗━━━━━━━━━━━━━━━━━━━━━━┛└──────────────────────────────────────────────────────────────────────────────────────────┘
-   │┌Suggested / Up Next───────────────────────────────────────────────────────────────────────────────────────────────┐
-   ││▶ Focus Flow →                                                                                                    │
-   │└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+VIEWS                      │1:Home │ 2:Library │ 3:Search │ 4:Discover │ 5:Radio                            YouTube [ok]
+›   1 Artists              │
+›   2 Playlists            │                                       ⌕ YouTube Home
+›   3 Queue                │
+›   4 YouTube              │                         Welcome! Your Home will grow as you listen.
+────────────────────────   │
+DISCOVER                   │                                       To get started:
+♫   H Home                 │                  • Play a local track (browse with h j k l, Enter to play)
+✦   S Discover             │            • Authenticate YouTube (:yt auth browser <name>) for YouTube content
+◎ :radio Radio             │                                 • Search with / in any view
+◆ :gen Generator           │                     • Open the Discover overlay with S for suggestions
+────────────────────────   │
+TOOLS                      │                             As you listen, this Home will show:
+/   / Search               │                Continue Listening · Quick Picks · Made for You · Start Radio
+!   D Diagnostics          │                      New and Relevant · Your YouTube Library · Explore
+?   ? Help                 │
+                           │
+                           │
+                           │
+                           │
+                           │
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 [STOPPED] ■ — nothing playing —  --:-- / --:--  ▸ Enter to play  --  MODE local · YT · CONT off · SHUF off · RPT off
 VIEW: youtube · SOURCE: local [Y ok]  Enter play · q quit · ? help · 1-4 view · > < next prev · M mode · S discover

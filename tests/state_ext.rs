@@ -39,6 +39,10 @@ fn layout_round_trips() {
             last_cursor_album: 1,
             last_cursor_track: 2,
             last_cursor_playlist: 0,
+            player_bar_mode: "mini",
+            track_layout_mode: "table",
+            sidebar_visible: true,
+            playlist_col: &jukebox::tui::app::PlaylistColumnState::default(),
         },
     )
     .unwrap();

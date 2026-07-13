@@ -29,7 +29,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{columns, footer, overlay, player_bar, player_bar_big};
+use super::{columns, footer, overlay, player_bar, player_bar_big, sidebar};
 use crate::tui::app::{App, View};
 use crate::tui::view::theme::{self, h_line, v_sep, Theme};
 
@@ -107,6 +107,25 @@ pub fn overlay_content_area(area: Rect) -> Rect {
         .map(|bar| bar.y.saturating_sub(area.y).saturating_sub(separator_h))
         .unwrap_or(area.height);
     Rect::new(area.x, area.y, area.width, height)
+}
+
+/// Split `area` into sidebar + content when the sidebar is visible. Renders
+/// the sidebar into the left split and returns the right split for content.
+/// When the sidebar is off, returns `area` unchanged.
+fn split_sidebar(f: &mut Frame, area: Rect, app: &App) -> Rect {
+    if sidebar::is_visible(app, area.width) {
+        let sw = sidebar::sidebar_width(area.width);
+        if sw > 0 && area.width > sw {
+            let split =
+                Layout::horizontal([Constraint::Length(sw), Constraint::Min(1)]).split(area);
+            sidebar::render_sidebar(f, split[0], app);
+            split[1]
+        } else {
+            area
+        }
+    } else {
+        area
+    }
 }
 
 /// The single entry point the event loop calls. Renders the full TUI frame:
@@ -188,7 +207,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 Constraint::Length(footer_h),
             ])
             .split(area);
-        columns::render(f, outer[0], app);
+        let content = split_sidebar(f, outer[0], app);
+        columns::render(f, content, app);
         if sep_h > 0 {
             render_separator_rule(f, outer[1], app);
         }
@@ -207,7 +227,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             ])
             .split(area);
         render_tab_bar(f, outer[0], app);
-        columns::render(f, outer[1], app);
+        let content = split_sidebar(f, outer[1], app);
+        columns::render(f, content, app);
         if sep_h > 0 {
             render_separator_rule(f, outer[2], app);
         }

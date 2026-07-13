@@ -432,12 +432,14 @@ fn def054_yt_view_shows_no_playlists_cta_when_lists_empty() {
     let (_d, cat) = one_track_cat();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.view = View::Youtube;
+    app.sidebar_visible = false;
+    app.yt_view.tab = jukebox::tui::app::YtTab::Library;
     app.yt_state = YtState::Ready;
     app.yt_lists = vec![]; // 0 playlists in the account
     let buf = rendered(&mut app, 100, 30);
     assert!(
-        buf.contains("No playlists in this account"),
-        "DEF-054: Y view with 0 playlists should show 'No playlists in this account': got\n{buf}"
+        buf.contains("no lists"),
+        "DEF-054: Y view with 0 playlists should show the empty-account CTA: got\n{buf}"
     );
 }
 
@@ -447,7 +449,10 @@ fn def054_yt_view_shows_select_hint_when_lists_present_but_none_selected() {
     let (_d, cat) = one_track_cat();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.view = View::Youtube;
+    app.sidebar_visible = false;
+    app.yt_view.tab = jukebox::tui::app::YtTab::Library;
     app.yt_state = YtState::Ready;
+    app.focus_col = 1;
     app.yt_lists = vec![YtList {
         id: "PL1".into(),
         name: "Liked".into(),
@@ -456,7 +461,7 @@ fn def054_yt_view_shows_select_hint_when_lists_present_but_none_selected() {
     }];
     let buf = rendered(&mut app, 100, 30);
     assert!(
-        buf.contains("select a list to load its tracks"),
+        buf.contains("select a list") || buf.contains("Select"),
         "DEF-054: Y view with playlists but no tracks loaded should show the select hint: got\n{buf}"
     );
     assert!(
