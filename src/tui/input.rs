@@ -1064,16 +1064,29 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                         });
                         app.save_playlists_db();
                         app.yt_status = Some(format!("Saved \"{}\"", name));
+                        // RC11-DEF-065: offer to play the saved playlist.
+                        // Stash the saved playlist's index so the confirm
+                        // handler can play it on y/Enter.
+                        let saved_idx = app.playlists.len() - 1;
+                        app.pending_play_saved_idx = Some(saved_idx);
+                        app.overlay = Some(Overlay::Confirm {
+                            message: format!("Play \"{}\" now? (y/n)", name),
+                            action: crate::tui::app::ConfirmAction::PlaySavedPlaylist,
+                        });
+                        return;
                     }
                     app.overlay = None;
                     return;
                 }
                 // `s` is a save alias in the Preview phase (RC11-DEF-060:
                 // the help text advertises `s` but the binding was missing).
+                // Put the overlay back before re-dispatching as Enter so the
+                // recursive handle_key sees the overlay is open and routes
+                // through the overlay handler (the overlay was `take()`n at
+                // the top of this function; without restoring it the Enter
+                // recursion would skip overlay routing entirely).
                 KeyCode::Char('s') if state.phase == GeneratorPhase::Preview => {
-                    // Re-dispatch as Enter by falling through to the Enter
-                    // arm: we set the key to Enter and re-handle. The
-                    // simplest way is to recurse with a synthesized Enter.
+                    app.overlay = Some(Overlay::Generator { state });
                     handle_key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                     return;
                 }
@@ -1184,13 +1197,16 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                         && state.field == crate::tui::view::publication::PubField::Name
                         && c != 'n'
                         && c != 'y'
+                        && c != 'j'
+                        && c != 'k'
                         && c != '\t'
                         && c != '\n'
                         && c != '\r' =>
                 {
                     // Editable name field. Reject newlines/tabs (Tab is
-                    // privacy-cycle above) and the reserved verbs `n`/`y`
-                    // (which are handled above as cancel/confirm).
+                    // privacy-cycle above), the reserved verbs `n`/`y`
+                    // (cancel/confirm), and `j`/`k` (field navigation) so
+                    // those keys keep working when Name is focused.
                     state.name.push(c);
                     clear_err = true;
                 }
