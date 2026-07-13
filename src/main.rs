@@ -114,6 +114,34 @@ fn main() -> anyhow::Result<()> {
                     _ => View::Artists,
                 };
                 app.source_mode = jukebox::mode::SourceMode::parse_mode(&layout.source_mode);
+                // RC11-DEF-014: restore the last-focused browse cursors so the
+                // user returns to the last-played track instead of track 1.
+                // clamp_cursors (called per-frame + on play) keeps them valid
+                // if the catalog changed since the save.
+                app.cursors.artist = layout.last_cursor_artist;
+                app.cursors.album = layout.last_cursor_album;
+                app.cursors.track = layout.last_cursor_track;
+                app.cursors.playlist = layout.last_cursor_playlist;
+                // RC11-DEF-014: restore the last-played track + position so a
+                // "resume" hint can show and `resume_last()` (R / Enter on the
+                // restored cursor) can seek to the saved position. The hint
+                // is built from the catalog title + a M:SS position; when the
+                // track id is gone (catalog changed) or no track was played
+                // yet, no hint is shown.
+                app.last_played_track_id = layout.last_played_track_id.clone();
+                app.last_played_position = layout.last_played_position;
+                if let Some(id) = &layout.last_played_track_id {
+                    let title = app
+                        .track_by_id_fast(id)
+                        .map(|t| t.title.clone())
+                        .unwrap_or_else(|| id.clone());
+                    let pos = layout.last_played_position.max(0.0);
+                    let m = (pos as u64) / 60;
+                    let s = (pos as u64) % 60;
+                    app.resume_hint =
+                        Some(format!("resume: {title} at {m}:{s:02} · Enter to resume"));
+                    app.pending_resume = Some((id.clone(), pos));
+                }
                 // Restore the saved browser-auth preference. We do NOT re-spawn
                 // `spawn_browser` here (that re-reads Chrome's Keychain-encrypted
                 // cookie store → a password prompt every launch). Instead the
@@ -249,6 +277,14 @@ fn main() -> anyhow::Result<()> {
                 continue_mode: app.transport.continue_mode,
                 source_mode: app.source_mode,
                 yt_browser: &app.yt_browser,
+                // RC11-DEF-014: persist the last-played track + position +
+                // browse cursors so the next launch can offer a resume.
+                last_played_track_id: app.last_played_track_id.as_deref(),
+                last_played_position: app.last_played_position,
+                last_cursor_artist: app.cursors.artist,
+                last_cursor_album: app.cursors.album,
+                last_cursor_track: app.cursors.track,
+                last_cursor_playlist: app.cursors.playlist,
             });
             let _ = state::save_playlists(&app.playlists);
             let _ = state::save_command_history(&app.command_history);

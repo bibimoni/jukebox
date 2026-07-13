@@ -202,6 +202,27 @@ pub struct LayoutState {
     /// the sidecar then falls back to persisted pasted cookies, else guest.
     #[serde(default)]
     pub yt_browser: String,
+    /// RC11-DEF-014: the last-played track id, restored on launch so the
+    /// cursor can return to it and a "resume" hint can show. `None` on a
+    /// fresh install (no track has been played yet).
+    #[serde(default)]
+    pub last_played_track_id: Option<String>,
+    /// RC11-DEF-014: the last-played track's position in seconds, restored
+    /// on launch so `resume_last()` can seek to it. afplay can't seek so
+    /// resume only re-seeks on mpv; afplay restarts from 0.
+    #[serde(default)]
+    pub last_played_position: f64,
+    /// RC11-DEF-014: the last-focused browse cursors (artist/album/track/
+    /// playlist), restored on launch so the user returns to the last-played
+    /// track instead of track 1. `queue` is not persisted (it's transient).
+    #[serde(default)]
+    pub last_cursor_artist: usize,
+    #[serde(default)]
+    pub last_cursor_album: usize,
+    #[serde(default)]
+    pub last_cursor_track: usize,
+    #[serde(default)]
+    pub last_cursor_playlist: usize,
 }
 
 fn default_focus() -> String {
@@ -231,6 +252,12 @@ impl Default for LayoutState {
             continue_mode: "off".to_string(),
             source_mode: "local".to_string(),
             yt_browser: String::new(),
+            last_played_track_id: None,
+            last_played_position: 0.0,
+            last_cursor_artist: 0,
+            last_cursor_album: 0,
+            last_cursor_track: 0,
+            last_cursor_playlist: 0,
         }
     }
 }
@@ -288,6 +315,16 @@ pub struct LayoutSave<'a> {
     pub continue_mode: crate::tui::queue::ContinueMode,
     pub source_mode: crate::mode::SourceMode,
     pub yt_browser: &'a str,
+    /// RC11-DEF-014: the last-played track id + position (None when nothing
+    /// has been played this session).
+    pub last_played_track_id: Option<&'a str>,
+    pub last_played_position: f64,
+    /// RC11-DEF-014: the last-focused browse cursors so the next launch
+    /// returns to the last-played track.
+    pub last_cursor_artist: usize,
+    pub last_cursor_album: usize,
+    pub last_cursor_track: usize,
+    pub last_cursor_playlist: usize,
 }
 
 /// Save the layout (focus + widths + volume + shuffle/repeat) to `path`.
@@ -324,6 +361,12 @@ pub fn save_layout_at(path: &Path, input: &LayoutSave) -> Result<()> {
         .to_string(),
         source_mode: input.source_mode.as_str().to_string(),
         yt_browser: input.yt_browser.to_string(),
+        last_played_track_id: input.last_played_track_id.map(|s| s.to_string()),
+        last_played_position: input.last_played_position,
+        last_cursor_artist: input.last_cursor_artist,
+        last_cursor_album: input.last_cursor_album,
+        last_cursor_track: input.last_cursor_track,
+        last_cursor_playlist: input.last_cursor_playlist,
     })?;
     conn.execute(
         "INSERT INTO state (key, value) VALUES ('layout', ?1)

@@ -111,6 +111,61 @@ fn spinner_glyph(app: &App) -> &'static str {
     frames[app.spinner_frame as usize % frames.len()]
 }
 
+/// RC11-DEF-015: true when a YouTube track is being resolved (cold miss,
+/// `pending_play` set) or loaded but not yet playing while a resolve is in
+/// flight. Drives the `[BUFFERING]` state label and the "Buffering [title]…"
+/// now-playing slot so a cold-start pick (now_playing still None for the
+/// ~1.3s resolve) doesn't read as `[STOPPED] — nothing playing —`.
+fn is_buffering(app: &App) -> bool {
+    app.pending_play.is_some()
+        || (app.now_playing.is_some() && !app.player.is_playing() && app.is_resolving())
+}
+
+/// RC11-DEF-015: the title of the pending (cold-miss) YouTube track, if it's
+/// cached in the session's track cache. Returns None when the metadata hasn't
+/// been fetched yet (the bar falls back to a generic "Loading stream…" label).
+fn buffering_title(app: &App) -> Option<String> {
+    let vid = app.pending_play.as_ref()?;
+    app.yt_session
+        .as_ref()
+        .and_then(|s| s.track_for(vid))
+        .map(|t| t.title.clone())
+}
+
+/// RC11-DEF-043: the transient confirmation toast (e.g. "Added to queue"),
+/// truncated to `max` display columns so it fits the up-next slot. Returns
+/// None when no toast is active. The toast is rendered in the up-next slot
+/// (precedence over the `Next:` preview) with an accent style so it's visible
+/// regardless of `yt_state` (the `yt_status` toast was gated on Ready, so
+/// local-only users never saw "added to queue").
+fn toast_preview(app: &App, max: usize) -> Option<String> {
+    let toast = app.toast.as_ref()?;
+    Some(truncate_title(toast, max))
+}
+
+/// RC11-DEF-043: pick the up-next slot's content + style. A transient toast
+/// (e.g. "Added to queue") takes precedence over the `Next:` preview and uses
+/// the accent style so the confirmation is visible; otherwise the dim
+/// `Next:`/`Enter to play` preview. Used by both the full and compact bars so
+/// the toast renders regardless of `yt_state` (the old `yt_status` toast was
+/// hidden when yt_state != Ready, so local-only users never saw it).
+///
+/// `avail` is the full display width available for the slot. The toast uses
+/// all of it (it has no `▸ Next: ` prefix); the up-next preview reserves 8
+/// cols for that prefix internally.
+fn next_or_toast(app: &App, avail: usize) -> Option<(String, Style)> {
+    let theme = Theme::default();
+    let accent = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme.dim);
+    if let Some(t) = toast_preview(app, avail) {
+        return Some((t, accent));
+    }
+    let max_title = avail.saturating_sub(8);
+    up_next_preview(app, max_title).map(|n| (n, dim))
+}
+
 /// The "Up Next" preview string: `▸ Next: {title}` when a successor is queued,
 /// or `▸ Next: (end)` when the context is exhausted (so the up-next slot is
 /// always visible while a track is playing — GLM: up-next-missing). When
@@ -233,11 +288,14 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
     let resolving = app.is_resolving();
     let has_track = app.now_playing.is_some();
     let playing = app.player.is_playing() && has_track;
+    // RC11-DEF-015: buffering state (cold-miss YouTube pick or loaded-but-
+    // not-playing with a resolve in flight) — distinct from stopped/paused.
+    let buffering = is_buffering(app);
     // State convention: ▶ = playing, ⏸ = paused, ■ = stopped (Issue 1: the
     // old logic showed ⏸ while playing and ▶ while paused — backwards — and
     // □ for stopped which reads as a stop button. Now the glyph reflects the
     // CURRENT state, matching the [PLAYING]/[PAUSED]/[STOPPED] label.)
-    let state_glyph = if resolving {
+    let state_glyph = if resolving || buffering {
         spinner_glyph(app)
     } else if playing {
         play_glyph()
@@ -251,7 +309,7 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
     // so it's visually prominent (T2: play-pause-icon-missing — glyph was
     // color-only, now bold+colored = two cues surviving NO_COLOR). Both auto-
     // degrade to Reset under NO_COLOR (theme); bold weight survives mono.
-    let glyph_style = if resolving {
+    let glyph_style = if resolving || buffering {
         Style::default()
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD)
@@ -260,13 +318,21 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
     };
-    // State label: [PLAYING]/[PAUSED]/[STOPPED] — the clearest single signal
-    // of the playback state, leading the row (GLM: state-label-missing).
-    // Colors: Magenta for playing (attention), Yellow for paused (caution),
-    // dim for stopped. All collapse to Reset under NO_COLOR (the label text
-    // distinguishes states without color).
+    // State label: [PLAYING]/[PAUSED]/[STOPPED]/[BUFFERING] — the clearest
+    // single signal of the playback state, leading the row (GLM:
+    // state-label-missing). Colors: Magenta for playing (attention), Yellow
+    // for paused (caution), Cyan+bold for buffering, dim for stopped. All
+    // collapse to Reset under NO_COLOR (the label text distinguishes states
+    // without color).
     let nc = crate::tui::view::theme::no_color();
-    let (state_label, state_style) = if playing {
+    let (state_label, state_style) = if buffering {
+        (
+            "[BUFFERING]",
+            Style::default()
+                .fg(if nc { Color::Reset } else { Color::Cyan })
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if playing {
         (
             "[PLAYING]",
             Style::default().fg(if nc { Color::Reset } else { Color::Magenta }),
@@ -298,10 +364,32 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::styled(format!(" {} ", em_dash()), dim));
             spans.push(Span::styled(v.artist.clone(), text));
         }
-        None => spans.push(Span::styled(
-            format!("{dash} nothing playing {dash}", dash = em_dash()),
-            dim,
-        )),
+        None => {
+            // RC11-DEF-015: show "Buffering [title]…" when a cold-miss YouTube
+            // pick is resolving; else the dim "— nothing playing —" placeholder
+            // (or the RC11-DEF-014 resume hint when a last-played track is saved).
+            if buffering {
+                let title = buffering_title(app).unwrap_or_else(|| "Loading stream".to_string());
+                spans.push(Span::styled(
+                    format!("Buffering {title}{}", ellipsis()),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else if let Some(hint) = app.resume_hint.as_ref() {
+                spans.push(Span::styled(
+                    format!("{} {}", marker_glyph(), hint),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!("{dash} nothing playing {dash}", dash = em_dash()),
+                    dim,
+                ));
+            }
+        }
     }
     // Progress text (always visible — essential playback info; T3:
     // status-drops-indicators — keep title + progress + mode at small size).
@@ -329,12 +417,15 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
     if area.width > 60 {
         let used = spans_width(&spans);
         let avail = (area.width as usize).saturating_sub(used + reserved + 2);
-        if avail >= 10 {
-            let max_title = avail.saturating_sub(8);
-            if let Some(next) = up_next_preview(app, max_title) {
+        // RC11-DEF-043: a toast shows even in a crowded bar (truncated to fit);
+        // the up-next preview needs more room (8-col "▸ Next: " prefix), so its
+        // threshold is 10.
+        let threshold = if app.toast.is_some() { 4 } else { 10 };
+        if avail >= threshold {
+            if let Some((next, nstyle)) = next_or_toast(app, avail) {
                 if disp_width(&next) <= avail {
                     spans.push(Span::styled("  ", dim));
-                    spans.push(Span::styled(next, dim));
+                    spans.push(Span::styled(next, nstyle));
                 }
             }
         }
@@ -586,11 +677,16 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
     let playing = app.player.is_playing();
     let has_track = app.now_playing.is_some();
     let resolving = app.is_resolving();
+    // RC11-DEF-015: a cold-miss YouTube pick (pending_play set, now_playing
+    // still None for the ~1.3s resolve) or a loaded-but-not-yet-playing track
+    // with a resolve in flight is "buffering" — distinct from stopped and
+    // paused. The bar shows [BUFFERING] + the spinner + "Buffering [title]…".
+    let buffering = is_buffering(app);
     // State convention: ▶ = playing, ⏸ = paused, ■ = stopped (Issue 1: the
     // old logic showed ⏸ while playing and ▶ while paused — backwards — and
     // □ for stopped which reads as a stop button. Now the glyph reflects the
     // CURRENT state, matching the [PLAYING]/[PAUSED]/[STOPPED] label.)
-    let state_glyph = if resolving {
+    let state_glyph = if resolving || buffering {
         spinner_glyph(app)
     } else if playing && has_track {
         play_glyph()
@@ -599,7 +695,7 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
     } else {
         stop_glyph()
     };
-    let glyph_style = if resolving {
+    let glyph_style = if resolving || buffering {
         Style::default()
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD)
@@ -609,10 +705,18 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
         Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
     };
 
-    // State label: [PLAYING]/[PAUSED]/[STOPPED] — the clearest single signal
-    // of the playback state. Magenta for playing, Yellow for paused, dim for
-    // stopped. All collapse to Reset under NO_COLOR.
-    let (state_label, state_style) = if playing && has_track {
+    // State label: [PLAYING]/[PAUSED]/[STOPPED]/[BUFFERING] — the clearest
+    // single signal of the playback state. Magenta for playing, Yellow for
+    // paused, Cyan+bold for buffering (an active wait, not a stopped state),
+    // dim for stopped. All collapse to Reset under NO_COLOR.
+    let (state_label, state_style) = if buffering {
+        (
+            "[BUFFERING]",
+            Style::default()
+                .fg(if nc { Color::Reset } else { Color::Cyan })
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if playing && has_track {
         (
             "[PLAYING]",
             Style::default().fg(if nc { Color::Reset } else { Color::Magenta }),
@@ -684,6 +788,14 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
     if width >= 70 {
         trailing.push(Span::raw("   "));
         trailing.push(Span::styled("vol ", dim));
+        // RC11-DEF-022: when muted, show a "MUTED" text label alongside the
+        // bar so the state is unambiguous (the bar dims to 0% but the
+        // underlying volume is still 70%, which read as "volume 0" not
+        // "muted"). The label uses the dim color so it reads as a state flag,
+        // not a value.
+        if app.muted {
+            trailing.push(Span::styled("MUTED ", Style::default().fg(theme.dim)));
+        }
         let blocks = 4u32;
         let filled = ((u32::from(app.volume) * blocks + 50) / 100).min(blocks);
         let mut vol_bar = String::new();
@@ -725,32 +837,59 @@ fn build_info_line(app: &App, width: usize) -> Line<'static> {
                 let used = spans_width(&spans);
                 // 2 cols "  " prefix + 8 cols "▸ Next: " prefix + trailing.
                 let avail = width.saturating_sub(used + trailing_w + 2);
-                if avail >= 10 {
-                    let max_title = avail.saturating_sub(8);
-                    if let Some(next) = up_next_preview(app, max_title) {
+                // RC11-DEF-043: a toast shows even in a crowded bar (truncated
+                // to fit); the up-next preview needs more room (8-col prefix).
+                let threshold = if app.toast.is_some() { 4 } else { 10 };
+                if avail >= threshold {
+                    if let Some((next, nstyle)) = next_or_toast(app, avail) {
                         if disp_width(&next) <= avail {
                             spans.push(Span::styled("  ", dim));
-                            spans.push(Span::styled(next, dim));
+                            spans.push(Span::styled(next, nstyle));
                         }
                     }
                 }
             }
         }
         None => {
-            spans.push(Span::styled(
-                format!("{} nothing playing {}", em_dash(), em_dash()),
-                dim,
-            ));
+            // RC11-DEF-015: when buffering (cold-miss YouTube pick), show
+            // "Buffering [title]…" instead of "— nothing playing —" so the
+            // user knows a track is loading. Falls back to "Loading stream…"
+            // when the pending track's metadata isn't cached yet. Else
+            // RC11-DEF-014: show the "resume" hint when a last-played track is
+            // saved; else the dim "nothing playing" placeholder.
+            if buffering {
+                let title = buffering_title(app).unwrap_or_else(|| "Loading stream".to_string());
+                spans.push(Span::styled(
+                    format!("Buffering {title}{}", ellipsis()),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else if let Some(hint) = app.resume_hint.as_ref() {
+                spans.push(Span::styled(
+                    format!("{} {}", marker_glyph(), hint),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!("{} nothing playing {}", em_dash(), em_dash()),
+                    dim,
+                ));
+            }
             // Up-next hint when nothing is playing.
             if width > 60 {
                 let used = spans_width(&spans);
                 let avail = width.saturating_sub(used + trailing_w + 2);
-                if avail >= 10 {
-                    let max_title = avail.saturating_sub(8);
-                    if let Some(next) = up_next_preview(app, max_title) {
+                // RC11-DEF-043: a toast shows even in a crowded bar (truncated);
+                // the up-next preview needs more room (8-col prefix).
+                let threshold = if app.toast.is_some() { 4 } else { 10 };
+                if avail >= threshold {
+                    if let Some((next, nstyle)) = next_or_toast(app, avail) {
                         if disp_width(&next) <= avail {
                             spans.push(Span::styled("  ", dim));
-                            spans.push(Span::styled(next, dim));
+                            spans.push(Span::styled(next, nstyle));
                         }
                     }
                 }
@@ -909,6 +1048,15 @@ fn build_flags_line(app: &App, width: usize) -> Line<'static> {
 /// `(percent, "M:SS / M:SS")` for the progress gauge. When position/duration
 /// are unavailable the gauge reads 0% with a `--:--` label.
 fn progress(app: &App) -> (u16, String) {
+    // RC11-DEF-041: when stopped (no now-playing track), always show a clean
+    // `0% --:-- / --:--` — even if the player backend still reports the last
+    // track's position/duration (StubPlayer keeps them after `stop`; mpv may
+    // lag before its `end-file` resets the cache). Without this guard the bar
+    // displayed a stale `33% 0:02 / 0:06` after the track ended, looking like
+    // the track was still playing.
+    if app.now_playing.is_none() {
+        return (0, "--:-- / --:--".to_string());
+    }
     let pos = app.player.position();
     let dur = app.player.duration();
     match (pos, dur) {

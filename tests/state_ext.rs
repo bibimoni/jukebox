@@ -33,6 +33,12 @@ fn layout_round_trips() {
             continue_mode: ContinueMode::Radio,
             source_mode: jukebox::mode::SourceMode::Mixed,
             yt_browser: "chrome",
+            last_played_track_id: Some("t9"),
+            last_played_position: 12.0,
+            last_cursor_artist: 3,
+            last_cursor_album: 1,
+            last_cursor_track: 2,
+            last_cursor_playlist: 0,
         },
     )
     .unwrap();
@@ -45,6 +51,13 @@ fn layout_round_trips() {
     assert_eq!(loaded.continue_mode, "radio");
     assert_eq!(loaded.source_mode, "mixed");
     assert_eq!(loaded.yt_browser, "chrome");
+    // RC11-DEF-014: last-played track + position + cursors round-trip.
+    assert_eq!(loaded.last_played_track_id.as_deref(), Some("t9"));
+    assert!((loaded.last_played_position - 12.0).abs() < f64::EPSILON);
+    assert_eq!(loaded.last_cursor_artist, 3);
+    assert_eq!(loaded.last_cursor_album, 1);
+    assert_eq!(loaded.last_cursor_track, 2);
+    assert_eq!(loaded.last_cursor_playlist, 0);
 }
 
 #[test]

@@ -130,12 +130,24 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // `s` instant random track in context; `S` discover overlay (spec §5.5).
         (KeyCode::Char('s'), _) => app.instant_random(),
         (KeyCode::Char('S'), _) => app.open_discover(),
-        // `R` retry the YouTube provider probe after an error/stale state
-        // (ProviderError / AuthExpired / RateLimited / ReadyStale). No-op when
-        // the state is healthy (Ready) or needs auth (Unconfigured/SignedOut) —
-        // `retry_yt_probe` guards with `can_retry()`. This is the fix for the
-        // "repeated login" root cause: press R instead of re-authenticating.
-        (KeyCode::Char('R'), _) => app.retry_yt_probe(),
+        // `R` has two jobs depending on state:
+        //   - RC11-DEF-014: when stopped with a saved last-played track (the
+        //     `resume_hint` is showing), R resumes that track at its saved
+        //     position. The hint clears on the first play so this branch only
+        //     fires from the stopped-with-resume state.
+        //   - Otherwise: retry the YouTube provider probe after an
+        //     error/stale state (ProviderError / AuthExpired / RateLimited /
+        //     ReadyStale). No-op when the state is healthy (Ready) or needs
+        //     auth (Unconfigured/SignedOut) — `retry_yt_probe` guards with
+        //     `can_retry()`. This is the fix for the "repeated login" root
+        //     cause: press R instead of re-authenticating.
+        (KeyCode::Char('R'), _) => {
+            if app.resume_hint.is_some() {
+                app.resume_last();
+            } else {
+                app.retry_yt_probe();
+            }
+        }
 
         // --- Queue & playlist ----------------------------------------------
         // `e` enqueues the focused track to the manual "play next" queue.
