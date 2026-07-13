@@ -1390,7 +1390,11 @@ fn render_radio_overlay(f: &mut Frame, area: Rect, app: &mut App, session: Optio
             .into_iter()
             .map(|c| track_label(app, &c.track_id))
             .collect();
-        radio::render(popup, s, &icons, &seed_title, &upcoming)
+        // RC14-DEF-2: resolve the played-this-session history to display
+        // titles so the panel shows "Title — Artist" instead of raw ids like
+        // "v020" / "local004".
+        let played: Vec<String> = s.history().iter().map(|id| track_label(app, id)).collect();
+        radio::render(popup, s, &icons, &seed_title, &upcoming, &played)
     } else {
         Paragraph::new(Line::from(Span::styled(
             "No active radio session.".to_string(),

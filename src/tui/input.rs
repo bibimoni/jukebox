@@ -104,7 +104,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // --- Playback -------------------------------------------------------
         (KeyCode::Enter, _) => app.play_selected(),
         (KeyCode::Char(' '), _) => {
-            let _ = app.player.play_pause();
+            // RC14-DEF-4: route through `toggle_pause` so wall-clock pause
+            // tracking stays in sync (used by the hi-res progress fallback).
+            app.toggle_pause();
         }
         (KeyCode::Char('>'), _) => app.next(),
         (KeyCode::Char('<'), _) => app.prev(),
@@ -1831,7 +1833,8 @@ fn handle_player_bar_click(app: &mut App, col: u16, row: u16, area: ratatui::lay
     if rect_contains(geo.previous, col, row) {
         app.prev();
     } else if rect_contains(geo.play_pause, col, row) {
-        let _ = app.player.play_pause();
+        // RC14-DEF-4: route through `toggle_pause` for pause-time tracking.
+        app.toggle_pause();
     } else if rect_contains(geo.next, col, row) {
         app.next();
     }

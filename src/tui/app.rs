@@ -489,8 +489,23 @@ pub struct App {
     // --- Playback-event tracking (DEF-034) ---------------------------------
     /// When the currently-playing track started (for rapid-skip detection:
     /// a skip within 10s is a strong negative signal). Reset on every
-    /// `start_playback` / `load_track`.
+    /// `start_playback` / `load_track`. Also the wall-clock anchor for
+    /// `estimated_position()` (RC14-DEF-4: hi-res progress fallback).
     pub play_started_at: Option<std::time::Instant>,
+    /// RC14-DEF-4: when the current track was paused (SIGSTOP for afplay /
+    /// `pause` property for mpv). `None` while playing or stopped. Used by
+    /// `estimated_position()` to subtract paused wall-clock time so the
+    /// progress bar doesn't advance while paused.
+    pub pause_started_at: Option<std::time::Instant>,
+    /// RC14-DEF-4: accumulated paused wall-clock time for the current track.
+    /// Reset in `note_play_started` (new track). Added to in `toggle_pause`
+    /// on resume. Subtracted from `play_started_at.elapsed()` in
+    /// `estimated_position()`.
+    pub accumulated_paused: std::time::Duration,
+    /// RC14-DEF-4: the playback position (seconds) the current track started
+    /// at — 0 for a fresh play, the resume offset for `load_at`. Added to
+    /// the wall-clock elapsed in `estimated_position()`.
+    pub play_start_offset: f64,
     /// The track id for which `meaningful_threshold` has already been fired
     /// this play, so `on_tick` doesn't duplicate-fire it each tick. Cleared
     /// when the now-playing track changes.
@@ -754,6 +769,9 @@ impl App {
             reco_mixes: Vec::new(),
             reco_feedback_pending: Vec::new(),
             play_started_at: None,
+            pause_started_at: None,
+            accumulated_paused: std::time::Duration::ZERO,
+            play_start_offset: 0.0,
             threshold_fired_for: None,
             last_natural_end: None,
             persist_events: false,
@@ -4292,16 +4310,34 @@ impl App {
         let mut state = PublicationState::new();
         state.name = playlist_name.to_string();
 
-        // Resolve the playlist's track_ids. If `playlist_name` matches an
-        // existing local playlist, use its tracks; otherwise leave the
-        // track list empty (the user can still type a name and the overlay
-        // will show "0 tracks to publish" — better than silently publishing
-        // nothing).
+        // Resolve the playlist's track_ids. Preference order:
+        // 1. A local playlist whose name matches `playlist_name`.
+        // 2. RC14-DEF-1: the focused YouTube list when the user is in the
+        //    YouTube view (`:publish` is most often issued there, with a YT
+        //    playlist open). `cursors.playlist` indexes `yt_lists` in that
+        //    view; its `track_ids` are YouTube video_ids.
+        // 3. A YouTube list whose name matches `playlist_name`.
+        // 4. Empty (the overlay shows "0 tracks to publish").
         let track_ids: Vec<String> = self
             .playlists
             .iter()
             .find(|p| p.name == playlist_name)
             .map(|p| p.track_ids.clone())
+            .or_else(|| {
+                if self.view == View::Youtube {
+                    self.yt_lists
+                        .get(self.cursors.playlist)
+                        .map(|l| l.track_ids.clone())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                self.yt_lists
+                    .iter()
+                    .find(|l| l.name == playlist_name)
+                    .map(|l| l.track_ids.clone())
+            })
             .unwrap_or_default();
 
         // Classify each track id:
@@ -4490,6 +4526,10 @@ impl App {
     /// load_track Local Ok, load_remote Ok).
     fn note_play_started(&mut self, track_id: &str) {
         self.play_started_at = Some(std::time::Instant::now());
+        // RC14-DEF-4: reset pause + start-offset tracking for the new track.
+        self.pause_started_at = None;
+        self.accumulated_paused = std::time::Duration::ZERO;
+        self.play_start_offset = 0.0;
         // New track → threshold not yet fired for it.
         self.threshold_fired_for = None;
         self.record_listen_event(track_id, "track_started");
@@ -4500,6 +4540,51 @@ impl App {
         self.last_played_track_id = Some(track_id.to_string());
         self.last_played_position = 0.0;
         self.resume_hint = None;
+    }
+
+    /// RC14-DEF-4: set the playback start offset (seconds) for the current
+    /// track — the resume position captured by `load_with_resume`. Called
+    /// BEFORE `note_play_started` so the wall-clock estimate accounts for the
+    /// non-zero start. `0.0` for a fresh play (the default reset in
+    /// `note_play_started`).
+    fn set_play_start_offset(&mut self, offset: f64) {
+        self.play_start_offset = offset.max(0.0);
+    }
+
+    /// RC14-DEF-4: toggle pause/resume on the player backend AND track the
+    /// wall-clock pause interval so `estimated_position()` can subtract it.
+    /// Replaces bare `app.player.play_pause()` calls at the input/mouse call
+    /// sites so the pause duration is always accounted for. No-op when nothing
+    /// is loaded (mirrors the player backend's no-op).
+    pub fn toggle_pause(&mut self) {
+        let was_paused = self.pause_started_at.is_some();
+        if was_paused {
+            // Resuming: accumulate the paused interval.
+            if let Some(t) = self.pause_started_at.take() {
+                self.accumulated_paused += t.elapsed();
+            }
+        } else if self.now_playing.is_some() {
+            // Pausing: start the pause clock.
+            self.pause_started_at = Some(std::time::Instant::now());
+        }
+        let _ = self.player.play_pause();
+    }
+
+    /// RC14-DEF-4: wall-clock-based playback position (seconds) for the
+    /// current track. `play_start_offset + (play_started_at.elapsed() -
+    /// accumulated_paused - current_pause_elapsed)`. Used as the progress
+    /// fallback when the player backend's `position()` is unreliable —
+    /// afplay returns `None` always, and mpv reports erratic `time-pos` for
+    /// hi-res (192 kHz) files (~1/7 real-time). Returns `None` when no track
+    /// is playing or `play_started_at` is unset.
+    pub fn estimated_position(&self) -> Option<f64> {
+        let start = self.play_started_at?;
+        let mut elapsed = start.elapsed();
+        elapsed = elapsed.saturating_sub(self.accumulated_paused);
+        if let Some(p) = self.pause_started_at {
+            elapsed = elapsed.saturating_sub(p.elapsed());
+        }
+        Some(self.play_start_offset + elapsed.as_secs_f64().max(0.0))
     }
 
     /// RC11-DEF-014: load `path` into the player, resuming at the saved
@@ -4514,7 +4599,13 @@ impl App {
             _ => None,
         };
         match resume_pos {
-            Some(pos) => self.player.load_at(path, pos),
+            Some(pos) => {
+                // RC14-DEF-4: the track resumes at `pos`, not 0. Record the
+                // start offset so `estimated_position()` (wall-clock fallback)
+                // starts from `pos` instead of 0.
+                self.set_play_start_offset(pos);
+                self.player.load_at(path, pos)
+            }
             None => self.player.load(path),
         }
     }
@@ -5459,6 +5550,170 @@ mod tests {
         assert!(
             state.unavailable.is_empty(),
             "RC13-DEF-2: no tracks should be unavailable — non-catalog ids are publishable"
+        );
+    }
+
+    /// RC14-DEF-1: `open_publication` populates `publishable_ids` from the
+    /// focused YouTube playlist when the user is in the YouTube view. Before
+    /// the fix, `open_publication` only looked at local `playlists` by name,
+    /// so `:publish test` from the YouTube view always showed 0 tracks —
+    /// even with a YT playlist open and its [Y] tracks loaded + playing.
+    #[test]
+    fn rc14_def1_publication_populates_from_focused_yt_playlist() {
+        let mut app = make_app();
+        app.view = View::Youtube;
+        app.yt_lists.push(crate::tui::app::YtList {
+            id: "PL001".into(),
+            name: "Chill Mix".into(),
+            kind: crate::tui::app::YtListKind::Account,
+            track_ids: vec!["v001".into(), "v002".into(), "v003".into()],
+        });
+        app.yt_lists.push(crate::tui::app::YtList {
+            id: "PL002".into(),
+            name: "Workout Energy".into(),
+            kind: crate::tui::app::YtListKind::Account,
+            track_ids: vec!["v010".into(), "v011".into()],
+        });
+        // Focus the second playlist (cursors.playlist = 1).
+        app.cursors.playlist = 1;
+        // `:publish test` — name doesn't match any local playlist, so the
+        // focused yt_list's tracks should be used.
+        app.open_publication("test");
+        let state = match &app.overlay {
+            Some(Overlay::Publication { state }) => state,
+            _ => panic!("expected Publication overlay"),
+        };
+        assert_eq!(
+            state.publishable_ids.len(),
+            2,
+            "RC14-DEF-1: focused YT playlist's 2 video ids should be publishable, got {}",
+            state.publishable_ids.len()
+        );
+        assert!(state.publishable_ids.contains(&"v010".to_string()));
+        assert!(state.publishable_ids.contains(&"v011".to_string()));
+        assert!(
+            state.local_only.is_empty(),
+            "RC14-DEF-1: no local-only tracks from a YT playlist"
+        );
+    }
+
+    /// RC14-DEF-1: a local playlist with a matching name takes precedence
+    /// over the focused YouTube list (the user named an existing local
+    /// playlist explicitly).
+    #[test]
+    fn rc14_def1_publication_local_playlist_name_takes_precedence() {
+        let mut app = make_app();
+        app.view = View::Youtube;
+        app.yt_lists.push(crate::tui::app::YtList {
+            id: "PL001".into(),
+            name: "My Mix".into(),
+            kind: crate::tui::app::YtListKind::Account,
+            track_ids: vec!["v001".into()],
+        });
+        app.cursors.playlist = 0;
+        // Local playlist with the SAME name — should win.
+        app.playlists.push(crate::tui::app::Playlist {
+            name: "My Mix".into(),
+            track_ids: vec!["t1".into(), "v099".into()],
+        });
+        app.open_publication("My Mix");
+        let state = match &app.overlay {
+            Some(Overlay::Publication { state }) => state,
+            _ => panic!("expected Publication overlay"),
+        };
+        // t1 is local → local_only; v099 is a YouTube id → publishable.
+        assert_eq!(state.local_only, vec!["t1".to_string()]);
+        assert_eq!(state.publishable_ids, vec!["v099".to_string()]);
+    }
+
+    /// RC14-DEF-4: `estimated_position()` returns the wall-clock elapsed
+    /// since `play_started_at` (minus paused time). With a fresh play (no
+    /// pause, no offset) it should be ≈ 0 immediately after
+    /// `note_play_started`.
+    #[test]
+    fn rc14_def4_estimated_position_tracks_wall_clock() {
+        let mut app = make_app();
+        // Simulate a track starting: note_play_started is private, so set the
+        // fields it sets directly.
+        app.play_started_at = Some(std::time::Instant::now());
+        app.pause_started_at = None;
+        app.accumulated_paused = std::time::Duration::ZERO;
+        app.play_start_offset = 0.0;
+        let p = app.estimated_position().unwrap();
+        assert!(
+            (0.0..0.5).contains(&p),
+            "RC14-DEF-4: fresh play estimated_position should be ~0, got {p}"
+        );
+        // Simulate 3s elapsed.
+        app.play_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        let p = app.estimated_position().unwrap();
+        assert!(
+            (p - 3.0).abs() < 0.5,
+            "RC14-DEF-4: 3s elapsed → estimated_position ≈ 3.0, got {p}"
+        );
+    }
+
+    /// RC14-DEF-4: `estimated_position()` subtracts paused wall-clock time so
+    /// the progress bar doesn't advance while paused.
+    #[test]
+    fn rc14_def4_estimated_position_subtracts_pause() {
+        let mut app = make_app();
+        // Track started 10s ago, paused for 4s (accumulated), still playing.
+        app.play_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        app.accumulated_paused = std::time::Duration::from_secs(4);
+        app.pause_started_at = None;
+        app.play_start_offset = 0.0;
+        let p = app.estimated_position().unwrap();
+        assert!(
+            (p - 6.0).abs() < 0.5,
+            "RC14-DEF-4: 10s elapsed − 4s paused → ≈ 6.0, got {p}"
+        );
+    }
+
+    /// RC14-DEF-4: `estimated_position()` includes the resume start offset so
+    /// a resumed track's progress starts from the saved position, not 0.
+    #[test]
+    fn rc14_def4_estimated_position_includes_start_offset() {
+        let mut app = make_app();
+        app.play_started_at = Some(std::time::Instant::now());
+        app.play_start_offset = 30.0;
+        app.accumulated_paused = std::time::Duration::ZERO;
+        app.pause_started_at = None;
+        let p = app.estimated_position().unwrap();
+        assert!(
+            (p - 30.0).abs() < 0.5,
+            "RC14-DEF-4: start_offset=30 + ~0s elapsed → ≈ 30.0, got {p}"
+        );
+    }
+
+    /// RC14-DEF-4: `toggle_pause()` tracks the pause interval. After pausing
+    /// then resuming, `accumulated_paused` should have grown.
+    #[test]
+    fn rc14_def4_toggle_pause_tracks_pause_duration() {
+        let mut app = make_app();
+        // StubPlayer: load a track so play_pause has a child to toggle.
+        app.now_playing = Some(crate::source::TrackSource::Local {
+            track_id: "t1".into(),
+        });
+        app.play_started_at = Some(std::time::Instant::now());
+        // Pause.
+        app.toggle_pause();
+        assert!(
+            app.pause_started_at.is_some(),
+            "pause_started_at set on pause"
+        );
+        // Hold the pause for a brief moment.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Resume.
+        app.toggle_pause();
+        assert!(
+            app.pause_started_at.is_none(),
+            "pause_started_at cleared on resume"
+        );
+        assert!(
+            app.accumulated_paused >= std::time::Duration::from_millis(40),
+            "RC14-DEF-4: accumulated_paused should include the pause interval, got {:?}",
+            app.accumulated_paused
         );
     }
 

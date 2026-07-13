@@ -105,12 +105,14 @@ fn radio_overlay_renders() {
     // only verifies render doesn't panic.
     let seed_title = "t1";
     let upcoming: Vec<String> = Vec::new();
+    let played: Vec<String> = Vec::new();
     let para = radio::render(
         ratatui::layout::Rect::new(0, 0, 80, 24),
         &session,
         &icons,
         seed_title,
         &upcoming,
+        &played,
     );
     let _ = para;
 }

@@ -624,7 +624,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     // Reserve the rightmost 14 columns for the transport controls (◀◀ ▶ ▶▶)
     // so a long info line is truncated before it can be overwritten by them.
     // The 14 matches `controls_width = area.width.min(14)` in `geometry()`.
-    let line = build_info_line(app, info_area.width.saturating_sub(14) as usize);
+    // RC14-DEF-3: reserve 1 extra col so the volume percentage ("70%") and
+    // the transport glyphs ("◀◀") always have a ≥1-space gap between them
+    // (the old budget let the info line fill right up to the transport start,
+    // producing "70%◀◀" with 0 spaces when the title was long).
+    let line = build_info_line(app, info_area.width.saturating_sub(15) as usize);
     f.render_widget(
         Paragraph::new(line).block(Block::default().borders(Borders::NONE)),
         info_area,
@@ -1141,6 +1145,15 @@ fn build_flags_line(app: &App, width: usize) -> Line<'static> {
 
 /// `(percent, "M:SS / M:SS")` for the progress gauge. When position/duration
 /// are unavailable the gauge reads 0% with a `--:--` label.
+///
+/// RC14-DEF-4: for hi-res (≥192 kHz) local tracks, mpv's `time-pos` property
+/// advances erratically (~1/7 real-time observed on 24/192 FLAC) — likely a
+/// coreaudio/mpv reporting quirk for non-standard sample rates. afplay
+/// reports `None` always. In both cases fall back to a wall-clock estimate
+/// (`App::estimated_position`: start offset + elapsed − paused) when the
+/// player's `position()` is `None` OR the now-playing track is hi-res local.
+/// The duration still comes from the player backend (mpv reports it
+/// correctly for hi-res; afplay has none → the label stays `--:--`).
 fn progress(app: &App) -> (u16, String) {
     // RC11-DEF-041: when stopped (no now-playing track), always show a clean
     // `0% --:-- / --:--` — even if the player backend still reports the last
@@ -1151,8 +1164,18 @@ fn progress(app: &App) -> (u16, String) {
     if app.now_playing.is_none() {
         return (0, "--:-- / --:--".to_string());
     }
-    let pos = app.player.position();
     let dur = app.player.duration();
+    // RC14-DEF-4: decide whether to trust the player's reported position or
+    // use the wall-clock estimate. Prefer the estimate when:
+    //   - the player reports no position (afplay), OR
+    //   - the now-playing track is a hi-res (≥192 kHz) local file (mpv's
+    //     time-pos is erratic for hi-res).
+    let prefer_estimate = app.player.position().is_none() || is_hires_local(app);
+    let pos = if prefer_estimate {
+        app.estimated_position()
+    } else {
+        app.player.position()
+    };
     match (pos, dur) {
         (Some(p), Some(d)) if d > 0.0 => {
             let pct = ((p / d) * 100.0).clamp(0.0, 100.0) as u16;
@@ -1160,6 +1183,27 @@ fn progress(app: &App) -> (u16, String) {
         }
         _ => (0, "--:-- / --:--".to_string()),
     }
+}
+
+/// RC14-DEF-4: true when the now-playing track is a local file with a sample
+/// rate ≥ 192 kHz. mpv's `time-pos` property advances erratically for such
+/// hi-res files (~1/7 real-time on 24/192 FLAC), so the progress bar should
+/// use the wall-clock estimate instead. Remote (YouTube) tracks are never
+/// affected (mpv streams them at 48 kHz).
+fn is_hires_local(app: &App) -> bool {
+    let Some(np) = &app.now_playing else {
+        return false;
+    };
+    if np.is_remote() {
+        return false;
+    }
+    // Local track: look up the catalog entry for its sample rate.
+    let crate::source::TrackSource::Local { track_id } = np else {
+        return false;
+    };
+    app.track_by_id_fast(track_id)
+        .map(|t| t.sample_rate_hz >= 192_000)
+        .unwrap_or(false)
 }
 
 /// Render a `▰▰▰▰▱▱▱▱ 42%` style progress bar into `area`. The filled portion
@@ -1419,7 +1463,10 @@ mod mod_tests {
             "MAJ-1: should show Next: preview: {bar}"
         );
         // Track 2's title (or a truncation of it) should appear in the bar.
-        let has_track2 = bar.contains("A Very Long") || bar.contains("Track Title");
+        // RC14-DEF-3: the info-line budget shrank by 1 col (volume↔transport
+        // gap), so the next-preview truncates 1 char shorter — accept both
+        // "A Very Long" and "A Very Lon" (the shorter ellipsis cutoff).
+        let has_track2 = bar.contains("A Very Lon");
         assert!(
             has_track2,
             "MAJ-1: should show next track title (t2): {bar}"
@@ -1669,6 +1716,110 @@ mod mod_tests {
         assert!(
             bar.contains("Next:"),
             "DEF-057: Next: cue must be visible while playing: {bar}"
+        );
+    }
+
+    /// RC14-DEF-3: the volume percentage and the transport controls must have
+    /// a ≥1-space gap. Before the fix, a long-title track filled the info
+    /// line right up to the transport start, producing "70%◀◀" (0 spaces).
+    /// Now the info line budget is 1 col shorter, guaranteeing a gap.
+    #[test]
+    fn rc14_def3_volume_transport_has_gap() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        // t2 has a very long title that fills the info line.
+        app.play_in_context_ids(vec!["t2".into()], "t2");
+        assert!(app.player.is_playing());
+        // Render at 100×2 (the width where the defect was observed).
+        let bar = rendered_bar(&app, 100, 2);
+        // The volume reads "70%" (default volume). The transport starts with
+        // ◀◀ (Unicode) or << (ASCII). Either way, "70%" must NOT be
+        // immediately followed by the transport glyph — there must be a gap.
+        assert!(
+            !bar.contains("70%◀◀"),
+            "RC14-DEF-3: volume + transport must have a gap, not \"70%◀◀\":\n{bar}"
+        );
+        assert!(
+            !bar.contains("70%<<"),
+            "RC14-DEF-3: volume + transport must have a gap, not \"70%<<\":\n{bar}"
+        );
+        // Sanity: the transport IS rendered (the gap fix didn't remove it).
+        assert!(
+            bar.contains("◀◀") || bar.contains("<<"),
+            "RC14-DEF-3: transport glyphs must still be present:\n{bar}"
+        );
+    }
+
+    /// Catalog with a hi-res (24/192 kHz) local track for RC14-DEF-4.
+    fn hires_cat() -> (tempfile::TempDir, Catalog) {
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({
+            "version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+            "tracks":[
+              {"id":"h1","artists":["HiRes"],"primary_artist":"HiRes","title":"Desert Wind","album":"HiRes","bit_depth":24,"sample_rate_hz":192000,"source_path":"lossless/A/01.flac","symlinked_into_artists":["HiRes"]}
+            ]
+        })
+        .to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        (d, Catalog::load(&p).unwrap())
+    }
+
+    /// RC14-DEF-4: for a hi-res (≥192 kHz) local track, the progress bar uses
+    /// the wall-clock estimate instead of the player backend's `position()`.
+    /// StubPlayer reports position=0 always, so without the fix the bar would
+    /// read 0%. With the fix (estimated position from `play_started_at`), a
+    /// track that started ~3s ago shows a non-zero percentage.
+    #[test]
+    fn rc14_def4_hires_progress_uses_wall_clock() {
+        let (_d, cat) = hires_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.play_in_context_ids(vec!["h1".into()], "h1");
+        assert!(app.player.is_playing());
+        // Simulate 3s of playback. StubPlayer.duration() = 180, so the
+        // estimated percentage ≈ 3/180*100 ≈ 1% (vs 0% from player.position()).
+        app.play_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        app.play_start_offset = 0.0;
+        app.accumulated_paused = std::time::Duration::ZERO;
+        app.pause_started_at = None;
+        let bar = rendered_bar(&app, 100, 2);
+        // The progress bar row contains "{pct}%". With the fix, pct > 0.
+        // Find the progress percentage in the bar (row 2).
+        let row2 = bar.lines().nth(1).unwrap_or("");
+        assert!(
+            !row2.contains(" 0%"),
+            "RC14-DEF-4: hi-res progress should use wall-clock estimate (>0%), not 0%:\n{bar}"
+        );
+        // The percentage should be small but non-zero (~1%).
+        assert!(
+            row2.contains(" 1%") || row2.contains(" 2%"),
+            "RC14-DEF-4: hi-res 3s/180s ≈ 1-2%, got:\n{row2}"
+        );
+    }
+
+    /// RC14-DEF-4: for a normal (44.1/96 kHz) local track, the player
+    /// backend's `position()` is trusted (not the wall-clock estimate).
+    /// StubPlayer reports position=0, so the bar reads 0% even after
+    /// simulating elapsed wall-clock time — confirming the estimate is NOT
+    /// used for non-hi-res tracks.
+    #[test]
+    fn rc14_def4_normal_res_track_trusts_player_position() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        // t1 is 24/96 kHz — not hi-res (≥192 kHz).
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        assert!(app.player.is_playing());
+        // Simulate 5s of wall-clock elapsed.
+        app.play_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        let bar = rendered_bar(&app, 100, 2);
+        let row2 = bar.lines().nth(1).unwrap_or("");
+        // StubPlayer.position() = 0 → 0%, NOT the wall-clock 5/180 ≈ 2%.
+        assert!(
+            row2.contains(" 0%"),
+            "RC14-DEF-4: non-hi-res track should trust player.position() (0%), not wall-clock:\n{row2}"
         );
     }
 }

@@ -507,6 +507,7 @@ fn radio_render_shows_resolved_seed_title() {
         &icons,
         "Ado — あのバンド",
         &[],
+        &[],
     );
 }
 
@@ -523,6 +524,7 @@ fn radio_render_shows_upcoming_list() {
         &icons,
         "track t1",
         &upcoming,
+        &[],
     );
 }
 

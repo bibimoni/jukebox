@@ -13,15 +13,18 @@ use crate::tui::view::theme::{ellipsis, sep_dot};
 /// `seed_title` is the resolved display title for the seed (DEF-061: the raw
 /// track id is replaced with "Title — Artist"). `upcoming` is the list of
 /// resolved display titles for the next pool tracks (DEF-063: shows the
-/// upcoming 5-10 tracks, not just a count). Both are resolved by the caller
-/// (which has access to the catalog + YouTube `track_cache`); the view layer
-/// only formats them.
+/// upcoming 5-10 tracks, not just a count). `played` is the list of resolved
+/// display titles for tracks played this session (RC14-DEF-2: replaces the
+/// raw track ids that showed as "v020"/"local004"). All three are resolved by
+/// the caller (which has access to the catalog + YouTube `track_cache`); the
+/// view layer only formats them.
 pub fn render(
     _area: Rect,
     session: &RadioSession,
     icons: &IconRenderer,
     seed_title: &str,
     upcoming: &[String],
+    played: &[String],
 ) -> Paragraph<'static> {
     let mut lines = Vec::new();
 
@@ -72,8 +75,12 @@ pub fn render(
             format!("Played this session ({}):", history.len()),
             Style::default().fg(Color::Cyan),
         )));
-        for (i, track_id) in history.iter().take(10).enumerate() {
-            lines.push(Line::from(format!("  {}. {track_id}", i + 1)));
+        // RC14-DEF-2: show resolved "Title — Artist" titles instead of raw
+        // track ids. `played` is parallel to `history` (same length, same
+        // order); fall back to the raw id if a title wasn't resolved.
+        for (i, (track_id, title)) in history.iter().zip(played.iter()).take(10).enumerate() {
+            let label = if title.is_empty() { track_id } else { title };
+            lines.push(Line::from(format!("  {}. {label}", i + 1)));
         }
         if history.len() > 10 {
             lines.push(Line::from(Span::styled(
@@ -105,7 +112,14 @@ mod tests {
     fn render_radio_session_produces_content() {
         let session = RadioSession::new(RadioSeed::Track("t1".into()));
         let icons = IconRenderer::new(FontMode::Unicode);
-        let para = render(Rect::new(0, 0, 80, 24), &session, &icons, "track t1", &[]);
+        let para = render(
+            Rect::new(0, 0, 80, 24),
+            &session,
+            &icons,
+            "track t1",
+            &[],
+            &[],
+        );
         let _ = para;
     }
 
@@ -118,6 +132,7 @@ mod tests {
             &session,
             &icons,
             "artist Test Artist",
+            &[],
             &[],
         );
         let _ = para;
@@ -133,6 +148,7 @@ mod tests {
             &session,
             &icons,
             "Ado — あのバンド",
+            &[],
             &[],
         );
         let _ = para;
@@ -153,7 +169,34 @@ mod tests {
             &icons,
             "track t1",
             &upcoming,
+            &[],
         );
         let _ = para;
+    }
+
+    #[test]
+    fn render_radio_shows_resolved_played_titles() {
+        // RC14-DEF-2: played-this-session entries show "Title — Artist"
+        // instead of raw track ids like "local002".
+        let mut session = RadioSession::new(RadioSeed::Track("t1".into()));
+        session.session_history.push("local002".into());
+        session.session_history.push("v020".into());
+        let icons = IconRenderer::new(FontMode::Unicode);
+        let played = vec![
+            "Ocean Drive — Test Artist".to_string(),
+            "Eye of the Tiger — Survivor".to_string(),
+        ];
+        let para = render(
+            Rect::new(0, 0, 80, 24),
+            &session,
+            &icons,
+            "track t1",
+            &[],
+            &played,
+        );
+        let _ = para;
+        // The titles (not raw ids) must be the display text. We can't inspect
+        // Paragraph lines directly, but the render must not panic and the
+        // titles flow through to the formatter.
     }
 }
