@@ -3,12 +3,16 @@
 //! A 10-row rectangle that shows the now-playing track with richer metadata
 //! than the 2-row mini bar: title, artist · album, quality readout, a
 //! `▰▰▰▰▱▱` progress bar with `M:SS / M:SS + pct`, transport controls, a
-//! block-bar volume meter, the `SHUF · RPT · CONT · MODE` flags, a `Next:`
+//! block-bar volume meter, the `SHUF · RPT · CONT · PREF` flags, a `Next:`
 //! preview, and a `♫ Lyrics:` first-line preview.
 //!
-//! Album art is approximated by a 4×4 grid of `░▒▓█` chars derived from the
-//! track id hash (deterministic, decorative — terminals can't render real
-//! art). ASCII mode falls back to `#` / `.`.
+//! RC19-D15: the album-art placeholder (a 4×4 `░▒▓█` grid + "album art" text
+//! label) was removed. The label lived in the same row as the transport
+//! controls and bled through the gaps between glyphs (`◀◀bu▶ ▶▶t`). The art
+//! was decorative-only (terminals can't render real cover art), so dropping
+//! it cleans up the transport row. The 10-col left reservation REMAINS so
+//! the flags line (rendered into the right sub-rect) doesn't overwrite the
+//! transport glyphs.
 //!
 //! Mini mode (`player_bar::render` / `render_compact`) is byte-identical to
 //! the pre-I.2 implementation; this module is purely additive.
@@ -274,12 +278,17 @@ fn render_progress_bar(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// `SHUF · RPT · CONT · MODE` flags line for row 9. Mirrors
+/// `SHUF · RPT · CONT · PREF` flags line for row 9. Mirrors
 /// `player_bar::build_flags_line` but local so mini mode stays untouched.
 /// RC18-D4: appends `· SRC {actual}` when the now-playing track's source
-/// differs from `source_mode` (e.g. a YouTube track plays while MODE=local)
+/// differs from `source_mode` (e.g. a YouTube track plays while PREF=local)
 /// so the flags line never contradicts the actual playing source — mirrors
 /// the mini bar's DEF-013 fix.
+/// RC19-D4: the user-preference label was renamed `MODE` → `PREF` so it
+/// reads as the user's preference (Local / YouTube / Mixed) rather than
+/// the actual playing source. `SRC` (appended when the playing source
+/// differs) is the actual source — `PREF local · SRC youtube` is no
+/// longer contradictory.
 fn build_flags_line(app: &App) -> Line<'static> {
     let theme = Theme::default();
     let dim = Style::default().fg(theme.dim);
@@ -308,7 +317,7 @@ fn build_flags_line(app: &App) -> Line<'static> {
         Span::raw(format!(" {sd} ")),
         Span::styled(format!("CONT {cont}"), dim),
         Span::raw(format!(" {sd} ")),
-        Span::styled(format!("MODE {mode}"), dim),
+        Span::styled(format!("PREF {mode}"), dim),
     ];
     // RC18-D4: SRC badge when the playing source differs from the mode.
     if let Some(np) = &app.now_playing {
@@ -329,45 +338,6 @@ fn build_flags_line(app: &App) -> Line<'static> {
         }
     }
     Line::from(spans)
-}
-
-/// A 4×4 album-art placeholder grid derived from a deterministic hash of
-/// `id`. Uses `░▒▓█` (Unicode) or `#`/`.` (ASCII). Decorative — terminals
-/// can't render real art. The grid is returned as 4 `Line`s.
-fn album_art_grid(id: &str) -> [Line<'static>; 4] {
-    let ascii = is_ascii();
-    // Simple deterministic hash: fold bytes of the id into a u64.
-    let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
-    for &b in id.as_bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    let cells: [&str; 4] = if ascii {
-        ["#", ".", ".", "#"]
-    } else {
-        ["░", "▒", "▓", "█"]
-    };
-    let mut out = [
-        Line::from(""),
-        Line::from(""),
-        Line::from(""),
-        Line::from(""),
-    ];
-    for (row, out_row) in out.iter_mut().enumerate() {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        for col in 0..4usize {
-            let bit = (h >> (row * 4 + col)) & 1;
-            let ch = if bit == 1 { cells[0] } else { cells[1] };
-            // Use a 2-char block for visual weight when Unicode.
-            let _ = col;
-            spans.push(Span::raw(ch.to_string()));
-            if !ascii {
-                spans.push(Span::raw(ch.to_string()));
-            }
-        }
-        *out_row = Line::from(spans);
-    }
-    out
 }
 
 /// The first non-empty line of the now-playing track's lyrics, for the
@@ -461,26 +431,16 @@ pub fn render_big(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Reserve a left column for album art (8 cols wide × 4 rows) when there
-    // is room; the metadata sits to its right.
-    let show_art = inner.width >= 60;
-    let meta_area = if show_art {
-        let split = Layout::horizontal([Constraint::Length(10), Constraint::Min(1)]).split(inner);
-        // Render the 4×4 art grid at the top-left, with a text label below.
-        let art = album_art_grid(app.now_playing.as_ref().map(|s| s.id()).unwrap_or(""));
-        let art_label = if is_ascii() { "art" } else { "album art" };
-        let art_label_style = dim;
-        let mut art_lines: Vec<Line> = art.to_vec();
-        art_lines.push(Line::from(""));
-        art_lines.push(Line::from(Span::styled(
-            art_label.to_string(),
-            art_label_style,
-        )));
-        f.render_widget(Paragraph::new(art_lines), split[0]);
-        split[1]
-    } else {
-        inner
-    };
+    // Reserve a 10-col left column for the transport controls so the flags
+    // line (rendered into `meta_area` row 6 = rows[5]) doesn't overwrite the
+    // transport glyphs (geometry_big places transport at x0 = area.x + 1,
+    // cols 1-8). The old `show_art` branch put the album-art grid + label
+    // in this column; RC19-D15 removed the art (it was decorative and its
+    // "album art" text label bled through the transport gaps as `b`/`u`/`t`
+    // stray chars). The column reservation stays so the transport area and
+    // the flags text don't collide.
+    let split = Layout::horizontal([Constraint::Length(10), Constraint::Min(1)]).split(inner);
+    let meta_area = split[1];
 
     // Split the metadata area into 10 rows per the spec.
     let rows = Layout::vertical([
@@ -650,7 +610,7 @@ pub fn render_big(f: &mut Frame, area: Rect, app: &App) {
     }
 
     // Row 8: blank
-    // Row 9: SHUF · RPT · CONT · MODE flags
+    // Row 9: SHUF · RPT · CONT · PREF flags
     f.render_widget(Paragraph::new(build_flags_line(app)), rows[5]);
 
     // Row 10: Next: {title} + ♫ Lyrics: {first line}
@@ -805,7 +765,7 @@ mod tests {
         assert!(bar.contains("70%"), "big bar must show volume pct: {bar}");
     }
 
-    /// The big bar must show the SHUF/RPT/CONT/MODE flags on row 9.
+    /// The big bar must show the SHUF/RPT/CONT/PREF flags on row 9.
     #[test]
     fn big_bar_shows_flags() {
         let (_d, cat) = two_track_cat();
@@ -815,7 +775,7 @@ mod tests {
         assert!(bar.contains("SHUF"), "big bar must show SHUF: {bar}");
         assert!(bar.contains("RPT"), "big bar must show RPT: {bar}");
         assert!(bar.contains("CONT"), "big bar must show CONT: {bar}");
-        assert!(bar.contains("MODE"), "big bar must show MODE: {bar}");
+        assert!(bar.contains("PREF"), "big bar must show PREF: {bar}");
     }
 
     /// The big bar must show the Next: preview on row 10.
@@ -879,18 +839,87 @@ mod tests {
         assert_eq!(TrackLayoutMode::parse(""), TrackLayoutMode::Table);
     }
 
-    /// The album-art grid is deterministic: the same id always produces the
-    /// same 4 lines, and different ids (usually) produce different grids.
+    /// The album-art placeholder was removed (RC19-D15). The grid function
+    /// is gone; this test now verifies the big bar still renders fine
+    /// without any album-art content (no regression in title/flags/etc).
     #[test]
-    fn album_art_grid_is_deterministic() {
-        let g1 = album_art_grid("t1");
-        let g1b = album_art_grid("t1");
-        // Same id → same grid.
-        for r in 0..4 {
-            assert_eq!(g1[r].spans.len(), g1b[r].spans.len());
+    fn album_art_grid_removed_bar_renders() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        let bar = rendered_big(&app, 100, 10);
+        assert!(
+            bar.contains("Freedom"),
+            "big bar must still render title without album art: {bar}"
+        );
+    }
+
+    /// RC19-D15: the big bar transport row must show `◀◀ ▶ ▶▶` with NO
+    /// stray `b`/`u`/`t` chars from the old "album art" text label. The old
+    /// layout rendered the label at the same row as the transport controls,
+    /// and the gaps between transport rects let the label chars show through.
+    /// The fix removes the label (and the whole album-art placeholder).
+    #[test]
+    fn rc19_d15_big_bar_transport_row_no_stray_chars() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        let bar = rendered_big(&app, 100, 10);
+        // Find the transport row (the one containing ◀◀ or <<).
+        let transport_row = bar
+            .lines()
+            .find(|l| l.contains("◀◀") || l.contains("<<"))
+            .expect("RC19-D15: transport row must exist in big bar");
+        // The transport area is the first ~12 cols (border at col 0, then
+        // ◀◀ at 1-2, gap at 3, ▶ at 4-5, gap at 6, ▶▶ at 7-8, gap at 9-10).
+        // No stray 'b', 'u', 't' should appear in that area.
+        let transport_area: String = transport_row.chars().take(12).collect();
+        for stray in ['b', 'u', 't'] {
+            assert!(
+                !transport_area.contains(stray),
+                "RC19-D15: stray '{stray}' in transport area \
+                 (transport_area={transport_area:?})\nfull row: {transport_row}\nfull bar:\n{bar}"
+            );
         }
-        // Non-empty grid.
-        assert!(g1[0].spans.len() >= 4, "art grid row must have 4 cells");
+        // Sanity: transport glyphs are still present.
+        assert!(
+            transport_row.contains("◀◀") || transport_row.contains("<<"),
+            "RC19-D15: transport prev glyph missing: {transport_row}"
+        );
+        assert!(
+            transport_row.contains("▶▶") || transport_row.contains(">>"),
+            "RC19-D15: transport next glyph missing: {transport_row}"
+        );
+    }
+
+    /// RC19-D4: the big bar must show `PREF` (not `MODE`) for the user
+    /// source-preference label, and `SRC youtube` when a YouTube track
+    /// plays under PREF=local. The old label `MODE local` contradicted the
+    /// actual playing source; renaming to `PREF` makes the distinction
+    /// clear: PREF = user preference, SRC = actual source.
+    #[test]
+    fn rc19_d4_big_bar_pref_label_and_src_badge() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        // Play a remote (YouTube) track under PREF=local so the SRC badge
+        // appears alongside the PREF label.
+        app.now_playing = Some(crate::source::TrackSource::Remote {
+            video_id: "v1".into(),
+        });
+        // source_mode defaults to Local.
+        let bar = rendered_big(&app, 100, 10);
+        assert!(
+            bar.contains("PREF local"),
+            "RC19-D4: big bar must show 'PREF local' (not MODE): {bar}"
+        );
+        assert!(
+            !bar.contains("MODE"),
+            "RC19-D4: big bar must NOT show 'MODE' label anymore: {bar}"
+        );
+        assert!(
+            bar.contains("SRC youtube"),
+            "RC19-D4: big bar must show 'SRC youtube' when a YT track plays under PREF=local: {bar}"
+        );
     }
 
     /// The big bar must render without panicking when nothing is playing.

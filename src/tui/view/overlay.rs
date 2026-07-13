@@ -721,7 +721,7 @@ pub fn help_lines(sep_width: usize, ascii: bool) -> Vec<Line<'static>> {
         entry("z / Z", "cycle shuffle / reshuffle"),
         entry("r", repeat_desc),
         entry("c", "cycle continue (mode-dependent)"),
-        entry("M", "cycle source mode (Local / YouTube / Mixed)"),
+        entry("M", "cycle source pref (Local / YouTube / Mixed)"),
         entry("P", "toggle big player bar (needs 100x30+)"),
         entry("T", "toggle track-list cards (needs 140 cols+)"),
         sep(),

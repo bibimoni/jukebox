@@ -476,7 +476,7 @@ fn hint_line(app: &App, dim: &Style, width: u16) -> Line<'static> {
     if width >= 60 {
         parts.push("1-4 view".to_string());
         parts.push("> < next prev".to_string());
-        parts.push("M mode".to_string());
+        parts.push("M pref".to_string());
         // DEF-066: view-specific hints.
         match app.view {
             crate::tui::app::View::Queue => parts.push("x remove".to_string()),

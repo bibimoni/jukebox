@@ -363,8 +363,25 @@ pub fn render_yt_library(f: &mut Frame, area: Rect, app: &mut App) {
 /// the `HomeState` from `yt_view.home` (populated by `open_home`). If the
 /// overlay is also set (Overlay::Home), `overlay::render` skips the popup
 /// paint so this in-pane render is the visible one.
+///
+/// RC19-D2: when the user enters the YT Home tab via tab-switching (not the
+/// `H` overlay key), `yt_view.home` starts empty (default `HomeState`) and
+/// the tab showed the welcome screen even with a populated catalog. Now
+/// `populate_home_state` is called on first entry when sections are empty
+/// (and not loading), so the tab shows Quick Picks / Made for You / etc.
+/// instead of "Welcome! Your Home will grow as you listen." The populate is
+/// idempotent — after the first call `sections` is non-empty, so subsequent
+/// frames skip it. No overlay is set (the tab is the visible surface).
 pub fn render_yt_home(f: &mut Frame, area: Rect, app: &mut App) {
     let icons = IconRenderer::auto();
+    // RC19-D2: populate sections on first entry so the Home tab shows real
+    // content instead of the welcome screen. `populate_home_state` doesn't
+    // set the overlay (so no popup paints over the tab). After the first
+    // call `sections` is non-empty, so subsequent renders skip this branch.
+    if !app.yt_view.home.loading && app.yt_view.home.sections.is_empty() {
+        let state = app.populate_home_state();
+        app.yt_view.home = state;
+    }
     let state = &app.yt_view.home;
     if state.loading {
         let lines = home::render_header(area, state, &icons);
@@ -1028,6 +1045,85 @@ mod tests {
         assert!(
             !app.yt_view.home.sections.is_empty(),
             "open_home must populate yt_view.home sections"
+        );
+    }
+
+    /// RC19-D2: the YT Home tab must show real content (Quick Picks, Made
+    /// for You, etc.) when the user enters it via tab-switching, not just
+    /// the "Welcome! Your Home will grow as you listen." screen. The fix
+    /// calls `populate_home_state` on first entry when sections are empty.
+    /// The `H` overlay path already populated sections via `open_home`; the
+    /// tab-switch path (1-5 / Tab) didn't, so the welcome screen showed
+    /// even with a populated catalog + connected YouTube sidecar.
+    #[test]
+    fn rc19_d2_yt_home_tab_shows_sections_not_welcome() {
+        let mut app = one_track_app();
+        app.view = View::Youtube;
+        app.yt_view.tab = YtTab::Home;
+        // Default HomeState: not loading, empty sections → welcome screen
+        // would render before the fix.
+        assert!(app.yt_view.home.sections.is_empty());
+        let text = yt_view_text(&mut app, 100, 30);
+        // After the fix, populate_home_state is called on first render, so
+        // sections are populated and the rendered text shows section content.
+        assert!(
+            !app.yt_view.home.sections.is_empty(),
+            "RC19-D2: render_yt_home must populate sections on first entry: {text:?}"
+        );
+        // The welcome screen must NOT show (catalog has a track, so Quick
+        // Picks has content).
+        assert!(
+            !text.contains("Welcome! Your Home will grow"),
+            "RC19-D2: YT Home tab must not show welcome screen when catalog has tracks: {text:?}"
+        );
+        // Section content must be visible. Quick Picks is the first section
+        // and shows the catalog track title ("Freedom" in `one_track_app`).
+        assert!(
+            text.contains("Quick Picks") || text.contains("Quick"),
+            "RC19-D2: YT Home tab must show Quick Picks section: {text:?}"
+        );
+        // Made for You is the second section.
+        assert!(
+            text.contains("Made for You") || text.contains("Made"),
+            "RC19-D2: YT Home tab must show Made for You section: {text:?}"
+        );
+    }
+
+    /// RC19-D2: the populate-on-entry must be idempotent — calling
+    /// `render_yt_home` twice doesn't re-populate (sections already set).
+    /// Also verifies the overlay is NOT set by the tab path (only `open_home`
+    /// sets the overlay for the `H` key path).
+    #[test]
+    fn rc19_d2_yt_home_tab_populate_is_idempotent_no_overlay() {
+        let mut app = one_track_app();
+        app.view = View::Youtube;
+        app.yt_view.tab = YtTab::Home;
+        assert!(app.overlay.is_none(), "no overlay before first render");
+        // First render populates sections.
+        let _ = yt_view_text(&mut app, 100, 30);
+        let sections_after_first = app.yt_view.home.sections.len();
+        assert!(
+            sections_after_first > 0,
+            "RC19-D2: sections must be populated after first render"
+        );
+        assert!(
+            app.overlay.is_none(),
+            "RC19-D2: tab path must NOT set the overlay (no popup over tab): {:?}",
+            app.overlay
+        );
+        // Second render: sections already populated, populate_home_state
+        // must not be called again (idempotent). We can verify by checking
+        // the sections count stays the same.
+        let _ = yt_view_text(&mut app, 100, 30);
+        assert_eq!(
+            app.yt_view.home.sections.len(),
+            sections_after_first,
+            "RC19-D2: second render must not re-populate sections (idempotent)"
+        );
+        assert!(
+            app.overlay.is_none(),
+            "RC19-D2: second render must still NOT set the overlay: {:?}",
+            app.overlay
         );
     }
 }

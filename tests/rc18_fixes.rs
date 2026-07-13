@@ -188,12 +188,12 @@ fn rc18_d4_big_bar_shows_src_youtube_when_yt_track_plays_in_local_mode() {
     app.source_mode = jukebox::mode::SourceMode::Local;
     let bar = rendered_big_bar(&app, 100, 10);
     assert!(
-        bar.contains("MODE local"),
-        "D4: big bar must still show MODE local: {bar}"
+        bar.contains("PREF local"),
+        "D4: big bar must still show PREF local: {bar}"
     );
     assert!(
         bar.contains("SRC youtube"),
-        "D4: big bar must append SRC youtube when a YT track plays under MODE local: {bar}"
+        "D4: big bar must append SRC youtube when a YT track plays under PREF local: {bar}"
     );
 }
 
@@ -206,7 +206,7 @@ fn rc18_d4_big_bar_no_src_badge_when_sources_match() {
     app.source_mode = jukebox::mode::SourceMode::Local;
     app.play_in_context_ids(vec!["t1".into()], "t1");
     let bar = rendered_big_bar(&app, 100, 10);
-    assert!(bar.contains("MODE local"), "D4: MODE local shown: {bar}");
+    assert!(bar.contains("PREF local"), "D4: PREF local shown: {bar}");
     assert!(
         !bar.contains("SRC"),
         "D4: no SRC badge when playing source matches mode: {bar}"

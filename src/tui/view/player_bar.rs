@@ -392,7 +392,7 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
             // RC15-DEF-5 (ACC-02): at 80×24 the compact bar hard-cut long titles
             // mid-word with no ellipsis. Compute the available width for
             // title + " — " + artist, reserving space for the progress label
-            // and the trailing essentials (MODE + YT indicator + source
+            // and the trailing essentials (PREF + YT indicator + source
             // badge). Truncate title (and artist) with `…` so the cut is
             // clean. Mirrors `build_info_line`'s title_budget approach.
             let prefix_w = spans_width(&spans);
@@ -401,7 +401,7 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
             let (_pct, plabel) = progress(app);
             let progress_w = disp_width(&format!("  {plabel}"));
             let mode_str = app.source_mode.as_str();
-            let mode_w = disp_width(&format!("  MODE {mode_str}"));
+            let mode_w = disp_width(&format!("  PREF {mode_str}"));
             let yt_w = compact_yt_indicator_width(app);
             let badge_w = compact_src_badge_width(app);
             let reserved = mode_w + yt_w + badge_w + progress_w;
@@ -472,12 +472,12 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
         let (_pct, plabel) = progress(app);
         spans.push(Span::styled(format!("  {plabel}"), dim));
     }
-    // MOD-3: Reserve width for the essential trailing items (MODE + YT auth
+    // MOD-3: Reserve width for the essential trailing items (PREF + YT auth
     // indicator + source badge) so they're always visible at 80×24 even when
     // the up-next preview or quality readout would push them off-screen. The
     // up-next and quality are only added if there's room after reserving.
     let mode_str = app.source_mode.as_str();
-    let mode_w = disp_width(&format!("  MODE {mode_str}"));
+    let mode_w = disp_width(&format!("  PREF {mode_str}"));
     let yt_w = compact_yt_indicator_width(app);
     let badge_w = compact_src_badge_width(app);
     let reserved = mode_w + yt_w + badge_w;
@@ -548,19 +548,22 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
-    // MODE always visible (essential — shows playback source local/yt/mixed).
-    // CONT drops below 70 cols (lower priority). T3: keep title+progress+mode
+    // PREF always visible (essential — shows user source preference
+    // local/yt/mixed). The label was renamed MODE → PREF (RC19-D4) so it
+    // reads as a preference, not the actual playing source; `SRC` (added
+    // below when the playing source differs) is the actual source.
+    // CONT drops below 70 cols (lower priority). T3: keep title+progress+pref
     // at small sizes so the status bar never loses essential indicators.
     // DEF-004: SHUF/RPT also visible at >= 80 cols so the compact bar (used
-    // at height <= 24) shows playback state indicators alongside MODE+CONT.
+    // at height <= 24) shows playback state indicators alongside PREF+CONT.
     spans.push(Span::raw("  "));
-    spans.push(Span::styled(format!("MODE {mode_str}"), dim));
+    spans.push(Span::styled(format!("PREF {mode_str}"), dim));
     // DEF-011/DEF-012: compact YT auth indicator — always visible at >= 70
     // cols so the YouTube connection state is visible at all terminal sizes,
     // not just in the 2-row footer (which requires >100 width or >24 height).
     // DEF-013: when a track is playing, also show the actual source if it
-    // differs from the mode (e.g., "MODE local" while a YT track plays →
-    // "MODE local · [Y]" so the label isn't misleading).
+    // differs from the mode (e.g., "PREF local" while a YT track plays →
+    // "PREF local · [Y]" so the label isn't misleading).
     // MOD-3: the YT indicator is always added when relevant (width >= 70 +
     // yt_relevant + non-Unconfigured) — the width budget above reserves space
     // for it so earlier content is truncated/dropped instead.
@@ -656,7 +659,7 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
-    // DEF-051: strip trailing separator so MODE mixed doesn't end with dot.
+    // DEF-051: strip trailing separator so PREF mixed doesn't end with dot.
     let sd = sep_dot();
     while let Some(last) = spans.last() {
         let trimmed = last.content.trim();
@@ -677,7 +680,7 @@ pub fn render_compact(f: &mut Frame, area: Rect, app: &App) {
 
 /// Render the player bar into `area` using state from `app`. Two rows:
 /// row 1 = now-playing + quality + volume; row 2 = progress bar + mode
-/// flags (SHUF · RPT · CONT · MODE), `·`-separated, right-anchored.
+/// flags (SHUF · RPT · CONT · PREF), `·`-separated, right-anchored.
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let rows = Layout::vertical(if area.height >= 2 {
         vec![Constraint::Length(1), Constraint::Length(1)]
@@ -1114,15 +1117,18 @@ fn abbrev_src_str(s: &str) -> &'static str {
     }
 }
 
-/// Row 2 right-anchored flags: `SHUF off · RPT off · CONT off · MODE local`.
-/// `·`-separated and right-anchored so they read as one rhythm; `MODE` last
+/// Row 2 right-anchored flags: `SHUF off · RPT off · CONT off · PREF local`.
+/// `·`-separated and right-anchored so they read as one rhythm; `PREF` last
 /// (spec §5.1 cut #4). DEF-013: when a track is playing and its source
 /// differs from `source_mode`, a `· SRC youtube` or `· SRC local` badge is
 /// appended so the label doesn't contradict the actual playing source.
+/// RC19-D4: the user-preference label was renamed `MODE` → `PREF` so it
+/// reads as the user's preference (not the actual source); `SRC` covers
+/// the actual source.
 ///
 /// MOD-2: at 100×30 the flags area is 45 cols. The full line
-/// "SHUF smart · RPT off · CONT off · MODE youtube" is 46 cols, which
-/// truncates "MODE youtube" to "MODE youtu" (mid-word). When the full line
+/// "SHUF smart · RPT off · CONT off · PREF youtube" is 46 cols, which
+/// truncates "PREF youtube" to "PREF youtu" (mid-word). When the full line
 /// exceeds `width`, the values are abbreviated (smart→smt, youtube→yt, etc.)
 /// so every word remains complete.
 fn build_flags_line(app: &App, width: usize) -> Line<'static> {
@@ -1153,7 +1159,7 @@ fn build_flags_line(app: &App, width: usize) -> Line<'static> {
     // Build the full flags line and measure it. If it exceeds `width`,
     // switch to abbreviated values (MOD-2).
     let full_line =
-        format!("SHUF {shuf_full}{sep}RPT {rpt}{sep}CONT {cont_full}{sep}MODE {mode_full}");
+        format!("SHUF {shuf_full}{sep}RPT {rpt}{sep}CONT {cont_full}{sep}PREF {mode_full}");
     let abbrev = width > 0 && disp_width(&full_line) > width;
 
     let shuf = if abbrev {
@@ -1207,7 +1213,7 @@ fn build_flags_line(app: &App, width: usize) -> Line<'static> {
         Span::raw(sep.clone()),
         Span::styled(format!("CONT {cont}"), dim),
         Span::raw(sep.clone()),
-        Span::styled(format!("MODE {mode}"), dim),
+        Span::styled(format!("PREF {mode}"), dim),
     ];
     if let Some(src) = src_badge {
         spans.extend(src);
@@ -1465,8 +1471,8 @@ mod mod_tests {
     }
 
     /// MOD-2: At 100×30 the flags area is 45 cols. With SHUF=smart and
-    /// MODE=youtube the full flags line is 46 cols, which truncates
-    /// "MODE youtube" to "MODE youtu" (mid-word). The flags must either
+    /// PREF=youtube the full flags line is 46 cols, which truncates
+    /// "PREF youtube" to "PREF youtu" (mid-word). The flags must either
     /// abbreviate or fit so every word is complete.
     #[test]
     fn mod2_flags_fit_at_100_cols_smart_shuffle_youtube() {
@@ -1476,15 +1482,15 @@ mod mod_tests {
         app.source_mode = SourceMode::Youtube;
         let bar = rendered_bar(&app, 100, 2);
         assert!(
-            bar.contains("MODE"),
-            "MOD-2: MODE flag must be present: {bar}"
+            bar.contains("PREF"),
+            "MOD-2: PREF flag must be present: {bar}"
         );
         // Must show a complete mode word — "youtube" (fits) or "yt" (abbreviated).
         // "youtu" without trailing letter = mid-word truncation = bug.
-        let has_complete_mode = bar.contains("MODE youtube") || bar.contains("MODE yt");
+        let has_complete_mode = bar.contains("PREF youtube") || bar.contains("PREF yt");
         assert!(
             has_complete_mode,
-            "MOD-2: MODE must show a complete word (youtube or yt), not truncated mid-word: {bar}"
+            "MOD-2: PREF must show a complete word (youtube or yt), not truncated mid-word: {bar}"
         );
         assert!(
             bar.contains("SHUF"),
@@ -1494,6 +1500,69 @@ mod mod_tests {
         assert!(
             has_complete_shuf,
             "MOD-2: SHUF must show a complete word (smart or smt), not truncated: {bar}"
+        );
+    }
+
+    /// RC19-D4: the mini bar must show `PREF` (not `MODE`) for the user
+    /// source-preference label. The SRC badge behavior is unchanged by
+    /// the rename (covered by the big bar test); this test focuses on the
+    /// label swap. A remote track under PREF=local is used so the bar is
+    /// in the "playing source differs from preference" state, but we
+    /// don't assert on the SRC badge here (at 100×2 the flags area is
+    /// only 44 cols and the SRC badge can be clipped by the right edge —
+    /// a pre-existing layout quirk unrelated to the rename).
+    #[test]
+    fn rc19_d4_mini_bar_pref_label_and_src_badge() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        // Play a remote (YouTube) track under PREF=local so the bar is in
+        // the "source differs from preference" state.
+        app.now_playing = Some(crate::source::TrackSource::Remote {
+            video_id: "v1".into(),
+        });
+        // source_mode defaults to Local.
+        let bar = rendered_bar(&app, 100, 2);
+        assert!(
+            bar.contains("PREF local"),
+            "RC19-D4: mini bar must show 'PREF local' (not MODE): {bar}"
+        );
+        assert!(
+            !bar.contains("MODE "),
+            "RC19-D4: mini bar must NOT show 'MODE ' label anymore: {bar}"
+        );
+        // Wider terminal: flags area is wide enough for the full line incl.
+        // the SRC badge. Verify the SRC badge appears at 140 cols.
+        let bar_wide = rendered_bar(&app, 140, 2);
+        let has_src_badge = bar_wide.contains("SRC youtube") || bar_wide.contains("SRC yt");
+        assert!(
+            has_src_badge,
+            "RC19-D4: mini bar at 140 cols must show 'SRC youtube' (or 'SRC yt') when a YT track plays under PREF=local: {bar_wide}"
+        );
+        assert!(
+            bar_wide.contains("PREF local"),
+            "RC19-D4: mini bar at 140 cols must still show 'PREF local': {bar_wide}"
+        );
+        assert!(
+            !bar_wide.contains("MODE "),
+            "RC19-D4: mini bar at 140 cols must NOT show 'MODE ' label: {bar_wide}"
+        );
+    }
+
+    /// RC19-D4: the compact 1-row bar must also show `PREF` (not `MODE`).
+    #[test]
+    fn rc19_d4_compact_bar_pref_label() {
+        let (_d, cat) = two_track_cat();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        // source_mode defaults to Local; t1 is a local track, so no SRC badge.
+        let bar = rendered_compact(&app, 80, 1);
+        assert!(
+            bar.contains("PREF local"),
+            "RC19-D4: compact bar must show 'PREF local': {bar}"
+        );
+        assert!(
+            !bar.contains("MODE "),
+            "RC19-D4: compact bar must NOT show 'MODE ' label: {bar}"
         );
     }
 

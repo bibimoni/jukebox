@@ -4143,7 +4143,30 @@ impl App {
     /// data. The overlay always has content, even on a cold start — Quick
     /// Picks draws from the local catalog and Made for You uses the catalog
     /// fallback in the candidate generator.
+    ///
+    /// RC19-D2: the section-building logic is extracted into
+    /// [`populate_home_state`](Self::populate_home_state) so the YT Home tab
+    /// (`render_yt_home`) can populate `yt_view.home` on first entry WITHOUT
+    /// setting the overlay (which would paint a popup over the tab). This
+    /// method keeps the side effects (view switch, tab switch, overlay set)
+    /// for the `H` key path; the tab path uses `populate_home_state` directly.
     pub fn open_home(&mut self) {
+        let state = self.populate_home_state();
+        self.view = View::Youtube;
+        self.focus_col = 0;
+        self.yt_view.tab = YtTab::Home;
+        self.yt_view.home = state.clone();
+        self.overlay = Some(Overlay::Home { state });
+    }
+
+    /// Build a populated `HomeState` (sections filled from the catalog,
+    /// reco mixes, and `yt_lists`) WITHOUT the `open_home` side effects
+    /// (no view switch, no tab switch, no overlay set). Used by both
+    /// `open_home` (which adds the side effects for the `H` key path) and
+    /// `render_yt_home` (RC19-D2: populates `yt_view.home` on first entry to
+    /// the YT Home tab so the user sees sections instead of the welcome
+    /// screen).
+    pub fn populate_home_state(&mut self) -> crate::tui::view::home::HomeState {
         use crate::tui::view::home::{HomeItem, HomeSection, HomeState};
 
         // Generate mixes from the reco engine. Always generate (even cold
@@ -4203,11 +4226,7 @@ impl App {
         sections.push((HomeSection::Library, library));
 
         state.sections = sections;
-        self.view = View::Youtube;
-        self.focus_col = 0;
-        self.yt_view.tab = YtTab::Home;
-        self.yt_view.home = state.clone();
-        self.overlay = Some(Overlay::Home { state });
+        state
     }
 
     /// Start a radio session seeded from a track. Initializes the candidate
