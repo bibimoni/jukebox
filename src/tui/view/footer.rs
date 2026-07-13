@@ -4,7 +4,7 @@
 
 use ratatui::{
     layout::{Alignment, Constraint, Layout},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -111,6 +111,29 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
     use crate::yt::state::YtState;
     let badge = mode_badge(app, theme);
     let yt_badge = compact_yt_badge(app, theme);
+
+    // RC11-DEF-005: a status-bar toast (unknown command, ambiguous Tab) takes
+    // precedence over everything else so command feedback is visible within
+    // one frame regardless of `yt_state`. The old footer only rendered
+    // `yt_error` when `yt_state == Ready`, so local-only users (default
+    // `Unconfigured`) never saw "unknown command: :foobar". The toast clears
+    // after ~3s via `on_tick` and the normal status line returns.
+    if let Some(msg) = &app.status_toast {
+        let style = if no_color() {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            theme.error_style()
+        };
+        let budget = footer_msg_budget(app, msg);
+        let m = truncate_footer_msg(msg, budget);
+        return Line::from(vec![
+            badge,
+            Span::raw(" "),
+            yt_badge,
+            Span::raw(format!(" {} ", sep_dot())),
+            Span::styled(m, style),
+        ]);
+    }
 
     // Suppress YT status when in Local mode and not viewing the YT library.
     let yt_relevant = {
@@ -286,6 +309,12 @@ fn footer_msg_budget(_app: &App, _msg: &str) -> usize {
 /// communicate, and the player bar already shows the MODE label).
 pub fn footer_line(app: &App, theme: &Theme, dim: &Style, width: u16) -> Line<'static> {
     use crate::yt::state::YtState;
+    // RC11-DEF-005: a status-bar toast takes precedence over everything
+    // (including the hint bar) so command feedback is visible on the 1-row
+    // narrow footer too, regardless of `yt_state`.
+    if app.status_toast.is_some() {
+        return status_line(app, theme);
+    }
     // A transient yt_status (e.g. "Opening chrome — waiting for token…",
     // "YT setup OK · venv: …") is now shown by `status_line` regardless of
     // state (RC11-DEF-019 / RC11-DEF-017), so delegate to it whenever one is

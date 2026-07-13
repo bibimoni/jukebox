@@ -506,7 +506,20 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                                 }
                             })
                             .unwrap_or_default();
-                        input = String::from_utf8_lossy(&common).to_string();
+                        let completed = String::from_utf8_lossy(&common).to_string();
+                        // RC11-DEF-047: when the common prefix doesn't narrow
+                        // (e.g. empty `:` + Tab, or a prefix matching several
+                        // commands with no shared prefix beyond the typed
+                        // chars), surface the full match list as a status toast
+                        // so the user sees the available commands instead of a
+                        // silent no-op. Only show the toast when completion
+                        // didn't advance the input (otherwise a useful prefix
+                        // completion is its own feedback).
+                        if completed.len() <= prefix.len() {
+                            let list = matches.join("  ");
+                            app.set_status_toast(format!("commands:  {list}"));
+                        }
+                        input = completed;
                         cursor = input.len();
                     }
                 }
@@ -1524,7 +1537,15 @@ fn execute_command(app: &mut App, cmd: &str) {
             // wondering if their command ran. Known commands are matched
             // above; anything else (non-empty) is unknown.
             if !cmd.is_empty() {
-                app.yt_error = Some(format!("unknown command: :{cmd}"));
+                let msg = format!("unknown command: :{cmd}");
+                app.yt_error = Some(msg.clone());
+                // RC11-DEF-005: surface the error in the footer status line
+                // immediately (within one frame) regardless of `yt_state`.
+                // The old footer only rendered `yt_error` when
+                // `yt_state == Ready`, so local-only users (default
+                // `Unconfigured`) never saw the feedback. `yt_error` is still
+                // set for the diagnostics overlay (`D`).
+                app.set_status_toast(msg);
             }
         }
     }

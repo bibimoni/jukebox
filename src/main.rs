@@ -138,8 +138,7 @@ fn main() -> anyhow::Result<()> {
                     let pos = layout.last_played_position.max(0.0);
                     let m = (pos as u64) / 60;
                     let s = (pos as u64) % 60;
-                    app.resume_hint =
-                        Some(format!("resume: {title} at {m}:{s:02} · Enter to resume"));
+                    app.resume_hint = Some(format!("resume: {title} at {m}:{s:02} · R to resume"));
                     app.pending_resume = Some((id.clone(), pos));
                 }
                 // Restore the saved browser-auth preference. We do NOT re-spawn

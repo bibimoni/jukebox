@@ -523,7 +523,7 @@ pub struct App {
     /// RC11-DEF-014: a "resume" hint shown in the player bar when stopped
     /// with a saved last-played track. Set on launch from `state.db`;
     /// cleared on the first successful play so it doesn't linger. The bar
-    /// renders `▸ resume: [title] at [M:SS] · Enter to resume`.
+    /// renders `▸ resume: [title] at [M:SS] · R to resume`.
     pub resume_hint: Option<String>,
     /// RC11-DEF-043: a transient confirmation toast (e.g. "Added to queue")
     /// shown in the player bar's up-next slot. Set by `enqueue_selected`;
@@ -534,6 +534,18 @@ pub struct App {
     /// When the current `toast` was set; used by `on_tick` to clear it after
     /// the TTL. `None` when no toast is active.
     pub toast_at: Option<std::time::Instant>,
+    /// RC11-DEF-005: a transient status-bar toast (e.g. "unknown command:
+    /// :foobar") shown in the footer status line regardless of `yt_state`.
+    /// The old footer only rendered `yt_error` when `yt_state == Ready`, so
+    /// local-only users (default `Unconfigured`) never saw command errors.
+    /// Set by `execute_command` (unknown commands) and Tab-completion (no
+    /// prefix / ambiguous). Cleared by `on_tick` after ~3s. Distinct from
+    /// `toast` (which renders in the player bar up-next slot) so command
+    /// errors don't displace the "Next:" preview.
+    pub status_toast: Option<String>,
+    /// When the current `status_toast` was set; used by `on_tick` to clear it
+    /// after the TTL. `None` when no status toast is active.
+    pub status_toast_at: Option<std::time::Instant>,
 }
 
 /// Inline filter state for the `f` filter-on-focused-column (spec §5.4).
@@ -751,6 +763,8 @@ impl App {
             resume_hint: None,
             toast: None,
             toast_at: None,
+            status_toast: None,
+            status_toast_at: None,
         }
     }
 
@@ -2686,6 +2700,16 @@ impl App {
             }
         }
 
+        // RC11-DEF-005: decay the status-bar toast after ~3s so command
+        // errors (unknown command, ambiguous Tab) are readable but don't
+        // linger over the normal VIEW/SOURCE status line.
+        if let Some(t) = self.status_toast_at {
+            if t.elapsed() > Duration::from_millis(3000) {
+                self.status_toast = None;
+                self.status_toast_at = None;
+            }
+        }
+
         // RC11-DEF-014: track the now-playing track's position so it can be
         // saved to state.db on exit and restored on the next launch. Only
         // update when the player reports a real position (mpv); afplay
@@ -3672,6 +3696,16 @@ impl App {
     pub fn set_toast(&mut self, msg: String) {
         self.toast = Some(msg);
         self.toast_at = Some(std::time::Instant::now());
+    }
+
+    /// RC11-DEF-005: set a transient status-bar toast shown in the footer
+    /// status line regardless of `yt_state`. Used for command feedback
+    /// (unknown commands, ambiguous Tab completion) so local-only users
+    /// (default `Unconfigured`) see the message without opening the
+    /// diagnostics overlay. Clears after ~3s via `on_tick`.
+    pub fn set_status_toast(&mut self, msg: String) {
+        self.status_toast = Some(msg);
+        self.status_toast_at = Some(std::time::Instant::now());
     }
 
     /// RC11-DEF-014: resume the last-played track at its saved position.
