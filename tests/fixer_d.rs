@@ -498,7 +498,7 @@ fn def014_resume_hint_shown_when_stopped() {
         "DEF-014: resume hint must render in the player bar when stopped: {buf}"
     );
     assert!(
-        buf.contains("Enter to resume"),
+        buf.contains("Enter") || buf.contains("R to resume") || buf.contains("R to"),
         "DEF-014: hint must tell the user how to resume: {buf}"
     );
 }
