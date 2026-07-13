@@ -116,6 +116,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
 /// browse chrome (columns / player bar text) doesn't bleed through on either
 /// side of the popup at small terminals (80×24). Only the popup region was
 /// cleared before, leaving the Miller columns visible around the overlay.
+#[allow(clippy::too_many_arguments)]
 fn render_discover(
     f: &mut Frame,
     area: Rect,

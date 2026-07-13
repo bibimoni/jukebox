@@ -170,8 +170,9 @@ fn youtube_view_renders_account_and_suggested_lists() {
         },
     ];
     let s = render(&app);
-    assert!(s.contains("> Liked Songs"), "{s}");
-    assert!(s.contains("* Focus Flow"), "{s}");
+    // RC11-DEF-030: account playlists use ♫, suggested use ✦ (was > / *).
+    assert!(s.contains("♫ Liked Songs"), "{s}");
+    assert!(s.contains("✦ Focus Flow"), "{s}");
     assert!(
         s.contains("Up Next") || s.contains("Suggested"),
         "missing up-next: {s}"

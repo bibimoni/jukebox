@@ -169,7 +169,9 @@ impl HomeItem {
     pub fn radio_seed(description: String) -> Self {
         HomeItem {
             title: description.clone(),
-            subtitle: Some("radio".into()),
+            // RC11-DEF-045: use a real subtitle instead of the placeholder
+            // "radio". The subtitle now describes what the seed does.
+            subtitle: Some("start a radio session".into()),
             kind: HomeItemKind::RadioSeed { description },
             explanation: None,
         }

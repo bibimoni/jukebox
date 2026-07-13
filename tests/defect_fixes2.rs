@@ -187,6 +187,18 @@ fn def007_discover_enter_shows_loading_status() {
         )
     }));
 
+    // RC11-DEF-013: open_discover now prepends generated Mix items (from
+    // reco::mixes) before the sidecar's Playlist suggestions. Navigate to
+    // the first Playlist item so play_discover_selection takes the async
+    // sidecar path (pending_discover_play) — the Mix path plays synchronously.
+    if let Some(Overlay::Discover { items, cursor }) = &mut app.overlay {
+        let pl_idx = items
+            .iter()
+            .position(|d| matches!(d, DiscoverItem::Playlist { .. }))
+            .expect("test requires at least one Playlist item");
+        *cursor = pl_idx;
+    }
+
     app.play_discover_selection();
     assert!(
         app.yt_status.is_some(),
@@ -220,6 +232,15 @@ fn def007_discover_enter_empty_response_shows_error() {
                 if items.iter().any(|d| matches!(d, DiscoverItem::Playlist { .. }))
         )
     }));
+
+    // RC11-DEF-013: navigate to the first Playlist item (Mix items come first).
+    if let Some(Overlay::Discover { items, cursor }) = &mut app.overlay {
+        let pl_idx = items
+            .iter()
+            .position(|d| matches!(d, DiscoverItem::Playlist { .. }))
+            .expect("test requires at least one Playlist item");
+        *cursor = pl_idx;
+    }
 
     app.play_discover_selection();
     assert!(app.pending_discover_play.is_some());
@@ -279,6 +300,16 @@ fn def007_discover_enter_success_closes_overlay() {
                 if items.iter().any(|d| matches!(d, DiscoverItem::Playlist { .. }))
         )
     }));
+
+    // RC11-DEF-013: navigate to the first Playlist item ("PL1" — the sidecar
+    // suggestion) so the success path resolves the get_playlist response.
+    if let Some(Overlay::Discover { items, cursor }) = &mut app.overlay {
+        let pl_idx = items
+            .iter()
+            .position(|d| matches!(d, DiscoverItem::Playlist { .. }))
+            .expect("test requires at least one Playlist item");
+        *cursor = pl_idx;
+    }
 
     app.play_discover_selection();
     let played = tick_until(&mut app, 200, |a| {

@@ -117,10 +117,18 @@ fn discover_opens_instantly_and_populates_on_tick() {
     app.source_mode = jukebox::mode::SourceMode::Youtube;
 
     // Open discover — must return instantly (no blocking roundtrip). The
-    // overlay opens empty with discover_loading = true.
+    // overlay opens with the generated Mix items (synchronous, from
+    // reco::mixes — RC11-DEF-013) + discover_loading = true (the sidecar's
+    // home_suggestions fetch is still in flight).
     app.open_discover();
-    let (items_empty, loading) = match &app.overlay {
-        Some(Overlay::Discover { items, .. }) => (items.is_empty(), app.discover_loading),
+    let (has_mix, has_playlist, loading) = match &app.overlay {
+        Some(Overlay::Discover { items, .. }) => (
+            items.iter().any(|d| matches!(d, DiscoverItem::Mix { .. })),
+            items
+                .iter()
+                .any(|d| matches!(d, DiscoverItem::Playlist { .. })),
+            app.discover_loading,
+        ),
         other => panic!("expected Discover overlay, got {other:?}"),
     };
     assert!(
@@ -128,8 +136,12 @@ fn discover_opens_instantly_and_populates_on_tick() {
         "discover should be loading (fire-and-forget in flight)"
     );
     assert!(
-        items_empty,
-        "overlay should open empty — items land on tick, not synchronously"
+        has_mix,
+        "RC11-DEF-013: overlay should open with generated Mix items (synchronous)"
+    );
+    assert!(
+        !has_playlist,
+        "Playlist items should NOT be present yet — they land on tick"
     );
 
     // Pump on_tick until the home_suggestions response lands + populates the
@@ -196,9 +208,18 @@ fn discover_playlist_selection_starts_playback_on_tick() {
         "discover items should land"
     );
 
-    // Enter on the first (Playlist) item. Must return instantly — the old
+    // Enter on the first Playlist item. Must return instantly — the old
     // blocking get_playlist is gone. The intent is staged in
     // pending_discover_play; playback starts on a later tick.
+    // RC11-DEF-013: navigate to the first Playlist item (Mix items come first
+    // now, so cursor 0 is a Mix, not the sidecar's Playlist).
+    if let Some(Overlay::Discover { items, cursor }) = &mut app.overlay {
+        let pl_idx = items
+            .iter()
+            .position(|d| matches!(d, DiscoverItem::Playlist { .. }))
+            .expect("test requires at least one Playlist item");
+        *cursor = pl_idx;
+    }
     app.play_discover_selection();
     assert_eq!(
         app.pending_discover_play,

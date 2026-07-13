@@ -324,10 +324,31 @@ pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
                     .iter()
                     .enumerate()
                     .map(|(i, l)| {
-                        let g = if l.kind == crate::tui::app::YtListKind::Account {
-                            ">"
-                        } else {
-                            "*"
+                        // RC11-DEF-030: type-distinguishable glyphs. ♫ account,
+                        // ✦ suggested, ◆ generated (Nerd Font / Unicode). In
+                        // ASCII font mode fall back to > / * / +.
+                        let g = match l.kind {
+                            crate::tui::app::YtListKind::Account => {
+                                if is_ascii() {
+                                    ">"
+                                } else {
+                                    "♫"
+                                }
+                            }
+                            crate::tui::app::YtListKind::Suggested => {
+                                if is_ascii() {
+                                    "*"
+                                } else {
+                                    "✦"
+                                }
+                            }
+                            crate::tui::app::YtListKind::Generated => {
+                                if is_ascii() {
+                                    "+"
+                                } else {
+                                    "◆"
+                                }
+                            }
                         };
                         // DEF-024: narrow layout must show the selected YT
                         // list with the selection style.
@@ -456,10 +477,30 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         .iter()
         .filter(|l| app.filter_matches(&l.name))
         .map(|l| {
-            let glyph = if l.kind == crate::tui::app::YtListKind::Account {
-                ">"
-            } else {
-                "*"
+            // RC11-DEF-030: type-distinguishable glyphs. ♫ account, ✦
+            // suggested, ◆ generated. ASCII fallback: > / * / +.
+            let glyph = match l.kind {
+                crate::tui::app::YtListKind::Account => {
+                    if is_ascii() {
+                        ">"
+                    } else {
+                        "♫"
+                    }
+                }
+                crate::tui::app::YtListKind::Suggested => {
+                    if is_ascii() {
+                        "*"
+                    } else {
+                        "✦"
+                    }
+                }
+                crate::tui::app::YtListKind::Generated => {
+                    if is_ascii() {
+                        "+"
+                    } else {
+                        "◆"
+                    }
+                }
             };
             ListItem::new(format!("{glyph} {}", l.name))
         })
