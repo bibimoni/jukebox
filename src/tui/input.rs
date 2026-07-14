@@ -60,18 +60,23 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     if app.view == View::Youtube && app.overlay.is_none() {
-        if let Some(tab) = match key.code {
-            KeyCode::Char('1') => Some(YtTab::Home),
-            KeyCode::Char('2') => Some(YtTab::Library),
-            KeyCode::Char('3') => Some(YtTab::Search),
-            KeyCode::Char('4') => Some(YtTab::Discover),
-            KeyCode::Char('5') => Some(YtTab::Radio),
-            _ => None,
-        } {
-            app.yt_view.tab = tab;
+        // Esc reliably exits the YouTube view to a local view when no overlay
+        // is open. This is the primary escape from the YT keyboard trap (RB-3):
+        // the global 1-4 view switches and Tab/Shift+Tab view cycling also work
+        // (handled in the main match below, no longer intercepted here).
+        if matches!(key.code, KeyCode::Esc) {
+            switch_view(app, View::Artists);
             return;
         }
-        if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
+        // [ / ] cycle the YT sub-tabs. These are non-conflicting with the
+        // global 1-4 view switches and Tab/Shift+Tab view cycling (which now
+        // always work, even inside the YouTube view). The old 1-5 / Tab
+        // tab bindings shadowed the global keys and trapped the user.
+        if matches!(key.code, KeyCode::Char('[')) {
+            app.yt_view.tab = app.yt_view.tab.prev();
+            return;
+        }
+        if matches!(key.code, KeyCode::Char(']')) {
             app.yt_view.tab = app.yt_view.tab.next();
             return;
         }
@@ -91,10 +96,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             app.open_discover();
             return;
         }
-        // Home tab navigation: j/k move cursor within the focused section,
-        // Tab/Shift+Tab switch sections, Enter plays the selected item.
-        // ? opens help (stacked). These only apply when the Home tab is active
-        // and the sections are populated (not the welcome/cold-start screen).
+        // Home tab navigation: j/k move the cursor within the focused section,
+        // h/l switch sections (h at the leftmost section exits the YouTube
+        // view), Enter plays the selected item. Tab/Shift+Tab are deliberately
+        // NOT bound here — they fall through to global view cycling so the user
+        // can always escape the YouTube view. ? opens help (stacked). These
+        // only apply when the Home tab is active and the sections are populated
+        // (not the welcome/cold-start screen).
         if app.yt_view.tab == YtTab::Home && !app.yt_view.home.sections.is_empty() {
             let section_len = app
                 .yt_view
@@ -103,6 +111,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 .get(app.yt_view.home.focused_section)
                 .map(|(_, items)| items.len())
                 .unwrap_or(0);
+            let n_sections = crate::tui::view::home::HomeSection::all().len();
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     app.yt_view.home.cursor_down(section_len.max(1));
@@ -112,14 +121,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                     app.yt_view.home.cursor_up();
                     return;
                 }
-                KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    app.yt_view.home.section_prev();
+                KeyCode::Left | KeyCode::Char('h') if key.modifiers == KeyModifiers::NONE => {
+                    if app.yt_view.home.focused_section == 0 {
+                        switch_view(app, View::Artists);
+                    } else {
+                        app.yt_view.home.section_prev();
+                    }
                     return;
                 }
-                KeyCode::Tab => {
-                    app.yt_view
-                        .home
-                        .section_next(crate::tui::view::home::HomeSection::all().len());
+                KeyCode::Right | KeyCode::Char('l') if key.modifiers == KeyModifiers::NONE => {
+                    app.yt_view.home.section_next(n_sections);
                     return;
                 }
                 KeyCode::Enter => {
@@ -344,6 +355,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 fn handle_overlay_key(app: &mut App, key: KeyEvent) {
     // Esc closes any overlay, first, before anything else.
     if matches!(key.code, KeyCode::Esc) {
+        // RB-4: closing the YtAuth overlay cancels any in-progress auth
+        // state so no busy/Authenticating/AuthenticatedNotSynced lingers.
+        if matches!(app.overlay, Some(Overlay::YtAuth { .. })) {
+            app.cancel_yt_auth();
+        }
         app.overlay = None;
         // Drop any stashed play-saved index so a later confirm doesn't
         // play a stale playlist (RC11-DEF-065 cleanup).
@@ -416,11 +432,19 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                             }
                         } else if !input.trim().is_empty() {
                             // Dirty / never submitted → fire-and-forget search.
-                            app.submit_yt_search(input.clone());
-                            submitted = Some(input.clone());
-                            searching = true;
-                            results.clear();
-                            cursor = 0;
+                            let dispatched = app.submit_yt_search(input.clone());
+                            if dispatched {
+                                submitted = Some(input.clone());
+                                searching = true;
+                                results.clear();
+                                cursor = 0;
+                            } else {
+                                // RB-2: search couldn't be dispatched (no
+                                // session / send failed). yt_error is already
+                                // set by submit_yt_search; don't set
+                                // searching=true (would hang on "searching…").
+                                searching = false;
+                            }
                         }
                     }
                 }
@@ -804,10 +828,13 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 }
                 KeyCode::Enter => {
                     if cursor < app.playlists.len() {
-                        app.add_track_to_playlist(&track_id, cursor);
+                        let added = app.add_track_to_playlist(&track_id, cursor);
                         app.save_playlists_db();
-                        app.yt_status =
-                            Some(format!("added to \"{}\"", app.playlists[cursor].name));
+                        app.yt_status = Some(if added {
+                            format!("added to \"{}\"", app.playlists[cursor].name)
+                        } else {
+                            format!("already in \"{}\" — no change", app.playlists[cursor].name)
+                        });
                         app.overlay = None;
                         return;
                     } else {
@@ -858,18 +885,47 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     scroll = scroll.saturating_add(1);
+                    app.lyrics_manual_scroll = true;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     scroll = scroll.saturating_sub(1);
+                    app.lyrics_manual_scroll = true;
                 }
                 KeyCode::PageDown => {
                     scroll = scroll.saturating_add(10);
+                    app.lyrics_manual_scroll = true;
                 }
                 KeyCode::PageUp => {
                     scroll = scroll.saturating_sub(10);
+                    app.lyrics_manual_scroll = true;
                 }
-                KeyCode::Char('g') => scroll = 0,
-                KeyCode::Char('G') => scroll = u16::MAX,
+                KeyCode::Char('g') => {
+                    scroll = 0;
+                    app.lyrics_manual_scroll = true;
+                }
+                KeyCode::Char('G') => {
+                    scroll = u16::MAX;
+                    app.lyrics_manual_scroll = true;
+                }
+                // M-2: 'f' resumes follow — clears manual-scroll and jumps the
+                // scroll back to the active (currently-playing) line so the user
+                // is not left with no resume path after manual scrolling.
+                KeyCode::Char('f') => {
+                    app.lyrics_manual_scroll = false;
+                    // Jump to the active line: compute active_idx the same way
+                    // the render does (last line whose time <= position).
+                    if let Some(crate::lyrics::Lyrics { lines, .. }) = content.as_ref() {
+                        let pos = app.player.position().unwrap_or(0.0);
+                        let active = lines
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .find(|(_, l)| l.time.is_some_and(|t| t <= pos))
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        scroll = active.saturating_sub(2) as u16;
+                    }
+                }
                 // RC11-DEF-009: pass `>` / `<` through to global playback while
                 // the lyrics overlay is open, then re-fetch lyrics for the new
                 // track. Keep the overlay open. `handle_overlay_key` takes the
@@ -1456,6 +1512,14 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 }
                 _ => {}
             }
+            // M-1: PgUp/PgDn scrolls the publication content so the account
+            // + publish/cancel controls are reachable when the content
+            // overflows the popup (e.g. at 80x24 or with many tracks).
+            match key.code {
+                KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(3),
+                KeyCode::PageDown => state.scroll = state.scroll.saturating_add(3),
+                _ => {}
+            }
             if clear_err {
                 state.error = None;
             }
@@ -1744,6 +1808,10 @@ fn max_focus_col(app: &App) -> usize {
 fn move_left(app: &mut App) {
     if app.focus_col > 0 {
         app.focus_col -= 1;
+    } else if app.view == View::Youtube {
+        // RB-3: at the left edge of the YouTube view, `h` / Left exits to a
+        // local view instead of being a no-op (a reliable second escape).
+        switch_view(app, View::Artists);
     }
 }
 
@@ -1847,6 +1915,7 @@ fn set_focused_cursor(app: &mut App, v: usize) {
 }
 
 fn switch_view(app: &mut App, view: View) {
+    let prev = app.view;
     app.view = view;
     app.focus_col = 0;
     // Clamp cursors for the target view so a stale cursor from the previous
@@ -1861,6 +1930,13 @@ fn switch_view(app: &mut App, view: View) {
     // synchronous roundtrip at the view-enter boundary; spec §5.3).
     if view == View::Youtube {
         app.refresh_yt_lists();
+        // RB-3: surface a short recovery/exit affordance when entering the
+        // YouTube view so the user can always see how to leave it (and is not
+        // trapped if the pane renders empty at 80x24). Kept under 80 columns
+        // so it fits the footer at 80x24 without clipping.
+        if prev != View::Youtube {
+            app.set_status_toast("YT: 1-4 view · Tab cycle · [ ] tabs · Esc exit".into());
+        }
     }
 }
 

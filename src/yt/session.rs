@@ -321,6 +321,12 @@ pub struct Session {
     /// sidecar, and the user's currently-focused playlist sat at the back of
     /// the queue behind redundant fetches → "Loading…" forever.
     playlist_inflight: std::collections::HashSet<String>,
+    /// Playlist ids whose `get_playlist` returned an error. `on_tick` skips
+    /// re-fetching these so a bad/transient id doesn't flood the single-threaded
+    /// sidecar every tick (a prior bug logged 72k `get_playlist start` lines
+    /// with zero completions against a poisoned cache of fake ids). Cleared on
+    /// `send_refresh` so R retries failed lists.
+    pub failed_playlists: std::collections::HashSet<String>,
     /// SYNC-49 fix: queue of playlist ids visited while a fetch was in flight.
     /// When the current fetch completes, on_tick checks this queue and fires
     /// the next one. This ensures rapid A→B→C→D→E switching loads ALL
@@ -442,6 +448,7 @@ impl Session {
             pending_suggestions: None,
             pending_tracks: Vec::new(),
             playlist_inflight: std::collections::HashSet::new(),
+            failed_playlists: std::collections::HashSet::new(),
             pending_playlist_queue: std::collections::VecDeque::new(),
             pending_search: None,
             search_inflight: None,
@@ -491,6 +498,7 @@ impl Session {
             pending_suggestions: None,
             pending_tracks: Vec::new(),
             playlist_inflight: std::collections::HashSet::new(),
+            failed_playlists: std::collections::HashSet::new(),
             pending_playlist_queue: std::collections::VecDeque::new(),
             pending_search: None,
             search_inflight: None,
@@ -659,6 +667,7 @@ impl Session {
         self.pending_publication = None;
         self.pending_errors.clear();
         self.playlist_inflight.clear();
+        self.failed_playlists.clear();
         self.pending_playlist_queue.clear();
         self.search_inflight = None;
         self.resolve_inflight = None;
@@ -750,6 +759,7 @@ impl Session {
                 // design removes only this list's id, preserving other lists'
                 // guards.
                 self.playlist_inflight.remove(id.as_str());
+                self.failed_playlists.remove(id.as_str());
             }
             (Response::WatchPlaylist(v), Pending::Watch) => {
                 for t in v {
@@ -924,6 +934,7 @@ impl Session {
             }
             (Response::Error(e), Pending::Tracks(id)) => {
                 self.playlist_inflight.remove(id.as_str());
+                self.failed_playlists.insert(id.clone());
                 self.set_error(ErrorScope::Other, e.clone());
             }
             (Response::Error(e), Pending::Resolve(_)) => {
@@ -1269,8 +1280,9 @@ impl Session {
     /// eventually loads ALL playlists. When the current fetch completes,
     /// `drain_playlist_queue()` fires the next one.
     pub fn send_get_playlist(&mut self, id: String) -> Result<()> {
-        // Don't re-fetch if already loaded or in flight.
-        if self.playlist_inflight.contains(&id) {
+        // Don't re-fetch if already loaded, in flight, or previously failed
+        // (a failed id would flood the sidecar every tick otherwise).
+        if self.playlist_inflight.contains(&id) || self.failed_playlists.contains(&id) {
             return Ok(());
         }
         if !self.playlist_inflight.is_empty() {

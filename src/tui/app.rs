@@ -461,6 +461,12 @@ pub struct App {
     /// (e.g. "upgraded to AAC 256k"); the state machine owns the auth/sync
     /// lifecycle. `yt_error` carries error *detail* alongside the state.
     pub yt_state: crate::yt::state::YtState,
+    /// Tick counter for the auth-busy timeout (RB-4). Incremented each `on_tick`
+    /// while `yt_state` is `Authenticating` or `AuthenticatedNotSynced`; reset to
+    /// 0 on any other state. After ~600 ticks (~30-90s) without a transition,
+    /// the state times out to `ProviderError` with a clear message so the user
+    /// is never left with an unexplained busy state.
+    pub yt_auth_busy_ticks: u32,
     /// `python3` path + the sidecar script path, used to (re)spawn the sidecar
     /// when cookies change via `:yt auth`. Set by `main.rs`; defaults to
     /// `python3` + the manifest-dir script (works in dev).
@@ -506,6 +512,17 @@ pub struct App {
     /// user moved to a different track). Guarantees stale lyrics can't
     /// overwrite a newer track's lyrics overlay.
     pub lyrics_gen: u64,
+    /// M-2: a pending local lyrics read (track_id, gen) deferred from
+    /// `request_lyrics` to `on_tick` so the Loading transition is visible for
+    /// at least one frame. Without this, the synchronous disk read in
+    /// `request_lyrics` sets Loading → NotFound in the same call, so the user
+    /// never sees the Loading state on a retry (R) for a local track.
+    pub pending_lyrics_local: Option<(String, u64)>,
+    /// M-2: true when the user has manually scrolled the lyrics overlay (j/k/
+    /// PgUp/PgDn/g/G). While true, the overlay shows a "f to resume follow"
+    /// hint so the user knows how to return to the active line. Reset to false
+    /// on 'f' (resume) and on a new lyrics request (toggle_lyrics / request_lyrics).
+    pub lyrics_manual_scroll: bool,
     /// Verbosity resolved from the `--verbose`/`--quiet` CLI flags. The footer
     /// / view layer consults this to decide how much chrome to render: `Quiet`
     /// shows only errors, `Normal` is the default hint bar, `Verbose` shows
@@ -857,6 +874,7 @@ impl App {
             yt_error: None,
             yt_status: None,
             yt_state: crate::yt::state::YtState::default(),
+            yt_auth_busy_ticks: 0,
             yt_python: std::path::PathBuf::from("python3"),
             yt_script: std::path::PathBuf::from("scripts/yt/yt.py"),
             filter: None,
@@ -870,6 +888,8 @@ impl App {
             command_history_cursor: None,
             command_draft: String::new(),
             lyrics_gen: 0,
+            pending_lyrics_local: None,
+            lyrics_manual_scroll: false,
             verbosity: crate::cli::Verbosity::default(),
             diagnostics: crate::diagnostics::Diagnostics::new(),
             notification_ttl: None,
@@ -1196,6 +1216,12 @@ impl App {
                             self.yt_error = Some(msg.clone());
                             self.yt_status = Some(msg);
                             self.dead.insert(id.clone());
+                            // F2: the player backend (mpv/afplay) kills the old
+                            // child during the failed load, so the previously-
+                            // playing track is stopped. Clear now_playing so the
+                            // UI doesn't show a stale track that's no longer
+                            // playing.
+                            self.now_playing = None;
                         }
                     }
                     return;
@@ -1423,6 +1449,9 @@ impl App {
                         self.yt_error = Some(msg.clone());
                         self.yt_status = Some(msg);
                         self.dead.insert(id.to_string());
+                        // F2: the player backend killed the old child during the
+                        // failed load; clear the stale now_playing.
+                        self.now_playing = None;
                     }
                 }
             }
@@ -1475,8 +1504,10 @@ impl App {
             }
             Err(e) => {
                 self.yt_error = Some(format!("stream load failed: {e}"));
-                // Don't set now_playing — keep the prior state (old track or
-                // nothing) so the UI doesn't show a track that isn't playing.
+                // F2: the player backend (mpv/afplay) kills the old child during
+                // the failed load, so the previously-playing track is stopped.
+                // Clear now_playing so the UI doesn't show a stale track.
+                self.now_playing = None;
             }
         }
     }
@@ -2080,6 +2111,15 @@ impl App {
     /// them. Best-effort: on failure sets `yt_error` so the Y view surfaces it.
     pub fn apply_yt_auth(&mut self, cookies: String) {
         self.yt_error = None;
+        // RB-4: reject empty cookie submission. The old code unconditionally
+        // spawned/set_cookies and transitioned to AuthenticatedNotSynced, so an
+        // empty paste left the user in the `[Y ~]` busy state with no credential.
+        if cookies.trim().is_empty() {
+            self.yt_error = Some(
+                "auth: paste your YouTube cookies first (or run :yt auth browser <name>)".into(),
+            );
+            return;
+        }
         // Pasted cookies are a distinct auth path from the browser profile;
         // clear the saved browser so the next launch doesn't try to read a
         // browser profile the user abandoned.
@@ -2133,6 +2173,21 @@ impl App {
         // which was false-ready (yt-recon §8 location 3). The launch probe or
         // refresh_yt_lists must succeed to promote this to Ready.
         self.yt_state = crate::yt::state::YtState::AuthenticatedNotSynced;
+        self.yt_auth_busy_ticks = 0;
+        // RB-4: immediately fire the launch probe so the user sees progress
+        // (the probe is in flight; on_tick promotes to Ready on success or
+        // ProviderError on failure). Fire send_refresh directly (not
+        // refresh_yt_lists) so the state stays AuthenticatedNotSynced — the
+        // probe verifies the credential without prematurely claiming
+        // "synchronizing." The on_tick auth-busy timeout catches a stuck probe.
+        if let Some(session) = self.yt_session.as_mut() {
+            if let Err(e) = session.send_refresh() {
+                self.yt_error = Some(format!("auth probe: {e}"));
+                self.yt_state = crate::yt::state::YtState::ProviderError;
+            } else {
+                self.yt_lists_loading = true;
+            }
+        }
     }
 
     /// `:yt auth browser <name>` — respawn the sidecar reading cookies from a
@@ -2196,6 +2251,39 @@ impl App {
         // The old code set yt_status = "connected via {browser}" here (yt-recon
         // §8 location 4); the launch probe or refresh must verify data first.
         self.yt_state = crate::yt::state::YtState::AuthenticatedNotSynced;
+        self.yt_auth_busy_ticks = 0;
+        // RB-4: immediately fire the launch probe so the user sees progress.
+        // See apply_yt_auth for the direct-send_refresh rationale.
+        if let Some(session) = self.yt_session.as_mut() {
+            if let Err(e) = session.send_refresh() {
+                self.yt_error = Some(format!("auth probe: {e}"));
+                self.yt_state = crate::yt::state::YtState::ProviderError;
+            } else {
+                self.yt_lists_loading = true;
+            }
+        }
+    }
+
+    /// RB-4: cancel an in-progress authentication. Called when the user closes
+    /// the YtAuth overlay with Esc. Resets `Authenticating` /
+    /// `AuthenticatedNotSynced` (the auth-flow pre-fetch states) back to the
+    /// appropriate non-busy state so no busy state lingers. Does NOT reset
+    /// `Synchronizing` (which may be from a view-enter probe, not the auth
+    /// flow) or any error/ready state.
+    pub fn cancel_yt_auth(&mut self) {
+        use crate::yt::state::YtState;
+        if matches!(
+            self.yt_state,
+            YtState::Authenticating | YtState::AuthenticatedNotSynced
+        ) {
+            self.yt_state = if self.yt_session.is_some() {
+                YtState::SignedOut
+            } else {
+                YtState::Unconfigured
+            };
+            self.yt_error = None;
+            self.yt_auth_busy_ticks = 0;
+        }
     }
 
     /// `:yt setup` — create the jukebox venv and install the YT deps into it,
@@ -2335,6 +2423,29 @@ impl App {
             }
         }
 
+        // RB-4: auth-busy timeout. If the provider is stuck in Authenticating
+        // or AuthenticatedNotSynced (the pre-fetch states set by :yt auth /
+        // :yt auth browser) for too long without a data fetch promoting it,
+        // transition to ProviderError with a clear message so the user is never
+        // left with an unexplained busy state. 600 ticks ≈ 30-90s depending on
+        // the poll interval.
+        use crate::yt::state::YtState;
+        if matches!(
+            self.yt_state,
+            YtState::Authenticating | YtState::AuthenticatedNotSynced
+        ) {
+            self.yt_auth_busy_ticks = self.yt_auth_busy_ticks.saturating_add(1);
+            if self.yt_auth_busy_ticks > 600 {
+                self.yt_error =
+                    Some("auth timed out — press R to retry or :yt auth browser <name>".into());
+                self.yt_state = YtState::ProviderError;
+                self.yt_lists_loading = false;
+                self.yt_auth_busy_ticks = 0;
+            }
+        } else {
+            self.yt_auth_busy_ticks = 0;
+        }
+
         // Meaningful-threshold detection (DEF-034): when the now-playing
         // track crosses ≥50% of its duration OR ≥30s (whichever first), fire
         // a single `meaningful_threshold` event — the first positive signal.
@@ -2434,6 +2545,54 @@ impl App {
         // here (needs &mut self for transport + `start_playback`) and started
         // below, after the session borrow ends. The video_id to play next.
         let mut pending_radio_start: Option<String> = None;
+
+        // M-2: process a deferred local lyrics read. `request_lyrics` defers
+        // the synchronous disk read (embedded FLAC tag + sidecar .lrc/.txt) to
+        // on_tick so the Loading transition is visible for at least one frame
+        // (without this, Loading → NotFound happens in the same call, so a
+        // retry for a local track shows no visible transition). The generation
+        // guard discards a stale read (the user moved to a different track).
+        if let Some((track_id, gen)) = self.pending_lyrics_local.take() {
+            if gen == self.lyrics_gen {
+                if let Some(track) = self.track_by_id_fast(&track_id).cloned() {
+                    if let Some(lyrics) =
+                        crate::lyrics::read_embedded(&track, &self.catalog.source_root)
+                    {
+                        let new_state = if lyrics.is_empty() {
+                            LyricsState::NotFound
+                        } else {
+                            LyricsState::Available(lyrics.synced)
+                        };
+                        if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
+                            self.overlay = Some(Overlay::Lyrics {
+                                content: Some(lyrics),
+                                state: new_state,
+                                scroll,
+                                track_id: track_id.clone(),
+                                gen,
+                            });
+                        }
+                    } else if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
+                        self.overlay = Some(Overlay::Lyrics {
+                            content: None,
+                            state: LyricsState::NotFound,
+                            scroll,
+                            track_id: track_id.clone(),
+                            gen,
+                        });
+                    }
+                } else if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
+                    self.overlay = Some(Overlay::Lyrics {
+                        content: None,
+                        state: LyricsState::NotFound,
+                        scroll,
+                        track_id: track_id.clone(),
+                        gen,
+                    });
+                }
+            }
+        }
+
         if let Some(session) = self.yt_session.as_mut() {
             // Pin the focused playlist's tracks before draining so
             // `evict_track_cache` (triggered by `cache_track` inside
@@ -2774,14 +2933,19 @@ impl App {
                         // Heuristic auth-expiry detection: an error mentioning
                         // auth/401/unauthorized/expired → AuthExpired (needs
                         // re-auth, not retry). S2.3.1 will make this structured.
+                        // RB-2: only classify as AuthExpired if the user was
+                        // previously authed (is_authed). A never-authenticated
+                        // account (Unconfigured/SignedOut) getting an auth-flavored
+                        // error must NOT be labeled "expired"/[reauth] — it was
+                        // never authenticated to expire.
                         let looks_like_auth_error = e.to_lowercase().contains("auth")
                             || e.to_lowercase().contains("401")
                             || e.to_lowercase().contains("unauthorized")
                             || e.to_lowercase().contains("expired")
                             || e.to_lowercase().contains("login");
-                        if looks_like_auth_error {
+                        if looks_like_auth_error && self.yt_state.is_authed() {
                             self.yt_state = crate::yt::state::YtState::AuthExpired;
-                        } else if self.yt_state == crate::yt::state::YtState::Ready {
+                        } else if looks_like_auth_error {
                             // Was Ready, now an error → degrade to ReadyStale
                             // (cached data still visible, retry can recover).
                             self.yt_state = crate::yt::state::YtState::ReadyStale;
@@ -3012,6 +3176,8 @@ impl App {
                 };
                 if !inflight && ((empty && !loaded) || any_missing) {
                     if let Some(session) = self.yt_session.as_mut() {
+                        // send_get_playlist skips ids in failed_playlists, so
+                        // a bad/transient id doesn't re-fetch every tick.
                         let _ = session.send_get_playlist(id);
                     }
                 }
@@ -3200,16 +3366,25 @@ impl App {
         // user pressed `R` expecting feedback to clear; leaving the error
         // visible would be misleading.
         self.yt_error = None;
-        let Some(session) = self.yt_session.as_mut() else {
+        if self.yt_session.is_none() {
             // No session — nothing to retry. The footer's state hint tells the
             // user to auth (`:yt auth browser`), not to press R.
             return;
-        };
+        }
         if !self.yt_state.can_retry() {
             // Only retry from error/stale/syncing states — not from Ready
             // (already healthy) or Unconfigured/SignedOut (need auth, not retry).
             return;
         }
+        // M-2: always show a visible "retrying" toast on every R press so the
+        // user sees immediate feedback even when: (a) a refresh is already in
+        // flight (the inflight guard no-ops send_refresh, so the state stays
+        // Synchronizing with no visible change), or (b) the sidecar is down
+        // (send_refresh errors → ProviderError, but the toast confirms the
+        // retry was attempted). `set_status_toast` refreshes the 3s window on
+        // every call (unlike `yt_status` which dedups), so rapid R presses each
+        // show "retrying YouTube…" anew.
+        self.set_status_toast("retrying YouTube…".into());
         // Immediate visual feedback: transition to Synchronizing. The footer
         // renders "synchronizing…" on the next frame (within ~150ms — the poll
         // timeout), so the user sees the retry is in progress without waiting
@@ -3223,6 +3398,9 @@ impl App {
         //     ProviderError otherwise) — lines ~1919-1946.
         // A refresh already in flight is a no-op (inflight guard in send_refresh),
         // so rapid R presses don't flood the sidecar.
+        let Some(session) = self.yt_session.as_mut() else {
+            return;
+        };
         if let Err(e) = session.send_refresh() {
             self.yt_error = Some(format!("retry: {e}"));
             self.yt_state = crate::yt::state::YtState::ProviderError;
@@ -3894,15 +4072,17 @@ impl App {
     /// returns immediately; `on_tick` folds the response into the open search
     /// overlay. No-op (and surfaces a hint via `yt_error`) when there's no
     /// session — typing locally without a configured sidecar.
-    pub fn submit_yt_search(&mut self, q: String) {
+    pub fn submit_yt_search(&mut self, q: String) -> bool {
         let Some(session) = self.yt_session.as_mut() else {
             self.yt_error =
                 Some("search: YouTube not configured — run :yt auth browser <chrome>".into());
-            return;
+            return false;
         };
         if let Err(e) = session.send_search(q) {
             self.yt_error = Some(format!("search: {e}"));
+            return false;
         }
+        true
     }
 
     /// Toggle the lyrics overlay (`L`). On open: requests lyrics for the
@@ -3919,6 +4099,8 @@ impl App {
             self.yt_error = Some("lyrics: nothing is playing".into());
             return;
         };
+        // M-2: reset manual-scroll follow state on a fresh lyrics open.
+        self.lyrics_manual_scroll = false;
         self.overlay = Some(Overlay::Lyrics {
             content: None,
             state: LyricsState::Idle,
@@ -3941,6 +4123,8 @@ impl App {
         // Bump the generation so a stale in-flight response is discarded.
         self.lyrics_gen = self.lyrics_gen.wrapping_add(1);
         let gen = self.lyrics_gen;
+        // M-2: reset manual-scroll follow state on a fresh lyrics request.
+        self.lyrics_manual_scroll = false;
         // Update the overlay to Loading if it's the Lyrics overlay.
         if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
             self.overlay = Some(Overlay::Lyrics {
@@ -3955,35 +4139,15 @@ impl App {
         // These are fast (one metaflac subprocess + filesystem reads) and
         // never block; a miss falls through to NotFound for local tracks (no
         // video_id to ask ytmusicapi).
-        if let Some(track) = self.track_by_id_fast(track_id).cloned() {
-            if let Some(lyrics) = crate::lyrics::read_embedded(&track, &self.catalog.source_root) {
-                let new_state = if lyrics.is_empty() {
-                    LyricsState::NotFound
-                } else {
-                    LyricsState::Available(lyrics.synced)
-                };
-                if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
-                    self.overlay = Some(Overlay::Lyrics {
-                        content: Some(lyrics),
-                        state: new_state,
-                        scroll,
-                        track_id: track_id.to_string(),
-                        gen,
-                    });
-                }
-                return;
-            }
-            // Local track, no embedded/sidecar lyrics → NotFound (truthful; no
-            // fabricated text, AC-M3.5.1).
-            if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
-                self.overlay = Some(Overlay::Lyrics {
-                    content: None,
-                    state: LyricsState::NotFound,
-                    scroll,
-                    track_id: track_id.to_string(),
-                    gen,
-                });
-            }
+        // M-2: defer the disk read to on_tick so the Loading transition set
+        // above is visible for at least one frame. Without this, the
+        // synchronous read sets Loading → NotFound in the same call, so a
+        // retry (R) for a local track shows no visible transition — the user
+        // presses R and the overlay stays NotFound. By deferring, on_tick
+        // processes the read on the next tick (~150ms), giving the render a
+        // chance to paint Loading first.
+        if self.track_by_id_fast(track_id).is_some() {
+            self.pending_lyrics_local = Some((track_id.to_string(), gen));
             return;
         }
         // Remote (YouTube) track → fire-and-forget sidecar get_lyrics. The
@@ -4257,6 +4421,9 @@ impl App {
 
         let mut state = HomeState::new();
         state.has_history = self.reco_profile.has_history();
+        // RB-2: capture the provider state so the Home renderer can show a
+        // sign-in prompt for signed-out accounts instead of growth messaging.
+        state.yt_state = self.yt_state;
         // Local data is synchronous — not loading. YouTube home suggestions
         // (if a session is available) are fetched by the existing discover
         // mechanism and don't block this overlay.

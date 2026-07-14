@@ -84,7 +84,20 @@ fn snapshot_at(name: &str, w: u16, h: u16, app: &mut App) {
     let backend = TestBackend::new(w, h);
     let mut term = Terminal::new(backend).unwrap();
     term.draw(|f| draw(f, app)).unwrap();
-    let s = buffer_string(&term, w, h);
+    let mut s = buffer_string(&term, w, h);
+    // Redact the non-deterministic temp-dir path so snapshots are stable
+    // across runs and machines. The footer can surface a "file not found:
+    // <tmp path>" for tracks whose TempDir was dropped; the tempdir name
+    // varies per run (fixed length, variable content). Replace the OS temp
+    // root with <TMPROOT>, then collapse <TMPROOT>/.tmpXXXX into <TMP>.
+    if let Some(prefix) = std::env::temp_dir().to_str() {
+        s = s.replace(prefix.trim_end_matches('/'), "<TMPROOT>");
+    }
+    if let Some(start) = s.find("<TMPROOT>/") {
+        let after = start + "<TMPROOT>/".len();
+        let end = s[after..].find('/').map(|e| after + e).unwrap_or(s.len());
+        s.replace_range(start..end, "<TMP>");
+    }
     assert_snapshot!(name, s);
 }
 

@@ -65,8 +65,11 @@ impl Sidecar {
     ///   OR
     /// - `browser` (e.g. `"chrome"`) via `JUKEBOX_YT_BROWSER`, which makes the
     ///   sidecar read cookies from that browser's profile (yt-dlp's
-    ///   `--cookies-from-browser` + browser_cookie3 for ytmusicapi). No cookie
-    ///   file is written; values never leave the browser.
+    ///   `--cookies-from-browser` + browser_cookie3 for ytmusicapi). The
+    ///   decrypted cookies are written to the persistent 0600 path in
+    ///   `JUKEBOX_YT_COOKIES_FILE` (managed by `session.rs`) so the next
+    ///   launch can load them without re-reading the Keychain; the raw cookie
+    ///   values never leave the browser otherwise.
     ///   Both `None` → guest mode.
     pub fn spawn(
         python: &Path,

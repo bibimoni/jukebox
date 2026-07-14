@@ -129,6 +129,112 @@ fn no_secret_in_logs() {
     );
 }
 
+/// F3 regression: `authorization=Bearer <token>` must redact the ENTIRE
+/// remainder of the line (the credential may contain a space), not just the
+/// first token. The old token-consume stopped at the space, leaking the
+/// actual secret after `Bearer `.
+#[test]
+fn redact_authorization_bearer_consumes_to_end_of_line() {
+    let raw = "authorization=Bearer secrettoken123";
+    let redacted = jukebox::tui::event::redact(raw);
+    assert_eq!(
+        redacted, "[REDACTED]",
+        "the full Bearer token must be redacted, got: {redacted:?}"
+    );
+    assert!(
+        !redacted.contains("secrettoken123"),
+        "the token after the space must NOT leak: {redacted:?}"
+    );
+    assert!(
+        !redacted.contains("Bearer"),
+        "the marker value 'Bearer' must not survive: {redacted:?}"
+    );
+}
+
+/// F3 regression: `authorization=` in the middle of a line still consumes the
+/// whole remainder (to end-of-line), so the token after `Bearer ` doesn't
+/// leak even when there's context before the marker.
+#[test]
+fn redact_authorization_bearer_with_prefix_context() {
+    let raw = "yt_error: auth failed — authorization=Bearer s3cr3t";
+    let redacted = jukebox::tui::event::redact(raw);
+    assert!(
+        redacted.contains("[REDACTED]"),
+        "must contain [REDACTED]: {redacted:?}"
+    );
+    assert!(
+        !redacted.contains("s3cr3t"),
+        "the token after Bearer must NOT leak: {redacted:?}"
+    );
+    assert!(
+        redacted.contains("yt_error: auth failed"),
+        "prefix context must survive: {redacted:?}"
+    );
+}
+
+/// F3 regression: `cookie=` consumes to end-of-line so a full cookie line
+/// `cookie=name=val; name2=val2` is entirely redacted (the old token-consume
+/// stopped at the first `=`, leaking `=val; name2=val2`).
+#[test]
+fn redact_cookie_consumes_to_end_of_line() {
+    let raw = "cookie=name=val1; name2=val2";
+    let redacted = jukebox::tui::event::redact(raw);
+    assert_eq!(
+        redacted, "[REDACTED]",
+        "the full cookie line must be redacted, got: {redacted:?}"
+    );
+    assert!(
+        !redacted.contains("val1") && !redacted.contains("val2") && !redacted.contains("name"),
+        "no cookie values or names may survive: {redacted:?}"
+    );
+}
+
+/// F3 regression: every SID-family marker still gets the single-token consume
+/// (alnum + `_.-`), so two markers on the same line are BOTH redacted. The
+/// per-marker change must not break the default behavior.
+#[test]
+fn redact_sid_family_markers_still_consume_single_token() {
+    // SID-family markers stop at the first non-token char, so the next marker
+    // on the same line is still caught.
+    let raw = "SAPISID=abc123; __Secure-3PAPISID=def456 SSID=ghi789 end";
+    let redacted = jukebox::tui::event::redact(raw);
+    assert!(
+        !redacted.contains("abc123")
+            && !redacted.contains("def456")
+            && !redacted.contains("ghi789"),
+        "all SID-family values must be redacted: {redacted:?}"
+    );
+    // "end" survives (it's not a marker value — it's after the last marker's
+    // token consume stopped at the space).
+    assert!(
+        redacted.contains("end"),
+        "trailing non-secret text must survive: {redacted:?}"
+    );
+    // Three markers → three [REDACTED]s.
+    assert_eq!(
+        redacted.matches("[REDACTED]").count(),
+        3,
+        "three SID markers must produce three [REDACTED]: {redacted:?}"
+    );
+}
+
+/// F3 regression: case-insensitive matching still applies (the marker table
+/// is compared with `eq_ignore_ascii_case`). `Authorization=` (capital A)
+/// must redact just like `authorization=`.
+#[test]
+fn redact_markers_are_case_insensitive() {
+    let raw = "Authorization=Bearer MyToken123";
+    let redacted = jukebox::tui::event::redact(raw);
+    assert_eq!(
+        redacted, "[REDACTED]",
+        "capital-A Authorization must still consume to EOL: {redacted:?}"
+    );
+    assert!(
+        !redacted.contains("MyToken123"),
+        "token must not leak: {redacted:?}"
+    );
+}
+
 /// A new `yt_error` is captured into the `Diagnostics` buffer by `on_tick`
 /// so the diagnostics overlay can show it (the footer only shows the latest
 /// error). Change-detection avoids pushing one entry per tick.

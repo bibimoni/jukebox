@@ -138,11 +138,19 @@ pub fn log_to_file_at(path: &std::path::Path, line: &str) {
 /// Redact cookie/token secrets from a log line before it's written to disk.
 /// Replaces any `<marker><value>` substring with `[REDACTED]`, where `<marker>`
 /// is one of `SAPISID=`, `__Secure-3PAPISID=`, `authorization=`, `cookie=`
-/// (case-insensitive) and `<value>` is the run of `[A-Za-z0-9_.-]` that
-/// follows. The marker itself is consumed so the secret name doesn't leak
-/// either; other text (including the surrounding context) is preserved so
-/// the log stays readable. Public so the run loop can call it before
-/// [`log_to_file`] and so tests can verify the redaction directly.
+/// (case-insensitive). The marker itself is consumed so the secret name
+/// doesn't leak either; other text (including the surrounding context) is
+/// preserved so the log stays readable. Public so the run loop can call it
+/// before [`log_to_file`] and so tests can verify the redaction directly.
+///
+/// **Per-marker consume.** Most markers (`SAPISID=`, `SID=`, …) take a
+/// single-token value (`[A-Za-z0-9_.-]*`), so the value is consumed up to the
+/// first non-token char (whitespace, `;`, …) and the next marker on the same
+/// line can still be caught. The `authorization=` and `cookie=` markers take
+/// a value that may contain spaces and `=` (e.g. `Bearer <token>` or
+/// `name=val; name2=val2`), so for those the ENTIRE remainder of the line is
+/// consumed — otherwise `authorization=Bearer secret` would stop at the space
+/// and leak `secret`.
 pub fn redact(line: &str) -> String {
     /// Markers whose following value is a secret. Order doesn't matter: at a
     /// given position only one marker can match (they have distinct first
@@ -159,6 +167,13 @@ pub fn redact(line: &str) -> String {
         "authorization=",
         "cookie=",
     ];
+    /// Markers whose value may contain spaces / `=` / `;` (a full header or
+    /// cookie line). For these the ENTIRE remainder of the line is the
+    /// credential — consume to end-of-line so a `Bearer <token>` doesn't leak
+    /// the token after the space, and a `cookie=name=val; …` line doesn't
+    /// leak everything after the first `=`. The SID-family markers are single
+    /// tokens (alnum + `_.-`), so they keep the default token consume.
+    const CONSUME_TO_EOL: &[&str] = &["authorization=", "cookie="];
     let mut out = String::with_capacity(line.len());
     let mut i = 0usize;
     while i < line.len() {
@@ -173,13 +188,25 @@ pub fn redact(line: &str) -> String {
         if let Some(m) = hit {
             out.push_str("[REDACTED]");
             i += m.len();
-            // Consume the secret value: alnum + `_`, `-`, `.`. Stop at the
-            // first non-token char (whitespace, `;`, `]`, …) so the next
-            // marker in the same line can still be caught.
             let tail = &line[i..];
-            let consume = tail
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'))
-                .unwrap_or(tail.len());
+            let consume = if CONSUME_TO_EOL
+                .iter()
+                .copied()
+                .any(|c| m.eq_ignore_ascii_case(c))
+            {
+                // The whole remainder is the credential (may contain spaces,
+                // `=`, `;`). Consume to end-of-line so nothing leaks past a
+                // space or delimiter.
+                tail.len()
+            } else {
+                // Single token: alnum + `_`, `-`, `.`. Stop at the first
+                // non-token char so the next marker in the same line can
+                // still be caught.
+                tail.find(|c: char| {
+                    !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+                })
+                .unwrap_or(tail.len())
+            };
             i += consume;
         } else {
             // Advance by one char (UTF-8 safe): copy the whole codepoint.
@@ -271,6 +298,22 @@ fn enter_alt_screen() -> Result<()> {
     Ok(())
 }
 
+/// True when the terminal supports raw mode + alt screen (ANSI controls).
+/// False for `TERM=dumb`, which can't render ANSI controls or handle raw
+/// mode. When false, [`run`] prints a clear message and exits without
+/// emitting any ANSI controls — the app refuses to enter raw mode rather
+/// than dumping raw escape sequences a dumb terminal can't render (RB-6).
+///
+/// `TERM` unset → assume raw-capable (the common case for most terminal
+/// emulators). An empty `TERM` is treated as dumb (some environments set
+/// `TERM=""` to indicate no terminal capabilities).
+pub fn terminal_supports_raw_mode() -> bool {
+    match std::env::var("TERM") {
+        Ok(term) => term != "dumb" && !term.is_empty(),
+        Err(_) => true,
+    }
+}
+
 /// The terminal event loop.
 ///
 /// `captured` is the pre-loop CoreAudio format snapshot (Task 7) used to
@@ -288,6 +331,22 @@ pub fn run(app: &mut App, captured: Option<CapturedFormat>) -> Result<()> {
 
     install_panic_hook();
     install_signal_handlers()?;
+
+    // RB-6: TERM=dumb terminals can't handle raw mode / alt-screen / ANSI
+    // controls. Refuse to enter raw mode with a clear message instead of
+    // dumping raw escape sequences a dumb terminal can't render.
+    if !terminal_supports_raw_mode() {
+        let term = std::env::var("TERM").unwrap_or_default();
+        eprintln!(
+            "jukebox: this terminal (TERM={term}) does not support the raw mode / \
+             alternate screen the TUI requires."
+        );
+        eprintln!(
+            "Set TERM=xterm (or similar) and try again, or use a terminal that \
+             supports ANSI controls."
+        );
+        return Ok(());
+    }
 
     let mut stdout = std::io::stdout();
     enable_raw_mode().context("enabling raw mode")?;

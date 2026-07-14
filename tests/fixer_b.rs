@@ -86,7 +86,11 @@ fn mk_dummy(id: &str, artist: &str, title: &str) -> Track {
 }
 
 fn make_app() -> App {
-    // persist_events defaults false — tests must NOT touch the real state DB.
+    // Isolate XDG so save_yt_lists / state.db writes never touch the user's
+    // real home dir. The comment below already says "tests must NOT touch the
+    // real state DB" — this actually enforces it.
+    let _xdg = tempfile::tempdir().unwrap();
+    std::env::set_var("XDG_CONFIG_HOME", _xdg.path());
     let (_dir, cat) = make_catalog();
     // Leak the tempdir so it (and its .flac files) stay alive for the test's
     // lifetime — the StubPlayer reads the file path during `load`, which is

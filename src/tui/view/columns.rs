@@ -27,7 +27,7 @@ use ratatui::{
 use crate::tui::app::{App, View};
 use crate::tui::view::theme::{
     ascii_sanitize, disp_width, ellipsis, em_dash, h_line, is_ascii, left_arrow, marker_glyph,
-    no_color, pad_between, play_glyph, sep_dot, Theme, ASCII_BORDER_SET,
+    no_color, pad_between, play_glyph, selection_marker, sep_dot, Theme, ASCII_BORDER_SET,
 };
 
 // --- I.5: Multi-column track list (DEF-069) -------------------------------
@@ -871,11 +871,15 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
 fn yt_status_line(app: &App, lists_empty: bool, ids_empty: bool) -> String {
     yt_status_line_impl(app, lists_empty, ids_empty)
 }
-pub(crate) fn yt_status_line_pub(app: &App, lists_empty: bool, ids_empty: bool) -> String {
+pub fn yt_status_line_pub(app: &App, lists_empty: bool, ids_empty: bool) -> String {
     yt_status_line_impl(app, lists_empty, ids_empty)
 }
 fn yt_status_line_impl(app: &App, lists_empty: bool, ids_empty: bool) -> String {
     use crate::yt::state::YtState;
+    // Maximum status line width: 78 chars so the line fits at 80-wide
+    // terminals with 2 border chars (RB-6: long retry_hint messages clipped
+    // the recovery guidance at 80x24).
+    const MAX_WIDTH: usize = 78;
     // An error detail takes precedence over the generic state label so a
     // specific failure (e.g. "retry failed: …") is visible in the Y view too.
     if let Some(e) = &app.yt_error {
@@ -883,10 +887,18 @@ fn yt_status_line_impl(app: &App, lists_empty: bool, ids_empty: bool) -> String 
             || app.yt_state == YtState::AuthExpired
             || app.yt_state == YtState::RateLimited
         {
-            return format!("YT: {} {} {}", app.yt_state.human_label(), em_dash(), e);
+            // The human_label already contains the recovery guidance (e.g.
+            // "provider error — press R to retry"), so it goes first. The
+            // error detail is truncated so the total line fits at 80 wide —
+            // the recovery guidance stays visible even with a long error.
+            let label = ascii_sanitize(app.yt_state.human_label());
+            let prefix = format!("YT: {label} {} ", em_dash());
+            let max_detail = MAX_WIDTH.saturating_sub(disp_width(&prefix));
+            let detail = truncate_ellipsis(e, max_detail);
+            return format!("{prefix}{detail}");
         }
     }
-    match app.yt_state {
+    let line = match app.yt_state {
         YtState::Unconfigured => format!(
             "YouTube not configured {} run :yt auth browser <chrome>",
             em_dash()
@@ -936,6 +948,12 @@ fn yt_status_line_impl(app: &App, lists_empty: bool, ids_empty: bool) -> String 
             em_dash()
         )
         .to_string(),
+    };
+    // Truncate to MAX_WIDTH so the line doesn't clip at 80-wide terminals.
+    if disp_width(&line) > MAX_WIDTH {
+        truncate_ellipsis(&line, MAX_WIDTH)
+    } else {
+        line
     }
 }
 
@@ -960,7 +978,8 @@ pub(crate) fn truncate_ellipsis(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let target = width.saturating_sub(1); // reserve 1 for ellipsis
+    let ell_w = disp_width(ellipsis());
+    let target = width.saturating_sub(ell_w);
     let mut out = String::new();
     let mut w = 0;
     for c in s.chars() {
@@ -1110,7 +1129,7 @@ fn render_artists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                 .map(|(i, a)| {
                     let name = truncate_ellipsis(a, name_w);
                     if i == cursor {
-                        let marker = marker_glyph();
+                        let marker = selection_marker();
                         Line::from(Span::styled(
                             format!("{marker} {name}"),
                             theme.selected_style(),

@@ -8,7 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use jukebox::catalog::Catalog;
 use jukebox::player::StubPlayer;
 use jukebox::search::Searcher;
-use jukebox::tui::app::{App, DiscoverItem, Overlay, View};
+use jukebox::tui::app::{App, DiscoverItem, Overlay, View, YtTab};
 use jukebox::tui::input::{handle_key, handle_mouse_in_area};
 use jukebox::tui::queue::{RepeatMode, ShuffleMode};
 use jukebox::tui::view::{layout::player_bar_area, player_bar::geometry};
@@ -1192,5 +1192,214 @@ fn radio_overlay_equals_key_applies_like() {
     assert!(
         app.reco_profile.track_score(&track_id) > 0.0,
         "'=' must apply Like feedback just like '+'"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RB-3: YouTube keyboard trap. The global view-switch keys (1-4, Tab/
+// Shift+Tab) were intercepted inside the YouTube view as YT sub-tab switches,
+// Esc was a no-op with no overlay, and `h`/move_left couldn't escape — so the
+// user could get trapped in a view with no reliable exit, and the trapped
+// view persisted across restart. These regressions pin the fix: the
+// documented global keys always work inside YouTube, Esc exits, `h` exits
+// at the left edge, `[`/`]` cycle YT tabs, and a persisted YouTube view is
+// not a trap on restore.
+// ---------------------------------------------------------------------------
+
+/// An `App` placed inside the YouTube view with no overlay/filter open.
+fn rb3_yt_app() -> (tempfile::TempDir, App) {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.view = View::Youtube;
+    app.overlay = None;
+    app.filter = None;
+    app.yt_view.tab = YtTab::Home;
+    (_d, app)
+}
+
+#[test]
+fn rb3_global_view_switch_keys_work_inside_youtube() {
+    let (_d, mut app) = rb3_yt_app();
+    assert_eq!(app.view, View::Youtube);
+    handle_key(&mut app, key('1'));
+    assert_eq!(
+        app.view,
+        View::Artists,
+        "1 must switch to Artists from inside YouTube"
+    );
+    app.view = View::Youtube;
+    handle_key(&mut app, key('2'));
+    assert_eq!(
+        app.view,
+        View::Playlists,
+        "2 must switch to Playlists from inside YouTube"
+    );
+    app.view = View::Youtube;
+    handle_key(&mut app, key('3'));
+    assert_eq!(
+        app.view,
+        View::Queue,
+        "3 must switch to Queue from inside YouTube"
+    );
+}
+
+#[test]
+fn rb3_tab_and_shift_tab_escape_youtube() {
+    let (_d, mut app) = rb3_yt_app();
+    handle_key(&mut app, key_code(KeyCode::Tab));
+    assert_ne!(app.view, View::Youtube, "Tab must cycle away from YouTube");
+    app.view = View::Youtube;
+    handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+    assert_ne!(
+        app.view,
+        View::Youtube,
+        "Shift+Tab must cycle away from YouTube"
+    );
+}
+
+#[test]
+fn rb3_esc_exits_youtube_view() {
+    let (_d, mut app) = rb3_yt_app();
+    handle_key(&mut app, key_code(KeyCode::Esc));
+    assert_ne!(app.view, View::Youtube, "Esc must exit the YouTube view");
+    assert_eq!(app.view, View::Artists);
+}
+
+#[test]
+fn rb3_h_at_left_edge_exits_youtube() {
+    let (_d, mut app) = rb3_yt_app();
+    app.yt_view.tab = YtTab::Library;
+    app.focus_col = 0;
+    handle_key(&mut app, key('h'));
+    assert_eq!(
+        app.view,
+        View::Artists,
+        "h at the left edge must exit YouTube"
+    );
+}
+
+#[test]
+fn rb3_brackets_cycle_yt_tabs() {
+    let (_d, mut app) = rb3_yt_app();
+    assert_eq!(app.yt_view.tab, YtTab::Home);
+    handle_key(&mut app, key(']'));
+    assert_eq!(
+        app.yt_view.tab,
+        YtTab::Library,
+        "] must cycle to the next YT tab"
+    );
+    handle_key(&mut app, key(']'));
+    assert_eq!(app.yt_view.tab, YtTab::Search);
+    handle_key(&mut app, key('['));
+    assert_eq!(
+        app.yt_view.tab,
+        YtTab::Library,
+        "[ must cycle to the previous YT tab"
+    );
+}
+
+#[test]
+fn rb3_persisted_youtube_view_is_not_a_trap() {
+    use jukebox::state::{load_layout_at, save_layout_at, LayoutSave, ARTISTS};
+    use jukebox::tui::app::{ColumnWidths, PlaylistColumnState};
+
+    let path = tempfile::tempdir().unwrap().keep().join("state.db");
+    // First launch (no saved layout): the default focus is "artists", not a
+    // trapped YouTube view.
+    let fresh = load_layout_at(&path).unwrap();
+    assert_eq!(fresh.focus, ARTISTS);
+
+    // Simulate quitting while inside the YouTube view: focus="youtube" persists.
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.view = View::Youtube;
+    save_layout_at(
+        &path,
+        &LayoutSave {
+            focus: app.focus_key(),
+            widths: &ColumnWidths::default(),
+            volume: app.volume,
+            shuffle: app.transport.shuffle,
+            repeat: app.transport.repeat,
+            continue_mode: app.transport.continue_mode,
+            source_mode: app.source_mode,
+            yt_browser: &app.yt_browser,
+            last_played_track_id: app.last_played_track_id.as_deref(),
+            last_played_position: app.last_played_position,
+            last_cursor_artist: app.cursors.artist,
+            last_cursor_album: app.cursors.album,
+            last_cursor_track: app.cursors.track,
+            last_cursor_playlist: app.cursors.playlist,
+            player_bar_mode: "mini",
+            track_layout_mode: "table",
+            sidebar_visible: app.sidebar_visible,
+            playlist_col: &PlaylistColumnState::default(),
+        },
+    )
+    .unwrap();
+    let loaded = load_layout_at(&path).unwrap();
+    assert_eq!(
+        loaded.focus, "youtube",
+        "the trapped YouTube view was persisted"
+    );
+
+    // Simulate the next launch restoring the YouTube view (as main.rs does),
+    // then verify the user can navigate away — the exit keys work on restore.
+    let (_d2, cat2) = cat_album();
+    let mut restored = App::new(cat2, Box::new(StubPlayer::default()), None, None);
+    restored.view = View::Youtube;
+    restored.overlay = None;
+    handle_key(&mut restored, key_code(KeyCode::Esc));
+    assert_ne!(
+        restored.view,
+        View::Youtube,
+        "Esc must exit the restored YouTube view (no persistent trap)"
+    );
+}
+
+#[test]
+fn rb3_recovery_hint_fits_80_columns() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    assert_eq!(app.view, View::Artists);
+    handle_key(&mut app, key('4')); // enter YouTube
+    assert_eq!(app.view, View::Youtube);
+    let hint = app
+        .status_toast
+        .as_deref()
+        .expect("a recovery hint should be shown when entering the YouTube view");
+    assert!(
+        hint.chars().count() <= 80,
+        "recovery hint must fit 80 columns, got {} chars: {hint}",
+        hint.chars().count()
+    );
+    assert!(
+        hint.contains("Esc") || hint.contains("1-4") || hint.contains("Tab"),
+        "recovery hint should mention an exit key: {hint}"
+    );
+}
+
+#[test]
+fn rb3_recovery_hint_renders_at_80x24() {
+    use ratatui::{backend::TestBackend, Terminal};
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    handle_key(&mut app, key('4')); // enter YouTube -> sets the recovery toast
+    assert_eq!(app.view, View::Youtube);
+    let backend = TestBackend::new(80, 24);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| jukebox::tui::view::layout::draw(f, &mut app))
+        .unwrap();
+    let buf = term.backend().buffer();
+    let mut text = String::new();
+    for y in 0..24u16 {
+        for x in 0..80u16 {
+            text.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+        }
+        text.push('\n');
+    }
+    assert!(
+        text.contains("Esc"),
+        "recovery hint must be visible at 80x24 (expected 'Esc' in footer):\n{text}"
     );
 }

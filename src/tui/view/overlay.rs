@@ -61,7 +61,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
             render_playlist_picker(f, area, app, &track_id, cursor)
         }
         Overlay::Command { input, cursor } => render_command(f, area, &input, cursor),
-        Overlay::YtAuth { input } => render_yt_auth(f, area, &input),
+        Overlay::YtAuth { input } => render_yt_auth(f, area, app, &input),
         Overlay::Discover { items, cursor } => render_discover(
             f,
             area,
@@ -257,7 +257,11 @@ fn render_discover(
 
 /// The YouTube cookie-paste overlay (spec §5.7). A centered popup with the
 /// paste instructions and the accumulating cookie text; `Enter` saves.
-fn render_yt_auth(f: &mut Frame, area: Rect, input: &str) {
+/// RB-4: also shows the current provider state (Authenticating / error) so the
+/// user is never left with an unexplained busy state — they see progress and
+/// know Esc cancels.
+fn render_yt_auth(f: &mut Frame, area: Rect, app: &App, input: &str) {
+    use crate::yt::state::YtState;
     let theme = Theme::default();
     let popup = centered(area, 70, 40);
     f.render_widget(Clear, popup);
@@ -283,7 +287,7 @@ fn render_yt_auth(f: &mut Frame, area: Rect, input: &str) {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let lines: Vec<Line> = vec![
+    let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
             "Paste your YouTube cookies (Premium recommended).",
             Style::default().fg(theme.text),
@@ -303,11 +307,36 @@ fn render_yt_auth(f: &mut Frame, area: Rect, input: &str) {
             Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
         ]),
         Line::from(""),
+    ];
+
+    // RB-4: show the current provider state so the user sees progress / error
+    // instead of an unexplained busy state. An error detail (yt_error) takes
+    // precedence; a busy state shows the state label; otherwise the plain hint.
+    // The "Esc: cancel" hint is ALWAYS shown so the user knows they can cancel.
+    let state_line = if let Some(e) = &app.yt_error {
+        Line::from(vec![
+            Span::styled(format!("[!] {e}  "), Style::default().fg(Color::Red)),
+            Span::styled("Esc: cancel".to_string(), Style::default().fg(theme.dim)),
+        ])
+    } else if matches!(
+        app.yt_state,
+        YtState::Authenticating | YtState::AuthenticatedNotSynced | YtState::Synchronizing
+    ) {
+        Line::from(vec![
+            Span::styled(
+                format!("[~] {}  ", app.yt_state.human_label()),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled("Esc: cancel".to_string(), Style::default().fg(theme.dim)),
+        ])
+    } else {
         Line::from(Span::styled(
             format!("Enter: save & connect    {}    Esc: cancel", sep_dot()),
             Style::default().fg(theme.dim),
-        )),
-    ];
+        ))
+    };
+    lines.push(state_line);
+
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -318,6 +347,31 @@ fn centered(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
         Constraint::Percentage((100 - height_pct) / 2),
         Constraint::Percentage(height_pct),
         Constraint::Percentage((100 - height_pct) / 2),
+    ])
+    .split(area)[1];
+    Layout::horizontal([
+        Constraint::Percentage((100 - width_pct) / 2),
+        Constraint::Percentage(width_pct),
+        Constraint::Percentage((100 - width_pct) / 2),
+    ])
+    .split(pop)[1]
+}
+
+/// Center a popup with a FIXED height (in rows), clamped to `area.height`.
+/// Used by overlays whose content has a known minimum row count (text input,
+/// confirm dialog) so the content is never clipped at 80x24 — a percentage-
+/// based height collapses too aggressively on short terminals (e.g. 20% of 24
+/// rows = 4 rows, only 2 inner rows after borders, not enough for 5 content
+/// lines).
+fn centered_fixed(area: Rect, width_pct: u16, height: u16) -> Rect {
+    let h = height.min(area.height);
+    let leftover = area.height - h;
+    let top = leftover / 2;
+    let bottom = leftover - top;
+    let pop = Layout::vertical([
+        Constraint::Length(top),
+        Constraint::Length(h),
+        Constraint::Length(bottom),
     ])
     .split(area)[1];
     Layout::horizontal([
@@ -503,7 +557,38 @@ fn render_search(
             }
         }
         crate::tui::app::SearchScope::Youtube => {
-            if searching {
+            // RB-2: distinguish "search succeeded, zero matches" from "search
+            // failed/offline." When the provider is in an error or not-configured
+            // state, the search can't have succeeded — show the truthful provider
+            // state, not "No results for '...'" as if the search ran and was
+            // empty.
+            use crate::yt::state::YtState;
+            let provider_down = app.yt_state.is_error()
+                || matches!(
+                    app.yt_state,
+                    YtState::Unconfigured | YtState::SignedOut | YtState::Failed
+                );
+            let provider_msg = match app.yt_state {
+                YtState::Unconfigured | YtState::SignedOut => {
+                    "YouTube not connected — :yt auth browser <name>".to_string()
+                }
+                YtState::AuthExpired => {
+                    "authorization expired — :yt auth browser <name>".to_string()
+                }
+                YtState::RateLimited => "rate limited — wait, then press R".to_string(),
+                YtState::Failed => "YouTube failed — run :yt setup".to_string(),
+                _ => "YouTube offline — press R to retry".to_string(),
+            };
+            if searching && provider_down {
+                Line::from(Span::styled(
+                    format!(
+                        "{provider_msg}   {}   Tab {} local",
+                        sep_dot(),
+                        right_arrow()
+                    ),
+                    dim,
+                ))
+            } else if searching {
                 Line::from(Span::styled(
                     format!(
                         "searching{}   (Tab {} local {} Esc cancel)",
@@ -523,15 +608,27 @@ fn render_search(
                     dim,
                 ))
             } else if results.is_empty() && submitted.as_deref() == Some(input) {
-                // A search ran and returned nothing.
-                Line::from(Span::styled(
-                    format!(
-                        "No results for '{input}'  {}  Tab {} local to switch scope",
-                        sep_dot(),
-                        right_arrow()
-                    ),
-                    dim,
-                ))
+                if provider_down {
+                    // Provider offline/failed — the search didn't succeed.
+                    Line::from(Span::styled(
+                        format!(
+                            "{provider_msg}   {}   Tab {} local",
+                            sep_dot(),
+                            right_arrow()
+                        ),
+                        dim,
+                    ))
+                } else {
+                    // Search succeeded, zero matches.
+                    Line::from(Span::styled(
+                        format!(
+                            "No results for '{input}'  {}  Tab {} local to switch scope",
+                            sep_dot(),
+                            right_arrow()
+                        ),
+                        dim,
+                    ))
+                }
             } else if submitted.as_deref() == Some(input) && !results.is_empty() {
                 // RC11-DEF-059: show the result count so the user knows how
                 // many matches the search returned (a fixture-bound sidecar
@@ -702,11 +799,14 @@ pub fn help_lines(sep_width: usize, ascii: bool) -> Vec<Line<'static>> {
         sep(),
         section("YouTube view tabs (I.4)"),
         entry(
-            "1-5 (in YT view)",
-            "switch YT tab: Home / Library / Search / Discover / Radio",
+            "[ / ]",
+            "cycle YT tab: Home / Library / Search / Discover / Radio",
         ),
-        entry("Tab (in YT view)", "cycle YT tab"),
         entry("h / l (Library)", "focus playlist list <-> track list"),
+        entry(
+            "h / l (Home tab)",
+            "switch Home section (h at left exits YT)",
+        ),
         entry("/", "jump to Search tab with input focused"),
         entry("H", "open Home tab (switches to YT view)"),
         entry("S (YT/Mixed)", "open Discover tab"),
@@ -782,7 +882,7 @@ pub fn help_lines(sep_width: usize, ascii: bool) -> Vec<Line<'static>> {
         sep(),
         section("Navigation in overlays"),
         entry(sel_key, "move search-result / discover selection"),
-        entry("Esc", "close overlay / cancel"),
+        entry("Esc", "close overlay / exit YouTube view"),
         entry("q", "quit"),
         sep(),
         section("Accessibility"),
@@ -1241,9 +1341,17 @@ fn render_lyrics_overlay(
 
     // Persistent footer hint — dim + centered so it reads as chrome, not
     // lyrics. Visible in every state so Esc/scroll is always discoverable.
+    // M-2: when the user has manually scrolled, show a "f to resume follow"
+    // affordance so they know how to return to the active (playing) line —
+    // without this, manual scroll leaves the user with no resume path.
+    let hint = if app.lyrics_manual_scroll {
+        format!("Esc close {} f resume follow", sep_dot())
+    } else {
+        format!("Esc close {} j/k scroll", sep_dot())
+    };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!("Esc close {} j/k scroll", sep_dot()),
+            hint,
             Style::default().fg(theme.dim),
         )))
         .alignment(Alignment::Center),
@@ -1320,7 +1428,7 @@ fn render_confirm(f: &mut Frame, area: Rect, message: &str) {
 /// and a block cursor. Enter confirms; Esc cancels.
 fn render_text_input(f: &mut Frame, area: Rect, prompt: &str, buffer: &str, cursor: usize) {
     let theme = Theme::default();
-    let popup = centered(area, 50, 20);
+    let popup = centered_fixed(area, 50, 7);
     f.render_widget(Clear, popup);
     let block = if is_ascii() {
         Block::default()
@@ -1411,10 +1519,20 @@ fn titled_block(title: &str, theme: &Theme) -> Block<'static> {
 /// - no sections (cold start before `open_home` populates them) → the
 ///   welcome / getting-started paragraph.
 fn render_home_overlay(f: &mut Frame, area: Rect, state: &home::HomeState) {
+    use crate::yt::state::YtState;
     let icons = IconRenderer::auto();
     // Full-screen: clear so the browse chrome (columns / player bar) doesn't
     // bleed through behind the Home content.
     f.render_widget(Clear, area);
+
+    // RB-2: a signed-out account shows a sign-in prompt, not the cold-start
+    // growth messaging ("listen more to build your profile"). The state was
+    // captured at populate_home_state time.
+    if matches!(state.yt_state, YtState::Unconfigured | YtState::SignedOut) {
+        let p = home::render_signed_out(&icons);
+        f.render_widget(p, area);
+        return;
+    }
 
     if state.loading {
         let lines = home::render_header(area, state, &icons);
@@ -1537,12 +1655,17 @@ fn render_publication_overlay(f: &mut Frame, area: Rect, state: &publication::Pu
         Paragraph::new("").style(Style::default().bg(Color::Black)),
         area,
     );
-    let popup = centered(area, 60, 70);
+    // M-1: at 80x24 a 70%-height popup is only ~16 rows, and the publication
+    // content (>16 lines) overflows so the account + publish/cancel controls
+    // are clipped off-screen. Use a fixed height that fills most of the
+    // viewport (clamped to area) so the controls stay reachable, and apply
+    // the content's scroll offset for terminals shorter than the content.
+    let popup = centered_fixed(area, 70, area.height.saturating_sub(2).max(20));
     f.render_widget(Clear, popup);
     let block = titled_block(" publish ", &theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
-    let para = publication::render(popup, state, &icons);
+    let para = publication::render(popup, state, &icons).scroll((state.scroll, 0));
     f.render_widget(para, inner);
 }
 
@@ -1736,7 +1859,9 @@ mod tests {
 
     #[test]
     fn home_overlay_loading_shows_header() {
-        let state = crate::tui::view::home::HomeState::new(); // loading = true
+        use crate::yt::state::YtState;
+        let mut state = crate::tui::view::home::HomeState::new(); // loading = true
+        state.yt_state = YtState::Ready;
         let text = overlay_text(80, 24, |f, area| render_home_overlay(f, area, &state));
         assert!(
             text.contains("YouTube Home"),
@@ -1750,9 +1875,11 @@ mod tests {
 
     #[test]
     fn home_overlay_cold_start_shows_welcome() {
+        use crate::yt::state::YtState;
         let mut state = crate::tui::view::home::HomeState::new();
         state.loading = false;
         state.has_history = false;
+        state.yt_state = YtState::Ready;
         let text = overlay_text(80, 24, |f, area| render_home_overlay(f, area, &state));
         assert!(
             text.contains("Welcome"),
@@ -1763,10 +1890,12 @@ mod tests {
     #[test]
     fn home_overlay_with_sections_shows_section_titles() {
         use crate::tui::view::home::{HomeItem, HomeSection};
+        use crate::yt::state::YtState;
 
         let mut state = crate::tui::view::home::HomeState::new();
         state.loading = false;
         state.has_history = false;
+        state.yt_state = YtState::Ready;
         state.sections = vec![
             (
                 HomeSection::QuickPicks,
@@ -1807,9 +1936,11 @@ mod tests {
 
     #[test]
     fn home_overlay_ready_shows_ready_status() {
+        use crate::yt::state::YtState;
         let mut state = crate::tui::view::home::HomeState::new();
         state.loading = false;
         state.has_history = true;
+        state.yt_state = YtState::Ready;
         // Populate sections (as App::open_home does) so the renderer takes
         // the render_compact path, which includes render_header → "ready".
         state.sections = vec![(

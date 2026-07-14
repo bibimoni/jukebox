@@ -57,9 +57,18 @@ pub fn render(f: &mut Frame, area: Rect, diag: &Diagnostics) {
     let body: Vec<Line> = if msgs.is_empty() {
         vec![Line::from(Span::styled("no diagnostics yet", dim))]
     } else {
-        msgs.iter()
+        // M-2: render newest-first so the latest error (the recovery
+        // guidance the user needs) is at the top and always visible —
+        // oldest-first clips the latest off-screen when the buffer has more
+        // messages than rows (especially at 80x24). A header note makes the
+        // order explicit.
+        let mut lines: Vec<Line> = msgs
+            .iter()
+            .rev()
             .map(|m| Line::from(Span::styled(m.clone(), dim)))
-            .collect()
+            .collect();
+        lines.insert(0, Line::from(Span::styled("(newest first)", dim)));
+        lines
     };
 
     f.render_widget(

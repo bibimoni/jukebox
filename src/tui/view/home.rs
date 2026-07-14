@@ -14,6 +14,7 @@ use crate::tui::view::icons::{Icon, IconRenderer};
 use crate::tui::view::theme::{
     bullet, ellipsis, em_dash, h_line, is_ascii, marker_glyph, play_glyph, sep_dot, Theme,
 };
+use crate::yt::state::YtState;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -231,6 +232,11 @@ pub struct HomeState {
     /// `open_home` runs; the renderer shows the welcome screen only when this
     /// is empty.
     pub sections: Vec<(HomeSection, Vec<HomeItem>)>,
+    /// The YouTube provider state captured at `populate_home_state` time so the
+    /// renderer can distinguish a signed-out Home (show a sign-in prompt) from a
+    /// cold-start Home with a live account (show the growth messaging). RB-2:
+    /// a signed-out account must never see "listen more to build your profile."
+    pub yt_state: YtState,
 }
 
 impl HomeState {
@@ -242,6 +248,7 @@ impl HomeState {
             loading: true,
             has_history: false,
             sections: Vec::new(),
+            yt_state: YtState::Unconfigured,
         }
     }
 
@@ -289,10 +296,18 @@ pub fn render_header(_area: Rect, state: &HomeState, icons: &IconRenderer) -> Ve
     ]);
     lines.push(title);
 
-    // Status line (loading / ready / offline).
+    // Status line (loading / ready / offline / signed out).
     let status = if state.loading {
         Span::styled(
             format!("loading{}", ellipsis()),
+            Style::default().fg(Color::Yellow),
+        )
+    } else if matches!(state.yt_state, YtState::Unconfigured | YtState::SignedOut) {
+        Span::styled(
+            format!(
+                "signed out {} run :yt auth browser <name> to connect",
+                em_dash()
+            ),
             Style::default().fg(Color::Yellow),
         )
     } else if state.has_history {
@@ -424,11 +439,13 @@ pub fn render_compact(
         current_line += 1;
 
         if items.is_empty() {
+            let msg = if matches!(state.yt_state, YtState::Unconfigured | YtState::SignedOut) {
+                "sign in to populate this section"
+            } else {
+                "no items — listen to music to build this section"
+            };
             lines.push(Line::from(Span::styled(
-                format!(
-                    "  (no items {} listen to music to build this section)",
-                    em_dash()
-                ),
+                format!("  (no items {} {})", em_dash(), msg),
                 Style::default().fg(Color::DarkGray),
             )));
             current_line += 1;
@@ -583,6 +600,40 @@ pub fn render_empty(icons: &IconRenderer) -> Paragraph<'static> {
                 "  New and Relevant {sd} Your YouTube Library {sd} Explore",
                 sd = sep_dot()
             ),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+}
+
+/// Render the signed-out Home (RB-2): a truthful sign-in prompt instead of the
+/// cold-start growth messaging. A signed-out account must never see "listen
+/// more to build your profile" as if it were a live account.
+pub fn render_signed_out(icons: &IconRenderer) -> Paragraph<'static> {
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{} YouTube Home", icons.glyph(Icon::Search)),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "You're signed out of YouTube.".to_string(),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from("Connect to see your library, mixes, and recommendations:"),
+        Line::from(format!(
+            "  {} Run :yt auth browser <chrome|firefox|safari> to sign in",
+            bullet()
+        )),
+        Line::from(format!("  {} Or paste cookies with :yt auth", bullet())),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Local music is fully functional while signed out.".to_string(),
             Style::default().fg(Color::DarkGray),
         )),
     ];

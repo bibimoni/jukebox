@@ -79,7 +79,16 @@ where
     false
 }
 
+/// Isolate `XDG_CONFIG_HOME` to a temp dir so `on_tick`'s `save_yt_lists()`
+/// can't leak fake playlist stubs into the user's real state.db.
+fn isolate_xdg() -> tempfile::TempDir {
+    let d = tempfile::tempdir().unwrap();
+    std::env::set_var("XDG_CONFIG_HOME", d.path());
+    d
+}
+
 fn local_cat() -> (tempfile::TempDir, jukebox::catalog::Catalog) {
+    let _xdg = isolate_xdg();
     let d = tempfile::tempdir().unwrap();
     let lossless = d.path().join("lossless");
     std::fs::create_dir_all(lossless.join("Adele")).unwrap();

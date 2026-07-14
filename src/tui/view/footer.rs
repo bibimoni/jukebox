@@ -26,7 +26,7 @@ pub fn render(f: &mut Frame, area: &ratatui::layout::Rect, app: &App) {
         let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(*area);
 
         // Line 1: YT status (or transient message, or blank when Ready).
-        let status = status_line(app, &theme);
+        let status = status_line(app, &theme, area.width);
         f.render_widget(
             Paragraph::new(status.alignment(Alignment::Left))
                 .block(Block::default().borders(Borders::NONE)),
@@ -114,10 +114,17 @@ fn mode_badge(app: &App, theme: &Theme) -> Span<'static> {
 /// visible — RC11-DEF-020) + YT provider status from `yt_state`. YT status is
 /// suppressed in pure Local mode (non-YouTube view) so unrelated provider
 /// errors don't alarm the user — only the compact `[Y …]` badge is shown.
-fn status_line(app: &App, theme: &Theme) -> Line<'static> {
+fn status_line(app: &App, theme: &Theme, width: u16) -> Line<'static> {
+    use crate::tui::view::theme::disp_width;
     use crate::yt::state::YtState;
     let badge = mode_badge(app, theme);
     let yt_badge = compact_yt_badge(app, theme);
+    // M-2: compute the message budget from the ACTUAL badge + yt_badge widths
+    // (not a hardcoded 57) so recovery guidance is not clipped to invisibility
+    // at 80x24. The overhead = badge + " " + yt_badge + " · " (separator).
+    let overhead =
+        disp_width(badge.content.as_ref()) + 1 + disp_width(yt_badge.content.as_ref()) + 3;
+    let budget = (width as usize).saturating_sub(overhead).max(10);
 
     // RC11-DEF-005: a status-bar toast (unknown command, ambiguous Tab) takes
     // precedence over everything else so command feedback is visible within
@@ -131,7 +138,6 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
         } else {
             theme.error_style()
         };
-        let budget = footer_msg_budget(app, msg);
         let m = truncate_footer_msg(msg, budget);
         return Line::from(vec![
             badge,
@@ -157,7 +163,6 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
         } else {
             theme.accent
         };
-        let budget = footer_msg_budget(app, msg);
         let m = truncate_footer_msg(msg, budget);
         return Line::from(vec![
             badge,
@@ -186,7 +191,6 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
         // DEF-003: show yt_error when Ready (e.g., "Unknown command: foobar").
         if let Some(err) = &app.yt_error {
             let err_style = theme.error_style();
-            let budget = footer_msg_budget(app, err);
             let m = truncate_footer_msg(err, budget);
             return Line::from(vec![
                 badge,
@@ -296,12 +300,16 @@ fn compact_yt_badge(app: &App, theme: &Theme) -> Span<'static> {
 /// reserving space for the mode badge, the compact YT badge, the separators,
 /// and a small margin. Used so long `yt_status` / `yt_error` strings get a
 /// clean `…` truncation instead of a mid-word cut at the terminal width
-/// (RC11-DEF-017). Sized for the 100-col standard test terminal: the mode
-/// badge (~28 chars) + YT badge (~7) + separators (~6) + margin (~2) leave 57
-/// chars for the message — enough for typical venv paths on macOS/Linux. At
-/// wider terminals the unused space is harmless (no truncation needed).
-fn footer_msg_budget(_app: &App, _msg: &str) -> usize {
-    57
+/// (RC11-DEF-017). M-2: the budget is now derived from the footer width so
+/// recovery guidance is NOT clipped to invisibility at 80x24 — the old
+/// hardcoded 57 was sized for a 100-col terminal and overflowed by ~20 cols
+/// at 80, clipping the end of the message (often the actionable part — "press
+/// R to retry"). The fixed overhead (badge + yt_badge + separators + margin)
+/// is ~40 cols; the rest is the message budget, clamped to a sane minimum.
+pub fn footer_msg_budget(width: u16, _msg: &str) -> usize {
+    const OVERHEAD: usize = 40;
+    let budget = (width as usize).saturating_sub(OVERHEAD);
+    budget.max(10)
 }
 
 /// Build the footer line: a YT provider status (from `yt_state`) when the
@@ -325,21 +333,21 @@ pub fn footer_line(app: &App, theme: &Theme, dim: &Style, width: u16) -> Line<'s
     // (including the hint bar) so command feedback is visible on the 1-row
     // narrow footer too, regardless of `yt_state`.
     if app.status_toast.is_some() {
-        return status_line(app, theme);
+        return status_line(app, theme, width);
     }
     // A transient yt_status (e.g. "Opening chrome — waiting for token…",
     // "YT setup OK · venv: …") is now shown by `status_line` regardless of
     // state (RC11-DEF-019 / RC11-DEF-017), so delegate to it whenever one is
     // set instead of falling through to the hint bar.
     if app.yt_status.is_some() {
-        return status_line(app, theme);
+        return status_line(app, theme, width);
     }
     // Ready + no transient: check yt_error first (DEF-003: unknown commands
     // set yt_error while yt_state stays Ready — the old footer only showed
     // yt_status/yt_state, never yt_error, so the user got no feedback).
     if app.yt_state == YtState::Ready {
         if app.yt_error.is_some() {
-            return status_line(app, theme);
+            return status_line(app, theme, width);
         }
         // Ready + no transient + no error: hint line, prefixed with the
         // compact YT indicator so it stays visible in the 1-row footer too
@@ -353,7 +361,7 @@ pub fn footer_line(app: &App, theme: &Theme, dim: &Style, width: u16) -> Line<'s
         return Line::from(spans);
     }
     // Non-Ready + no yt_status: state label (with the compact YT badge).
-    status_line(app, theme)
+    status_line(app, theme, width)
 }
 
 /// DEF-036: a description of the current async operation, if one is in

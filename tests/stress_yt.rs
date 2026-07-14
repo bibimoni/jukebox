@@ -84,7 +84,18 @@ fn local_cat() -> (tempfile::TempDir, jukebox::catalog::Catalog) {
     (d, jukebox::catalog::Catalog::load(&p).unwrap())
 }
 
+/// Isolate `XDG_CONFIG_HOME` to a temp dir so `on_tick`'s `save_yt_lists()`
+/// (which writes to `state::db_path()`) can't leak fake `PL1`–`PL5` stubs
+/// into the user's real `~/Library/Application Support/jukebox/state.db`.
+/// Must be called before `App::new` / `on_tick` in every test here.
+fn isolate_xdg() -> tempfile::TempDir {
+    let d = tempfile::tempdir().unwrap();
+    std::env::set_var("XDG_CONFIG_HOME", d.path());
+    d
+}
+
 fn yt_app(script: &std::path::Path) -> App {
+    let _xdg = isolate_xdg();
     let session = Session::spawn(std::path::Path::new("python3"), script, None).unwrap();
     let (_d, cat) = local_cat();
     let mut app = App::new(
@@ -543,6 +554,82 @@ fn rapid_switch_all_five_should_load() {
             i + 1
         );
     }
+
+    let _ = std::fs::remove_file(&script);
+}
+
+/// Regression: a playlist id that the sidecar errors on (e.g. a poisoned
+/// cache of fake "PL1" stubs) must NOT cause on_tick to re-fetch every tick
+/// forever (the 72k-loop / 3.6MB-log bug). After the error lands, the id is
+/// added to `failed_playlists` and subsequent on_tick calls skip it.
+#[test]
+fn failed_playlist_does_not_refetch_every_tick() {
+    let script = std::env::temp_dir().join(format!(
+        "fail-pl-{}-{}.py",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut f = std::fs::File::create(&script).unwrap();
+    write!(
+        f,
+        r#"import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: req = json.loads(line)
+    except Exception: continue
+    cmd = req.get("cmd")
+    if cmd == "ping":
+        print(json.dumps({{"ok": True, "data": {{"pong": True}}}}), flush=True)
+        continue
+    if cmd == "auth_status":
+        print(json.dumps({{"ok": True, "data": {{"auth": {{"ok": True, "premium": False, "account": False, "valid": True, "expired": False, "reason": None}}}}}}), flush=True)
+        continue
+    if cmd == "get_playlist":
+        print(json.dumps({{"ok": False, "error": "Unable to find contents - not a real playlist id"}}), flush=True)
+        continue
+"#
+    )
+    .unwrap();
+    writeln!(f).unwrap();
+    let mut app = yt_app(&script);
+    app.yt_lists = vec![YtList {
+        id: "PLFAKE".into(),
+        name: "Fake".into(),
+        kind: YtListKind::Account,
+        track_ids: Vec::new(),
+    }];
+    app.cursors.playlist = 0;
+    app.loaded_yt_lists.clear();
+
+    // First on_tick fires get_playlist("PLFAKE").
+    app.on_tick();
+    // Let the error response land.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    app.on_tick();
+    // After the error: PLFAKE must be in failed_playlists.
+    assert!(
+        app.yt_session
+            .as_ref()
+            .map(|s| s.failed_playlists.contains("PLFAKE"))
+            .unwrap_or(false),
+        "PLFAKE should be in failed_playlists after get_playlist error"
+    );
+
+    // Run 20 more on_tick calls — NONE should re-send (the infinite-loop bug).
+    for _ in 0..20 {
+        app.on_tick();
+    }
+    assert!(
+        !app.yt_session
+            .as_ref()
+            .map(|s| s.playlist_loading("PLFAKE"))
+            .unwrap_or(false),
+        "failed playlist must NOT be re-fetched every tick (infinite-loop regression)"
+    );
 
     let _ = std::fs::remove_file(&script);
 }

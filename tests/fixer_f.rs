@@ -274,8 +274,10 @@ fn def058_request_lyrics_sets_loading_before_async_fetch() {
         gen: app.lyrics_gen,
     });
 
-    // A local track (t1) with no sidecar → request_lyrics sets Loading then
-    // NotFound synchronously. We verify the gen bumps (the request fired).
+    // A local track (t1) with no sidecar → request_lyrics sets Loading and
+    // queues the disk read for on_tick (so the user sees a Loading transition
+    // before the truthful NotFound). We verify the gen bumps (the request fired)
+    // and that Loading is visible before on_tick resolves to NotFound.
     let before_gen = app.lyrics_gen;
     app.request_lyrics("t1");
     assert_eq!(
@@ -283,7 +285,19 @@ fn def058_request_lyrics_sets_loading_before_async_fetch() {
         before_gen.wrapping_add(1),
         "request_lyrics must bump lyrics_gen"
     );
-    // Local track with no lyrics → NotFound (truthful).
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Lyrics {
+                state: LyricsState::Loading,
+                ref track_id,
+                ..
+            }) if track_id == "t1"
+        ),
+        "local track lyrics must show a Loading transition before resolving"
+    );
+    // on_tick processes the deferred local read → NotFound (no lyrics for this fixture).
+    app.on_tick();
     assert!(
         matches!(
             app.overlay,
@@ -293,6 +307,6 @@ fn def058_request_lyrics_sets_loading_before_async_fetch() {
                 ..
             }) if track_id == "t1"
         ),
-        "local track with no sidecar must end in NotFound"
+        "local track with no sidecar must end in NotFound after on_tick"
     );
 }

@@ -24,7 +24,22 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Play => {
             let cfg = cli::ensure_config()?;
-            let cat = catalog::Catalog::load(&cfg.filtered_dir.join("catalog.json"))?;
+            let cat_path = cfg.filtered_dir.join("catalog.json");
+            // A missing/empty catalog means the user hasn't run `jukebox sync`
+            // yet (or the last sync indexed 0 tracks). Surface a clear recovery
+            // hint and exit gracefully instead of launching the TUI into a
+            // mid-playback "file not found" state.
+            let cat = match catalog::Catalog::load_for_playback(&cat_path)? {
+                Some(c) => c,
+                None => {
+                    eprintln!(
+                        "No playable catalog found at {}.\n\
+                         Run `jukebox sync` first to index your library, then `jukebox`.",
+                        cat_path.display()
+                    );
+                    return Ok(());
+                }
+            };
             // The search index may not exist yet on a fresh install (the user
             // hasn't run `jukebox sync`); treat that as "no search" rather than
             // blocking playback.
@@ -338,9 +353,16 @@ fn main() -> anyhow::Result<()> {
                 ])
                 .status()?;
             if !status.success() {
-                anyhow::bail!("standardize.sh failed");
+                anyhow::bail!(
+                    "standardize.sh failed — see output above; run `jukebox sync` \
+                     again once the source dir has playable .flac files"
+                );
             }
             let cat = catalog::Catalog::load(&cfg.filtered_dir.join("catalog.json"))?;
+            // Defense in depth: standardize.sh exits non-zero on 0 tracks, but a
+            // stale empty catalog (e.g. from a pre-fix sync) must not be reported
+            // as "synced: 0 tracks" success.
+            cat.require_tracks()?;
             search::build_index(&cat, &cfg.filtered_dir.join("search-index"))?;
             println!("synced: {} tracks", cat.tracks.len());
         }

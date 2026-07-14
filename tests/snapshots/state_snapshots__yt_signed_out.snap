@@ -1,28 +1,29 @@
 ---
 source: tests/state_snapshots.rs
+assertion_line: 88
 expression: s
 ---
 VIEWS                      │1:Home │ 2:Library │ 3:Search │ 4:Discover │ 5:Radio                             YouTube [!]
-›   1 Artists              │⌕ YouTube Home
-›   2 Playlists            │cold start — listening to music builds your profile
+›   1 Artists              │
+›   2 Playlists            │                                       ⌕ YouTube Home
 ›   3 Queue                │
-›   4 YouTube              │── Quick Picks ──
-────────────────────────   │Tracks based on your recent listening
-DISCOVER                   │▸ ♫ Song1 — 40mP
-♫   H Home                 │♫ Ghost Rule — DECO*27
-✦   S Discover             │
-◎ :radio Radio             │── Made for You ──
-◆ :gen Generator           │Generated mixes tailored to your taste
-────────────────────────   │✨  Daily Mix — Tracks clustered by your recent listening, refreshed daily
-TOOLS                      │✨  Discover Mix — Taste-adjacent music you haven't heard
-/   / Search               │✨  Local + YouTube Blend — A blend of your local library and YouTube
+›   4 YouTube              │                                You're signed out of YouTube.
+────────────────────────   │
+DISCOVER                   │                  Connect to see your library, mixes, and recommendations:
+♫   H Home                 │                  • Run :yt auth browser <chrome|firefox|safari> to sign in
+✦   S Discover             │                              • Or paste cookies with :yt auth
+◎ :radio Radio             │
+◆ :gen Generator           │                      Local music is fully functional while signed out.
+────────────────────────   │
+TOOLS                      │
+/   / Search               │
 !   D Diagnostics          │
-?   ? Help                 │── Start Radio ──
-                           │Start a radio session from any seed
-                           │◎ Track Radio — start a radio session
-                           │◎ Artist Radio — start a radio session
+?   ? Help                 │
                            │
-                           │                j/k navigate · Tab sections · Enter play · ? help · Esc close
+                           │
+                           │
+                           │
+                           │
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 [STOPPED] ■ — nothing playing —  --:-- / --:--  ▸ Enter to play  --  PREF local · YT… · CONT off · SHUF off · RPT off
 VIEW: youtube · SOURCE: local [Y —] · [!] YT: signed out — run :yt auth to reconnect

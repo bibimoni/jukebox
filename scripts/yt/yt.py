@@ -11,20 +11,23 @@ import sys
 import os
 import json
 import time
-import atexit
 
 # Process-lifetime cache for the browser cookie read. On macOS, reading the
 # browser cookie store triggers a Keychain password prompt (Chromium browsers
 # encrypt cookies with a Keychain key). We read ONCE and cache both the jar
-# (for the ytmusicapi Cookie header) and a derived cookies.txt (for yt-dlp),
-# so the single prompt happens at first use — not on every resolve_url (play).
+# (for the ytmusicapi Cookie header) and the Netscape content string (for a
+# short-lived yt-dlp cookiefile), so the single prompt happens at first use —
+# not on every resolve_url (play).
 _BC3_JAR = None        # http.cookiejar.CookieJar, or None if not yet/unreadable
 _BC3_JAR_ERR = None    # str error if the read failed (no retry)
-_BC3_FILE = None       # str path to the written cookies.txt, "" if failed
-
-# Cache for the pasted-cookies temp file so we only create one and clean it up
-# on exit instead of leaking a new /tmp file per resolve_url call.
-_PASTED_COOKIE_FILE = None
+# Persistent cookies.txt path once written (0600), or None if not yet written.
+# When JUKEBOX_YT_COOKIES_FILE is set the decrypted jar is written there ONCE
+# and reused across calls; the next app launch loads it without re-reading the
+# Keychain. When no persistent path is set, _browser_cookies_file returns the
+# content and the caller writes a short-lived temp file (0600) per resolve_url,
+# unlinking it immediately after yt-dlp reads it — no long-lived temp cookie
+# file can leak on SIGKILL/crash (defense-in-depth).
+_BC3_FILE = None
 
 
 def _have_deps():
@@ -37,24 +40,15 @@ def _have_deps():
 
 
 def _cookie_pair():
-    """Return (Cookie header str, temp cookies.txt path) from the env, or
-    (None, None) when no cookies are set. The temp file is created once and
-    cached for the process lifetime; it's cleaned up on exit via atexit."""
-    global _PASTED_COOKIE_FILE
+    """Return (Cookie header str, Netscape cookies.txt content) from the env,
+    or (None, None) when no cookies are set. The content is the raw env value
+    (Netscape format); the caller writes it to a short-lived 0600 temp file
+    for yt-dlp and unlinks it immediately after use, so no cookie file
+    persists beyond a single resolve_url call (defense-in-depth: a
+    SIGKILL/crash can't leak a long-lived temp cookie file)."""
     raw = os.environ.get("JUKEBOX_YT_COOKIES", "")
     if not raw:
         return None, None
-    # Reuse the cached temp file if we already created one.
-    if _PASTED_COOKIE_FILE is not None:
-        # Re-read the header from the cached file (the raw env is still available).
-        parts = []
-        for line in raw.splitlines():
-            if not line or line.startswith("#"):
-                continue
-            f = line.split("\t")
-            if len(f) >= 7:
-                parts.append(f"{f[5]}={f[6]}")
-        return "; ".join(parts) if parts else None, _PASTED_COOKIE_FILE
     parts = []
     for line in raw.splitlines():
         if not line or line.startswith("#"):
@@ -64,24 +58,7 @@ def _cookie_pair():
             parts.append(f"{f[5]}={f[6]}")
     if not parts:
         return None, None
-    import tempfile
-    tmp = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
-    tmp.write(raw)
-    tmp.close()
-    _PASTED_COOKIE_FILE = tmp.name
-    atexit.register(_cleanup_pasted_cookie)
-    return "; ".join(parts), tmp.name
-
-
-def _cleanup_pasted_cookie():
-    """Remove the pasted-cookies temp file on exit (atexit handler)."""
-    global _PASTED_COOKIE_FILE
-    if _PASTED_COOKIE_FILE:
-        try:
-            os.unlink(_PASTED_COOKIE_FILE)
-        except OSError:
-            pass
-        _PASTED_COOKIE_FILE = None
+    return "; ".join(parts), raw
 
 
 def _browser_name():
@@ -150,50 +127,20 @@ def _browser_cookie_header():
     return "; ".join(parts) if parts else None
 
 
-def _browser_cookies_file():
-    """Write the cached browser cookie jar to a Netscape cookies.txt ONCE and
-    return the path (cached for the process lifetime). yt-dlp uses this as
-    `cookiefile` instead of `cookiesfrombrowser`, so it never re-reads the
-    Keychain on each resolve_url — the single Keychain prompt happens on the
-    first call, then plays are silent.
-
-    If JUKEBOX_YT_COOKIES_FILE is set, write to that PERSISTENT path (0600)
-    instead of a temp file, so the next app launch can load the decrypted
-    cookies WITHOUT re-reading the Keychain (the Rust side passes our config
-    `cookies_file()`). The single Keychain prompt then happens only on the
-    explicit `:yt auth browser` command, not every launch.
-
-    Returns None if no browser / read failed.
-    """
-    global _BC3_FILE
-    if _BC3_FILE is not None:
-        return _BC3_FILE if _BC3_FILE != "" else None
-    cj, err = _browser_cookie_jar()
-    if not cj:
-        _BC3_FILE = ""  # sentinel: tried and failed → None to callers, no retry
-        return None
-    out_path = os.environ.get("JUKEBOX_YT_COOKIES_FILE", "").strip()
-    if out_path:
-        # Persistent (used by `:yt auth browser` so the next launch is
-        # prompt-free). 0600 — these are decrypted long-lived auth cookies.
-        import os as _os
-        _os.makedirs(_os.path.dirname(out_path) or ".", exist_ok=True)
-        tf = open(out_path, "w")
-    else:
-        import tempfile
-        tf = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
-    # Netscape cookies.txt header.
-    tf.write("# Netscape HTTP Cookie File\n")
+def _netscape_cookie_content(cj):
+    """Build the Netscape cookies.txt content string from a CookieJar,
+    filtered to youtube.com / google.com domains. Shared by the persistent
+    path (written once to JUKEBOX_YT_COOKIES_FILE) and the per-call temp file
+    (written + unlinked per resolve_url)."""
+    lines = ["# Netscape HTTP Cookie File\n"]
     for c in cj:
-        # http.cookiejar.Cookie attributes: domain, path, secure, expires, name, value.
         d = (c.domain or "").lower()
         if "youtube.com" not in d and "google.com" not in d:
             continue
         flag = "TRUE" if (c.domain or "").startswith(".") else "FALSE"
         secure = "TRUE" if c.secure else "FALSE"
         expires = str(int(c.expires)) if c.expires else "0"
-        # domain | flag | path | secure | expiration | name | value
-        tf.write("\t".join([
+        lines.append("\t".join([
             c.domain or "",
             flag,
             c.path or "/",
@@ -202,18 +149,57 @@ def _browser_cookies_file():
             c.name or "",
             c.value or "",
         ]) + "\n")
-    tf.close()
+    return "".join(lines)
+
+
+def _write_cookie_temp(content):
+    """Write `content` to a fresh 0600 temp file and return its path. The
+    caller MUST unlink it (via _cleanup_temp) as soon as yt-dlp has read it —
+    the file exists only for the duration of a single resolve_url call so a
+    SIGKILL/crash can't leak a long-lived decrypted cookie file to /tmp
+    (defense-in-depth; the previous atexit-only cleanup didn't fire on
+    SIGKILL)."""
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
+    os.chmod(path, 0o600)
+    return path
+
+
+def _browser_cookies_file():
+    """Return (persistent_path, netscape_content) for the cached browser
+    cookie jar. When JUKEBOX_YT_COOKIES_FILE is set, writes the jar to that
+    PERSISTENT 0600 path (once; cached) and returns (path, None) — the path
+    is reused across calls and loaded by the next app launch without
+    re-reading the Keychain. When no persistent path is set, returns
+    (None, content) — the caller writes content to a short-lived 0600 temp
+    file for yt-dlp and unlinks it immediately after use, so no decrypted
+    cookie file persists beyond a single resolve_url call (defense-in-depth
+    against SIGKILL/crash leaving a temp file in /tmp).
+
+    Returns (None, None) if no browser / read failed.
+    """
+    global _BC3_FILE
+    cj, _err = _browser_cookie_jar()
+    if not cj:
+        return None, None
+    out_path = os.environ.get("JUKEBOX_YT_COOKIES_FILE", "").strip()
     if out_path:
-        try:
-            os.chmod(out_path, 0o600)
-        except OSError:
-            pass
-    else:
-        # Temp path (no JUKEBOX_YT_COOKIES_FILE): clean it up on exit so we
-        # don't leak decrypted cookies to /tmp for the sidecar's lifetime.
-        atexit.register(_cleanup_temp, tf.name)
-    _BC3_FILE = out_path if out_path else tf.name
-    return _BC3_FILE
+        # Persistent path: write ONCE (cached via _BC3_FILE), then reuse.
+        if _BC3_FILE != out_path:
+            import os as _os
+            _os.makedirs(_os.path.dirname(out_path) or ".", exist_ok=True)
+            with open(out_path, "w") as tf:
+                tf.write(_netscape_cookie_content(cj))
+            try:
+                os.chmod(out_path, 0o600)
+            except OSError:
+                pass
+            _BC3_FILE = out_path
+        return out_path, None
+    # No persistent path: return the content for a short-lived temp file.
+    return None, _netscape_cookie_content(cj)
 
 
 def _track(d):
@@ -320,13 +306,21 @@ def _yt():
         _json.dump(headers, tf)
         tf.close()
         ytm = ytmusicapi.YTMusic(tf.name)
-        atexit.register(_cleanup_temp, tf.name)
+        # Unlink the headers temp file immediately — ytmusicapi reads it once
+        # at construction and holds the parsed headers in memory. Defense in
+        # depth: no auth file (Cookie + authorization) lingers in /tmp to leak
+        # on SIGKILL/crash.
+        try:
+            os.unlink(tf.name)
+        except OSError:
+            pass
         return ytm
     return ytmusicapi.YTMusic()  # guest
 
 
 def _cleanup_temp(path):
-    """Remove a temp file on exit (atexit handler)."""
+    """Remove a temp file (called from a finally block after yt-dlp has
+    read the cookie file). Best-effort: a missing file is not an error."""
     try:
         os.unlink(path)
     except OSError:
@@ -501,110 +495,130 @@ def handle(cmd, arg, ytm):
             ]
         authed = False
         cookiefile = None
+        # Short-lived temp cookie file (0600), unlinked in the finally below so
+        # the file exists only during yt-dlp's read — defense-in-depth against
+        # a SIGKILL/crash leaving a decrypted cookie file in /tmp (the old
+        # atexit-only cleanup didn't fire on SIGKILL). None when the persistent
+        # path is used (browser cookies file already written) or no cookies.
+        cookie_temp = None
         if _browser_name():
             # Use the cached cookies.txt (read once from the browser profile,
             # not per-play) so the macOS Keychain prompt happens at most once
             # per sidecar lifetime, not on every resolve_url. BOTH tiers go
-            # through this same cached read — never a second cookie read (which
-            # would re-prompt the Keychain).
-            f = _browser_cookies_file()
-            if f:
-                cookiefile = f
+            # through this same cached read — never a second cookie read
+            # (which would re-prompt the Keychain).
+            fpath, fcontent = _browser_cookies_file()
+            if fpath:
+                cookiefile = fpath
+                authed = True
+            elif fcontent is not None:
+                cookiefile = _write_cookie_temp(fcontent)
+                cookie_temp = cookiefile
                 authed = True
         else:
-            _, cookies_path = _cookie_pair()
-            if cookies_path:
-                cookiefile = cookies_path
+            _, cookies_content = _cookie_pair()
+            if cookies_content:
+                cookiefile = _write_cookie_temp(cookies_content)
+                cookie_temp = cookiefile
                 authed = True
 
-        vid = arg.get("video_id", "")
-        info = None
-        last_err = None
-        for yt_args in client_sets:
-            opts = {
-                # Permissive: AAC preferred, else any audio (opus/m4a), else best.
-                # Don't restrict to acodec^=mp4a only — opus is fine for audio.
-                "format": "bestaudio[acodec^=mp4a]/bestaudio/m4a/bestaudio/best",
-                "quiet": True,
-                "noplaylist": True,
-                "extractor_args": {"youtube": yt_args},
-            }
-            if cookiefile:
-                opts["cookiefile"] = cookiefile
-            try:
-                info = _extract_with_retry(
-                    opts, f"https://www.youtube.com/watch?v={vid}"
-                )
-                # Confirm we got at least one AUDIO format; else keep trying
-                # other client sets (some return only video on a given video).
-                fmts = info.get("formats") or [info]
-                if any((f.get("acodec") or "") != "none" and f.get("vcodec") in (None, "none") for f in fmts):
-                    break  # got audio
-                # info may itself be an audio-only format (single, no list).
-                if (info.get("acodec") or "") != "none" and info.get("vcodec") in (None, "none"):
-                    break
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                info = None
-                continue
-        if info is None:
-            msg = str(last_err) if last_err else "no audio formats available for this video"
-            # Strip the noisy yt-dlp prefix the user can't act on.
-            if "Requested format is not available" in msg:
-                msg = "YouTube returned no playable audio for this video (try another track, or it may be region/age-restricted)"
-            elif last_err is not None and _is_transient(last_err):
-                # Already retried inside _extract_with_retry and still failed
-                # across every client_set — a real network block, not a :yt
-                # setup issue. Say so plainly (mirrors the init-path message).
-                msg = (
-                    f"can't reach YouTube to resolve this track ({last_err}) — "
-                    "likely a network block, VPN/proxy, or YouTube rate-limiting "
-                    "this IP. Check your connection / VPN; retry in a moment; "
-                    "this is not fixed by :yt setup."
-                )
-            raise RuntimeError(msg)
+        try:
+            vid = arg.get("video_id", "")
+            info = None
+            last_err = None
+            for yt_args in client_sets:
+                opts = {
+                    # Permissive: AAC preferred, else any audio (opus/m4a), else best.
+                    # Don't restrict to acodec^=mp4a only — opus is fine for audio.
+                    "format": "bestaudio[acodec^=mp4a]/bestaudio/m4a/bestaudio/best",
+                    "quiet": True,
+                    "noplaylist": True,
+                    "extractor_args": {"youtube": yt_args},
+                }
+                if cookiefile:
+                    opts["cookiefile"] = cookiefile
+                try:
+                    info = _extract_with_retry(
+                        opts, f"https://www.youtube.com/watch?v={vid}"
+                    )
+                    # Confirm we got at least one AUDIO format; else keep trying
+                    # other client sets (some return only video on a given video).
+                    fmts = info.get("formats") or [info]
+                    if any((f.get("acodec") or "") != "none" and f.get("vcodec") in (None, "none") for f in fmts):
+                        break  # got audio
+                    # info may itself be an audio-only format (single, no list).
+                    if (info.get("acodec") or "") != "none" and info.get("vcodec") in (None, "none"):
+                        break
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
+                    info = None
+                    continue
+            if info is None:
+                msg = str(last_err) if last_err else "no audio formats available for this video"
+                # Strip the noisy yt-dlp prefix the user can't act on.
+                if "Requested format is not available" in msg:
+                    msg = "YouTube returned no playable audio for this video (try another track, or it may be region/age-restricted)"
+                elif last_err is not None and _is_transient(last_err):
+                    # Already retried inside _extract_with_retry and still failed
+                    # across every client_set — a real network block, not a :yt
+                    # setup issue. Say so plainly (mirrors the init-path message).
+                    msg = (
+                        f"can't reach YouTube to resolve this track ({last_err}) — "
+                        "likely a network block, VPN/proxy, or YouTube rate-limiting "
+                        "this IP. Check your connection / VPN; retry in a moment; "
+                        "this is not fixed by :yt setup."
+                    )
+                raise RuntimeError(msg)
 
-        fmts = info.get("formats") or [info]
-        # AUDIO-only formats only: vcodec is none/None and acodec is not none.
-        audio = [f for f in fmts if (f.get("vcodec") in (None, "none")) and (f.get("acodec") or "none") != "none"]
-        if not audio:
-            # info itself might be the audio format (single-format result).
-            audio = [info] if (info.get("vcodec") in (None, "none") and (info.get("acodec") or "none") != "none") else []
-        if not audio:
-            raise RuntimeError("no audio-only formats available for this video")
-        # Prefer AAC (mp4a) for best mpv compatibility, then opus, then anything;
-        # within a codec prefer higher abr (fall back to tbr / a heuristic).
-        def _rank(f):
-            codec = (f.get("acodec") or "").lower()
-            codec_pref = 2 if codec.startswith("mp4a") or codec.startswith("aac") else (1 if codec.startswith("opus") else 0)
-            br = f.get("abr") or f.get("tbr") or 0
-            return (codec_pref, br)
-        best = max(audio, key=_rank) if audio else info
-        abr = int(best.get("abr") or best.get("tbr") or 0)
-        # acodec is like "mp4a.40.5" (AAC), "opus", "vorbis". Map to a friendly
-        # codec name; fall back to the raw acodec.
-        acodec = (best.get("acodec") or "").lower()
-        if acodec.startswith("mp4a") or acodec.startswith("aac"):
-            codec = "AAC"
-        elif acodec.startswith("opus"):
-            codec = "Opus"
-        elif acodec:
-            codec = acodec.split(".")[0].upper()
-        else:
-            codec = "AAC"
-        # `premium` is quality-aware: only the premium tier can reach itag 141
-        # (AAC 256k). The fast tier always reports False (it caps at 129k even
-        # for a Premium account, since itag 141 isn't offered to tv_embedded).
-        is_premium = (quality == "premium") and authed and abr >= 256
-        return {"resolve": {
-            "url": best.get("url") or info.get("url", ""),
-            "expires_at": None,
-            "codec": codec,
-            "abr": abr,
-            "sample_rate": int(best.get("asr") or 48000),
-            "container": best.get("ext", "m4a"),
-            "premium": is_premium,
-        }}
+            fmts = info.get("formats") or [info]
+            # AUDIO-only formats only: vcodec is none/None and acodec is not none.
+            audio = [f for f in fmts if (f.get("vcodec") in (None, "none")) and (f.get("acodec") or "none") != "none"]
+            if not audio:
+                # info itself might be the audio format (single-format result).
+                audio = [info] if (info.get("vcodec") in (None, "none") and (info.get("acodec") or "none") != "none") else []
+            if not audio:
+                raise RuntimeError("no audio-only formats available for this video")
+            # Prefer AAC (mp4a) for best mpv compatibility, then opus, then anything;
+            # within a codec prefer higher abr (fall back to tbr / a heuristic).
+            def _rank(f):
+                codec = (f.get("acodec") or "").lower()
+                codec_pref = 2 if codec.startswith("mp4a") or codec.startswith("aac") else (1 if codec.startswith("opus") else 0)
+                br = f.get("abr") or f.get("tbr") or 0
+                return (codec_pref, br)
+            best = max(audio, key=_rank) if audio else info
+            abr = int(best.get("abr") or best.get("tbr") or 0)
+            # acodec is like "mp4a.40.5" (AAC), "opus", "vorbis". Map to a friendly
+            # codec name; fall back to the raw acodec.
+            acodec = (best.get("acodec") or "").lower()
+            if acodec.startswith("mp4a") or acodec.startswith("aac"):
+                codec = "AAC"
+            elif acodec.startswith("opus"):
+                codec = "Opus"
+            elif acodec:
+                codec = acodec.split(".")[0].upper()
+            else:
+                codec = "AAC"
+            # `premium` is quality-aware: only the premium tier can reach itag 141
+            # (AAC 256k). The fast tier always reports False (it caps at 129k even
+            # for a Premium account, since itag 141 isn't offered to tv_embedded).
+            is_premium = (quality == "premium") and authed and abr >= 256
+            return {"resolve": {
+                "url": best.get("url") or info.get("url", ""),
+                "expires_at": None,
+                "codec": codec,
+                "abr": abr,
+                "sample_rate": int(best.get("asr") or 48000),
+                "container": best.get("ext", "m4a"),
+                "premium": is_premium,
+            }}
+        finally:
+            # Unlink the short-lived temp cookie file as soon as yt-dlp has
+            # read it (the resolve loop above is the only reader). The file
+            # existed only for this call — no long-lived temp cookie file can
+            # leak to /tmp on SIGKILL/crash (defense-in-depth). No-op when the
+            # persistent path was used (cookie_temp is None).
+            if cookie_temp is not None:
+                _cleanup_temp(cookie_temp)
     if cmd == "get_lyrics":
         # Two-step ytmusicapi flow (research: ytmusicapi-research.md §1):
         #   1. get_watch_playlist(videoId, radio=False) → lyrics browseId

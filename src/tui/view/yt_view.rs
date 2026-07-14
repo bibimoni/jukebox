@@ -373,7 +373,15 @@ pub fn render_yt_library(f: &mut Frame, area: Rect, app: &mut App) {
 /// idempotent — after the first call `sections` is non-empty, so subsequent
 /// frames skip it. No overlay is set (the tab is the visible surface).
 pub fn render_yt_home(f: &mut Frame, area: Rect, app: &mut App) {
+    use crate::yt::state::YtState;
     let icons = IconRenderer::auto();
+    // RB-2: a signed-out account shows a sign-in prompt, not the cold-start
+    // growth messaging ("listen more to build your profile").
+    if matches!(app.yt_state, YtState::Unconfigured | YtState::SignedOut) {
+        let p = home::render_signed_out(&icons);
+        f.render_widget(p, area);
+        return;
+    }
     // RC19-D2: populate sections on first entry so the Home tab shows real
     // content instead of the welcome screen. `populate_home_state` doesn't
     // set the overlay (so no popup paints over the tab). After the first
@@ -468,55 +476,87 @@ pub fn render_yt_search(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(input_line, rows[0]);
 
     // Status/hint line.
-    let status: Line = if searching {
-        Line::from(Span::styled(
-            format!(
-                "searching{} Tab {} local {} Esc cancel",
-                ellipsis(),
-                sep_dot(),
-                sep_dot()
-            ),
-            dim,
-        ))
-    } else if input.trim().is_empty() {
-        Line::from(Span::styled(
-            format!(
-                "type a query, then Enter to search {} Tab {} local",
-                sep_dot(),
-                sep_dot()
-            ),
-            dim,
-        ))
-    } else if results.is_empty() && submitted.as_deref() == Some(input.as_str()) {
-        Line::from(Span::styled(
-            format!(
-                "No results for '{input}' {} Tab {} local",
-                sep_dot(),
-                sep_dot()
-            ),
-            dim,
-        ))
-    } else if !results.is_empty() {
-        Line::from(Span::styled(
-            format!(
-                "{} result{} {} Enter plays {} Tab {} local",
-                results.len(),
-                if results.len() == 1 { "" } else { "s" },
-                sep_dot(),
-                sep_dot(),
-                sep_dot()
-            ),
-            dim,
-        ))
-    } else {
-        Line::from(Span::styled(
-            format!(
-                "Enter to search YouTube {} Tab {} local",
-                sep_dot(),
-                sep_dot()
-            ),
-            dim,
-        ))
+    let status: Line = {
+        use crate::yt::state::YtState;
+        // RB-2: distinguish "search succeeded, zero matches" from "search
+        // failed/offline." When the provider is down, show the truthful provider
+        // state, not "No results" as if the search ran and was empty.
+        let provider_down = app.yt_state.is_error()
+            || matches!(
+                app.yt_state,
+                YtState::Unconfigured | YtState::SignedOut | YtState::Failed
+            );
+        let provider_msg = match app.yt_state {
+            YtState::Unconfigured | YtState::SignedOut => {
+                "YouTube not connected — :yt auth browser <name>".to_string()
+            }
+            YtState::AuthExpired => "authorization expired — :yt auth browser <name>".to_string(),
+            YtState::RateLimited => "rate limited — wait, then press R".to_string(),
+            YtState::Failed => "YouTube failed — run :yt setup".to_string(),
+            _ => "YouTube offline — press R to retry".to_string(),
+        };
+        if searching && provider_down {
+            Line::from(Span::styled(
+                format!("{provider_msg} {} Tab {} local", sep_dot(), sep_dot()),
+                dim,
+            ))
+        } else if searching {
+            Line::from(Span::styled(
+                format!(
+                    "searching{} Tab {} local {} Esc cancel",
+                    ellipsis(),
+                    sep_dot(),
+                    sep_dot()
+                ),
+                dim,
+            ))
+        } else if input.trim().is_empty() {
+            Line::from(Span::styled(
+                format!(
+                    "type a query, then Enter to search {} Tab {} local",
+                    sep_dot(),
+                    sep_dot()
+                ),
+                dim,
+            ))
+        } else if results.is_empty() && submitted.as_deref() == Some(input.as_str()) {
+            if provider_down {
+                Line::from(Span::styled(
+                    format!("{provider_msg} {} Tab {} local", sep_dot(), sep_dot()),
+                    dim,
+                ))
+            } else {
+                Line::from(Span::styled(
+                    format!(
+                        "No results for '{input}' {} Tab {} local",
+                        sep_dot(),
+                        sep_dot()
+                    ),
+                    dim,
+                ))
+            }
+        } else if !results.is_empty() {
+            Line::from(Span::styled(
+                format!(
+                    "{} result{} {} Enter plays {} Tab {} local",
+                    results.len(),
+                    if results.len() == 1 { "" } else { "s" },
+                    sep_dot(),
+                    sep_dot(),
+                    sep_dot()
+                ),
+                dim,
+            ))
+        } else {
+            Line::from(Span::styled(
+                format!(
+                    "Enter to search YouTube {} Tab {} local",
+                    sep_dot(),
+                    sep_dot()
+                ),
+                dim,
+            ))
+        }
     };
     let _ = scope;
     f.render_widget(status, rows[1]);
@@ -1057,9 +1097,11 @@ mod tests {
     /// even with a populated catalog + connected YouTube sidecar.
     #[test]
     fn rc19_d2_yt_home_tab_shows_sections_not_welcome() {
+        use crate::yt::state::YtState;
         let mut app = one_track_app();
         app.view = View::Youtube;
         app.yt_view.tab = YtTab::Home;
+        app.yt_state = YtState::Ready;
         // Default HomeState: not loading, empty sections → welcome screen
         // would render before the fix.
         assert!(app.yt_view.home.sections.is_empty());
@@ -1095,9 +1137,11 @@ mod tests {
     /// sets the overlay for the `H` key path).
     #[test]
     fn rc19_d2_yt_home_tab_populate_is_idempotent_no_overlay() {
+        use crate::yt::state::YtState;
         let mut app = one_track_app();
         app.view = View::Youtube;
         app.yt_view.tab = YtTab::Home;
+        app.yt_state = YtState::Ready;
         assert!(app.overlay.is_none(), "no overlay before first render");
         // First render populates sections.
         let _ = yt_view_text(&mut app, 100, 30);

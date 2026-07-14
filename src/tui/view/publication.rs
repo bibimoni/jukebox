@@ -54,6 +54,10 @@ pub struct PublicationState {
     /// The last validation error message (shown until the user edits
     /// something). Cleared on the next keypress that changes state.
     pub error: Option<String>,
+    /// Vertical scroll offset for the publication content (M-1: at 80x24 the
+    /// content overflows the popup; PgUp/PgDn scrolls so the account +
+    /// publish/cancel controls stay reachable on small terminals).
+    pub scroll: u16,
 }
 
 impl PublicationState {
@@ -73,6 +77,7 @@ impl PublicationState {
             step: 0,
             field: PubField::Name,
             error: None,
+            scroll: 0,
         }
     }
 
@@ -141,7 +146,10 @@ pub fn render(_area: Rect, state: &PublicationState, icons: &IconRenderer) -> Pa
         // `publishable_titles` is populated by `App::open_publication` from
         // the catalog or the YT session's track_cache. Falls back to the raw
         // id when metadata isn't cached.
-        for (i, id) in state.publishable_ids.iter().take(5).enumerate() {
+        // M-1: show 3 tracks (not 5) so the content fits at 80x24 and the
+        // account + publish/cancel controls stay on-screen. The full count
+        // is in the header line; PgUp/PgDn scrolls if needed.
+        for (i, id) in state.publishable_ids.iter().take(3).enumerate() {
             let label = state
                 .publishable_titles
                 .get(i)
@@ -149,12 +157,12 @@ pub fn render(_area: Rect, state: &PublicationState, icons: &IconRenderer) -> Pa
                 .unwrap_or_else(|| id.clone());
             lines.push(Line::from(format!("   {}. {label}", i + 1)));
         }
-        if state.publishable_ids.len() > 5 {
+        if state.publishable_ids.len() > 3 {
             lines.push(Line::from(Span::styled(
                 format!(
                     "   {} and {} more",
                     ellipsis(),
-                    state.publishable_ids.len() - 5
+                    state.publishable_ids.len() - 3
                 ),
                 Style::default().fg(Color::DarkGray),
             )));
@@ -178,7 +186,7 @@ pub fn render(_area: Rect, state: &PublicationState, icons: &IconRenderer) -> Pa
             ),
             Style::default().fg(Color::Yellow),
         )));
-        for (i, id) in state.local_only.iter().take(5).enumerate() {
+        for (i, id) in state.local_only.iter().take(3).enumerate() {
             let label = state
                 .local_only_titles
                 .get(i)
@@ -203,7 +211,7 @@ pub fn render(_area: Rect, state: &PublicationState, icons: &IconRenderer) -> Pa
             format!("3. Unavailable ({}):", state.unavailable.len()),
             Style::default().fg(Color::Red),
         )));
-        for (i, id) in state.unavailable.iter().take(5).enumerate() {
+        for (i, id) in state.unavailable.iter().take(3).enumerate() {
             let label = state
                 .unavailable_titles
                 .get(i)

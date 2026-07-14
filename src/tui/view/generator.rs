@@ -165,12 +165,23 @@ pub fn render(_area: Rect, state: &GeneratorState, icons: &IconRenderer) -> Para
                     } else {
                         display
                     };
-                    lines.push(Line::from(format!(
-                        "  {}. {} {}{pin_marker}",
-                        i + 1,
-                        source_tag,
-                        display_truncated
-                    )));
+                    // M-1: show a selected-row indicator for `state.cursor` so
+                    // j/k navigation has a visible marker (the cursor field
+                    // existed but was never rendered). `▶` on the selected row,
+                    // ` ` on other rows; bold + accent on the selected row's
+                    // text so it's distinguishable without color too.
+                    let selected = i == state.cursor;
+                    let marker = if selected { "▶" } else { " " };
+                    let row_style = if selected {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{marker} {}. ", i + 1), row_style),
+                        Span::styled(format!("{source_tag} "), row_style),
+                        Span::styled(format!("{display_truncated}{pin_marker}"), row_style),
+                    ]));
                 }
                 if playlist.tracks.len() > 20 {
                     lines.push(Line::from(Span::styled(

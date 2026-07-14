@@ -12,6 +12,42 @@
 
 use serde::{Deserialize, Serialize};
 
+/// True when `TERM=dumb` — a terminal that can't render ANSI controls or
+/// Unicode glyphs (RB-6). Used by [`FontMode::auto_detect`] to select ASCII
+/// glyphs.
+fn is_dumb_terminal() -> bool {
+    matches!(std::env::var("TERM"), Ok(t) if t == "dumb")
+}
+
+/// True when the locale is ASCII (`LC_ALL` / `LC_CTYPE` / `LANG` set to `C`
+/// or `POSIX`) — an environment where Unicode glyphs may not render (RB-6).
+/// `LC_ALL` takes precedence over `LC_CTYPE` which takes precedence over
+/// `LANG` (the standard POSIX locale resolution order). A missing or empty
+/// variable is treated as "not ASCII" (the common case for modern systems).
+/// `C.UTF-8` and `POSIX.UTF-8` are NOT ASCII locales — they use the C base
+/// locale but with UTF-8 encoding, so Unicode glyphs render correctly.
+fn is_ascii_locale() -> bool {
+    fn is_c_or_posix(var: &str) -> bool {
+        match std::env::var(var) {
+            Ok(v) => {
+                if v.is_empty() {
+                    return false;
+                }
+                // Exact match: C or POSIX (no encoding suffix) = ASCII.
+                if v == "C" || v == "POSIX" {
+                    return true;
+                }
+                // C.<encoding> or POSIX.<encoding>: ASCII only when the
+                // encoding is ASCII (not UTF-8, which supports Unicode).
+                let suffix = v.split_once('.').map(|(_, enc)| enc);
+                matches!(suffix, Some(e) if e.eq_ignore_ascii_case("ASCII"))
+            }
+            Err(_) => false,
+        }
+    }
+    is_c_or_posix("LC_ALL") || is_c_or_posix("LC_CTYPE") || is_c_or_posix("LANG")
+}
+
 /// The font mode for icon rendering.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum FontMode {
@@ -36,6 +72,12 @@ impl FontMode {
     /// When set to "nerd" or "nerdfont", returns `FontMode::NerdFont`. When
     /// set to "unicode", returns `FontMode::Unicode`.
     ///
+    /// RB-6: also checks `TERM=dumb` and ASCII locales (`LC_ALL`/`LC_CTYPE`/
+    /// `LANG` set to `C` or `POSIX`). These environments can't render Unicode
+    /// glyphs, so `FontMode::Ascii` is selected so all glyphs use plain ASCII
+    /// labels. `JUKEBOX_FONT_MODE` takes precedence over both (explicit user
+    /// choice wins).
+    ///
     /// D2: `NO_COLOR` is NOT checked here. `NO_COLOR` (no-color.org) only
     /// disables colors (handled in `theme.rs`); it must not change Unicode
     /// symbols to ASCII labels. `JUKEBOX_FONT_MODE=ascii` is the sole way to
@@ -51,6 +93,12 @@ impl FontMode {
                 "unicode" => return FontMode::Unicode,
                 _ => {}
             }
+        }
+        // RB-6: TERM=dumb or ASCII locale → ASCII glyphs. These environments
+        // can't render Unicode, so use plain ASCII labels for all icons and
+        // structural glyphs.
+        if is_dumb_terminal() || is_ascii_locale() {
+            return FontMode::Ascii;
         }
         // Check common Nerd Font environment hints.
         if let Ok(term) = std::env::var("TERM") {

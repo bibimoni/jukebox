@@ -254,9 +254,11 @@ emit_winner() { # <dedup_key> <winner-line>
 
   local id; id="$(printf '%s' "$key" | shasum -a 256 | cut -c1-16)"
 
-  # source_path relative to the PARENT of source_root (matches spec example
-  # `lossless/...`); Rust Track::resolve_source joins onto source_root.parent().
-  local src_rel; src_rel="lossless/$(rel_target "$path" "$SRC_ABS")"
+  # source_path relative to the PARENT of source_root: the prefix MUST be the
+  # actual source dir basename (not a hardcoded "lossless/"), so Rust
+  # Track::resolve_source (source_root.parent().join(source_path)) finds the
+  # file regardless of the source dir's name.
+  local src_rel; src_rel="$(basename "$SRC_ABS")/$(rel_target "$path" "$SRC_ABS")"
 
   tracks_json="$(echo "$tracks_json" | jq -c \
     --arg id "$id" --arg artists "$canon" \
@@ -303,5 +305,10 @@ done < "$LOSERS"
 jq -n --argjson tracks "$tracks_json" --arg src "$SRC_ABS" --arg at "$(date -u +%FT%TZ)" \
   '{version:1, built_at:$at, source_root:$src, tracks:$tracks}' > "$OUT/catalog.json"
 
-echo "indexed $(echo "$tracks_json" | jq 'length') unique tracks" >&3
-echo "done: $(echo "$tracks_json" | jq 'length') unique tracks written to $OUT/catalog.json" >&2
+TRACK_COUNT="$(echo "$tracks_json" | jq 'length')"
+echo "indexed $TRACK_COUNT unique tracks" >&3
+if (( TRACK_COUNT == 0 )); then
+  echo "standardize.sh: indexed 0 tracks — no playable .flac files in $SOURCE (check that files are valid FLAC and ffprobe/metaflac are installed)" >&2
+  exit 1
+fi
+echo "done: $TRACK_COUNT unique tracks written to $OUT/catalog.json" >&2

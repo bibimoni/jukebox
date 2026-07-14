@@ -666,6 +666,14 @@ pub fn marker_glyph() -> &'static str {
         "▸"
     }
 }
+/// Selection marker glyph for the currently-selected row: `▸` (Unicode) or
+/// `>` (ASCII). Exposed as a dedicated helper (RB-6) so the view layer can
+/// apply a visible non-color cue to the selected row without depending on
+/// `REVERSED` or color. This is the same as [`marker_glyph`] but named to
+/// convey its role in accessibility (selection visibility under `NO_COLOR`).
+pub fn selection_marker() -> &'static str {
+    marker_glyph()
+}
 /// Separator dot: `·` (Unicode) or `*` (ASCII). Used between status fields.
 pub fn sep_dot() -> &'static str {
     if is_ascii() {
