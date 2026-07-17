@@ -12,7 +12,7 @@
 
 use jukebox::source::TrackSource;
 use jukebox::tui::app::{App, DiscoverItem, Overlay};
-use jukebox::tui::queue::ContinueMode;
+use jukebox::tui::queue::{ContinueMode, RepeatMode};
 use jukebox::yt::session::Session;
 use std::io::Write;
 
@@ -312,6 +312,69 @@ fn cont_youtube_auto_advance_non_blocking() {
     assert!(
         advanced,
         "CONT=YouTube should advance to yt2 on tick, got {:?}",
+        app.now_playing
+    );
+
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&map_file);
+}
+
+/// Regression: with RPT=all on a single-track context (the one the
+/// CONT=YouTube radio continuation builds — `Context::Search { track_ids:
+/// vec![vid] }`), `>` must still advance the radio, not replay the lone
+/// track. Before the fix, `Transport::next()` wrapped the single-element
+/// order and returned the same id, so `App::next()`'s radio-continuation
+/// `None`-arm never fired and `load_track` reloaded the same track (replay).
+/// The sibling test `cont_youtube_auto_advance_non_blocking` only passes
+/// because it leaves repeat at the default Off.
+#[test]
+fn cont_youtube_next_advances_radio_with_repeat_all_single_track() {
+    let wp = r#"{"get_watch_playlist":"{\"ok\":true,\"data\":{\"watch_playlist\":[{\"video_id\":\"yt1\",\"title\":\"A\",\"artist\":\"X\",\"album\":null,\"dur\":null,\"isrc\":null},{\"video_id\":\"yt2\",\"title\":\"B\",\"artist\":\"X\",\"album\":null,\"dur\":null,\"isrc\":null}]}}"}"#;
+    let (script, map_file) = fake_sidecar(wp);
+    let session = spawn_session(&script);
+    let (_d, cat) = local_cat();
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
+    app.source_mode = jukebox::mode::SourceMode::Youtube;
+    app.transport.continue_mode = ContinueMode::YouTube;
+    // The user's setting from the report: RPT all. This is what diverges from
+    // `cont_youtube_auto_advance_non_blocking` (repeat Off) and triggers the
+    // wrap-to-same-track path in `Transport::next`.
+    app.transport.set_repeat(RepeatMode::All);
+
+    // Play yt1 (cold miss → URL lands on tick).
+    app.play_in_context_ids(vec!["yt1".into()], "yt1");
+    assert!(
+        tick_until(&mut app, 100, |a| a.now_playing.is_some()),
+        "yt1 should resolve+play via the fake sidecar"
+    );
+
+    // `>` on the single-track context with RPT=all: must stage the radio
+    // seed (advance), NOT replay yt1. Before the fix, the wrap returned
+    // Some("yt1") so the None-arm never ran and pending_radio_seed stayed
+    // None.
+    app.next();
+    assert_eq!(
+        app.pending_radio_seed,
+        Some("yt1".into()),
+        "next() with RPT=all on a single-track context should stage the \
+         radio seed (advance), not replay the lone track"
+    );
+
+    // Pump on_tick until the radio advances to yt2.
+    let advanced = tick_until(&mut app, 100, |a| {
+        matches!(
+            a.now_playing,
+            Some(TrackSource::Remote { ref video_id }) if video_id == "yt2"
+        )
+    });
+    assert!(
+        advanced,
+        "CONT=YouTube + RPT=all should advance to yt2 on tick, got {:?}",
         app.now_playing
     );
 

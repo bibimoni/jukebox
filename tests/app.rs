@@ -361,6 +361,70 @@ fn continue_radio_keeps_playing_at_context_end() {
     assert!(["t1", "t2", "t3", "s1"].contains(&after.id()));
 }
 
+/// Regression (user report "CONT radio mode still didn't work, it still
+/// replaying song (Local)"): on a Local source with ContinueMode::Radio,
+/// pressing `>` on a single-track context must advance to a DIFFERENT
+/// catalog track — not replay the just-finished one. The earlier fix
+/// (queue.rs `wrap == cur` → None) made `Transport::next()` signal
+/// exhaustion so the continue-mode path runs, but `switch_to_radio()`
+/// builds the new context with `switch_context(ctx, None, ...)` (cursor 0
+/// of a fresh smart shuffle) and never excludes the just-played track —
+/// so when smart shuffle's first pick is the same id, `>` replays.
+#[test]
+fn continue_radio_local_advances_to_different_track() {
+    let starters = ["t1", "t2", "t3", "s1"];
+    for start in starters {
+        let (_d, cat) = cat_two_albums();
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.source_mode = jukebox::mode::SourceMode::Local;
+        app.transport.continue_mode = ContinueMode::Radio;
+        app.transport.set_repeat(RepeatMode::All);
+
+        app.play_in_context_ids(vec![start.into()], start);
+        assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some(start));
+
+        app.next();
+        let after = app.now_playing.clone().unwrap();
+        assert_ne!(
+            after.id(),
+            start,
+            "CONT=Radio on Local must advance to a different track, not replay {start}"
+        );
+    }
+}
+
+/// User's exact flow: play a track, cycle continue to Radio via `c`
+/// (Off→NextAlbum→Radio for Local), press `>`. Must advance, not replay.
+/// Tests every starting track in a multi-track album + every repeat mode.
+#[test]
+fn continue_radio_user_flow_advances_not_replays() {
+    let starters = ["t1", "t2", "t3", "s1"];
+    let repeat_modes = [RepeatMode::Off, RepeatMode::All, RepeatMode::One];
+    for start in starters {
+        for rpt in repeat_modes {
+            let (_d, cat) = cat_two_albums();
+            let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+            app.source_mode = jukebox::mode::SourceMode::Local;
+            // Play from a single-track context so `>` exhausts it.
+            app.play_in_context_ids(vec![start.into()], start);
+            assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some(start));
+            // Cycle continue to Radio exactly as the user does (c c for Local).
+            app.cycle_continue(); // Off → NextAlbum
+            app.cycle_continue(); // NextAlbum → Radio
+            assert_eq!(app.transport.continue_mode, ContinueMode::Radio);
+            app.transport.set_repeat(rpt);
+
+            app.next();
+            let after = app.now_playing.as_ref().map(|s| s.id());
+            assert_ne!(
+                after,
+                Some(start),
+                "CONT=Radio user flow (c c then >) must advance, not replay {start} (RPT={rpt:?})"
+            );
+        }
+    }
+}
+
 #[test]
 fn cycle_continue_is_mode_aware() {
     let (_d, cat, _l) = cat_album();

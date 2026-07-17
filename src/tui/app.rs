@@ -2044,6 +2044,19 @@ impl App {
             self.record_listen_event(&id, "completed");
             self.last_natural_end = Some(id);
         }
+        // RPT=One: a natural end-of-track replays the same track. This is
+        // the ONLY place RPT=One replay happens — `Transport::next()` no
+        // longer short-circuits on RPT=One, so a user `>` press advances to
+        // the next track (or the continue-mode path) instead of replaying.
+        // Without this split, `>` with RPT=One + CONT=Radio would replay the
+        // current track forever (the user's "CONT radio still replaying
+        // song" report).
+        if self.transport.repeat == RepeatMode::One {
+            if let Some(np) = self.now_playing.clone() {
+                self.load_track(np.id());
+            }
+            return;
+        }
         self.next();
     }
 
@@ -3992,6 +4005,10 @@ impl App {
                 .switch_context(ctx, Some(&id), &r, &self.catalog);
             return;
         }
+        // Capture the just-finished track BEFORE we push it to history +
+        // switch context — we need it to keep the fresh radio order from
+        // starting on the same track (see below).
+        let just_played = self.now_playing.clone().map(|s| s.id().to_string());
         if let Some(np) = self.now_playing.clone() {
             self.transport
                 .history
@@ -4011,6 +4028,36 @@ impl App {
             yt_lists: &self.yt_lists,
         };
         self.transport.switch_context(ctx, None, &r, &self.catalog);
+        // CONT=Radio must advance to a DIFFERENT track, not replay the one
+        // the user just left. `switch_context(.., None, ..)` leaves the
+        // cursor at 0 of a fresh smart shuffle — and the just-finished track
+        // is a valid candidate in the all-catalog context, so the shuffle's
+        // first pick can land back on it (the user's "CONT radio still
+        // replaying song (Local)" report). When that happens, rotate that
+        // track's order entry to the end so a different track starts now
+        // and the just-finished one is heard last (maximally far away).
+        // Single-track catalogs can't avoid the replay — degenerate.
+        if let Some(just) = just_played {
+            if self.transport.order.len() > 1 {
+                let r2 = ClonedResolver {
+                    playlists: &self.playlists,
+                    manual_queue: self.transport.manual_queue.clone(),
+                    yt_lists: &self.yt_lists,
+                };
+                if self.transport.current(&r2, &self.catalog).as_deref() == Some(just.as_str()) {
+                    let ids = self.transport.context.track_ids(&r2);
+                    if let Some(just_pos) = ids.iter().position(|x| x == &just) {
+                        if let Some(order_idx) =
+                            self.transport.order.iter().position(|&o| o == just_pos)
+                        {
+                            let removed = self.transport.order.remove(order_idx);
+                            self.transport.order.push(removed);
+                            self.transport.cursor = 0;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn volume_up(&mut self) {
