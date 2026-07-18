@@ -96,9 +96,9 @@ fn render_playlist_browse(
     tab_name: &str,
     theme: &Theme,
     dim: &Style,
-    dash: &str,
-    dot: &str,
 ) {
+    let dash = em_dash();
+    let dot = sep_dot();
     let block = border("Playlist tracks", true, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -216,7 +216,7 @@ pub fn render_yt_explore(f: &mut Frame, area: Rect, app: &App) {
 
     // Browse mode: show the playlist's tracks instead of the playlist list.
     if app.yt_view.browse_playlist_id.is_some() {
-        render_playlist_browse(f, area, app, "Explore", &theme, &dim, &dash, &dot);
+        render_playlist_browse(f, area, app, "Explore", &theme, &dim);
         return;
     }
 
@@ -386,7 +386,7 @@ pub fn render_yt_charts(f: &mut Frame, area: Rect, app: &App) {
 
     // Browse mode: show the playlist's tracks instead of the chart list.
     if app.yt_view.browse_playlist_id.is_some() {
-        render_playlist_browse(f, area, app, "Charts", &theme, &dim, &dash, &dot);
+        render_playlist_browse(f, area, app, "Charts", &theme, &dim);
         return;
     }
 

@@ -429,7 +429,7 @@ fn main() -> anyhow::Result<()> {
             // survive a restart).
             if let Some(session) = &app.yt_session {
                 let tracks = session.all_cached_tracks();
-                let _ = jukebox::yt::cache::save_track_cache(&tracks);
+                jukebox::yt::cache::save_track_cache(&tracks);
             }
         }
         Cmd::Sync => {

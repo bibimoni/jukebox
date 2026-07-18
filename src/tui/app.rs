@@ -2833,7 +2833,7 @@ impl App {
                             if disk.len() > 512 {
                                 disk = disk.split_off(disk.len() - 512);
                             }
-                            let _ = crate::yt::cache::save_track_cache(&disk);
+                            crate::yt::cache::save_track_cache(&disk);
                             new.restore_track_cache(disk);
                         } else {
                             // No in-memory tracks — just restore from disk.
@@ -3035,7 +3035,7 @@ impl App {
                 // artist, album) is now in the in-memory track_cache. Save
                 // it so a respawn (or crash) doesn't lose it. Best-effort.
                 let all_tracks = session.all_cached_tracks();
-                let _ = crate::yt::cache::save_track_cache(&all_tracks);
+                crate::yt::cache::save_track_cache(&all_tracks);
             }
 
             // CONT=YouTube radio refill: a watch_playlist response landed.
