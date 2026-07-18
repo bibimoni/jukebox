@@ -38,11 +38,19 @@ pub enum HomeSection {
     Library,
     /// Intentional discovery by genre, mood, activity, decade, region.
     Explore,
+    /// A YouTube Music home-feed shelf whose title didn't map to a known
+    /// variant. Carries the raw section title (e.g. "Today's hits") so the
+    /// renderer can display it verbatim under its original name. Populated
+    /// by `App::map_yt_section_title` (Task 4) when `on_tick` folds a
+    /// `HomeSectionProto` into `home.sections`. The variant is dynamic (not
+    /// part of `HomeSection::all()` — the cold-start canonical set) and
+    /// requires no local listening history.
+    YtFeed(String),
 }
 
 impl HomeSection {
     /// The display title for this section.
-    pub fn title(&self) -> &'static str {
+    pub fn title(&self) -> &str {
         match self {
             HomeSection::ContinueListening => "Continue Listening",
             HomeSection::QuickPicks => "Quick Picks",
@@ -51,11 +59,12 @@ impl HomeSection {
             HomeSection::NewRelevant => "New and Relevant",
             HomeSection::Library => "Your YouTube Library",
             HomeSection::Explore => "Explore",
+            HomeSection::YtFeed(title) => title.as_str(),
         }
     }
 
     /// A short description for this section.
-    pub fn description(&self) -> &'static str {
+    pub fn description(&self) -> &str {
         match self {
             HomeSection::ContinueListening => "Pick up where you left off",
             HomeSection::QuickPicks => "Tracks based on your recent listening",
@@ -64,6 +73,7 @@ impl HomeSection {
             HomeSection::NewRelevant => "New from artists you listen to",
             HomeSection::Library => "Your playlists, liked songs, and subscriptions",
             HomeSection::Explore => "Discover by genre, mood, activity, and more",
+            HomeSection::YtFeed(_) => "From YouTube",
         }
     }
 
@@ -702,6 +712,35 @@ mod tests {
         assert!(HomeSection::QuickPicks.requires_history());
         assert!(!HomeSection::MadeForYou.requires_history());
         assert!(!HomeSection::Explore.requires_history());
+    }
+
+    /// Task 4: `HomeSection::YtFeed(String)` carries the raw YouTube section
+    /// title verbatim — `title()` returns the carried string (the section is
+    /// already named by ytmusicapi).
+    #[test]
+    fn home_section_ytfeed_carries_title() {
+        let sec = HomeSection::YtFeed("Listen again".into());
+        assert_eq!(sec.title(), "Listen again");
+    }
+
+    /// Task 4: `HomeSection::YtFeed` describes itself as "From YouTube" (a
+    /// generic fallback description — the carried title is already the
+    /// shelf's name, the description is a one-line provenance hint).
+    #[test]
+    fn home_section_ytfeed_description_from_youtube() {
+        let sec = HomeSection::YtFeed("Today's hits".into());
+        assert_eq!(sec.description(), "From YouTube");
+    }
+
+    /// Task 4: `HomeSection::YtFeed` does NOT require local listening history
+    /// (it's a YouTube-sourced shelf, not a local-recs-driven section).
+    #[test]
+    fn home_section_ytfeed_requires_history_false() {
+        let sec = HomeSection::YtFeed("x".into());
+        assert!(
+            !sec.requires_history(),
+            "YtFeed should not require local history"
+        );
     }
 
     #[test]

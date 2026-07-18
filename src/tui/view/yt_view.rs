@@ -50,7 +50,38 @@ pub fn render_yt_view(f: &mut Frame, area: Rect, app: &mut App) {
         YtTab::Search => render_yt_search(f, split[1], app),
         YtTab::Discover => render_yt_discover(f, split[1], app),
         YtTab::Radio => render_yt_radio(f, split[1], app),
+        // Task 4: stub arms so the 7-tab match is exhaustive. Task 5 replaces
+        // these with real `render_yt_explore` / `render_yt_charts` that render
+        // from `app.yt_view.explore_cached` / `charts_cached`. The placeholder
+        // shows a "loading…" state so the user can cycle to the tab without a
+        // crash while the fetch is in flight (or after it lands — Task 5 will
+        // surface the cached data).
+        YtTab::Explore => render_yt_tab_placeholder(f, split[1], "Explore"),
+        YtTab::Charts => render_yt_tab_placeholder(f, split[1], "Charts"),
     }
+}
+
+/// Task 4: minimal placeholder for the new Explore/Charts tabs so the
+/// 7-tab `render_yt_view` match is exhaustive and the user can cycle to
+/// the tabs without a crash. Task 5 replaces this with real rendering that
+/// reads from `app.yt_view.explore_cached` / `charts_cached`. The
+/// placeholder mirrors the `border` + empty-paragraph pattern used by
+/// `render_yt_radio`'s "No active radio session." state.
+fn render_yt_tab_placeholder(f: &mut Frame, area: Rect, title: &str) {
+    let theme = Theme::default();
+    let dim = Style::default().fg(if no_color() { Color::Reset } else { theme.dim });
+    let block = border(title, true, &theme);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let msg = if title == "Explore" {
+        "loading explore playlists…"
+    } else {
+        "loading charts…"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(msg.to_string(), dim))),
+        inner,
+    );
 }
 
 /// A titled border whose color reflects focus: accent when `focused`, dim
@@ -819,14 +850,24 @@ mod tests {
         out
     }
 
-    /// I.4: YT view shows 5-tab bar with all five labels at 100×30.
+    /// I.4: YT view shows 7-tab bar with all seven labels at 100×30. Task 4
+    /// added `Explore` and `Charts` variants and removed the `1:`-`5:`
+    /// number prefixes (BB-027).
     #[test]
-    fn yt_view_shows_five_tab_bar() {
+    fn yt_view_shows_seven_tab_bar() {
         let mut app = one_track_app();
         app.view = View::Youtube;
         app.yt_view.tab = YtTab::Home;
         let text = yt_view_text(&mut app, 100, 30);
-        for label in ["1:Home", "2:Library", "3:Search", "4:Discover", "5:Radio"] {
+        for label in [
+            "Home",
+            "Library",
+            "Search",
+            "Discover",
+            "Radio",
+            "Explore",
+            "Charts",
+        ] {
             assert!(
                 text.contains(label),
                 "I.4: tab bar must show {label}: {text:?}"
@@ -835,7 +876,8 @@ mod tests {
     }
 
     /// I.4: the active tab is distinguishable (REVERSED + BOLD modifier on
-    /// its label cells).
+    /// its label cells). Task 4 removed the `1:`-`5:` number prefixes, so the
+    /// probe strings look for "Library" (active) and "Home" (inactive).
     #[test]
     fn yt_view_active_tab_has_selection_style() {
         use ratatui::style::Modifier;
@@ -850,37 +892,40 @@ mod tests {
             })
             .unwrap();
         let buf = terminal.backend().buffer();
-        // Find the row containing the tab labels, then check the "2:Library"
-        // cells carry REVERSED + BOLD (active). Other tabs should not.
+        // Find the row containing the tab labels, then check the "Library"
+        // cells carry REVERSED + BOLD (active). Other tabs should not. We
+        // probe by scanning for the "L" of "Library" and the "H" of "Home",
+        // then reading a window to confirm the full label is present (the
+        // bare letters alone could collide with other words; the window
+        // check disambiguates).
         let mut found_active_reversed = false;
         let mut found_inactive_not_reversed = false;
         for y in 0..3u16 {
             for x in 0..100u16 {
                 let cell = &buf[(x, y)];
                 let sym = cell.symbol();
-                if sym.contains('2') {
-                    // Check the cells around for "Library"
+                if sym.contains('L') {
                     let mut probe = String::new();
                     for dx in 0..10u16 {
                         if let Some(c) = buf.cell((x + dx, y)) {
                             probe.push(c.symbol().chars().next().unwrap_or(' '));
                         }
                     }
-                    if probe.contains("2:Library")
+                    if probe.contains("Library")
                         && cell.modifier.contains(Modifier::REVERSED)
                         && cell.modifier.contains(Modifier::BOLD)
                     {
                         found_active_reversed = true;
                     }
                 }
-                if sym.contains('1') {
+                if sym.contains('H') {
                     let mut probe = String::new();
-                    for dx in 0..10u16 {
+                    for dx in 0..6u16 {
                         if let Some(c) = buf.cell((x + dx, y)) {
                             probe.push(c.symbol().chars().next().unwrap_or(' '));
                         }
                     }
-                    if probe.contains("1:Home") && !cell.modifier.contains(Modifier::REVERSED) {
+                    if probe.contains("Home") && !cell.modifier.contains(Modifier::REVERSED) {
                         found_inactive_not_reversed = true;
                     }
                 }
@@ -888,11 +933,11 @@ mod tests {
         }
         assert!(
             found_active_reversed,
-            "I.4: active tab '2:Library' must have REVERSED+BOLD"
+            "I.4: active tab 'Library' must have REVERSED+BOLD"
         );
         assert!(
             found_inactive_not_reversed,
-            "I.4: inactive tab '1:Home' must NOT have REVERSED"
+            "I.4: inactive tab 'Home' must NOT have REVERSED"
         );
     }
 
@@ -1027,28 +1072,36 @@ mod tests {
         );
     }
 
-    /// I.4: YtTab::next/prev cycle through all five tabs.
+    /// I.4: YtTab::next/prev cycle through all seven tabs (Task 4 added
+    /// `Explore` and `Charts`).
     #[test]
     fn yt_tab_next_prev_cycle() {
         assert_eq!(YtTab::Home.next(), YtTab::Library);
         assert_eq!(YtTab::Library.next(), YtTab::Search);
         assert_eq!(YtTab::Search.next(), YtTab::Discover);
         assert_eq!(YtTab::Discover.next(), YtTab::Radio);
-        assert_eq!(YtTab::Radio.next(), YtTab::Home);
-        assert_eq!(YtTab::Home.prev(), YtTab::Radio);
+        assert_eq!(YtTab::Radio.next(), YtTab::Explore);
+        assert_eq!(YtTab::Explore.next(), YtTab::Charts);
+        assert_eq!(YtTab::Charts.next(), YtTab::Home);
+        assert_eq!(YtTab::Home.prev(), YtTab::Charts);
+        assert_eq!(YtTab::Charts.prev(), YtTab::Explore);
+        assert_eq!(YtTab::Explore.prev(), YtTab::Radio);
         assert_eq!(YtTab::Radio.prev(), YtTab::Discover);
     }
 
-    /// I.4: YtTab::all() returns 5 tabs with `1:`-`5:` prefixes.
+    /// I.4: YtTab::all() returns 7 tabs with no number prefixes (Task 4 /
+    /// BB-027).
     #[test]
-    fn yt_tab_all_has_five_with_number_prefix() {
+    fn yt_tab_all_has_seven_no_number_prefix() {
         let tabs = YtTab::all();
-        assert_eq!(tabs.len(), 5);
-        assert_eq!(tabs[0].0, "1:Home");
-        assert_eq!(tabs[1].0, "2:Library");
-        assert_eq!(tabs[2].0, "3:Search");
-        assert_eq!(tabs[3].0, "4:Discover");
-        assert_eq!(tabs[4].0, "5:Radio");
+        assert_eq!(tabs.len(), 7);
+        assert_eq!(tabs[0].0, "Home");
+        assert_eq!(tabs[1].0, "Library");
+        assert_eq!(tabs[2].0, "Search");
+        assert_eq!(tabs[3].0, "Discover");
+        assert_eq!(tabs[4].0, "Radio");
+        assert_eq!(tabs[5].0, "Explore");
+        assert_eq!(tabs[6].0, "Charts");
     }
 
     /// I.4: YtViewState::default() has Home tab + zeroed cursors.

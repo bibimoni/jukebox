@@ -1,9 +1,8 @@
 ---
 source: tests/state_snapshots.rs
-assertion_line: 88
 expression: s
 ---
-VIEWS                      │1:Home │ 2:Library │ 3:Search │ 4:Discover │ 5:Radio                             YouTube [!]
+VIEWS                      │Home │ Library │ Search │ Discover │ Radio │ Explore │ Charts                    YouTube [!]
 ›   1 Artists              │
 ›   2 Playlists            │                                       ⌕ YouTube Home
 ›   3 Queue                │

@@ -35,16 +35,20 @@ pub enum YtTab {
     Search,
     Discover,
     Radio,
+    Explore,
+    Charts,
 }
 
 impl YtTab {
-    pub fn all() -> [(&'static str, YtTab); 5] {
+    pub fn all() -> [(&'static str, YtTab); 7] {
         [
-            ("1:Home", YtTab::Home),
-            ("2:Library", YtTab::Library),
-            ("3:Search", YtTab::Search),
-            ("4:Discover", YtTab::Discover),
-            ("5:Radio", YtTab::Radio),
+            ("Home", YtTab::Home),
+            ("Library", YtTab::Library),
+            ("Search", YtTab::Search),
+            ("Discover", YtTab::Discover),
+            ("Radio", YtTab::Radio),
+            ("Explore", YtTab::Explore),
+            ("Charts", YtTab::Charts),
         ]
     }
     pub fn next(self) -> YtTab {
@@ -53,16 +57,20 @@ impl YtTab {
             YtTab::Library => YtTab::Search,
             YtTab::Search => YtTab::Discover,
             YtTab::Discover => YtTab::Radio,
-            YtTab::Radio => YtTab::Home,
+            YtTab::Radio => YtTab::Explore,
+            YtTab::Explore => YtTab::Charts,
+            YtTab::Charts => YtTab::Home,
         }
     }
     pub fn prev(self) -> YtTab {
         match self {
-            YtTab::Home => YtTab::Radio,
+            YtTab::Home => YtTab::Charts,
             YtTab::Library => YtTab::Home,
             YtTab::Search => YtTab::Library,
             YtTab::Discover => YtTab::Search,
             YtTab::Radio => YtTab::Discover,
+            YtTab::Explore => YtTab::Radio,
+            YtTab::Charts => YtTab::Explore,
         }
     }
 }
@@ -74,6 +82,23 @@ pub struct YtViewState {
     pub home: crate::tui::view::home::HomeState,
     pub library_cursor: usize,
     pub library_section: usize,
+    /// YouTube Music home-feed shelves (ytmusicapi `get_home`). `None` until
+    /// the first successful `send_home` response lands in `on_tick`; set to
+    /// `Some(Vec<HomeSectionProto>)` once cached. Cleared by `R` (manual
+    /// refresh on the Home tab) and by `yt_logout` (credential change). The
+    /// `home.sections` field carries the local cold-start sections + the
+    /// mapped YouTube shelves appended after them; this field holds the raw
+    /// proto list so a re-render can rebuild without re-fetching.
+    pub home_sections_cached: Option<Vec<crate::yt::proto::HomeSectionProto>>,
+    /// YouTube Music explore-feed playlists (ytmusicapi `get_explore`).
+    /// `None` until the first successful `send_explore` response lands in
+    /// `on_tick`. The Explore tab renders directly from this cache (Task 5).
+    pub explore_cached: Option<Vec<crate::yt::proto::PlaylistProto>>,
+    /// YouTube Music chart entries (ytmusicapi `get_charts`). `None` until
+    /// the first successful `send_charts` response lands in `on_tick`. The
+    /// Charts tab groups entries by the `chart` field and renders from this
+    /// cache (Task 5).
+    pub charts_cached: Option<Vec<crate::yt::proto::ChartEntryProto>>,
 }
 
 /// A YouTube playlist/mood list shown in the Y view. `track_ids` are the
@@ -3010,6 +3035,103 @@ impl App {
                 }
             }
 
+            // YouTube Home feed shelves landed (ytmusicapi `get_home`). Map
+            // each `HomeSectionProto` to a `(HomeSection, Vec<HomeItem>)` and
+            // append to `yt_view.home.sections` AFTER the local cold-start
+            // sections (Quick Picks, Made for You, Start Radio, Library) that
+            // `populate_home_state` already built. Stash the raw proto list in
+            // `home_sections_cached` so the next tab switch doesn't re-fetch.
+            // NOTE: do NOT promote `yt_state` to Ready here — this is a
+            // secondary fire-and-forget fetch, not the primary refresh. The
+            // `pending_playlists` consumer (above) handles the Ready
+            // promotion when `send_refresh` succeeds; overwriting yt_state
+            // here would clobber an AuthExpired classification that landed
+            // from the same drain cycle's error response (the empty
+            // home_sections response from the fake sidecar / a guest-mode
+            // sidecar can land AFTER an auth error and would wrongly mask it
+            // as Ready). Matches the `pending_discover` pattern (which also
+            // doesn't touch yt_state).
+            if let Some(sections) = session.pending_home_sections.take() {
+                self.yt_view.home_sections_cached = Some(sections.clone());
+                for sec in sections {
+                    let home_section = map_yt_section_title(&sec.title);
+                    let items: Vec<crate::tui::view::home::HomeItem> = sec
+                        .items
+                        .iter()
+                        .map(|it| {
+                            if let Some(pid) = &it.playlist_id {
+                                crate::tui::view::home::HomeItem::playlist(
+                                    pid.clone(),
+                                    it.title.clone(),
+                                    false,
+                                )
+                            } else if let Some(vid) = &it.video_id {
+                                let artist = it.artist.clone().unwrap_or_default();
+                                crate::tui::view::home::HomeItem::track(
+                                    vid.clone(),
+                                    it.title.clone(),
+                                    artist,
+                                    false,
+                                )
+                            } else if let Some(bid) = &it.browse_id {
+                                crate::tui::view::home::HomeItem::subscription(
+                                    bid.clone(),
+                                    it.title.clone(),
+                                )
+                            } else {
+                                // Fallback: an entry with no usable id — render
+                                // as a non-selectable playlist stub carrying the
+                                // title so the user still sees the shelf.
+                                crate::tui::view::home::HomeItem::playlist(
+                                    String::new(),
+                                    it.title.clone(),
+                                    false,
+                                )
+                            }
+                        })
+                        .collect();
+                    self.yt_view.home.sections.push((home_section, items));
+                }
+            }
+
+            // YouTube Explore feed landed (ytmusicapi `get_explore`). The
+            // Explore tab renders directly from `explore_cached` (Task 5), so
+            // we just stash the raw `Vec<PlaylistProto>` here — no
+            // `home.sections` push (that's the Home tab, not Explore). See the
+            // `pending_home_sections` consumer above for the rationale on NOT
+            // promoting yt_state here.
+            if let Some(playlists) = session.pending_explore_playlists.take() {
+                self.yt_view.explore_cached = Some(playlists);
+            }
+
+            // YouTube Charts landed (ytmusicapi `get_charts`). The Charts tab
+            // groups entries by the `chart` field and renders from
+            // `charts_cached` (Task 5), so we just stash the raw
+            // `Vec<ChartEntryProto>` here. See the `pending_home_sections`
+            // consumer above for the rationale on NOT promoting yt_state.
+            if let Some(charts) = session.pending_charts.take() {
+                self.yt_view.charts_cached = Some(charts);
+            }
+
+            // Fetch-on-first-visit for the Home/Explore/Charts tabs. Each
+            // `send_*` method has its own inflight guard (Task 3), so an
+            // already-in-flight fetch is a no-op — calling unconditionally
+            // when the cache is `None` is safe and avoids a separate
+            // fast-path `*_loading()` check. This mirrors how
+            // `refresh_yt_lists` fires on YT view entry (input.rs).
+            match self.yt_view.tab {
+                YtTab::Home if self.yt_view.home_sections_cached.is_none() => {
+                    let _ = session.send_home();
+                }
+                YtTab::Explore if self.yt_view.explore_cached.is_none() => {
+                    let _ = session.send_explore();
+                }
+                YtTab::Charts if self.yt_view.charts_cached.is_none() => {
+                    let _ = session.send_charts();
+                }
+                _ => {}
+            }
+
             // Cold-miss swap: if a pick is pending and its URL just landed,
             // stage it for the player swap below. If the fast resolve finished
             // with no URL (error), give up so the user isn't stuck on the
@@ -3340,6 +3462,18 @@ impl App {
         self.discover_loading_ticks = 0;
         self.pending_discover_play = None;
         self.pending_radio_seed = None;
+        // Drop the Home/Explore/Charts caches so a re-login under a different
+        // account never shows the prior account's YouTube shelves. The
+        // session-side `clear_all_caches` (called above via `clear_cookies`)
+        // resets the three new pending fields + inflight guards; these three
+        // fields live on `YtViewState` and need their own clear here. The
+        // local cold-start `home.sections` are NOT cleared here — the next
+        // `render_yt_home` re-runs `populate_home_state` (rebuilding local
+        // sections only) and re-fires `send_home` because the cache is now
+        // `None`, so the YouTube shelves re-append when the response lands.
+        self.yt_view.home_sections_cached = None;
+        self.yt_view.explore_cached = None;
+        self.yt_view.charts_cached = None;
         // Drop a pending audio format switch handle (the thread detaches
         // and completes on its own — best-effort, no blocking).
         self.audio_switch_handle = None;
@@ -3931,6 +4065,64 @@ impl App {
         // download + Keychain read happens on the first real `preload_next_url`
         // (during playback, not browsing), and the fast-URL fallback covers the
         // gap. Browsing responsiveness > gapless handoff cold-start.
+    }
+
+    /// Fetch-on-first-visit for the Home/Explore/Charts tabs. Called by the
+    /// tab-switch handler in `input.rs` (Task 6) after a `[`/`]` cycle sets a
+    /// new tab. Each `send_*` method has its own inflight guard (Task 3), so
+    /// an already-in-flight fetch is a no-op — calling unconditionally when
+    /// the cache is `None` is safe. The `on_tick` consumer (above) also fires
+    /// the same `send_*` methods as a fallback path, so this method is the
+    /// user-driven "switched to the tab" trigger and `on_tick` is the
+    /// polling-driven "tab is active and cache is empty" trigger. Together
+    /// they cover both the immediate switch and the "response landed but
+    /// cache was cleared by `R`/logout" recovery case.
+    pub fn yt_tab_fetch_on_visit(&mut self) {
+        let Some(session) = self.yt_session.as_mut() else {
+            return;
+        };
+        match self.yt_view.tab {
+            YtTab::Home if self.yt_view.home_sections_cached.is_none() => {
+                let _ = session.send_home();
+            }
+            YtTab::Explore if self.yt_view.explore_cached.is_none() => {
+                let _ = session.send_explore();
+            }
+            YtTab::Charts if self.yt_view.charts_cached.is_none() => {
+                let _ = session.send_charts();
+            }
+            _ => {}
+        }
+    }
+
+    /// Manual refresh for the Home/Explore/Charts tab. Clears the matching
+    /// cache field and re-fires the `send_*` method. The view shows a loading
+    /// state until the response arrives. Called by the `R` key handler when
+    /// on a Home/Explore/Charts tab (Task 6 wires the key). The spec's `r`
+    /// (lowercase) is shorthand for "the refresh key" — the existing
+    /// refresh convention in this codebase is `R` (uppercase, see
+    /// `retry_yt_probe` at input.rs:261-267), since `r` is already bound to
+    /// `cycle_repeat` globally (input.rs:223). This method is a no-op when
+    /// no session is available or the current tab is not Home/Explore/Charts.
+    pub fn refresh_yt_home_explore_charts(&mut self) {
+        let Some(session) = self.yt_session.as_mut() else {
+            return;
+        };
+        match self.yt_view.tab {
+            YtTab::Home => {
+                self.yt_view.home_sections_cached = None;
+                let _ = session.send_home();
+            }
+            YtTab::Explore => {
+                self.yt_view.explore_cached = None;
+                let _ = session.send_explore();
+            }
+            YtTab::Charts => {
+                self.yt_view.charts_cached = None;
+                let _ = session.send_charts();
+            }
+            _ => {}
+        }
     }
 
     /// Auto-continue to the next album by the same artist. Pushes the current
@@ -5273,6 +5465,29 @@ impl App {
 // `self` as the resolver and `&self.catalog` as the catalog; the split-borrow is
 // sound because `manual_queue` (the resolver's data source) lives in a distinct
 // field from `catalog` and from the `&mut self.transport` we hold.
+
+/// Map a YouTube Music home-feed section title to a [`HomeSection`] variant.
+/// ytmusicapi's section titles are free-form strings; known titles map to
+/// existing variants (so the renderer's existing styling / cursor behavior
+/// applies), and unknown titles fall back to `HomeSection::YtFeed(title)`
+/// (carrying the raw string) so the user still sees the shelf under its
+/// original name. The mapping table is documented in the spec:
+///
+/// | YouTube section title             | HomeSection variant        |
+/// |-----------------------------------|----------------------------|
+/// | "Listen again" / "Resume listening" | `ContinueListening`      |
+/// | "Mixed for You" / "Made for You"  | `MadeForYou`               |
+/// | "Featured playlists" / "Featured" | `Library`                  |
+/// | anything else                     | `YtFeed(title)` (new)      |
+fn map_yt_section_title(title: &str) -> crate::tui::view::home::HomeSection {
+    use crate::tui::view::home::HomeSection;
+    match title {
+        "Listen again" | "Resume listening" => HomeSection::ContinueListening,
+        "Mixed for You" | "Made for You" => HomeSection::MadeForYou,
+        "Featured playlists" | "Featured" => HomeSection::Library,
+        _ => HomeSection::YtFeed(title.to_string()),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -6646,6 +6861,97 @@ mod tests {
             app.yt_error.is_none(),
             "RC16-DEF-2: prev with history must not error: {:?}",
             app.yt_error
+        );
+    }
+
+    /// Task 4: `YtViewState::default()` starts with all three new cache
+    /// fields as `None` (so the first tab visit fires the fetch).
+    #[test]
+    fn yt_view_state_default_caches_are_none() {
+        let s = YtViewState::default();
+        assert!(
+            s.home_sections_cached.is_none(),
+            "home_sections_cached should default to None"
+        );
+        assert!(
+            s.explore_cached.is_none(),
+            "explore_cached should default to None"
+        );
+        assert!(
+            s.charts_cached.is_none(),
+            "charts_cached should default to None"
+        );
+    }
+
+    /// Task 4: `YtTab::next()` cycles through all 7 tabs, including the new
+    /// Explore and Charts variants.
+    #[test]
+    fn yt_tab_cycle_includes_explore_charts() {
+        assert_eq!(YtTab::Radio.next(), YtTab::Explore);
+        assert_eq!(YtTab::Explore.next(), YtTab::Charts);
+        assert_eq!(YtTab::Charts.next(), YtTab::Home);
+    }
+
+    /// Task 4: `YtTab::prev()` cycles back through the new variants.
+    #[test]
+    fn yt_tab_prev_cycle_includes_explore_charts() {
+        assert_eq!(YtTab::Home.prev(), YtTab::Charts);
+        assert_eq!(YtTab::Charts.prev(), YtTab::Explore);
+        assert_eq!(YtTab::Explore.prev(), YtTab::Radio);
+    }
+
+    /// Task 4: `YtTab::all()` returns 7 entries (the 5 existing + Explore +
+    /// Charts) with no number prefixes per BB-027.
+    #[test]
+    fn yt_tab_all_has_seven_tabs_no_number_prefix() {
+        let tabs = YtTab::all();
+        assert_eq!(tabs.len(), 7);
+        assert_eq!(tabs[0].0, "Home");
+        assert_eq!(tabs[1].0, "Library");
+        assert_eq!(tabs[2].0, "Search");
+        assert_eq!(tabs[3].0, "Discover");
+        assert_eq!(tabs[4].0, "Radio");
+        assert_eq!(tabs[5].0, "Explore");
+        assert_eq!(tabs[6].0, "Charts");
+    }
+
+    /// Task 4: `map_yt_section_title` maps known YouTube section titles to
+    /// the documented `HomeSection` variants.
+    #[test]
+    fn map_yt_section_title_known() {
+        use crate::tui::view::home::HomeSection;
+        assert_eq!(
+            map_yt_section_title("Listen again"),
+            HomeSection::ContinueListening
+        );
+        assert_eq!(
+            map_yt_section_title("Resume listening"),
+            HomeSection::ContinueListening
+        );
+        assert_eq!(
+            map_yt_section_title("Mixed for You"),
+            HomeSection::MadeForYou
+        );
+        assert_eq!(
+            map_yt_section_title("Made for You"),
+            HomeSection::MadeForYou
+        );
+        assert_eq!(
+            map_yt_section_title("Featured playlists"),
+            HomeSection::Library
+        );
+        assert_eq!(map_yt_section_title("Featured"), HomeSection::Library);
+    }
+
+    /// Task 4: unknown section titles fall back to the new
+    /// `HomeSection::YtFeed(String)` variant carrying the raw title.
+    #[test]
+    fn map_yt_section_title_unknown_falls_back_to_ytfeed() {
+        use crate::tui::view::home::HomeSection;
+        let got = map_yt_section_title("Today's hits");
+        assert!(
+            matches!(got, HomeSection::YtFeed(ref t) if t == "Today's hits"),
+            "unknown title should map to YtFeed carrying the raw title, got {got:?}"
         );
     }
 }
