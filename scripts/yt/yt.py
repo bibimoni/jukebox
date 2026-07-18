@@ -457,6 +457,61 @@ def handle(cmd, arg, ytm):
         finally:
             _sig.alarm(0)
             _sig.signal(_sig.SIGALRM, _old_handler)
+    if cmd == "home":
+        # 5s SIGALRM guard — get_home() can hang in guest mode (mirrors the
+        # home_suggestions handler above). On timeout, return an empty feed
+        # (NOT an error): an empty feed is a valid state for guest users.
+        import signal as _sig
+        def _timeout_handler(signum, frame):
+            raise TimeoutError("get_home() timed out after 5s")
+        _old_handler = _sig.signal(_sig.SIGALRM, _timeout_handler)
+        _sig.alarm(5)
+        try:
+            out = []
+            for sec in ytm.get_home():
+                items = []
+                for it in sec.get("contents", []):
+                    items.append({
+                        "title": it.get("title", ""),
+                        "subtitle": it.get("subtitle", ""),
+                        "playlist_id": it.get("playlistId"),
+                        "video_id": it.get("videoId"),
+                        "artist": it.get("artists", [{}])[0].get("name") if it.get("artists") else None,
+                        "browse_id": it.get("browseId"),
+                    })
+                out.append({"title": sec.get("title", ""), "items": items})
+            return {"home_sections": out}
+        except TimeoutError:
+            return {"home_sections": []}
+        finally:
+            _sig.alarm(0)
+            _sig.signal(_sig.SIGALRM, _old_handler)
+    if cmd == "explore":
+        out = []
+        for cat in ytm.get_explore():
+            for pl in cat.get("items", []):  # flatten across categories
+                out.append({
+                    "id": pl.get("playlistId", ""),
+                    "title": pl.get("title", ""),
+                    "subtitle": pl.get("subtitle", ""),
+                    "count": pl.get("itemCount"),
+                })
+        return {"explore_playlists": out}
+    if cmd == "charts":
+        out = []
+        for chart_name, items in ytm.get_charts().items():
+            if not isinstance(items, list):
+                continue
+            for it in items:
+                out.append({
+                    "title": it.get("title", ""),
+                    "subtitle": it.get("subtitle", ""),
+                    "video_id": it.get("videoId"),
+                    "playlist_id": it.get("playlistId"),
+                    "artist": it.get("artists", [{}])[0].get("name") if it.get("artists") else None,
+                    "chart": chart_name,
+                })
+        return {"charts": out}
     if cmd == "get_watch_playlist":
         res = ytm.get_watch_playlist(videoId=arg.get("video_id", ""), radio=True)
         return {"watch_playlist": [_track(t) for t in res.get("tracks", [])]}

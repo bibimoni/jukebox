@@ -38,11 +38,19 @@ pub enum HomeSection {
     Library,
     /// Intentional discovery by genre, mood, activity, decade, region.
     Explore,
+    /// A YouTube Music home-feed shelf whose title didn't map to a known
+    /// variant. Carries the raw section title (e.g. "Today's hits") so the
+    /// renderer can display it verbatim under its original name. Populated
+    /// by `App::map_yt_section_title` (Task 4) when `on_tick` folds a
+    /// `HomeSectionProto` into `home.sections`. The variant is dynamic (not
+    /// part of `HomeSection::all()` — the cold-start canonical set) and
+    /// requires no local listening history.
+    YtFeed(String),
 }
 
 impl HomeSection {
     /// The display title for this section.
-    pub fn title(&self) -> &'static str {
+    pub fn title(&self) -> &str {
         match self {
             HomeSection::ContinueListening => "Continue Listening",
             HomeSection::QuickPicks => "Quick Picks",
@@ -51,11 +59,12 @@ impl HomeSection {
             HomeSection::NewRelevant => "New and Relevant",
             HomeSection::Library => "Your YouTube Library",
             HomeSection::Explore => "Explore",
+            HomeSection::YtFeed(title) => title.as_str(),
         }
     }
 
     /// A short description for this section.
-    pub fn description(&self) -> &'static str {
+    pub fn description(&self) -> &str {
         match self {
             HomeSection::ContinueListening => "Pick up where you left off",
             HomeSection::QuickPicks => "Tracks based on your recent listening",
@@ -64,6 +73,7 @@ impl HomeSection {
             HomeSection::NewRelevant => "New from artists you listen to",
             HomeSection::Library => "Your playlists, liked songs, and subscriptions",
             HomeSection::Explore => "Discover by genre, mood, activity, and more",
+            HomeSection::YtFeed(_) => "From YouTube",
         }
     }
 
@@ -704,6 +714,35 @@ mod tests {
         assert!(!HomeSection::Explore.requires_history());
     }
 
+    /// Task 4: `HomeSection::YtFeed(String)` carries the raw YouTube section
+    /// title verbatim — `title()` returns the carried string (the section is
+    /// already named by ytmusicapi).
+    #[test]
+    fn home_section_ytfeed_carries_title() {
+        let sec = HomeSection::YtFeed("Listen again".into());
+        assert_eq!(sec.title(), "Listen again");
+    }
+
+    /// Task 4: `HomeSection::YtFeed` describes itself as "From YouTube" (a
+    /// generic fallback description — the carried title is already the
+    /// shelf's name, the description is a one-line provenance hint).
+    #[test]
+    fn home_section_ytfeed_description_from_youtube() {
+        let sec = HomeSection::YtFeed("Today's hits".into());
+        assert_eq!(sec.description(), "From YouTube");
+    }
+
+    /// Task 4: `HomeSection::YtFeed` does NOT require local listening history
+    /// (it's a YouTube-sourced shelf, not a local-recs-driven section).
+    #[test]
+    fn home_section_ytfeed_requires_history_false() {
+        let sec = HomeSection::YtFeed("x".into());
+        assert!(
+            !sec.requires_history(),
+            "YtFeed should not require local history"
+        );
+    }
+
     #[test]
     fn home_item_playlist() {
         let item = HomeItem::playlist("PL123".into(), "My Playlist".into(), false);
@@ -853,6 +892,57 @@ mod tests {
         terminal
             .draw(|f| render_compact(f, f.area(), &sections, &state, &icons))
             .unwrap();
+    }
+
+    /// Task 5: `render_compact` renders a `HomeSection::YtFeed(String)`
+    /// section cleanly — the section header shows the carried title and the
+    /// "From YouTube" description, and the items render with their own
+    /// `HomeItemKind` glyphs (no match on `HomeSection` itself). This
+    /// verifies the view-layer side of Task 4's YtFeed variant addition: the
+    /// YouTube-sourced home shelves (appended to `home.sections` by Task 3's
+    /// `on_tick` consumer) render through the existing compact pipeline
+    /// without needing a home.rs code change.
+    #[test]
+    fn render_compact_with_ytfeed_section() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let icons = IconRenderer::new(FontMode::Unicode);
+        let mut state = HomeState::new();
+        state.loading = false;
+        // A YouTube-sourced shelf: the section title is carried verbatim by
+        // YtFeed, and the items are YouTube playlists (is_local = false →
+        // Icon::Youtube glyph).
+        let sections = vec![(
+            HomeSection::YtFeed("Listen again".into()),
+            vec![HomeItem::playlist("PL1".into(), "Chill Vibes".into(), false)],
+        )];
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_compact(f, f.area(), &sections, &state, &icons))
+            .unwrap();
+        // Inspect the buffer: the carried title "Listen again" must appear
+        // in the section header, and the playlist title "Chill Vibes" must
+        // appear in the item row.
+        let buf = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                text.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("Listen again"),
+            "Task 5: YtFeed section must show carried title 'Listen again': {text:?}"
+        );
+        assert!(
+            text.contains("From YouTube"),
+            "Task 5: YtFeed section must show 'From YouTube' description: {text:?}"
+        );
+        assert!(
+            text.contains("Chill Vibes"),
+            "Task 5: YtFeed section must render its playlist item 'Chill Vibes': {text:?}"
+        );
     }
 
     /// RC11-DEF-001: the focused item (at `state.cursor` within the focused

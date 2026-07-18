@@ -74,10 +74,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // tab bindings shadowed the global keys and trapped the user.
         if matches!(key.code, KeyCode::Char('[')) {
             app.yt_view.tab = app.yt_view.tab.prev();
+            app.yt_tab_fetch_on_visit();
             return;
         }
         if matches!(key.code, KeyCode::Char(']')) {
             app.yt_view.tab = app.yt_view.tab.next();
+            app.yt_tab_fetch_on_visit();
             return;
         }
         if matches!(key.code, KeyCode::Char('/')) {
@@ -94,6 +96,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             )
         {
             app.open_discover();
+            return;
+        }
+        // R refreshes the cached content on the Home/Explore/Charts tabs (clears
+        // the matching cache field + re-fires the send_* method). On other YT
+        // tabs (Library/Search/Discover/Radio) R falls through to the global
+        // handler (retry_yt_probe / resume_last). Spec's `r` is mapped to `R`
+        // (uppercase) to match the existing refresh convention — `r` (lowercase)
+        // is already bound to `cycle_repeat` in the global keymap.
+        if matches!(key.code, KeyCode::Char('R'))
+            && matches!(app.yt_view.tab, YtTab::Home | YtTab::Explore | YtTab::Charts)
+        {
+            app.refresh_yt_home_explore_charts();
             return;
         }
         // Home tab navigation: j/k move the cursor within the focused section,

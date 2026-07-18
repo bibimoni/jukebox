@@ -1403,3 +1403,288 @@ fn rb3_recovery_hint_renders_at_80x24() {
         "recovery hint must be visible at 80x24 (expected 'Esc' in footer):\n{text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 6: `R` manual refresh on the Home/Explore/Charts tabs.
+//
+// The spec's `r` (lowercase) is shorthand for "the refresh key" — it's mapped
+// to `R` (uppercase) here because `r` is already bound to `cycle_repeat`
+// globally. The YT-view intercept fires `App::refresh_yt_home_explore_charts`
+// on Home/Explore/Charts; on Library/Search/Discover/Radio it falls through
+// to the global R handler (`retry_yt_probe` / `resume_last`).
+//
+// Distinguishing the intercept from the fall-through WITHOUT a session:
+//   - `refresh_yt_home_explore_charts` early-returns when `yt_session` is
+//     None (no cache clear, no toast, no state change).
+//   - `retry_yt_probe` ALWAYS clears `yt_error` (even with no session —
+//     line 3515 of app.rs), then early-returns.
+// So: with no session, R on Home/Explore/Charts leaves `yt_error` UNCHANGED
+// (intercept fired → refresh_yt_home_explore_charts → early return → no
+// yt_error clear), while R on Library/Search/Discover/Radio CLEARS
+// `yt_error` (global handler fired). That's the observable distinction.
+//
+// The positive "cache IS cleared" path needs a session — covered by
+// `r_key_on_home_tab_clears_cache_with_session` below using a dummy sidecar
+// (same pattern as `tests/lyrics.rs::fake_lyrics_session`).
+// ---------------------------------------------------------------------------
+
+/// Place an `App` in the YouTube view on `tab` with no overlay/filter and a
+/// preset `yt_error` (so we can observe whether `retry_yt_probe`'s
+/// unconditional `yt_error` clear ran).
+fn yt_app_on_tab(tab: YtTab) -> (tempfile::TempDir, App) {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.view = View::Youtube;
+    app.overlay = None;
+    app.filter = None;
+    app.yt_view.tab = tab;
+    app.yt_error = Some("preset error".to_string());
+    (_d, app)
+}
+
+#[test]
+fn r_key_on_home_tab_intercepted_global_not_called() {
+    let (_d, mut app) = yt_app_on_tab(YtTab::Home);
+    app.yt_view.home_sections_cached = Some(Vec::new());
+    handle_key(&mut app, key('R'));
+    // Intercept fired → refresh_yt_home_explore_charts → early-return (no
+    // session) → global handler did NOT run → yt_error preserved.
+    assert_eq!(
+        app.yt_error.as_deref(),
+        Some("preset error"),
+        "R on Home tab must NOT fall through to the global handler (which \
+         would clear yt_error)"
+    );
+    // Cache field unchanged (early-return preserved it).
+    assert!(
+        app.yt_view.home_sections_cached.is_some(),
+        "home_sections_cached must be unchanged when refresh_yt_home_explore_\
+         charts early-returns (no session)"
+    );
+}
+
+#[test]
+fn r_key_on_explore_tab_intercepted_global_not_called() {
+    let (_d, mut app) = yt_app_on_tab(YtTab::Explore);
+    app.yt_view.explore_cached = Some(Vec::new());
+    handle_key(&mut app, key('R'));
+    assert_eq!(
+        app.yt_error.as_deref(),
+        Some("preset error"),
+        "R on Explore tab must NOT fall through to the global handler"
+    );
+    assert!(
+        app.yt_view.explore_cached.is_some(),
+        "explore_cached must be unchanged when refresh_yt_home_explore_charts \
+         early-returns (no session)"
+    );
+}
+
+#[test]
+fn r_key_on_charts_tab_intercepted_global_not_called() {
+    let (_d, mut app) = yt_app_on_tab(YtTab::Charts);
+    app.yt_view.charts_cached = Some(Vec::new());
+    handle_key(&mut app, key('R'));
+    assert_eq!(
+        app.yt_error.as_deref(),
+        Some("preset error"),
+        "R on Charts tab must NOT fall through to the global handler"
+    );
+    assert!(
+        app.yt_view.charts_cached.is_some(),
+        "charts_cached must be unchanged when refresh_yt_home_explore_charts \
+         early-returns (no session)"
+    );
+}
+
+#[test]
+fn r_key_on_library_tab_falls_through_to_global() {
+    let (_d, mut app) = yt_app_on_tab(YtTab::Library);
+    handle_key(&mut app, key('R'));
+    // No intercept for Library → global handler ran → retry_yt_probe cleared
+    // yt_error unconditionally (app.rs line 3515), then early-returned (no
+    // session). The cache fields are untouched (Library isn't a refresh tab).
+    assert!(
+        app.yt_error.is_none(),
+        "R on Library tab must fall through to the global handler, which \
+         clears yt_error unconditionally (got {:?})",
+        app.yt_error
+    );
+}
+
+#[test]
+fn r_key_on_search_tab_falls_through_to_global() {
+    let (_d, mut app) = yt_app_on_tab(YtTab::Search);
+    handle_key(&mut app, key('R'));
+    assert!(
+        app.yt_error.is_none(),
+        "R on Search tab must fall through to the global handler (got {:?})",
+        app.yt_error
+    );
+}
+
+#[test]
+fn r_key_on_discover_tab_falls_through_to_global() {
+    let (_d, mut app) = yt_app_on_tab(YtTab::Discover);
+    handle_key(&mut app, key('R'));
+    assert!(
+        app.yt_error.is_none(),
+        "R on Discover tab must fall through to the global handler (got {:?})",
+        app.yt_error
+    );
+}
+
+#[test]
+fn r_key_on_radio_tab_falls_through_to_global() {
+    let (_d, mut app) = yt_app_on_tab(YtTab::Radio);
+    handle_key(&mut app, key('R'));
+    assert!(
+        app.yt_error.is_none(),
+        "R on Radio tab must fall through to the global handler (got {:?})",
+        app.yt_error
+    );
+}
+
+#[test]
+fn r_key_lowercase_cycle_repeat_unchanged() {
+    // Lowercase `r` is bound to `cycle_repeat` globally — it must NOT be
+    // intercepted by the new R refresh on any YT tab.
+    let (_d, mut app) = yt_app_on_tab(YtTab::Home);
+    app.yt_view.home_sections_cached = Some(Vec::new());
+    let repeat_before = app.transport.repeat;
+    handle_key(&mut app, key('r'));
+    assert_ne!(
+        app.transport.repeat, repeat_before,
+        "lowercase r must cycle repeat mode (existing global binding)"
+    );
+    // Cache and yt_error untouched — the R refresh intercept didn't fire.
+    assert!(
+        app.yt_view.home_sections_cached.is_some(),
+        "lowercase r must not clear home_sections_cached"
+    );
+    assert_eq!(
+        app.yt_error.as_deref(),
+        Some("preset error"),
+        "lowercase r must not clear yt_error (R refresh intercept didn't fire)"
+    );
+}
+
+/// Spawns a minimal sidecar that just drains stdin (no ytmusicapi responses).
+/// Same pattern as `tests/lyrics.rs::fake_lyrics_session` — lets us exercise
+/// the cache-clearing positive path without a real ytmusicapi roundtrip.
+/// `Session::spawn` requires `python3` on PATH (the lyrics test has the same
+/// dependency).
+fn fake_session() -> jukebox::yt::session::Session {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let script = std::env::temp_dir()
+        .join(format!("jk-input-fake-{}-{}.py", std::process::id(), n));
+    std::fs::write(&script, "import sys\nfor line in sys.stdin: pass\n").unwrap();
+    jukebox::yt::session::Session::spawn(std::path::Path::new("python3"), &script, None).unwrap()
+}
+
+#[test]
+fn r_key_on_home_tab_clears_cache_with_session() {
+    let (_d, mut app) = yt_app_on_tab(YtTab::Home);
+    app.yt_session = Some(fake_session());
+    app.yt_view.home_sections_cached = Some(Vec::new());
+    handle_key(&mut app, key('R'));
+    assert!(
+        app.yt_view.home_sections_cached.is_none(),
+        "R on Home tab with a session must clear home_sections_cached"
+    );
+    assert!(
+        app.yt_session.as_ref().unwrap().home_loading(),
+        "R on Home tab must re-fire send_home (home_inflight should be true)"
+    );
+}
+
+#[test]
+fn r_key_on_explore_tab_clears_cache_with_session() {
+    let (_d, mut app) = yt_app_on_tab(YtTab::Explore);
+    app.yt_session = Some(fake_session());
+    app.yt_view.explore_cached = Some(Vec::new());
+    handle_key(&mut app, key('R'));
+    assert!(
+        app.yt_view.explore_cached.is_none(),
+        "R on Explore tab with a session must clear explore_cached"
+    );
+    assert!(
+        app.yt_session.as_ref().unwrap().explore_loading(),
+        "R on Explore tab must re-fire send_explore (explore_inflight should be true)"
+    );
+}
+
+#[test]
+fn r_key_on_charts_tab_clears_cache_with_session() {
+    let (_d, mut app) = yt_app_on_tab(YtTab::Charts);
+    app.yt_session = Some(fake_session());
+    app.yt_view.charts_cached = Some(Vec::new());
+    handle_key(&mut app, key('R'));
+    assert!(
+        app.yt_view.charts_cached.is_none(),
+        "R on Charts tab with a session must clear charts_cached"
+    );
+    assert!(
+        app.yt_session.as_ref().unwrap().charts_loading(),
+        "R on Charts tab must re-fire send_charts (charts_inflight should be true)"
+    );
+}
+
+#[test]
+fn r_key_on_home_tab_does_not_clear_other_tab_caches() {
+    // R on Home must only clear the home cache, not explore/charts.
+    let (_d, mut app) = yt_app_on_tab(YtTab::Home);
+    app.yt_session = Some(fake_session());
+    app.yt_view.home_sections_cached = Some(Vec::new());
+    app.yt_view.explore_cached = Some(Vec::new());
+    app.yt_view.charts_cached = Some(Vec::new());
+    handle_key(&mut app, key('R'));
+    assert!(app.yt_view.home_sections_cached.is_none(), "home cleared");
+    assert!(app.yt_view.explore_cached.is_some(), "explore untouched");
+    assert!(app.yt_view.charts_cached.is_some(), "charts untouched");
+}
+
+#[test]
+fn bracket_keys_cycle_yt_tabs_with_fetch_on_visit() {
+    // `]` from Radio must land on Explore (per YtTab::next) and fire the
+    // fetch-on-visit (explore_inflight becomes true with a session).
+    let (_d, mut app) = yt_app_on_tab(YtTab::Radio);
+    app.yt_session = Some(fake_session());
+    app.yt_view.explore_cached = None;
+    handle_key(&mut app, key(']'));
+    assert_eq!(app.yt_view.tab, YtTab::Explore, "] must cycle Radio -> Explore");
+    assert!(
+        app.yt_session.as_ref().unwrap().explore_loading(),
+        "tab-switch to Explore must fire send_explore via yt_tab_fetch_on_visit"
+    );
+
+    // `[` from Explore goes back to Radio (no fetch). Then `[` from Radio
+    // goes to Discover (no fetch — Discover isn't a fetch tab). Then `[` from
+    // Discover goes to Search (no fetch). Then `[` from Search goes to Library
+    // (no fetch). Then `[` from Library goes to Home and SHOULD fire send_home.
+    app.yt_view.tab = YtTab::Library;
+    app.yt_view.home_sections_cached = None;
+    handle_key(&mut app, key('['));
+    assert_eq!(app.yt_view.tab, YtTab::Home, "[ must cycle Library -> Home");
+    assert!(
+        app.yt_session.as_ref().unwrap().home_loading(),
+        "tab-switch to Home must fire send_home via yt_tab_fetch_on_visit"
+    );
+}
+
+#[test]
+fn bracket_keys_skip_fetch_when_cache_populated() {
+    // `yt_tab_fetch_on_visit` only fires when the cache is None — a populated
+    // cache means the tab is already loaded, so no re-fetch on switch.
+    let (_d, mut app) = yt_app_on_tab(YtTab::Radio);
+    app.yt_session = Some(fake_session());
+    app.yt_view.explore_cached = Some(Vec::new()); // already cached
+    handle_key(&mut app, key(']'));
+    assert_eq!(app.yt_view.tab, YtTab::Explore);
+    assert!(
+        !app.yt_session.as_ref().unwrap().explore_loading(),
+        "tab-switch to a cached Explore tab must NOT re-fire send_explore"
+    );
+}

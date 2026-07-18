@@ -2,7 +2,7 @@
 source: tests/state_snapshots.rs
 expression: s
 ---
-VIEWS                      │1:Home │ 2:Library │ 3:Search │ 4:Discover │ 5:Radio                         YouTube [stale]
+VIEWS                      │Home │ Library │ Search │ Discover │ Radio │ Explore │ Charts                YouTube [stale]
 ›   1 Artists              │⌕ YouTube Home
 ›   2 Playlists            │cold start — listening to music builds your profile
 ›   3 Queue                │

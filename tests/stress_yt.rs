@@ -47,6 +47,18 @@ for line in sys.stdin:
     if cmd == "home_suggestions":
         print(json.dumps({{"ok": True, "data": {{"suggestions": []}}}}), flush=True)
         continue
+    # Task 4: auto-respond to home/explore/charts with empty payloads so the
+    # new on_tick fetch-on-first-visit (Home tab) doesn't block the pending
+    # queue. See e2e_yt::fake_sidecar for the full rationale.
+    if cmd == "home":
+        print(json.dumps({{"ok": True, "data": {{"home_sections": []}}}}), flush=True)
+        continue
+    if cmd == "explore":
+        print(json.dumps({{"ok": True, "data": {{"explore_playlists": []}}}}), flush=True)
+        continue
+    if cmd == "charts":
+        print(json.dumps({{"ok": True, "data": {{"charts": []}}}}), flush=True)
+        continue
     if cmd == "get_playlist":
         pid = req.get("id", "")
         time.sleep(delay / 1000.0)
@@ -590,6 +602,18 @@ for line in sys.stdin:
         continue
     if cmd == "get_playlist":
         print(json.dumps({{"ok": False, "error": "Unable to find contents - not a real playlist id"}}), flush=True)
+        continue
+    # Task 4: auto-respond to home/explore/charts with empty payloads so the
+    # new on_tick fetch-on-first-visit (Home tab) doesn't block the pending
+    # queue. See e2e_yt::fake_sidecar for the full rationale.
+    if cmd == "home":
+        print(json.dumps({{"ok": True, "data": {{"home_sections": []}}}}), flush=True)
+        continue
+    if cmd == "explore":
+        print(json.dumps({{"ok": True, "data": {{"explore_playlists": []}}}}), flush=True)
+        continue
+    if cmd == "charts":
+        print(json.dumps({{"ok": True, "data": {{"charts": []}}}}), flush=True)
         continue
 "#
     )

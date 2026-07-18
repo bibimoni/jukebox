@@ -50,6 +50,13 @@ pub fn render_yt_view(f: &mut Frame, area: Rect, app: &mut App) {
         YtTab::Search => render_yt_search(f, split[1], app),
         YtTab::Discover => render_yt_discover(f, split[1], app),
         YtTab::Radio => render_yt_radio(f, split[1], app),
+        // Task 5: real renderers that read from `app.yt_view.explore_cached`
+        // / `charts_cached` (populated by Task 3's `on_tick` consumers). Both
+        // show a "Loading…" state while the fetch is in flight and no cache
+        // exists, a "No content available" empty state when the fetch
+        // returned empty, and the content list otherwise.
+        YtTab::Explore => render_yt_explore(f, split[1], app),
+        YtTab::Charts => render_yt_charts(f, split[1], app),
     }
 }
 
@@ -76,6 +83,212 @@ fn border<'a>(title: &'a str, focused: bool, theme: &Theme) -> Block<'a> {
             .border_style(Style::default().fg(color))
             .title(Span::styled(title, Style::default().fg(color)))
     }
+}
+
+/// Explore tab (Task 5): renders the cached YouTube Music explore-feed
+/// playlists (mood/genre shelves) from `app.yt_view.explore_cached` (populated
+/// by Task 3's `on_tick` consumer for `Pending::Explore`). The layout mirrors
+/// `render_yt_discover` (single column inside a titled border) and
+/// `render_yt_radio` (centered dim empty state):
+///
+/// - **Loading**: while `session.explore_loading()` is true and no cache
+///   exists, shows a `Loading… Explore` line with a spinner frame (mirrors
+///   `render_yt_discover`'s loading indicator). The spinner doesn't animate
+///   in a single render — it ticks on redraws driven by `on_tick`.
+/// - **Empty**: when the fetch returned no playlists (cache is `None` or
+///   `Some(vec![])` and not loading), shows `No content available` centered
+///   + dim (mirrors `render_yt_radio`'s `No active radio session.` state).
+/// - **Content**: each `PlaylistProto` renders as `{glyph} {title} —
+///   {subtitle} — {count} tracks`. The glyph is the playlist glyph (`*` /
+///   `✦`, matching `kind_glyph_label`'s Suggested pattern). `subtitle` and
+///   `count` are optional and omitted when `None`.
+///
+/// Cursor tracking / j/k/Enter navigation belongs to Task 6 (input.rs); this
+/// task only renders the list (no selection styling). Task 6 may add an
+/// `explore_cursor` field on `YtViewState` if needed.
+pub fn render_yt_explore(f: &mut Frame, area: Rect, app: &App) {
+    let theme = Theme::default();
+    let nc = no_color();
+    let dim = Style::default().fg(if nc { Color::Reset } else { theme.dim });
+    let dash = em_dash();
+    let dot = sep_dot();
+
+    let loading = app
+        .yt_session
+        .as_ref()
+        .map(|s| s.explore_loading())
+        .unwrap_or(false);
+    let cached = app.yt_view.explore_cached.as_ref();
+    let is_empty = cached.map(|v| v.is_empty()).unwrap_or(true);
+
+    let block = border("Explore", true, &theme);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines: Vec<Line> = if loading && cached.is_none() {
+        // Loading state — mirror render_yt_discover's spinner. Use a static
+        // frame (no loading_ticks field for Explore; animation is a cosmetic
+        // concern for a follow-up).
+        let frame = if is_ascii() { "|" } else { "⠋" };
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("{frame} Loading{} Explore playlists", ellipsis()),
+                Style::default().fg(theme.hi_fg),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("Esc close {dot} wait for shelves to load"),
+                dim,
+            )),
+        ]
+    } else if is_empty {
+        // Empty state — mirror render_yt_radio's "No active radio session."
+        vec![
+            Line::from(""),
+            Line::from(Span::styled("No content available".to_string(), dim)),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("press R to refresh {dot} Esc close"),
+                dim,
+            )),
+        ]
+    } else {
+        // Content state — render each playlist as a line.
+        let playlists = cached.unwrap();
+        let glyph = if is_ascii() { "*" } else { "✦" };
+        let text_style = Style::default().fg(if nc { Color::Reset } else { theme.text });
+        let mut out: Vec<Line> = Vec::new();
+        for p in playlists {
+            let subtitle = p.subtitle.as_deref().unwrap_or("");
+            let count_label = match p.count {
+                Some(n) => format!(" {dash} {n} tracks"),
+                None => String::new(),
+            };
+            let line = if subtitle.is_empty() {
+                format!("{glyph} {}{count_label}", p.title)
+            } else {
+                format!("{glyph} {} {dash} {subtitle}{count_label}", p.title)
+            };
+            out.push(Line::from(Span::styled(line, text_style)));
+        }
+        // Hint line at the bottom.
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            format!("R refresh {dot} Esc close"),
+            dim,
+        )));
+        out
+    };
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Charts tab (Task 5): renders the cached YouTube Music chart entries from
+/// `app.yt_view.charts_cached` (populated by Task 3's `on_tick` consumer for
+/// `Pending::Charts`). Entries are grouped by their `chart` field (e.g.
+/// "Top songs", "Top videos", "Trending", "Top artists") with a section
+/// header + horizontal divider per group, mirroring `render_yt_library`'s
+/// `YtListKind` grouping (yt_view.rs:247-257).
+///
+/// State handling mirrors `render_yt_explore`:
+/// - **Loading**: `Loading… Charts` with a spinner frame.
+/// - **Empty**: `No content available` centered + dim.
+/// - **Content**: per-chart section header (`{chart} — {n} entries`, accent +
+///   BOLD) + dim `h_line()` divider + entry lines (`{glyph} {title} —
+///   {subtitle}`). The entry glyph is a bullet (`•` / `*`).
+///
+/// Cursor tracking / j/k/Enter navigation belongs to Task 6 (input.rs).
+pub fn render_yt_charts(f: &mut Frame, area: Rect, app: &App) {
+    let theme = Theme::default();
+    let nc = no_color();
+    let dim = Style::default().fg(if nc { Color::Reset } else { theme.dim });
+    let dash = em_dash();
+    let dot = sep_dot();
+    let header_style = Style::default()
+        .fg(if nc { Color::Reset } else { theme.accent })
+        .add_modifier(Modifier::BOLD);
+
+    let loading = app
+        .yt_session
+        .as_ref()
+        .map(|s| s.charts_loading())
+        .unwrap_or(false);
+    let cached = app.yt_view.charts_cached.as_ref();
+    let is_empty = cached.map(|v| v.is_empty()).unwrap_or(true);
+
+    let block = border("Charts", true, &theme);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines: Vec<Line> = if loading && cached.is_none() {
+        let frame = if is_ascii() { "|" } else { "⠋" };
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("{frame} Loading{} Charts", ellipsis()),
+                Style::default().fg(theme.hi_fg),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("Esc close {dot} wait for charts to load"),
+                dim,
+            )),
+        ]
+    } else if is_empty {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled("No content available".to_string(), dim)),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("press R to refresh {dot} Esc close"),
+                dim,
+            )),
+        ]
+    } else {
+        // Content state — group entries by `chart` field, emit a section
+        // header + dim h_line divider whenever the chart name changes.
+        let entries = cached.unwrap();
+        let glyph = if is_ascii() { "*" } else { "•" };
+        let text_style = Style::default().fg(if nc { Color::Reset } else { theme.text });
+        let col_w = inner.width.saturating_sub(2) as usize;
+        let rule_w = col_w.min(60);
+        let rule = h_line().repeat(rule_w);
+        let mut out: Vec<Line> = Vec::new();
+        let mut prev_chart: Option<&str> = None;
+        // Pre-compute per-chart counts so the header can show `Top songs — 5
+        // entries` (mirrors render_yt_library's per-kind count).
+        let mut counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for e in entries {
+            *counts.entry(e.chart.as_str()).or_default() += 1;
+        }
+        for e in entries {
+            if prev_chart != Some(e.chart.as_str()) {
+                let n = counts.get(e.chart.as_str()).copied().unwrap_or(0);
+                let header = format!("{} {dash} {n} entries", e.chart);
+                out.push(Line::from(Span::styled(header, header_style)));
+                out.push(Line::from(Span::styled(rule.clone(), dim)));
+                prev_chart = Some(e.chart.as_str());
+            }
+            let subtitle = e.subtitle.as_deref().unwrap_or("");
+            let line = if subtitle.is_empty() {
+                format!("{glyph} {}", e.title)
+            } else {
+                format!("{glyph} {} {dash} {subtitle}", e.title)
+            };
+            out.push(Line::from(Span::styled(line, text_style)));
+        }
+        // Hint line at the bottom.
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            format!("R refresh {dot} Esc close"),
+            dim,
+        )));
+        out
+    };
+
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Render the 5-tab sub-tab bar: `1:Home | 2:Library | 3:Search | 4:Discover
@@ -771,6 +984,7 @@ mod tests {
     use crate::catalog::Catalog;
     use crate::player::StubPlayer;
     use crate::tui::app::{App, View, YtList, YtListKind, YtTab, YtViewState};
+    use crate::yt::proto::{ChartEntryProto, PlaylistProto};
     use ratatui::{backend::TestBackend, Terminal};
 
     /// Minimal one-track catalog so `App::new` succeeds.
@@ -819,14 +1033,24 @@ mod tests {
         out
     }
 
-    /// I.4: YT view shows 5-tab bar with all five labels at 100×30.
+    /// I.4: YT view shows 7-tab bar with all seven labels at 100×30. Task 4
+    /// added `Explore` and `Charts` variants and removed the `1:`-`5:`
+    /// number prefixes (BB-027).
     #[test]
-    fn yt_view_shows_five_tab_bar() {
+    fn yt_view_shows_seven_tab_bar() {
         let mut app = one_track_app();
         app.view = View::Youtube;
         app.yt_view.tab = YtTab::Home;
         let text = yt_view_text(&mut app, 100, 30);
-        for label in ["1:Home", "2:Library", "3:Search", "4:Discover", "5:Radio"] {
+        for label in [
+            "Home",
+            "Library",
+            "Search",
+            "Discover",
+            "Radio",
+            "Explore",
+            "Charts",
+        ] {
             assert!(
                 text.contains(label),
                 "I.4: tab bar must show {label}: {text:?}"
@@ -835,7 +1059,8 @@ mod tests {
     }
 
     /// I.4: the active tab is distinguishable (REVERSED + BOLD modifier on
-    /// its label cells).
+    /// its label cells). Task 4 removed the `1:`-`5:` number prefixes, so the
+    /// probe strings look for "Library" (active) and "Home" (inactive).
     #[test]
     fn yt_view_active_tab_has_selection_style() {
         use ratatui::style::Modifier;
@@ -850,37 +1075,40 @@ mod tests {
             })
             .unwrap();
         let buf = terminal.backend().buffer();
-        // Find the row containing the tab labels, then check the "2:Library"
-        // cells carry REVERSED + BOLD (active). Other tabs should not.
+        // Find the row containing the tab labels, then check the "Library"
+        // cells carry REVERSED + BOLD (active). Other tabs should not. We
+        // probe by scanning for the "L" of "Library" and the "H" of "Home",
+        // then reading a window to confirm the full label is present (the
+        // bare letters alone could collide with other words; the window
+        // check disambiguates).
         let mut found_active_reversed = false;
         let mut found_inactive_not_reversed = false;
         for y in 0..3u16 {
             for x in 0..100u16 {
                 let cell = &buf[(x, y)];
                 let sym = cell.symbol();
-                if sym.contains('2') {
-                    // Check the cells around for "Library"
+                if sym.contains('L') {
                     let mut probe = String::new();
                     for dx in 0..10u16 {
                         if let Some(c) = buf.cell((x + dx, y)) {
                             probe.push(c.symbol().chars().next().unwrap_or(' '));
                         }
                     }
-                    if probe.contains("2:Library")
+                    if probe.contains("Library")
                         && cell.modifier.contains(Modifier::REVERSED)
                         && cell.modifier.contains(Modifier::BOLD)
                     {
                         found_active_reversed = true;
                     }
                 }
-                if sym.contains('1') {
+                if sym.contains('H') {
                     let mut probe = String::new();
-                    for dx in 0..10u16 {
+                    for dx in 0..6u16 {
                         if let Some(c) = buf.cell((x + dx, y)) {
                             probe.push(c.symbol().chars().next().unwrap_or(' '));
                         }
                     }
-                    if probe.contains("1:Home") && !cell.modifier.contains(Modifier::REVERSED) {
+                    if probe.contains("Home") && !cell.modifier.contains(Modifier::REVERSED) {
                         found_inactive_not_reversed = true;
                     }
                 }
@@ -888,11 +1116,11 @@ mod tests {
         }
         assert!(
             found_active_reversed,
-            "I.4: active tab '2:Library' must have REVERSED+BOLD"
+            "I.4: active tab 'Library' must have REVERSED+BOLD"
         );
         assert!(
             found_inactive_not_reversed,
-            "I.4: inactive tab '1:Home' must NOT have REVERSED"
+            "I.4: inactive tab 'Home' must NOT have REVERSED"
         );
     }
 
@@ -1027,28 +1255,36 @@ mod tests {
         );
     }
 
-    /// I.4: YtTab::next/prev cycle through all five tabs.
+    /// I.4: YtTab::next/prev cycle through all seven tabs (Task 4 added
+    /// `Explore` and `Charts`).
     #[test]
     fn yt_tab_next_prev_cycle() {
         assert_eq!(YtTab::Home.next(), YtTab::Library);
         assert_eq!(YtTab::Library.next(), YtTab::Search);
         assert_eq!(YtTab::Search.next(), YtTab::Discover);
         assert_eq!(YtTab::Discover.next(), YtTab::Radio);
-        assert_eq!(YtTab::Radio.next(), YtTab::Home);
-        assert_eq!(YtTab::Home.prev(), YtTab::Radio);
+        assert_eq!(YtTab::Radio.next(), YtTab::Explore);
+        assert_eq!(YtTab::Explore.next(), YtTab::Charts);
+        assert_eq!(YtTab::Charts.next(), YtTab::Home);
+        assert_eq!(YtTab::Home.prev(), YtTab::Charts);
+        assert_eq!(YtTab::Charts.prev(), YtTab::Explore);
+        assert_eq!(YtTab::Explore.prev(), YtTab::Radio);
         assert_eq!(YtTab::Radio.prev(), YtTab::Discover);
     }
 
-    /// I.4: YtTab::all() returns 5 tabs with `1:`-`5:` prefixes.
+    /// I.4: YtTab::all() returns 7 tabs with no number prefixes (Task 4 /
+    /// BB-027).
     #[test]
-    fn yt_tab_all_has_five_with_number_prefix() {
+    fn yt_tab_all_has_seven_no_number_prefix() {
         let tabs = YtTab::all();
-        assert_eq!(tabs.len(), 5);
-        assert_eq!(tabs[0].0, "1:Home");
-        assert_eq!(tabs[1].0, "2:Library");
-        assert_eq!(tabs[2].0, "3:Search");
-        assert_eq!(tabs[3].0, "4:Discover");
-        assert_eq!(tabs[4].0, "5:Radio");
+        assert_eq!(tabs.len(), 7);
+        assert_eq!(tabs[0].0, "Home");
+        assert_eq!(tabs[1].0, "Library");
+        assert_eq!(tabs[2].0, "Search");
+        assert_eq!(tabs[3].0, "Discover");
+        assert_eq!(tabs[4].0, "Radio");
+        assert_eq!(tabs[5].0, "Explore");
+        assert_eq!(tabs[6].0, "Charts");
     }
 
     /// I.4: YtViewState::default() has Home tab + zeroed cursors.
@@ -1168,6 +1404,242 @@ mod tests {
             app.overlay.is_none(),
             "RC19-D2: second render must still NOT set the overlay: {:?}",
             app.overlay
+        );
+    }
+
+    /// Task 5: `render_yt_explore` shows the empty state ("No content
+    /// available") when `explore_cached` is `None` (no fetch has landed yet)
+    /// and no session is loading. This is the default state when the user
+    /// first switches to the Explore tab before the sidecar responds.
+    #[test]
+    fn render_yt_explore_shows_empty_state_when_uncached() {
+        let mut app = one_track_app();
+        app.view = View::Youtube;
+        app.yt_view.tab = YtTab::Explore;
+        // No session, no cache → empty state (not loading, since there's no
+        // session to report `explore_loading() == true`).
+        assert!(app.yt_session.is_none());
+        assert!(app.yt_view.explore_cached.is_none());
+        let text = yt_view_text(&mut app, 100, 30);
+        assert!(
+            text.contains("No content available"),
+            "Task 5: Explore tab must show 'No content available' when uncached: {text:?}"
+        );
+    }
+
+    /// Task 5: `render_yt_explore` shows the empty state when the fetch
+    /// returned an empty vector (`Some(vec![])` and not loading). This is
+    /// distinct from "never fetched" (`None`) — the fetch ran and the
+    /// explore feed had no playlists.
+    #[test]
+    fn render_yt_explore_shows_empty_state_when_empty_vec() {
+        let mut app = one_track_app();
+        app.view = View::Youtube;
+        app.yt_view.tab = YtTab::Explore;
+        app.yt_view.explore_cached = Some(vec![]);
+        let text = yt_view_text(&mut app, 100, 30);
+        assert!(
+            text.contains("No content available"),
+            "Task 5: Explore tab must show 'No content available' when cache is empty vec: {text:?}"
+        );
+    }
+
+    /// Task 5: `render_yt_explore` shows the cached playlist titles when
+    /// `explore_cached` is `Some(vec![PlaylistProto, ...])`. Verifies the
+    /// title, subtitle, and track count all render.
+    #[test]
+    fn render_yt_explore_shows_content() {
+        let mut app = one_track_app();
+        app.view = View::Youtube;
+        app.yt_view.tab = YtTab::Explore;
+        app.yt_view.explore_cached = Some(vec![
+            PlaylistProto {
+                id: "PL1".into(),
+                title: "Chill Vibes".into(),
+                subtitle: Some("mood".into()),
+                count: Some(42),
+            },
+            PlaylistProto {
+                id: "PL2".into(),
+                title: "Workout Beats".into(),
+                subtitle: None,
+                count: None,
+            },
+        ]);
+        let text = yt_view_text(&mut app, 100, 30);
+        assert!(
+            text.contains("Chill Vibes"),
+            "Task 5: Explore tab must show playlist title 'Chill Vibes': {text:?}"
+        );
+        assert!(
+            text.contains("mood"),
+            "Task 5: Explore tab must show playlist subtitle 'mood': {text:?}"
+        );
+        assert!(
+            text.contains("42 tracks"),
+            "Task 5: Explore tab must show track count '42 tracks': {text:?}"
+        );
+        assert!(
+            text.contains("Workout Beats"),
+            "Task 5: Explore tab must show second playlist title 'Workout Beats': {text:?}"
+        );
+        // The "No content available" empty state must NOT show when there's
+        // content.
+        assert!(
+            !text.contains("No content available"),
+            "Task 5: Explore tab must not show empty state when content exists: {text:?}"
+        );
+    }
+
+    /// Task 5: `render_yt_charts` shows the empty state when
+    /// `charts_cached` is `None` (no fetch has landed yet).
+    #[test]
+    fn render_yt_charts_shows_empty_state_when_uncached() {
+        let mut app = one_track_app();
+        app.view = View::Youtube;
+        app.yt_view.tab = YtTab::Charts;
+        assert!(app.yt_session.is_none());
+        assert!(app.yt_view.charts_cached.is_none());
+        let text = yt_view_text(&mut app, 100, 30);
+        assert!(
+            text.contains("No content available"),
+            "Task 5: Charts tab must show 'No content available' when uncached: {text:?}"
+        );
+    }
+
+    /// Task 5: `render_yt_charts` shows the empty state when the fetch
+    /// returned an empty vector.
+    #[test]
+    fn render_yt_charts_shows_empty_state_when_empty_vec() {
+        let mut app = one_track_app();
+        app.view = View::Youtube;
+        app.yt_view.tab = YtTab::Charts;
+        app.yt_view.charts_cached = Some(vec![]);
+        let text = yt_view_text(&mut app, 100, 30);
+        assert!(
+            text.contains("No content available"),
+            "Task 5: Charts tab must show 'No content available' when cache is empty vec: {text:?}"
+        );
+    }
+
+    /// Task 5: `render_yt_charts` groups entries by their `chart` field,
+    /// emitting a section header per chart and the entry titles below. This
+    /// is the core grouping behavior the spec requires (mirror
+    /// `render_yt_library`'s `YtListKind` grouping at yt_view.rs:247-257).
+    #[test]
+    fn render_yt_charts_groups_by_chart() {
+        let mut app = one_track_app();
+        app.view = View::Youtube;
+        app.yt_view.tab = YtTab::Charts;
+        app.yt_view.charts_cached = Some(vec![
+            ChartEntryProto {
+                title: "Song A".into(),
+                subtitle: Some("Artist A".into()),
+                video_id: Some("v1".into()),
+                playlist_id: None,
+                artist: None,
+                chart: "Top songs".into(),
+            },
+            ChartEntryProto {
+                title: "Song B".into(),
+                subtitle: Some("Artist B".into()),
+                video_id: Some("v2".into()),
+                playlist_id: None,
+                artist: None,
+                chart: "Top songs".into(),
+            },
+            ChartEntryProto {
+                title: "Video C".into(),
+                subtitle: Some("Channel C".into()),
+                video_id: Some("v3".into()),
+                playlist_id: None,
+                artist: None,
+                chart: "Top videos".into(),
+            },
+        ]);
+        let text = yt_view_text(&mut app, 100, 30);
+        // Both chart section headers must render.
+        assert!(
+            text.contains("Top songs"),
+            "Task 5: Charts tab must show 'Top songs' section header: {text:?}"
+        );
+        assert!(
+            text.contains("Top videos"),
+            "Task 5: Charts tab must show 'Top videos' section header: {text:?}"
+        );
+        // All entry titles must render.
+        assert!(
+            text.contains("Song A"),
+            "Task 5: Charts tab must show entry title 'Song A': {text:?}"
+        );
+        assert!(
+            text.contains("Song B"),
+            "Task 5: Charts tab must show entry title 'Song B': {text:?}"
+        );
+        assert!(
+            text.contains("Video C"),
+            "Task 5: Charts tab must show entry title 'Video C': {text:?}"
+        );
+        // The per-chart count must show in the section header.
+        assert!(
+            text.contains("2 entries"),
+            "Task 5: Charts tab must show '2 entries' for Top songs section: {text:?}"
+        );
+        assert!(
+            text.contains("1 entries"),
+            "Task 5: Charts tab must show '1 entries' for Top videos section: {text:?}"
+        );
+        // The empty state must NOT show.
+        assert!(
+            !text.contains("No content available"),
+            "Task 5: Charts tab must not show empty state when content exists: {text:?}"
+        );
+    }
+
+    /// Task 5: `render_yt_charts` groups entries by their `chart` field even
+    /// when the entries are interleaved (defensive — the sidecar typically
+    /// sends them grouped, but the renderer should not assume that). The
+    /// section header must be re-emitted when the chart name changes between
+    /// consecutive entries.
+    #[test]
+    fn render_yt_charts_groups_interleaved_charts() {
+        let mut app = one_track_app();
+        app.view = View::Youtube;
+        app.yt_view.tab = YtTab::Charts;
+        app.yt_view.charts_cached = Some(vec![
+            ChartEntryProto {
+                title: "Song A".into(),
+                subtitle: None,
+                video_id: Some("v1".into()),
+                playlist_id: None,
+                artist: None,
+                chart: "Top songs".into(),
+            },
+            ChartEntryProto {
+                title: "Video B".into(),
+                subtitle: None,
+                video_id: Some("v2".into()),
+                playlist_id: None,
+                artist: None,
+                chart: "Top videos".into(),
+            },
+            ChartEntryProto {
+                title: "Song C".into(),
+                subtitle: None,
+                video_id: Some("v3".into()),
+                playlist_id: None,
+                artist: None,
+                chart: "Top songs".into(),
+            },
+        ]);
+        let text = yt_view_text(&mut app, 100, 30);
+        // The "Top songs" header should appear twice (once for the first
+        // entry, once for the third entry after "Top videos" interleaves).
+        // We count occurrences of "Top songs" in the rendered text.
+        let count = text.matches("Top songs").count();
+        assert!(
+            count >= 2,
+            "Task 5: Charts tab must re-emit 'Top songs' header for interleaved entries (found {count} occurrences): {text:?}"
         );
     }
 }

@@ -47,6 +47,20 @@ for line in sys.stdin:
     if cmd == "resolve_url":
         vid = req.get("video_id", "")
         key = json.dumps({"ok": True, "data": {"resolve": {"url": "https://x/" + vid, "expires_at": None, "codec": "AAC", "abr": 256, "sample_rate": 48000, "container": "m4a", "premium": True}}})
+    # Task 4: auto-respond to home/explore/charts with empty payloads when
+    # the test's map doesn't provide them. The new on_tick fetch-on-first-visit
+    # fires send_home on the default Home tab; without a response the
+    # Pending::Home sits at the queue head forever and blocks all later
+    # responses (resolve, get_playlist, etc.). An empty home_sections list
+    # drains the queue, sets home_sections_cached=Some(vec![]) (so the fetch
+    # doesn't re-fire), and appends nothing to home.sections. Tests that need
+    # real home/explore/charts content still put the key in their map.
+    if cmd == "home" and key is None:
+        key = json.dumps({"ok": True, "data": {"home_sections": []}})
+    if cmd == "explore" and key is None:
+        key = json.dumps({"ok": True, "data": {"explore_playlists": []}})
+    if cmd == "charts" and key is None:
+        key = json.dumps({"ok": True, "data": {"charts": []}})
     if key is not None:
         print(key, flush=True)
 "#
@@ -745,7 +759,7 @@ fn multiple_get_playlist_responses_in_one_drain_all_survive() {
     let script = dir.path().join("per_id.py");
     std::fs::write(
         &script,
-        "import sys, json\nfor line in sys.stdin:\n    line = line.strip()\n    if not line: continue\n    req = json.loads(line)\n    cmd = req.get('cmd')\n    if cmd == 'get_playlist':\n        pid = req.get('id', '')\n        if pid == 'PL_A':\n            print(json.dumps({\"ok\": True, \"data\": {\"tracks\": [{\"video_id\": \"a1\", \"title\": \"TrackA1\", \"artist\": \"X\"}, {\"video_id\": \"a2\", \"title\": \"TrackA2\", \"artist\": \"X\"}]}}), flush=True)\n        elif pid == 'PL_B':\n            print(json.dumps({\"ok\": True, \"data\": {\"tracks\": [{\"video_id\": \"b1\", \"title\": \"TrackB1\", \"artist\": \"Y\"}, {\"video_id\": \"b2\", \"title\": \"TrackB2\", \"artist\": \"Y\"}]}}), flush=True)\n",
+        "import sys, json\nfor line in sys.stdin:\n    line = line.strip()\n    if not line: continue\n    req = json.loads(line)\n    cmd = req.get('cmd')\n    if cmd == 'get_playlist':\n        pid = req.get('id', '')\n        if pid == 'PL_A':\n            print(json.dumps({\"ok\": True, \"data\": {\"tracks\": [{\"video_id\": \"a1\", \"title\": \"TrackA1\", \"artist\": \"X\"}, {\"video_id\": \"a2\", \"title\": \"TrackA2\", \"artist\": \"X\"}]}}), flush=True)\n        elif pid == 'PL_B':\n            print(json.dumps({\"ok\": True, \"data\": {\"tracks\": [{\"video_id\": \"b1\", \"title\": \"TrackB1\", \"artist\": \"Y\"}, {\"video_id\": \"b2\", \"title\": \"TrackB2\", \"artist\": \"Y\"}]}}), flush=True)\n    # Task 4: auto-respond to home/explore/charts with empty payloads so the\n    # new on_tick fetch-on-first-visit (Home tab) doesn't block the pending\n    # queue. Without these handlers, Pending::Home sits at the queue head\n    # forever and the get_playlist responses can't match.\n    elif cmd == 'home':\n        print(json.dumps({\"ok\": True, \"data\": {\"home_sections\": []}}), flush=True)\n    elif cmd == 'explore':\n        print(json.dumps({\"ok\": True, \"data\": {\"explore_playlists\": []}}), flush=True)\n    elif cmd == 'charts':\n        print(json.dumps({\"ok\": True, \"data\": {\"charts\": []}}), flush=True)\n",
     )
     .unwrap();
     let session = Session::spawn(std::path::Path::new("python3"), &script, None).unwrap();

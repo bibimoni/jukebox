@@ -49,6 +49,15 @@ for line in sys.stdin:
     if cmd == "resolve_url":
         vid = req.get("video_id", "")
         key = json.dumps({"ok": True, "data": {"resolve": {"url": "https://x/" + vid, "expires_at": None, "codec": "AAC", "abr": 256, "sample_rate": 48000, "container": "m4a", "premium": True}}})
+    # Task 4: auto-respond to home/explore/charts with empty payloads so the
+    # new on_tick fetch-on-first-visit (Home tab) doesn't block the pending
+    # queue. See e2e_yt::fake_sidecar for the full rationale.
+    if cmd == "home" and key is None:
+        key = json.dumps({"ok": True, "data": {"home_sections": []}})
+    if cmd == "explore" and key is None:
+        key = json.dumps({"ok": True, "data": {"explore_playlists": []}})
+    if cmd == "charts" and key is None:
+        key = json.dumps({"ok": True, "data": {"charts": []}})
     if key is not None:
         print(key, flush=True)
 "#
