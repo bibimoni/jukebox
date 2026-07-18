@@ -22,7 +22,7 @@
 //! timeouts (up to ~5s) instead of fixed sleeps.
 
 use jukebox::tui::app::{App, View, YtTab};
-use jukebox::tui::view::home::HomeSection;
+use jukebox::tui::view::home::{HomeItem, HomeSection};
 use jukebox::yt::session::Session;
 use jukebox::yt::state::YtState;
 use std::io::Write;
@@ -707,6 +707,178 @@ fn logout_clears_all_three_caches() {
     assert!(
         app.yt_view.charts_cached.is_none(),
         "yt_logout must clear charts_cached"
+    );
+    assert_eq!(
+        app.yt_state,
+        YtState::SignedOut,
+        "yt_logout transitions to SignedOut"
+    );
+
+    let _ = std::fs::remove_file(&script);
+}
+
+// ---------------------------------------------------------------------------
+// R refresh + logout must clear home.sections (prevent shelf duplication)
+// ---------------------------------------------------------------------------
+
+/// Build a realistic pre-refresh `home.sections` snapshot: one local
+/// cold-start shelf (Quick Picks with a local track) + one YouTube shelf
+/// (the "Listen again" shelf mapped to `ContinueListening` with a YouTube
+/// playlist item). This is the state after the first fetch lands — the
+/// shape `R` refresh must NOT accumulate onto.
+fn local_plus_yt_sections() -> Vec<(HomeSection, Vec<HomeItem>)> {
+    vec![
+        (
+            HomeSection::QuickPicks,
+            vec![HomeItem::track(
+                "t1".into(),
+                "Hello".into(),
+                "Adele".into(),
+                true,
+            )],
+        ),
+        (
+            HomeSection::ContinueListening,
+            vec![HomeItem::playlist("PL1".into(), "Mix 1".into(), false)],
+        ),
+    ]
+}
+
+/// `R` on the Home tab must NOT duplicate YouTube shelves in `home.sections`.
+/// The refresh clears `home_sections_cached` AND `home.sections`, so the next
+/// `render_yt_home` re-runs `populate_home_state` (rebuilding local-only
+/// sections) and the `on_tick` consumer appends the new YouTube shelves onto
+/// a fresh base. Without the `home.sections` clear, the consumer's `.push()`
+/// would append the new YouTube shelves onto the PREVIOUS shelves, doubling
+/// them on every `R`. Verified here by: pre-populating `home.sections` with
+/// local + YouTube shelves + a non-empty cache, calling
+/// `refresh_yt_home_explore_charts`, then asserting both the cache and
+/// `home.sections` are cleared (and that a `home` re-fire was sent to the
+/// sidecar).
+#[test]
+fn r_refresh_on_home_does_not_duplicate_sections() {
+    let log_dir = tempfile::tempdir().unwrap();
+    let log_path = log_dir.path().join("cmds.log");
+    let script = counting_sidecar(&log_path);
+    let (_xdg, mut app) = yt_app_on_tab(&script, YtTab::Home);
+
+    // Simulate the post-first-fetch state: local + YouTube shelves already
+    // in `home.sections`, and the raw proto list stashed in the cache.
+    app.yt_view.home.sections = local_plus_yt_sections();
+    app.yt_view.home_sections_cached = Some(vec![
+        jukebox::yt::proto::HomeSectionProto::default(),
+    ]);
+    let pre_count = app.yt_view.home.sections.len();
+    assert_eq!(
+        pre_count, 2,
+        "pre-condition: home.sections has local + YouTube shelves"
+    );
+    assert!(
+        app.yt_view.home_sections_cached.is_some(),
+        "pre-condition: home_sections_cached is populated"
+    );
+
+    // Simulate the `R` key on the Home tab.
+    app.refresh_yt_home_explore_charts();
+
+    // The cache is cleared (the existing behavior — fetch-on-next-visit
+    // re-fires `send_home`).
+    assert!(
+        app.yt_view.home_sections_cached.is_none(),
+        "R refresh must clear home_sections_cached"
+    );
+    // The fix: `home.sections` is also cleared so the `on_tick` consumer's
+    // `.push()` doesn't append onto the previous shelves (duplicating them).
+    // The next `render_yt_home` re-runs `populate_home_state` to rebuild the
+    // local-only base, then the new YouTube shelves append when the response
+    // lands.
+    assert!(
+        app.yt_view.home.sections.is_empty(),
+        "R refresh must clear home.sections so the next fetch appends onto a \
+         fresh base (not the previous shelves): got {:?}",
+        app.yt_view.home.sections
+    );
+
+    // The refresh re-fired `send_home` — verify the sidecar received a
+    // `home` command (give the reader thread a moment to flush the log).
+    std::thread::sleep(Duration::from_millis(100));
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let home_count = log.lines().filter(|l| l.trim() == "home").count();
+    assert_eq!(
+        home_count, 1,
+        "the sidecar must receive a 'home' command from the R refresh: \
+         log={log:?}"
+    );
+
+    let _ = std::fs::remove_file(&script);
+}
+
+/// `yt_logout` must clear `home.sections` (not just the three cache fields).
+/// Without this clear, `populate_home_state` would be skipped on the next
+/// `render_yt_home` (it only runs when `home.sections.is_empty()`) and the
+/// prior account's YouTube shelves would linger on the Home tab until
+/// `open_home` (H key) or restart — so a re-login under a different account
+/// would show the prior account's shelves (stale data). Verified by:
+/// pre-populating `home.sections` with local + YouTube shelves + the three
+/// caches, calling `yt_logout`, then asserting all four fields are cleared.
+#[test]
+fn yt_logout_clears_home_sections() {
+    let _xdg = isolate_xdg();
+    let script = draining_sidecar();
+    let session = Session::spawn(Path::new("python3"), &script, None).unwrap();
+    let (_d, cat) = local_cat();
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
+    // Point yt_script at the drainer so `clear_cookies`' respawn succeeds
+    // (the default `scripts/yt/yt.py` needs ytmusicapi installed).
+    app.yt_script = script.clone();
+
+    // Pre-populate `home.sections` with local + YouTube shelves (the state
+    // after the first fetch landed) and all three caches with non-empty
+    // content.
+    app.yt_view.home.sections = local_plus_yt_sections();
+    app.yt_view.home_sections_cached =
+        Some(vec![jukebox::yt::proto::HomeSectionProto::default()]);
+    app.yt_view.explore_cached =
+        Some(vec![jukebox::yt::proto::PlaylistProto::default()]);
+    app.yt_view.charts_cached =
+        Some(vec![jukebox::yt::proto::ChartEntryProto::default()]);
+    assert_eq!(
+        app.yt_view.home.sections.len(),
+        2,
+        "pre-condition: home.sections has local + YouTube shelves"
+    );
+    assert!(app.yt_view.home_sections_cached.is_some());
+    assert!(app.yt_view.explore_cached.is_some());
+    assert!(app.yt_view.charts_cached.is_some());
+
+    app.yt_logout();
+
+    // All three cache fields are cleared (the existing behavior).
+    assert!(
+        app.yt_view.home_sections_cached.is_none(),
+        "yt_logout must clear home_sections_cached"
+    );
+    assert!(
+        app.yt_view.explore_cached.is_none(),
+        "yt_logout must clear explore_cached"
+    );
+    assert!(
+        app.yt_view.charts_cached.is_none(),
+        "yt_logout must clear charts_cached"
+    );
+    // The fix: `home.sections` is also cleared so the next `render_yt_home`
+    // re-runs `populate_home_state` (rebuilding local-only sections, no
+    // YouTube shelves since the user is now signed out).
+    assert!(
+        app.yt_view.home.sections.is_empty(),
+        "yt_logout must clear home.sections so the prior account's YouTube \
+         shelves don't linger until open_home/restart: got {:?}",
+        app.yt_view.home.sections
     );
     assert_eq!(
         app.yt_state,

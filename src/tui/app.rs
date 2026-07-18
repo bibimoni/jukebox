@@ -3466,14 +3466,17 @@ impl App {
         // account never shows the prior account's YouTube shelves. The
         // session-side `clear_all_caches` (called above via `clear_cookies`)
         // resets the three new pending fields + inflight guards; these three
-        // fields live on `YtViewState` and need their own clear here. The
-        // local cold-start `home.sections` are NOT cleared here — the next
-        // `render_yt_home` re-runs `populate_home_state` (rebuilding local
-        // sections only) and re-fires `send_home` because the cache is now
-        // `None`, so the YouTube shelves re-append when the response lands.
+        // fields live on `YtViewState` and need their own clear here. We also
+        // clear `home.sections` here so the next `render_yt_home` re-runs
+        // `populate_home_state` (rebuilding local-only sections, no YouTube
+        // shelves since the user is now signed out). Without this clear,
+        // `populate_home_state` would be skipped (it only runs when
+        // `home.sections.is_empty()`) and the prior account's YouTube shelves
+        // would linger on the Home tab until `open_home` (H key) or restart.
         self.yt_view.home_sections_cached = None;
         self.yt_view.explore_cached = None;
         self.yt_view.charts_cached = None;
+        self.yt_view.home.sections.clear();
         // Drop a pending audio format switch handle (the thread detaches
         // and completes on its own — best-effort, no blocking).
         self.audio_switch_handle = None;
@@ -4111,6 +4114,13 @@ impl App {
         match self.yt_view.tab {
             YtTab::Home => {
                 self.yt_view.home_sections_cached = None;
+                // Clear `home.sections` so the next `render_yt_home` re-runs
+                // `populate_home_state` (rebuilding local-only sections) and
+                // the new YouTube shelves append onto a fresh base. Without
+                // this clear, the `on_tick` consumer's `.push()` would append
+                // the new YouTube shelves onto the PREVIOUS shelves still in
+                // `home.sections`, duplicating them on every R refresh.
+                self.yt_view.home.sections.clear();
                 let _ = session.send_home();
             }
             YtTab::Explore => {
