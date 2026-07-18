@@ -507,10 +507,17 @@ fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
         idx += 1;
     }
 
-    // Single pane: render the focused column only via the columns module's
-    // narrow path. The columns renderer already adapts to area.width; in a
-    // narrow area it shows the focused column with a breadcrumb title.
-    columns::render_narrow(f, outer[idx], app);
+    // Browse area: when the pane workspace is active (multiple panes OR
+    // pane edit mode), route through the pane workspace renderer instead
+    // of the narrow single-column path. The pane renderer handles borders,
+    // the EDIT badge, the edit-mode status line, and tiny-terminal
+    // fallback. When inactive, the legacy narrow single-column renderer
+    // runs (so a fresh app at 80×24 looks identical to today).
+    if crate::tui::pane::render::is_pane_mode_active(app) {
+        crate::tui::pane::render::render_pane_workspace(f, outer[idx], app);
+    } else {
+        columns::render_narrow(f, outer[idx], app);
+    }
     idx += 1;
 
     // Compressed 1-row player bar: now-playing + quality + flags on one line.

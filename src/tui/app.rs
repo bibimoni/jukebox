@@ -489,6 +489,27 @@ pub enum Overlay {
     Publication {
         state: crate::tui::view::publication::PublicationState,
     },
+    /// Pane-edit: choose which side to split the focused pane on. `s` in
+    /// PaneEdit mode opens this overlay; the user picks L/R/T/B with
+    /// `h/l/k/j` or arrow keys; on confirm the `PaneModulePicker` overlay
+    /// opens to pick the new pane's module.
+    PaneSplitDirection {
+        target_pane: crate::tui::pane::PaneId,
+    },
+    /// Pane-edit: pick a module to install in a pane. `m` in PaneEdit
+    /// mode opens this for the focused pane (no split); the split-
+    /// direction picker opens this with `pending_split = Some(side)` so
+    /// Enter both splits and assigns the module in one go. `j/k` or
+    /// arrows navigate; Enter confirms; Esc cancels.
+    PaneModulePicker {
+        target_pane: crate::tui::pane::PaneId,
+        /// `Some(side)` = the user picked this side in the
+        /// `PaneSplitDirection` overlay; Enter splits AND assigns the
+        /// module. `None` = change the existing pane's module (no split).
+        pending_split: Option<crate::tui::pane::model::Side>,
+        /// Cursor into `ModuleId::all()`.
+        cursor: usize,
+    },
 }
 
 /// Actions that can be confirmed via [`Overlay::Confirm`].
@@ -909,6 +930,22 @@ pub struct App {
     pub player_bar_state: crate::tui::view::player_bar_big::PlayerBarState,
     pub sidebar_visible: bool,
     pub playlist_col: PlaylistColumnState,
+
+    // --- Modular pane-editing system (Phase 1) ---------------------------
+    /// The pane workspace: split tree + focused pane + interaction mode.
+    /// Owned by `App` as a single field; all layout logic lives in
+    /// [`crate::tui::pane`]. Inactive by default (single root leaf +
+    /// Normal mode) so a fresh app renders identically to today. The
+    /// pane system activates when the user splits or enters edit mode.
+    /// The module registry is process-global (see
+    /// [`crate::tui::pane::registry`]) — keeping it out of `App` avoids
+    /// a split-borrow conflict between `&app.pane_registry` (for module
+    /// lookup) and `&mut app` (which `PaneModule::render` needs).
+    pub pane_workspace: crate::tui::pane::PaneWorkspace,
+    /// Pending `Ctrl+w` prefix: the next key is a pane command. Set by
+    /// `input::handle_key` when `Ctrl+w` is pressed; consumed by
+    /// [`crate::tui::pane::input::handle_prefix_key`] on the next key.
+    pub pending_pane_prefix: bool,
 }
 
 /// Inline filter state for the `f` filter-on-focused-column (spec §5.4).
@@ -1003,6 +1040,37 @@ impl ContextResolver for ClonedResolver<'_> {
 }
 
 impl App {
+    /// Best-effort estimate of the main content area's `Rect` — where the
+    /// pane workspace lives. Used by the pane input layer for directional
+    /// focus movement (which needs pane rects; the actual rects are
+    /// recomputed on render). Returns a 1×1 rect if the terminal size is
+    /// unknown (the focus logic gracefully no-ops on degenerate input).
+    ///
+    /// This mirrors [`crate::tui::view::layout::overlay_content_area`]'s
+    /// top-level computation but uses the live terminal size from
+    /// `crossterm::terminal::size`. The render layer recomputes the
+    /// actual rects from the tree on every frame, so an imprecise
+    /// estimate here only affects focus movement (and only when the
+    /// terminal has been resized between frames — a rare race that
+    /// self-corrects on the next render).
+    pub fn pane_content_area(&self) -> ratatui::layout::Rect {
+        let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+        let area = ratatui::layout::Rect::new(0, 0, w, h);
+        // Subtract the rail (when visible) so pane focus uses the same
+        // coordinate frame as the rendered panes.
+        let main = if self.sidebar_visible {
+            area
+        } else {
+            let split = ratatui::layout::Layout::horizontal([
+                ratatui::layout::Constraint::Length(self.column_widths.rail),
+                ratatui::layout::Constraint::Min(1),
+            ])
+            .split(area);
+            split[1]
+        };
+        crate::tui::view::layout::overlay_content_area(main)
+    }
+
     pub fn new(
         catalog: Catalog,
         player: Box<dyn Player>,
@@ -1148,6 +1216,8 @@ impl App {
             player_bar_state: crate::tui::view::player_bar_big::PlayerBarState::default(),
             sidebar_visible: true,
             playlist_col: PlaylistColumnState::default(),
+            pane_workspace: crate::tui::pane::PaneWorkspace::new(),
+            pending_pane_prefix: false,
         }
     }
 

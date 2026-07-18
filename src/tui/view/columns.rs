@@ -290,12 +290,40 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
         split[1]
     };
 
+    // Modular pane workspace: when active (more than one pane OR pane
+    // edit mode), the pane layer takes over the main area. Otherwise the
+    // legacy per-view renderer runs (so a fresh app looks identical to
+    // today). The pane layer draws its own borders around each pane.
+    if crate::tui::pane::render::is_pane_mode_active(app) {
+        crate::tui::pane::render::render_pane_workspace(f, main_area, app);
+        return;
+    }
+
     match app.view {
         View::Artists => render_artists(f, main_area, app, &theme),
         View::Playlists => render_playlists(f, main_area, app, &theme),
         View::Queue => render_queue(f, main_area, app, &theme),
         View::Youtube => super::yt_view::render_yt_view(f, main_area, app),
     }
+}
+
+/// Pane-module wrappers: public entry points for the pane layer to call
+/// each view's renderer directly (without re-running the rail + match
+/// dispatch in [`render`]). The pane layer has already split off the rail
+/// and is rendering into a single pane's inner rect. Each wrapper builds
+/// its own `Theme` (mirroring [`render`]) so the pane layer doesn't have
+/// to pass one in.
+pub fn render_artists_pane(f: &mut Frame, area: Rect, app: &mut App) {
+    let theme = Theme::default();
+    render_artists(f, area, app, &theme);
+}
+pub fn render_playlists_pane(f: &mut Frame, area: Rect, app: &mut App) {
+    let theme = Theme::default();
+    render_playlists(f, area, app, &theme);
+}
+pub fn render_queue_pane(f: &mut Frame, area: Rect, app: &mut App) {
+    let theme = Theme::default();
+    render_queue(f, area, app, &theme);
 }
 
 /// A titled border whose color reflects focus: accent when `focused`, dim

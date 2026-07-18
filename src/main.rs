@@ -165,6 +165,13 @@ fn main() -> anyhow::Result<()> {
                 };
                 let (tw, _) = crossterm::terminal::size().unwrap_or((0, 0));
                 app.playlist_col.clamp_width(tw.max(1));
+                // Restore the pane workspace (Phase 1): the split tree +
+                // focused pane + next-id counter. Falls back to the
+                // default single- Artists-pane workspace if absent
+                // (fresh install or schema migration).
+                if let Some(dto) = layout.pane_workspace {
+                    app.pane_workspace = dto.into();
+                }
                 // RC11-DEF-014: restore the last-played track + position so a
                 // "resume" hint can show and `resume_last()` (R / Enter on the
                 // restored cursor) can seek to the saved position. The hint
@@ -421,6 +428,9 @@ fn main() -> anyhow::Result<()> {
                 track_layout_mode: app.player_bar_state.track_layout.as_str(),
                 sidebar_visible: app.sidebar_visible,
                 playlist_col: &app.playlist_col,
+                pane_workspace: Some(&crate::tui::pane::persistence::PaneWorkspaceDto::from(
+                    &app.pane_workspace,
+                )),
             });
             let _ = state::save_playlists(&app.playlists);
             let _ = state::save_command_history(&app.command_history);

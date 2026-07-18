@@ -549,6 +549,7 @@ fn def014_last_played_state_round_trip() {
             track_layout_mode: "table",
             sidebar_visible: true,
             playlist_col: &jukebox::tui::app::PlaylistColumnState::default(),
+            pane_workspace: None,
         },
     )
     .unwrap();

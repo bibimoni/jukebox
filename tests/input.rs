@@ -1337,6 +1337,7 @@ fn rb3_persisted_youtube_view_is_not_a_trap() {
             track_layout_mode: "table",
             sidebar_visible: app.sidebar_visible,
             playlist_col: &PlaylistColumnState::default(),
+            pane_workspace: None,
         },
     )
     .unwrap();

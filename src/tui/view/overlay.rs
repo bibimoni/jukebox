@@ -102,6 +102,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
         Overlay::Explanation { explanation } => render_explanation_overlay(f, area, &explanation),
         // Publication confirmation — centered popup.
         Overlay::Publication { state } => render_publication_overlay(f, area, &state),
+        // Pane-edit: split-direction picker. Centered popup.
+        Overlay::PaneSplitDirection { .. } => render_pane_split_direction_overlay(f, area),
+        // Pane-edit: module picker. Centered popup.
+        Overlay::PaneModulePicker {
+            target_pane,
+            pending_split,
+            cursor,
+        } => render_pane_module_picker_overlay(f, area, target_pane, pending_split, cursor),
     }
 }
 
@@ -1670,6 +1678,130 @@ fn render_publication_overlay(f: &mut Frame, area: Rect, state: &publication::Pu
     f.render_widget(block, popup);
     let para = publication::render(popup, state, &icons).scroll((state.scroll, 0));
     f.render_widget(para, inner);
+}
+
+// ---------------------------------------------------------------------------
+// Pane-edit overlays: split-direction picker + module picker
+// ---------------------------------------------------------------------------
+
+/// `PaneSplitDirection` overlay: a centered popup asking the user which
+/// side to split the focused pane on. Mirrors the styling of the
+/// existing `PlaylistPicker` (centered, accent border, dim hint text).
+/// Key dispatch lives in `pane::input::handle_split_direction_key`.
+fn render_pane_split_direction_overlay(f: &mut Frame, area: Rect) {
+    let theme = Theme::default();
+    // Use centered_fixed (absolute height) instead of centered (percentage)
+    // so the overlay is tall enough to show all content rows regardless of
+    // terminal height. The content is 6 rows + 2 border = 8 rows.
+    let popup = centered_fixed(area, 60, 8);
+    f.render_widget(Clear, popup);
+    let block = block_with_title("Split direction", &theme);
+    let inner = block.inner(popup);
+
+    let accent = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme.dim);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("h", accent),
+            Span::styled(" / ", dim),
+            Span::styled("←", accent),
+            Span::styled("  split left    ", dim),
+            Span::styled("l", accent),
+            Span::styled(" / ", dim),
+            Span::styled("→", accent),
+            Span::styled("  split right", dim),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("k", accent),
+            Span::styled(" / ", dim),
+            Span::styled("↑", accent),
+            Span::styled("  split top     ", dim),
+            Span::styled("j", accent),
+            Span::styled(" / ", dim),
+            Span::styled("↓", accent),
+            Span::styled("  split bottom", dim),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Esc cancel", dim)),
+    ];
+
+    f.render_widget(block, popup);
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+}
+
+/// `PaneModulePicker` overlay: a centered popup listing the registered
+/// modules. `j/k` or arrows navigate; Enter confirms (splits if
+/// `pending_split` is set, else changes the existing pane's module).
+fn render_pane_module_picker_overlay(
+    f: &mut Frame,
+    area: Rect,
+    _target_pane: crate::tui::pane::PaneId,
+    pending_split: Option<crate::tui::pane::model::Side>,
+    cursor: usize,
+) {
+    let theme = Theme::default();
+    // Use centered_fixed (absolute height) instead of centered (percentage)
+    // so the overlay is tall enough to show all 5 modules. Content is
+    // 5 modules + blank + hint + 2 border = 9 rows; use 12 for padding.
+    let popup = centered_fixed(area, 60, 12);
+    f.render_widget(Clear, popup);
+    let title = if pending_split.is_some() {
+        "Choose module for new pane"
+    } else {
+        "Choose module for pane"
+    };
+    let block = block_with_title(title, &theme);
+    let inner = block.inner(popup);
+
+    let accent = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let text = Style::default().fg(theme.text);
+    let dim = Style::default().fg(theme.dim);
+
+    let modules = crate::tui::pane::model::ModuleId::all();
+    let mut lines = Vec::new();
+    for (i, m) in modules.iter().enumerate() {
+        let style = if i == cursor { accent } else { text };
+        let marker = if i == cursor { "› " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(marker, if i == cursor { accent } else { dim }),
+            Span::styled(m.label(), style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "j/k move · Enter confirm · Esc cancel",
+        dim,
+    )));
+
+    f.render_widget(block, popup);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A titled block with the accent border, mirroring the existing
+/// `PlaylistPicker` styling.
+fn block_with_title(title: &str, theme: &Theme) -> Block<'static> {
+    let accent = Style::default().fg(theme.accent);
+    let title_owned = title.to_string();
+    if crate::tui::view::theme::is_ascii() {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(ASCII_BORDER_SET)
+            .border_style(accent)
+            .title(Span::styled(title_owned, accent))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Thick)
+            .border_style(accent)
+            .title(Span::styled(title_owned, accent))
+    }
 }
 
 #[cfg(test)]

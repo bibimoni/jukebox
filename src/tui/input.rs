@@ -38,6 +38,35 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
     }
 
+    // Pane prefix: `Ctrl+w` arms a one-shot prefix. The next key is
+    // interpreted by `pane::input::handle_prefix_key` (pane navigation
+    // in any mode, toggle edit mode, etc.). If the next key isn't a
+    // pane command, it falls through to normal dispatch. This keeps
+    // pane keybindings out of the existing keymap (no conflicts) while
+    // letting the user enter pane-edit mode from anywhere.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('w')) {
+        app.pending_pane_prefix = true;
+        return;
+    }
+    if app.pending_pane_prefix {
+        app.pending_pane_prefix = false;
+        if crate::tui::pane::input::handle_prefix_key(app, key) {
+            return;
+        }
+        // Not a pane command — fall through to normal dispatch.
+    }
+    // Pane-edit mode: route to the pane-edit handler instead of the
+    // global match. The pane handler manages its own key set (split /
+    // close / resize / change-module / exit) and passes through global
+    // playback + quit keys. Overlay routing still happens first so
+    // pane-edit sub-modes (PaneSplitDirection, PaneModulePicker) work.
+    if app.pane_workspace.mode == crate::tui::pane::model::UiMode::PaneEdit
+        && app.overlay.is_none()
+        && crate::tui::pane::input::handle_pane_edit_key(app, key)
+    {
+        return;
+    }
+
     // Overlay-open routing: typing, n/N, Enter pick, Esc close.
     if app.overlay.is_some() {
         handle_overlay_key(app, key);
@@ -337,10 +366,52 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
 
         // View switching: 1/2/3/4 = Artists/Playlists/Queue/YouTube.
-        (KeyCode::Char('1'), m) if m == KeyModifiers::NONE => switch_view(app, View::Artists),
-        (KeyCode::Char('2'), m) if m == KeyModifiers::NONE => switch_view(app, View::Playlists),
-        (KeyCode::Char('3'), m) if m == KeyModifiers::NONE => switch_view(app, View::Queue),
-        (KeyCode::Char('4'), m) if m == KeyModifiers::NONE => switch_view(app, View::Youtube),
+        // When the pane workspace is active (multiple panes OR pane edit
+        // mode), 1-4 change the FOCUSED pane's module instead of switching
+        // the global view — the pane renderer overrides app.view during
+        // render, so a global view switch would be invisible. Changing
+        // the focused pane's module matches the user's expectation: 1-4
+        // always controls what's in the focused pane.
+        (KeyCode::Char('1'), m) if m == KeyModifiers::NONE => {
+            if app.pane_workspace.is_active() {
+                app.pane_workspace.set_module(
+                    app.pane_workspace.focused_pane,
+                    crate::tui::pane::ModuleId::Artists,
+                );
+            } else {
+                switch_view(app, View::Artists);
+            }
+        }
+        (KeyCode::Char('2'), m) if m == KeyModifiers::NONE => {
+            if app.pane_workspace.is_active() {
+                app.pane_workspace.set_module(
+                    app.pane_workspace.focused_pane,
+                    crate::tui::pane::ModuleId::Playlists,
+                );
+            } else {
+                switch_view(app, View::Playlists);
+            }
+        }
+        (KeyCode::Char('3'), m) if m == KeyModifiers::NONE => {
+            if app.pane_workspace.is_active() {
+                app.pane_workspace.set_module(
+                    app.pane_workspace.focused_pane,
+                    crate::tui::pane::ModuleId::Queue,
+                );
+            } else {
+                switch_view(app, View::Queue);
+            }
+        }
+        (KeyCode::Char('4'), m) if m == KeyModifiers::NONE => {
+            if app.pane_workspace.is_active() {
+                app.pane_workspace.set_module(
+                    app.pane_workspace.focused_pane,
+                    crate::tui::pane::ModuleId::Youtube,
+                );
+            } else {
+                switch_view(app, View::Youtube);
+            }
+        }
 
         // Tab / Shift+Tab cycle view forward / backward.
         (KeyCode::Tab, m) if m.contains(KeyModifiers::SHIFT) => cycle_view(app, false),
@@ -519,6 +590,15 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         // state so no busy/Authenticating/AuthenticatedNotSynced lingers.
         if matches!(app.overlay, Some(Overlay::YtAuth { .. })) {
             app.cancel_yt_auth();
+        }
+        // Pane-edit sub-mode overlays (PaneSplitDirection /
+        // PaneModulePicker) return to PaneEdit mode on Esc, not Normal.
+        if matches!(
+            app.overlay,
+            Some(Overlay::PaneSplitDirection { .. } | Overlay::PaneModulePicker { .. })
+        ) {
+            app.pane_workspace
+                .set_mode(crate::tui::pane::model::UiMode::PaneEdit);
         }
         app.overlay = None;
         // Drop any stashed play-saved index so a later confirm doesn't
@@ -1686,6 +1766,24 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 state.error = None;
             }
             app.overlay = Some(Overlay::Publication { state });
+        }
+        // Pane-edit: split-direction picker. h/l/k/j or arrows choose
+        // the side; Esc cancels (handled at the top of this fn). On
+        // confirm, the PaneModulePicker overlay opens to pick the new
+        // pane's module. The overlay is put back before dispatch so the
+        // handler can take it itself (mirroring the existing pattern
+        // where each overlay handler receives the destructured fields).
+        Some(overlay @ Overlay::PaneSplitDirection { .. }) => {
+            app.overlay = Some(overlay);
+            let _ = crate::tui::pane::input::handle_split_direction_key(app, key);
+        }
+        // Pane-edit: module picker. j/k or arrows navigate the module
+        // list; Enter confirms (splits if `pending_split` is set, else
+        // changes the existing pane's module); Esc cancels (handled at
+        // the top of this fn).
+        Some(overlay @ Overlay::PaneModulePicker { .. }) => {
+            app.overlay = Some(overlay);
+            let _ = crate::tui::pane::input::handle_module_picker_key(app, key);
         }
         None => {}
     }
