@@ -1141,4 +1141,458 @@ mod tests {
         ws.exit_edit_mode();
         assert!(ws.is_active(), "still active: more than one pane");
     }
+
+    /// `ModuleId::label` returns a non-empty label for each variant.
+    #[test]
+    fn module_id_labels() {
+        assert_eq!(ModuleId::Artists.label(), "Artists");
+        assert_eq!(ModuleId::Playlists.label(), "Playlists");
+        assert_eq!(ModuleId::Queue.label(), "Queue");
+        assert_eq!(ModuleId::Youtube.label(), "YouTube");
+        assert_eq!(ModuleId::Placeholder.label(), "Placeholder");
+    }
+
+    /// `ModuleId::all` returns the modules in the picker order.
+    #[test]
+    fn module_id_all_returns_picker_order() {
+        let all = ModuleId::all();
+        assert_eq!(all[0], ModuleId::Artists);
+        assert_eq!(all[4], ModuleId::Placeholder);
+        assert_eq!(all.len(), 5);
+    }
+
+    /// `Default::default()` for PaneWorkspace equals `new()`.
+    #[test]
+    fn default_equals_new() {
+        let def: PaneWorkspace = Default::default();
+        let new = PaneWorkspace::new();
+        assert_eq!(def.focused_pane, new.focused_pane);
+        assert_eq!(def.next_id, new.next_id);
+        assert_eq!(def.root.leaf_count(), new.root.leaf_count());
+        assert_eq!(def.mode, new.mode);
+    }
+
+    /// `split` on a non-existent target returns `Err(NotFound)` and does
+    /// NOT burn a pane id (the next successful split reuses it).
+    #[test]
+    fn split_nonexistent_target_returns_err_and_does_not_burn_id() {
+        let mut ws = PaneWorkspace::new();
+        assert_eq!(ws.next_id, 1);
+        let err = ws.split(PaneId(99), Side::Right, ModuleId::Queue);
+        assert_eq!(err, Err(SplitError::NotFound));
+        // Id not burned.
+        assert_eq!(ws.next_id, 1);
+        // Tree unchanged.
+        assert_eq!(ws.root.leaf_count(), 1);
+        // Next successful split reuses id 1.
+        let new = ws.split(PaneId(0), Side::Right, ModuleId::Queue).unwrap();
+        assert_eq!(new, PaneId(1));
+    }
+
+    /// `split_leaf` recurses into the second child when the target isn't
+    /// in the first. Build a tree Split(V, A, B) and split B.
+    #[test]
+    fn split_leaf_recurses_into_second_child() {
+        let mut root = split(
+            SplitAxis::Vertical,
+            0.5,
+            leaf(0, ModuleId::Artists),
+            leaf(1, ModuleId::Queue),
+        );
+        // Split the right child (id=1) on the right side.
+        let ok = split_leaf(
+            &mut root,
+            PaneId(1),
+            Side::Right,
+            PaneId(2),
+            ModuleId::Youtube,
+        );
+        assert!(ok);
+        // Right child is now a Split.
+        match &root {
+            PaneNode::Split { second, .. } => match second.as_ref() {
+                PaneNode::Split {
+                    axis,
+                    first,
+                    second,
+                    ..
+                } => {
+                    assert_eq!(*axis, SplitAxis::Vertical);
+                    assert!(first.is_leaf_with_id(PaneId(1)));
+                    assert!(second.is_leaf_with_id(PaneId(2)));
+                }
+                _ => panic!("expected inner Split"),
+            },
+            _ => panic!("expected outer Split"),
+        }
+    }
+
+    /// `close` on a non-existent target returns `Err(NotFound)` (the
+    /// target isn't the root, so it's not `IsRoot`).
+    #[test]
+    fn close_nonexistent_target_returns_not_found() {
+        let mut ws = PaneWorkspace::new();
+        // Need at least one split so close doesn't hit the IsRoot path.
+        ws.split(PaneId(0), Side::Right, ModuleId::Queue).unwrap();
+        let err = ws.close(PaneId(99));
+        assert_eq!(err, Err(CloseError::NotFound));
+    }
+
+    /// `close_leaf` recurses into the second child when the target
+    /// isn't in the first. Build Split(V, A, Split(H, B, C)) and close C.
+    #[test]
+    fn close_leaf_recurses_into_second_child() {
+        let mut root = split(
+            SplitAxis::Vertical,
+            0.5,
+            leaf(0, ModuleId::Artists),
+            split(
+                SplitAxis::Horizontal,
+                0.5,
+                leaf(1, ModuleId::Queue),
+                leaf(2, ModuleId::Youtube),
+            ),
+        );
+        let mut new_focus: Option<PaneId> = None;
+        let res = close_leaf(&mut root, PaneId(2), &mut new_focus);
+        assert_eq!(res, CloseResult::Closed);
+        // The right child is now a single leaf (id=1).
+        match &root {
+            PaneNode::Split { second, .. } => {
+                assert!(second.is_leaf_with_id(PaneId(1)));
+            }
+            _ => panic!("expected outer Split"),
+        }
+        assert_eq!(new_focus, Some(PaneId(1)));
+    }
+
+    /// `close_leaf` returns `NotFound` for a target that doesn't exist
+    /// anywhere in the tree (recurses through both children, finds
+    /// nothing).
+    #[test]
+    fn close_leaf_not_found_for_missing_target() {
+        let mut root = split(
+            SplitAxis::Vertical,
+            0.5,
+            leaf(0, ModuleId::Artists),
+            leaf(1, ModuleId::Queue),
+        );
+        let mut new_focus: Option<PaneId> = None;
+        let res = close_leaf(&mut root, PaneId(99), &mut new_focus);
+        assert_eq!(res, CloseResult::NotFound);
+        assert!(
+            new_focus.is_none(),
+            "new_focus should not be set on NotFound"
+        );
+    }
+
+    /// `resize` returns `Err(NoAncestor)` when there's no matching
+    /// ancestor for the direction (e.g. growing left in a Horizontal
+    /// split).
+    #[test]
+    fn resize_no_matching_ancestor_returns_err() {
+        let mut ws = PaneWorkspace::new();
+        ws.split(PaneId(0), Side::Bottom, ModuleId::Queue).unwrap();
+        // Horizontal split — left/right resize has no matching ancestor.
+        let err = ws.resize(PaneId(0), Direction::Left, 0.05);
+        assert_eq!(err, Err(ResizeError::NoAncestor));
+        let err = ws.resize(PaneId(0), Direction::Right, 0.05);
+        assert_eq!(err, Err(ResizeError::NoAncestor));
+    }
+
+    /// `resize` returns `Err(NotFound)` when the target isn't in the
+    /// tree.
+    #[test]
+    fn resize_nonexistent_target_returns_not_found() {
+        let mut ws = PaneWorkspace::new();
+        let err = ws.resize(PaneId(99), Direction::Left, 0.05);
+        assert_eq!(err, Err(ResizeError::NotFound));
+    }
+
+    /// `resize` for `Direction::Down` adjusts the ratio upward (focused
+    /// pane is the FIRST child of a Horizontal split).
+    #[test]
+    fn resize_down_increases_ratio() {
+        let mut root = split(
+            SplitAxis::Horizontal,
+            0.5,
+            leaf(0, ModuleId::Artists),
+            leaf(1, ModuleId::Queue),
+        );
+        let path = find_path(&root, PaneId(0)).unwrap();
+        assert_eq!(
+            resize_recursive(&mut root, &path, Direction::Down, 0.05),
+            ResizeResult::Resized
+        );
+        match &root {
+            PaneNode::Split { ratio, .. } => assert!(*ratio > 0.5, "ratio should grow: {ratio}"),
+            _ => panic!("expected Split"),
+        }
+    }
+
+    /// `resize` for `Direction::Up` adjusts the ratio downward (focused
+    /// pane is the SECOND child of a Horizontal split).
+    #[test]
+    fn resize_up_decreases_ratio() {
+        let mut root = split(
+            SplitAxis::Horizontal,
+            0.5,
+            leaf(0, ModuleId::Artists),
+            leaf(1, ModuleId::Queue),
+        );
+        let path = find_path(&root, PaneId(1)).unwrap();
+        assert_eq!(
+            resize_recursive(&mut root, &path, Direction::Up, 0.05),
+            ResizeResult::Resized
+        );
+        match &root {
+            PaneNode::Split { ratio, .. } => assert!(*ratio < 0.5, "ratio should shrink: {ratio}"),
+            _ => panic!("expected Split"),
+        }
+    }
+
+    /// `resize_recursive` on a leaf node (no split to adjust) returns
+    /// `NoAncestor`.
+    #[test]
+    fn resize_recursive_on_leaf_returns_no_ancestor() {
+        let mut root = leaf(0, ModuleId::Artists);
+        let path: Vec<ChildPos> = vec![];
+        assert_eq!(
+            resize_recursive(&mut root, &path, Direction::Left, 0.05),
+            ResizeResult::NoAncestor
+        );
+    }
+
+    /// `resize_recursive` recurses into the FIRST child when the path
+    /// starts with First. Tree: Split(V, Split(H, A, B), C). Focus on
+    /// A (path = [First, First]). Resizing A down matches the inner H
+    /// split — the deeper call returns Resized, we return at line 668.
+    #[test]
+    fn resize_recursive_recurses_into_first_child() {
+        let mut root = split(
+            SplitAxis::Vertical,
+            0.5,
+            split(
+                SplitAxis::Horizontal,
+                0.5,
+                leaf(0, ModuleId::Artists),
+                leaf(1, ModuleId::Queue),
+            ),
+            leaf(2, ModuleId::Youtube),
+        );
+        // Path to A (id=0) is [First, First].
+        let path = find_path(&root, PaneId(0)).unwrap();
+        assert_eq!(path, vec![ChildPos::First, ChildPos::First]);
+        // Grow A down — matches the inner H split (A is the FIRST child,
+        // so grow-down = increase ratio).
+        assert_eq!(
+            resize_recursive(&mut root, &path, Direction::Down, 0.05),
+            ResizeResult::Resized
+        );
+        // The inner H split's ratio should have increased.
+        match &root {
+            PaneNode::Split { first, .. } => match first.as_ref() {
+                PaneNode::Split { axis, ratio, .. } => {
+                    assert_eq!(*axis, SplitAxis::Horizontal);
+                    assert!(*ratio > 0.5, "inner ratio should have increased: {ratio}");
+                }
+                _ => panic!("expected inner Split"),
+            },
+            _ => panic!("expected outer Split"),
+        }
+    }
+
+    /// `resize_recursive` recurses into the FIRST child, but when the
+    /// deeper call returns NoAncestor (no matching axis deeper), we
+    /// fall through to check the current split. Tree: Split(V,
+    /// Split(H, A, B), C). Focus on A. Grow A left — the inner H split
+    /// doesn't match (Left needs Vertical), so the deeper call returns
+    /// NoAncestor. The outer V split doesn't match either (A is First,
+    /// grow-left needs Second). So the whole thing returns NoAncestor.
+    #[test]
+    fn resize_recursive_first_child_deeper_no_ancestor_falls_through() {
+        let mut root = split(
+            SplitAxis::Vertical,
+            0.5,
+            split(
+                SplitAxis::Horizontal,
+                0.5,
+                leaf(0, ModuleId::Artists),
+                leaf(1, ModuleId::Queue),
+            ),
+            leaf(2, ModuleId::Youtube),
+        );
+        let path = find_path(&root, PaneId(0)).unwrap();
+        // Grow A left — no matching ancestor anywhere.
+        let res = resize_recursive(&mut root, &path, Direction::Left, 0.05);
+        // The outer V split COULD match: A is First, grow-left needs
+        // Second. So no — outer doesn't match. Result is NoAncestor.
+        assert_eq!(res, ResizeResult::NoAncestor);
+    }
+
+    /// `move_focus` on a workspace returns false when there's no
+    /// candidate in the direction (single pane).
+    #[test]
+    fn workspace_move_focus_no_candidate_returns_false() {
+        let mut ws = PaneWorkspace::new();
+        let panes = crate::tui::pane::layout::resolve_rects(
+            &ws.root,
+            ratatui::layout::Rect::new(0, 0, 100, 30),
+        );
+        assert!(!ws.move_focus(&panes, Direction::Left));
+        assert!(!ws.move_focus(&panes, Direction::Right));
+        assert!(!ws.move_focus(&panes, Direction::Up));
+        assert!(!ws.move_focus(&panes, Direction::Down));
+    }
+
+    /// `move_focus` moves to the adjacent pane and returns true.
+    #[test]
+    fn workspace_move_focus_moves_to_adjacent_pane() {
+        let mut ws = PaneWorkspace::new();
+        ws.split(PaneId(0), Side::Right, ModuleId::Queue).unwrap();
+        // Now focused on the right pane (id=1).
+        let panes = crate::tui::pane::layout::resolve_rects(
+            &ws.root,
+            ratatui::layout::Rect::new(0, 0, 100, 30),
+        );
+        assert!(ws.move_focus(&panes, Direction::Left));
+        assert_eq!(ws.focused_pane, PaneId(0));
+    }
+
+    /// `cycle_focus` returns false on a single-pane workspace (no cycle).
+    #[test]
+    fn workspace_cycle_focus_single_pane_returns_false() {
+        let mut ws = PaneWorkspace::new();
+        let panes = crate::tui::pane::layout::resolve_rects(
+            &ws.root,
+            ratatui::layout::Rect::new(0, 0, 100, 30),
+        );
+        assert!(!ws.cycle_focus(&panes, true));
+        assert!(!ws.cycle_focus(&panes, false));
+    }
+
+    /// `cycle_focus` moves through the panes in tree order.
+    #[test]
+    fn workspace_cycle_focus_multi_pane() {
+        let mut ws = PaneWorkspace::new();
+        ws.split(PaneId(0), Side::Right, ModuleId::Queue).unwrap();
+        // Focused on pane 1 (right).
+        let panes = crate::tui::pane::layout::resolve_rects(
+            &ws.root,
+            ratatui::layout::Rect::new(0, 0, 100, 30),
+        );
+        assert!(ws.cycle_focus(&panes, true));
+        assert_eq!(ws.focused_pane, PaneId(0));
+        assert!(ws.cycle_focus(&panes, false));
+        assert_eq!(ws.focused_pane, PaneId(1));
+    }
+
+    /// `apply_rectangle_selection` with a non-existent target pane
+    /// returns false (no mutation, no id burn).
+    #[test]
+    fn apply_rectangle_selection_bad_target_returns_false() {
+        let mut ws = PaneWorkspace::new();
+        let next_id_before = ws.next_id;
+        // Build a selection that targets a non-existent pane.
+        let sel = crate::tui::pane::selection::RectangleSelection::new(PaneId(99));
+        let ok = ws.apply_rectangle_selection(&sel, ModuleId::Queue);
+        assert!(!ok, "should return false for bad target");
+        // No id burn.
+        assert_eq!(ws.next_id, next_id_before);
+        // Tree unchanged.
+        assert_eq!(ws.root.leaf_count(), 1);
+    }
+
+    /// `replace_leaf` replaces a leaf that's the second child of a
+    /// split (covers the recursion-into-second branch).
+    #[test]
+    fn replace_leaf_replaces_second_child() {
+        let mut root = split(
+            SplitAxis::Vertical,
+            0.5,
+            leaf(0, ModuleId::Artists),
+            leaf(1, ModuleId::Queue),
+        );
+        let replacement = leaf(99, ModuleId::Youtube);
+        let ok = replace_leaf(&mut root, PaneId(1), replacement);
+        assert!(ok);
+        match &root {
+            PaneNode::Split { second, .. } => assert!(second.is_leaf_with_id(PaneId(99))),
+            _ => panic!("expected Split"),
+        }
+    }
+
+    /// `replace_leaf` returns false for a target not in the tree.
+    #[test]
+    fn replace_leaf_returns_false_for_missing_target() {
+        let mut root = leaf(0, ModuleId::Artists);
+        let replacement = leaf(99, ModuleId::Youtube);
+        assert!(!replace_leaf(&mut root, PaneId(5), replacement));
+    }
+
+    /// `replace_leaf` on a Split where NEITHER child contains the
+    /// target returns false (covers the fall-through path through
+    /// both children's false branches).
+    #[test]
+    fn replace_leaf_split_no_match_returns_false() {
+        let mut root = split(
+            SplitAxis::Vertical,
+            0.5,
+            leaf(0, ModuleId::Artists),
+            leaf(1, ModuleId::Queue),
+        );
+        let replacement = leaf(99, ModuleId::Youtube);
+        assert!(!replace_leaf(&mut root, PaneId(42), replacement));
+        // Tree unchanged.
+        assert!(
+            root.is_leaf_with_id(PaneId(0))
+                || matches!(&root, PaneNode::Split { first, .. } if first.is_leaf_with_id(PaneId(0)))
+        );
+    }
+
+    /// `replace_leaf` replaces a leaf at the root (no split).
+    #[test]
+    fn replace_leaf_replaces_root() {
+        let mut root = leaf(0, ModuleId::Artists);
+        let replacement = leaf(99, ModuleId::Youtube);
+        let ok = replace_leaf(&mut root, PaneId(0), replacement);
+        assert!(ok);
+        match &root {
+            PaneNode::Leaf { id, .. } => assert_eq!(*id, PaneId(99)),
+            _ => panic!("expected Leaf"),
+        }
+    }
+
+    /// `replace_leaf` recurses into the first child when the target is
+    /// nested (Split(V, Split(H, A, B), C)) and we replace B.
+    #[test]
+    fn replace_leaf_recurses_into_first_child() {
+        let mut root = split(
+            SplitAxis::Vertical,
+            0.5,
+            split(
+                SplitAxis::Horizontal,
+                0.5,
+                leaf(0, ModuleId::Artists),
+                leaf(1, ModuleId::Queue),
+            ),
+            leaf(2, ModuleId::Youtube),
+        );
+        let replacement = leaf(99, ModuleId::Placeholder);
+        let ok = replace_leaf(&mut root, PaneId(1), replacement);
+        assert!(ok);
+        // Find leaf 99 in the tree.
+        fn has_leaf(node: &PaneNode, id: PaneId) -> bool {
+            match node {
+                PaneNode::Leaf { id: lid, .. } => *lid == id,
+                PaneNode::Split { first, second, .. } => {
+                    has_leaf(first, id) || has_leaf(second, id)
+                }
+            }
+        }
+        assert!(
+            has_leaf(&root, PaneId(99)),
+            "replacement leaf 99 should be in the tree"
+        );
+    }
 }

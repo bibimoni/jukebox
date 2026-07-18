@@ -199,6 +199,108 @@ jobs:
       - name: Verify binary exists
         run: test -f target/release/jukebox
 
+  # ── coverage ─────────────────────────────────────────────────────────
+  # Runs `cargo llvm-cov` on the full test suite to produce a lcov.info
+  # artifact + per-file coverage stats. The pane module's coverage %
+  # is published to the summary page so a human can see at a glance
+  # whether `src/tui/pane/` is above the 95% target.
+  #
+  # The job `needs: test` so it only runs when tests pass — there's no
+  # point computing coverage over a red test suite.
+  coverage:
+    name: coverage
+    needs: test
+    runs-on: ubuntu-22.04
+    # Expose the total + pane-module coverage % to downstream jobs
+    # (the summary). Step outputs are the canonical way to pass values
+    # between jobs — `$GITHUB_ENV` is per-step and doesn't persist.
+    outputs:
+      TOTAL_COVERAGE: ${{ steps.pane_cov.outputs.TOTAL_COVERAGE }}
+      PANE_COVERAGE: ${{ steps.pane_cov.outputs.PANE_COVERAGE }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install Linux audio deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-coverage-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            cargo-coverage-
+            cargo-test-ubuntu-22.04-
+            cargo-clippy-ubuntu-22.04-
+            cargo-build-ubuntu-22.04-
+
+      - name: Run coverage
+        # Single-threaded test runner: the stress_yt suite is timing-
+        # sensitive and the coverage instrumentation slows the process
+        # spawn enough to flake under parallel test execution.
+        run: |
+          cargo llvm-cov --package jukebox --no-fail-fast \
+            --lcov --output-path lcov.info -- --test-threads=1
+
+      - name: Compute pane-module coverage
+        # Parse lcov.info to compute the pane module's line coverage
+        # (`src/tui/pane/*.rs`) and the total line coverage. Publishes
+        # both as step outputs so the summary job can render them.
+        id: pane_cov
+        run: |
+          python3 - <<'PY'
+          import os
+          files = {}
+          cur, cur_lines = None, None
+          with open('lcov.info') as f:
+              for line in f:
+                  line = line.strip()
+                  if line.startswith('SF:'):
+                      cur = line[3:]
+                      cur_lines = {}
+                      files[cur] = cur_lines
+                  elif line.startswith('DA:'):
+                      parts = line[3:].split(',')
+                      cur_lines[int(parts[0])] = int(parts[1])
+          # Total coverage across all files.
+          tot_cov = sum(len([ln for ln, c in ls.items() if c > 0]) for ls in files.values())
+          tot_all = sum(len(ls) for ls in files.values())
+          total_pct = 100.0 * tot_cov / tot_all if tot_all else 0.0
+          # Pane-module coverage: only files under src/tui/pane/.
+          pane_files = [(p, ls) for p, ls in files.items() if '/src/tui/pane/' in p]
+          pane_cov = sum(len([ln for ln, c in ls.items() if c > 0]) for _, ls in pane_files)
+          pane_all = sum(len(ls) for _, ls in pane_files)
+          pane_pct = 100.0 * pane_cov / pane_all if pane_all else 0.0
+          # Persist as step outputs for the summary job.
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"TOTAL_COVERAGE={total_pct:.2f}\n")
+              f.write(f"PANE_COVERAGE={pane_pct:.2f}\n")
+          print(f"Total coverage: {total_pct:.2f}%")
+          print(f"Pane module coverage: {pane_pct:.2f}%")
+          PY
+
+      - name: Upload lcov artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov.info
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 30
+
   # ── summary ──────────────────────────────────────────────────────────
   # One-page digest of the whole pipeline. Runs `if: always()` so the
   # summary is posted even when upstream jobs fail — that's the whole
@@ -206,7 +308,7 @@ jobs:
   # Writes to `$GITHUB_STEP_SUMMARY` (the "Summary" tab on the run page).
   summary:
     name: summary
-    needs: [fmt, clippy, test, bats, build]
+    needs: [fmt, clippy, test, bats, build, coverage]
     if: always()
     runs-on: ubuntu-22.04
     steps:
@@ -224,6 +326,11 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           BATS_RESULT: ${{ needs.bats.result }}
           BUILD_RESULT: ${{ needs.build.result }}
+          COVERAGE_RESULT: ${{ needs.coverage.result }}
+          # Coverage percentages are propagated from the coverage job's
+          # env. Defaults to 'unknown' if the coverage job didn't run.
+          TOTAL_COVERAGE: ${{ needs.coverage.outputs.TOTAL_COVERAGE || 'unknown' }}
+          PANE_COVERAGE: ${{ needs.coverage.outputs.PANE_COVERAGE || 'unknown' }}
         run: |
           # Read version from Cargo.toml (handles "0.4.0" and quoted forms).
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
@@ -244,7 +351,8 @@ jobs:
                         "clippy:${CLIPPY_RESULT}" \
                         "test:${TEST_RESULT}" \
                         "bats:${BATS_RESULT}" \
-                        "build:${BUILD_RESULT}"; do
+                        "build:${BUILD_RESULT}" \
+                        "coverage:${COVERAGE_RESULT}"; do
               job="${pair%%:*}"
               result="${pair##*:}"
               case "$result" in
@@ -257,12 +365,35 @@ jobs:
               echo "| ${job} | ${icon} ${result} |"
             done
             echo
+            # ── Test coverage section ──────────────────────────────────
+            # Shows the total + pane-module coverage % from the coverage
+            # job. The pane module has a 95% line-coverage target; the
+            # badge flips from :white_check_mark: to :warning: below it.
+            echo "### Test coverage"
+            echo
+            if [ "${COVERAGE_RESULT}" = "success" ] \
+               && [ "${TOTAL_COVERAGE}" != "unknown" ] \
+               && [ "${PANE_COVERAGE}" != "unknown" ]; then
+              echo "**Total coverage:** \`${TOTAL_COVERAGE}%\`  "
+              if awk -v p="${PANE_COVERAGE}" 'BEGIN{exit !(p >= 95)}'; then
+                echo "**Pane module coverage:** \`${PANE_COVERAGE}%\` :white_check_mark: (meets the 95% target)  "
+              else
+                echo "**Pane module coverage:** \`${PANE_COVERAGE}%\` :warning: (below the 95% target)  "
+              fi
+              echo
+              echo "Download the \`lcov.info\` artifact from the [coverage job](${RUN_URL}) to view per-file coverage in detail (e.g. with [lcov's genhtml](https://github.com/linux-test-project/lcov) or the [Coverage Gutters](https://marketplace.visualstudio.com/items?itemName=ryanluker.vscode-coverage-gutters) VS Code extension)."
+            else
+              echo "Coverage data unavailable (the \`coverage\` job did not complete successfully)."
+            fi
+            echo
             # `bats` is `continue-on-error: true` — it never blocks the gate,
-            # so exclude it from the release-ready verdict.
+            # so exclude it from the release-ready verdict. `coverage` is
+            # a hard gate — a release requires up-to-date coverage data.
             if [ "${FMT_RESULT}" = "success" ] \
                && [ "${CLIPPY_RESULT}" = "success" ] \
                && [ "${TEST_RESULT}" = "success" ] \
-               && [ "${BUILD_RESULT}" = "success" ]; then
+               && [ "${BUILD_RESULT}" = "success" ] \
+               && [ "${COVERAGE_RESULT}" = "success" ]; then
               echo "### :rocket: Release-ready"
               echo
               echo "All gates passed (bats is informational only — \`continue-on-error: true\`)."

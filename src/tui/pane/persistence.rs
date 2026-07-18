@@ -161,4 +161,87 @@ mod tests {
         let restored: PaneWorkspace = dto.into();
         assert_eq!(restored.mode, UiMode::Normal);
     }
+
+    /// A corrupt DTO with a Split root and a focused_pane not in the
+    /// tree falls back to the first leaf (covers the Split branch of
+    /// `first_leaf_id`).
+    #[test]
+    fn corrupt_dto_with_split_root_falls_back_to_first_leaf() {
+        use crate::tui::pane::model::{PaneNode, SplitAxis};
+        let dto = PaneWorkspaceDto {
+            root: PaneNode::Split {
+                axis: SplitAxis::Vertical,
+                ratio: 0.5,
+                first: Box::new(PaneNode::Leaf {
+                    id: PaneId(0),
+                    module: ModuleId::Artists,
+                }),
+                second: Box::new(PaneNode::Leaf {
+                    id: PaneId(1),
+                    module: ModuleId::Queue,
+                }),
+            },
+            focused_pane: PaneId(99), // not in tree
+            next_id: 5,
+        };
+        let ws: PaneWorkspace = dto.into();
+        // First leaf of the split is PaneId(0).
+        assert_eq!(ws.focused_pane, PaneId(0));
+        assert_eq!(ws.root.leaf_count(), 2);
+    }
+
+    /// A DTO with a Split root and a valid focused_pane keeps the
+    /// focused_pane (covers the Split branch of `contains_leaf`).
+    #[test]
+    fn split_root_with_valid_focused_pane_preserved() {
+        use crate::tui::pane::model::{PaneNode, SplitAxis};
+        let dto = PaneWorkspaceDto {
+            root: PaneNode::Split {
+                axis: SplitAxis::Vertical,
+                ratio: 0.5,
+                first: Box::new(PaneNode::Leaf {
+                    id: PaneId(0),
+                    module: ModuleId::Artists,
+                }),
+                second: Box::new(PaneNode::Leaf {
+                    id: PaneId(1),
+                    module: ModuleId::Queue,
+                }),
+            },
+            focused_pane: PaneId(1),
+            next_id: 5,
+        };
+        let ws: PaneWorkspace = dto.into();
+        assert_eq!(ws.focused_pane, PaneId(1));
+        // max_leaf_id is 1 → next_id = max(5, 1+1) = 5.
+        assert_eq!(ws.next_id, 5);
+    }
+
+    /// `max_leaf_id` recurses through both children of a split.
+    #[test]
+    fn max_leaf_id_recurses_through_split() {
+        use crate::tui::pane::model::{PaneNode, SplitAxis};
+        let root = PaneNode::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(PaneNode::Leaf {
+                id: PaneId(3),
+                module: ModuleId::Artists,
+            }),
+            second: Box::new(PaneNode::Split {
+                axis: SplitAxis::Vertical,
+                ratio: 0.5,
+                first: Box::new(PaneNode::Leaf {
+                    id: PaneId(7),
+                    module: ModuleId::Queue,
+                }),
+                second: Box::new(PaneNode::Leaf {
+                    id: PaneId(2),
+                    module: ModuleId::Youtube,
+                }),
+            }),
+        };
+        // max leaf id is 7 (in the nested right split).
+        assert_eq!(max_leaf_id(&root), PaneId(7));
+    }
 }

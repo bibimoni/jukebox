@@ -328,4 +328,16 @@ mod tests {
             Some(PaneId(1))
         );
     }
+
+    /// `spans_overlap` returns false when either span is zero-length
+    /// (defensive guard). Two non-overlapping zero-length spans never
+    /// match.
+    #[test]
+    fn spans_overlap_zero_length_returns_false() {
+        assert!(!spans_overlap(0, 0, 5, 10));
+        assert!(!spans_overlap(5, 10, 0, 0));
+        assert!(!spans_overlap(0, 0, 0, 0));
+        // Sanity: non-zero overlapping spans DO overlap.
+        assert!(spans_overlap(0, 5, 3, 5));
+    }
 }

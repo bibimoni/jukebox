@@ -288,3 +288,311 @@ impl PaneModule for PlaceholderModule {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::Catalog;
+    use crate::player::StubPlayer;
+    use crate::tui::app::App;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use ratatui::Terminal;
+
+    /// Build a 1-track catalog + App so we can call `module.render` and
+    /// `module.handle_key` with a real `&mut App`. The tempdir is leaked
+    /// so the catalog's source paths stay valid for the test's lifetime.
+    fn build_app() -> App {
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("40mP")).unwrap();
+        std::fs::write(lossless.join("40mP").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({
+            "version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+            "tracks":[
+              {"id":"t1","artists":["40mP"],"primary_artist":"40mP","title":"Song1",
+               "album":"Cosmic","bit_depth":24,"sample_rate_hz":96000,
+               "source_path":"lossless/40mP/01.flac","symlinked_into_artists":["40mP"]}
+            ]
+        })
+        .to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        std::mem::forget(d);
+        let cat = Catalog::load(&p).unwrap();
+        App::new(cat, Box::new(StubPlayer::default()), None, None)
+    }
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// `with_builtins` registers all 5 built-in modules in the expected
+    /// order. `all_ids` returns them in registration order.
+    #[test]
+    fn with_builtins_registers_all_modules() {
+        let reg = ModuleRegistry::with_builtins();
+        let ids = reg.all_ids();
+        assert_eq!(
+            ids,
+            vec![
+                ModuleId::Artists,
+                ModuleId::Playlists,
+                ModuleId::Queue,
+                ModuleId::Youtube,
+                ModuleId::Placeholder,
+            ]
+        );
+    }
+
+    /// `Default::default()` is `with_builtins()`.
+    #[test]
+    fn default_is_with_builtins() {
+        let def = ModuleRegistry::default();
+        assert_eq!(def.all_ids(), ModuleRegistry::with_builtins().all_ids());
+    }
+
+    /// `get` returns the module for each registered id.
+    #[test]
+    fn get_returns_each_module() {
+        let reg = ModuleRegistry::with_builtins();
+        for id in reg.all_ids() {
+            assert!(reg.get(id).is_some(), "expected module for {id:?}");
+        }
+        assert!(reg.get(ModuleId::Placeholder).is_some());
+    }
+
+    /// `get` returns `None` for an unregistered id (defensive — currently
+    /// all `ModuleId` variants are registered, but a future variant
+    /// might not be).
+    #[test]
+    fn get_returns_none_for_unknown_id() {
+        let reg = ModuleRegistry { modules: vec![] };
+        assert!(reg.get(ModuleId::Artists).is_none());
+        assert!(reg.all_ids().is_empty());
+    }
+
+    /// A custom (third-party) module can be registered.
+    #[test]
+    fn register_custom_module() {
+        struct Custom;
+        impl PaneModule for Custom {
+            fn id(&self) -> ModuleId {
+                ModuleId::Placeholder
+            }
+            fn title(&self) -> &'static str {
+                "Custom"
+            }
+            fn render(&self, _f: &mut Frame, _area: Rect, _app: &mut App) {}
+            fn handle_key(&self, _key: KeyEvent, _app: &mut App) -> bool {
+                false
+            }
+        }
+        let custom = Custom;
+        // Cover the trait methods on the custom module.
+        assert_eq!(custom.id(), ModuleId::Placeholder);
+        assert_eq!(custom.title(), "Custom");
+        let mut app = build_app();
+        assert!(!custom.handle_key(key('x'), &mut app));
+        let backend = TestBackend::new(40, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 40, 12);
+        term.draw(|f| custom.render(f, area, &mut app)).unwrap();
+
+        let mut reg = ModuleRegistry::with_builtins();
+        reg.register(Box::new(Custom));
+        // Replaced the built-in Placeholder — same id, new title.
+        let m = reg.get(ModuleId::Placeholder).unwrap();
+        assert_eq!(m.title(), "Custom");
+    }
+
+    /// `register` with a brand-new id pushes onto the list.
+    #[test]
+    fn register_new_module_pushes() {
+        // Pre-condition: only one module.
+        let mut reg = ModuleRegistry { modules: vec![] };
+        reg.register(Box::new(ArtistsModule));
+        assert_eq!(reg.all_ids(), vec![ModuleId::Artists]);
+    }
+
+    /// `init_registry` returns true on the first call, false on the
+    /// second (the global OnceLock is already set). We isolate the test
+    /// by running it in a separate process — but since tests run in the
+    /// same process, we just verify the function signature works and
+    /// returns a bool. (The global registry may already be initialized
+    /// by other tests, so we don't assert on the value.)
+    #[test]
+    fn init_registry_returns_bool() {
+        let reg = ModuleRegistry::with_builtins();
+        let _ = init_registry(reg);
+    }
+
+    /// `registry()` returns a non-empty registry with built-ins.
+    #[test]
+    fn registry_has_builtins() {
+        let r = registry();
+        assert!(r.all_ids().contains(&ModuleId::Artists));
+        assert!(r.all_ids().contains(&ModuleId::Queue));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Per-module trait method coverage
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn artists_module_id_title_handle_key() {
+        let m = ArtistsModule;
+        assert_eq!(m.id(), ModuleId::Artists);
+        assert_eq!(m.title(), "Artists");
+        let mut app = build_app();
+        assert!(!m.handle_key(key('x'), &mut app));
+    }
+
+    #[test]
+    fn artists_module_render_no_panic() {
+        let m = ArtistsModule;
+        let mut app = build_app();
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 80, 24);
+        term.draw(|f| m.render(f, area, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn playlists_module_id_title_handle_key() {
+        let m = PlaylistsModule;
+        assert_eq!(m.id(), ModuleId::Playlists);
+        assert_eq!(m.title(), "Playlists");
+        let mut app = build_app();
+        assert!(!m.handle_key(key('x'), &mut app));
+    }
+
+    #[test]
+    fn playlists_module_render_no_panic() {
+        let m = PlaylistsModule;
+        let mut app = build_app();
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 80, 24);
+        term.draw(|f| m.render(f, area, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn queue_module_id_title_handle_key() {
+        let m = QueueModule;
+        assert_eq!(m.id(), ModuleId::Queue);
+        assert_eq!(m.title(), "Queue");
+        let mut app = build_app();
+        assert!(!m.handle_key(key('x'), &mut app));
+    }
+
+    #[test]
+    fn queue_module_render_no_panic() {
+        let m = QueueModule;
+        let mut app = build_app();
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 80, 24);
+        term.draw(|f| m.render(f, area, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn youtube_module_id_title_handle_key() {
+        let m = YoutubeModule;
+        assert_eq!(m.id(), ModuleId::Youtube);
+        assert_eq!(m.title(), "YouTube");
+        let mut app = build_app();
+        assert!(!m.handle_key(key('x'), &mut app));
+    }
+
+    #[test]
+    fn youtube_module_render_no_panic() {
+        let m = YoutubeModule;
+        let mut app = build_app();
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 80, 24);
+        term.draw(|f| m.render(f, area, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn placeholder_module_id_title_handle_key() {
+        let m = PlaceholderModule;
+        assert_eq!(m.id(), ModuleId::Placeholder);
+        assert_eq!(m.title(), "Placeholder");
+        let mut app = build_app();
+        assert!(!m.handle_key(key('x'), &mut app));
+    }
+
+    /// Placeholder module renders the "Press m" hint at a usable size.
+    #[test]
+    fn placeholder_module_render_normal_size() {
+        let m = PlaceholderModule;
+        let mut app = build_app();
+        let backend = TestBackend::new(40, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 40, 12);
+        term.draw(|f| m.render(f, area, &mut app)).unwrap();
+        // The buffer should contain "Press" somewhere.
+        let buf = term.backend().buffer();
+        let mut found = false;
+        for y in 0..12 {
+            for x in 0..40 {
+                if buf[(x, y)].symbol() == "P" {
+                    let mut word = String::new();
+                    for dx in 0..5 {
+                        if x + dx < 40 {
+                            word.push_str(buf[(x + dx, y)].symbol());
+                        }
+                    }
+                    if word.starts_with("Press") {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if found {
+                break;
+            }
+        }
+        assert!(found, "placeholder should render 'Press' hint");
+    }
+
+    /// Placeholder module at tiny size (inner < 10 wide or < 3 tall)
+    /// renders the block but NOT the hint (early return).
+    #[test]
+    fn placeholder_module_render_tiny_width() {
+        let m = PlaceholderModule;
+        let mut app = build_app();
+        // 8 wide → inner width = 6 (after 1-cell borders) → < 10.
+        let backend = TestBackend::new(8, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 8, 6);
+        term.draw(|f| m.render(f, area, &mut app)).unwrap();
+        // No panic; the block renders but the "Press" hint doesn't.
+        let buf = term.backend().buffer();
+        let mut found_press = false;
+        for y in 0..6 {
+            for x in 0..8 {
+                if buf[(x, y)].symbol() == "P" {
+                    found_press = true;
+                }
+            }
+        }
+        assert!(!found_press, "should not render 'Press' hint at tiny width");
+    }
+
+    /// Placeholder module at tiny height (inner < 3 tall).
+    #[test]
+    fn placeholder_module_render_tiny_height() {
+        let m = PlaceholderModule;
+        let mut app = build_app();
+        // 2 tall → inner height = 0 (after 2-cell borders) → < 3.
+        let backend = TestBackend::new(20, 2);
+        let mut term = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 20, 2);
+        term.draw(|f| m.render(f, area, &mut app)).unwrap();
+        // No panic.
+    }
+}
