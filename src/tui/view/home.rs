@@ -894,6 +894,57 @@ mod tests {
             .unwrap();
     }
 
+    /// Task 5: `render_compact` renders a `HomeSection::YtFeed(String)`
+    /// section cleanly — the section header shows the carried title and the
+    /// "From YouTube" description, and the items render with their own
+    /// `HomeItemKind` glyphs (no match on `HomeSection` itself). This
+    /// verifies the view-layer side of Task 4's YtFeed variant addition: the
+    /// YouTube-sourced home shelves (appended to `home.sections` by Task 3's
+    /// `on_tick` consumer) render through the existing compact pipeline
+    /// without needing a home.rs code change.
+    #[test]
+    fn render_compact_with_ytfeed_section() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let icons = IconRenderer::new(FontMode::Unicode);
+        let mut state = HomeState::new();
+        state.loading = false;
+        // A YouTube-sourced shelf: the section title is carried verbatim by
+        // YtFeed, and the items are YouTube playlists (is_local = false →
+        // Icon::Youtube glyph).
+        let sections = vec![(
+            HomeSection::YtFeed("Listen again".into()),
+            vec![HomeItem::playlist("PL1".into(), "Chill Vibes".into(), false)],
+        )];
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_compact(f, f.area(), &sections, &state, &icons))
+            .unwrap();
+        // Inspect the buffer: the carried title "Listen again" must appear
+        // in the section header, and the playlist title "Chill Vibes" must
+        // appear in the item row.
+        let buf = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                text.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("Listen again"),
+            "Task 5: YtFeed section must show carried title 'Listen again': {text:?}"
+        );
+        assert!(
+            text.contains("From YouTube"),
+            "Task 5: YtFeed section must show 'From YouTube' description: {text:?}"
+        );
+        assert!(
+            text.contains("Chill Vibes"),
+            "Task 5: YtFeed section must render its playlist item 'Chill Vibes': {text:?}"
+        );
+    }
+
     /// RC11-DEF-001: the focused item (at `state.cursor` within the focused
     /// section) must carry selection styling (REVERSED|BOLD under NO_COLOR, or
     /// accent bg in color mode) so the cursor is visible at all terminal
