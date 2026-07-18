@@ -599,6 +599,13 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         ) {
             app.pane_workspace
                 .set_mode(crate::tui::pane::model::UiMode::PaneEdit);
+            // Cancelling the PaneModulePicker also drops a pending
+            // rectangle selection (Phase 2): the user picked a
+            // rectangle but backed out of choosing a module, so the
+            // selection is abandoned. The pane tree is unchanged.
+            if matches!(app.overlay, Some(Overlay::PaneModulePicker { .. })) {
+                app.rectangle_selection = None;
+            }
         }
         app.overlay = None;
         // Drop any stashed play-saved index so a later confirm doesn't
@@ -2317,6 +2324,19 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent) {
 
 /// Deterministic mouse dispatcher for a known frame area.
 pub fn handle_mouse_in_area(app: &mut App, m: MouseEvent, area: ratatui::layout::Rect) {
+    // Rectangle selection (Phase 2): when a selection is active and the
+    // mouse event lands inside the focused pane's inner rect, route to
+    // the selection handler. This intercepts left-click-drag (to draw
+    // the rectangle), mouse-up (to confirm), and right-click (to
+    // cancel) before the normal browse-click routing runs.
+    if app.rectangle_selection.is_some() {
+        if let Some(pane_inner) = crate::tui::pane::input::focused_pane_inner_rect(app) {
+            if rect_contains(pane_inner, m.column, m.row) {
+                crate::tui::pane::input::handle_rectangle_selection_mouse(app, m, pane_inner);
+                return;
+            }
+        }
+    }
     match m.kind {
         MouseEventKind::ScrollUp => move_up(app),
         MouseEventKind::ScrollDown => move_down(app),

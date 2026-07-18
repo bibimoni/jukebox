@@ -33,6 +33,7 @@ pub mod model;
 pub mod persistence;
 pub mod registry;
 pub mod render;
+pub mod selection;
 
 pub use layout::ResolvedPane;
 pub use model::{
@@ -41,3 +42,7 @@ pub use model::{
 };
 pub use registry::{init_registry, registry, ModuleRegistry, PaneModule};
 pub use render::render_pane_workspace;
+pub use selection::{
+    NormalizedPoint, RectangleSelection, SelectionInput, SelectionPhase, MIN_SELECTION_HEIGHT,
+    MIN_SELECTION_WIDTH,
+};

@@ -946,6 +946,15 @@ pub struct App {
     /// `input::handle_key` when `Ctrl+w` is pressed; consumed by
     /// [`crate::tui::pane::input::handle_prefix_key`] on the next key.
     pub pending_pane_prefix: bool,
+    /// Active rectangle selection (Phase 2). `Some` when the user is in
+    /// the middle of picking a sub-region of the focused pane via `r`
+    /// in PaneEdit mode. Stored in normalized coords so it survives
+    /// terminal resize. The render layer draws the preview on top of
+    /// the focused pane; the input layer routes keys + mouse events to
+    /// the selection while it's active. Set to `None` on cancel (Esc)
+    /// or after the module picker confirms (the rectangle is converted
+    /// to split-tree ops and the selection is consumed).
+    pub rectangle_selection: Option<crate::tui::pane::RectangleSelection>,
 }
 
 /// Inline filter state for the `f` filter-on-focused-column (spec §5.4).
@@ -1218,6 +1227,7 @@ impl App {
             playlist_col: PlaylistColumnState::default(),
             pane_workspace: crate::tui::pane::PaneWorkspace::new(),
             pending_pane_prefix: false,
+            rectangle_selection: None,
         }
     }
 

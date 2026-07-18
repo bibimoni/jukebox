@@ -357,6 +357,83 @@ impl PaneWorkspace {
             false
         }
     }
+
+    /// Replace the target leaf with the subtree built from a rectangle
+    /// selection (see [`super::selection::RectangleSelection::convert_to_splits`]).
+    /// The chosen `module` is installed in the center pane; surrounding
+    /// panes get [`ModuleId::Placeholder`]. All new panes get fresh ids
+    /// (allocated from `next_id`); the center pane becomes focused.
+    ///
+    /// Returns `true` if the target was found and replaced. Returns
+    /// `false` if the target wasn't found (no mutation, no id burn —
+    /// defensive: the caller passes a stale id).
+    pub fn apply_rectangle_selection(
+        &mut self,
+        selection: &super::selection::RectangleSelection,
+        module: ModuleId,
+    ) -> bool {
+        // Build the subtree with placeholder ids (PaneId(0)..PaneId(n)).
+        let (subtree, _new_ids) = selection.convert_to_splits(module);
+        // Reassign ids to fresh ones from the workspace's counter. The
+        // center pane is the leaf that was PaneId(0) in the placeholder
+        // space; we track it through reassignment so we can focus it.
+        let mut counter = self.next_id;
+        let mut center_id: Option<PaneId> = None;
+        let mut new_subtree = subtree;
+        reassign_ids(&mut new_subtree, &mut counter, &mut center_id);
+        // Replace the target leaf with the new subtree.
+        if !replace_leaf(&mut self.root, selection.target_pane, new_subtree) {
+            // Target not found — don't burn ids. Caller error; no
+            // mutation performed.
+            return false;
+        }
+        self.next_id = counter;
+        if let Some(cid) = center_id {
+            self.focused_pane = cid;
+        }
+        true
+    }
+}
+
+/// Walk the subtree and reassign each leaf id to a fresh id from
+/// `counter`. The leaf that was `PaneId(0)` (the center, created first
+/// by `convert_to_splits`) is recorded in `center_id` so the caller can
+/// focus it.
+fn reassign_ids(node: &mut PaneNode, counter: &mut u64, center_id: &mut Option<PaneId>) {
+    match node {
+        PaneNode::Leaf { id, .. } => {
+            let was_center = *id == PaneId(0);
+            *id = PaneId(*counter);
+            *counter += 1;
+            if was_center {
+                *center_id = Some(*id);
+            }
+        }
+        PaneNode::Split { first, second, .. } => {
+            reassign_ids(first, counter, center_id);
+            reassign_ids(second, counter, center_id);
+        }
+    }
+}
+
+/// Replace the target leaf in `node` with `replacement`. Returns true if
+/// the target was found and replaced. Recurses into split children.
+/// Clones `replacement` for the first-child attempt so it can be moved
+/// into the second child if the first doesn't contain the target.
+fn replace_leaf(node: &mut PaneNode, target: PaneId, replacement: PaneNode) -> bool {
+    if node.is_leaf_with_id(target) {
+        *node = replacement;
+        return true;
+    }
+    if let PaneNode::Split { first, second, .. } = node {
+        if replace_leaf(first, target, replacement.clone()) {
+            return true;
+        }
+        if replace_leaf(second, target, replacement) {
+            return true;
+        }
+    }
+    false
 }
 
 impl Default for PaneWorkspace {

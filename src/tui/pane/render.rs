@@ -39,6 +39,7 @@ use crate::tui::app::App;
 use crate::tui::pane::layout::{is_usable, resolve_rects, MIN_PANE_HEIGHT};
 use crate::tui::pane::model::UiMode;
 use crate::tui::pane::registry::registry;
+use crate::tui::pane::selection::SelectionPhase;
 use crate::tui::view::theme::{is_ascii, ASCII_BORDER_SET};
 
 /// Minimum workspace size for the multi-pane layout. Below this we
@@ -124,6 +125,20 @@ pub fn render_pane_workspace(f: &mut Frame, area: Rect, app: &mut App) {
             STATUS_LINE_H,
         );
         render_edit_status_line(f, status_area);
+    }
+
+    // Rectangle selection preview (Phase 2): drawn on top of the
+    // focused pane's content. Painted LAST so it overlays the borders
+    // + content of the focused pane. Only drawn when a selection is
+    // active (the user pressed `r` in PaneEdit mode).
+    if app.rectangle_selection.is_some() {
+        let focused_pane = app.pane_workspace.focused_pane;
+        let focused_rect = panes
+            .iter()
+            .find(|p| p.pane_id == focused_pane)
+            .map(|p| p.rect)
+            .unwrap_or(area);
+        render_rectangle_selection(f, focused_rect, app);
     }
 }
 
@@ -254,6 +269,174 @@ fn render_edit_status_line(f: &mut Frame, area: Rect) {
 /// import the model.
 pub fn is_pane_mode_active(app: &App) -> bool {
     app.pane_workspace.is_active()
+}
+
+/// Render the rectangle selection preview on top of the focused pane
+/// (Phase 2). Draws:
+/// - A dim border around the selected region.
+/// - A dimension label at the top-left of the selection.
+/// - The active corner marked with `+` (ASCII) or `┼` (Unicode).
+/// - A "too small" indicator in red if the selection is below the
+///   minimum size.
+///
+/// `pane_rect` is the focused pane's OUTER rect (including border). The
+/// function computes the inner rect (after border) so the selection
+/// coords match the input layer's `focused_pane_inner_rect`.
+fn render_rectangle_selection(f: &mut Frame, pane_rect: Rect, app: &mut App) {
+    let sel = match app.rectangle_selection.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+    // Compute the inner rect (subtract 1-cell border on each side).
+    let inner = Rect::new(
+        pane_rect.x.saturating_add(1),
+        pane_rect.y.saturating_add(1),
+        pane_rect.width.saturating_sub(2),
+        pane_rect.height.saturating_sub(2),
+    );
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let sel_rect = sel.to_cell_rect(inner);
+
+    let theme = crate::tui::view::theme::Theme::default();
+    let nc = crate::tui::view::theme::no_color();
+    let accent = if nc { Color::Reset } else { theme.accent };
+    let dim = if nc { Color::Reset } else { theme.dim };
+
+    let is_valid = sel.is_valid(inner);
+    let label = sel.dimensions_label(inner);
+    let label_style = if is_valid {
+        Style::default().fg(accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    };
+    let label_text = if is_valid {
+        label.clone()
+    } else {
+        format!("{} · too small", label)
+    };
+
+    // Draw the selection border. Even if the rect is very small (1-2
+    // cells), we render a border so the user sees the selection. If
+    // the rect is 0×0 (degenerate), we render a crosshair marker at the
+    // anchor point instead.
+    if sel_rect.width > 0 && sel_rect.height > 0 {
+        let border_style = Style::default().fg(accent).add_modifier(Modifier::DIM);
+        let block = if is_ascii() {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_set(ASCII_BORDER_SET)
+                .border_style(border_style)
+        } else {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .border_style(border_style)
+        };
+        f.render_widget(block, sel_rect);
+    } else {
+        // Degenerate (0×0) selection: draw a crosshair at the anchor.
+        let (ax, ay) = (
+            (inner.x as f32 + sel.anchor.x * inner.width as f32).round() as u16,
+            (inner.y as f32 + sel.anchor.y * inner.height as f32).round() as u16,
+        );
+        if ax < inner.right() && ay < inner.bottom() {
+            let marker = if is_ascii() { "+" } else { "┼" };
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    marker,
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                )),
+                Rect::new(ax, ay, 1, 1),
+            );
+        }
+    }
+
+    // Dimension label: place it at the top-left of the selection if
+    // there's room; otherwise place it just above the selection (or at
+    // the pane's top row if the selection is at the very top).
+    let label_area = if sel_rect.width >= 4 && sel_rect.height >= 2 {
+        // Inside the selection's top-left.
+        Rect::new(
+            sel_rect.x.saturating_add(1),
+            sel_rect.y.saturating_add(1),
+            sel_rect.width.saturating_sub(2),
+            1,
+        )
+    } else if sel_rect.y > inner.y {
+        // Above the selection.
+        Rect::new(
+            sel_rect.x.max(inner.x),
+            sel_rect.y.saturating_sub(1),
+            label_text
+                .len()
+                .min(inner.right().saturating_sub(sel_rect.x.max(inner.x)) as usize)
+                as u16,
+            1,
+        )
+    } else {
+        // At the pane's first row.
+        Rect::new(
+            inner.x,
+            inner.y,
+            inner.width.min(label_text.len() as u16),
+            1,
+        )
+    };
+    if label_area.width > 0 {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(label_text, label_style))),
+            label_area,
+        );
+    }
+
+    // Active corner marker. The active corner is `anchor` if
+    // `active_is_anchor` else `cursor`. Convert to cell coords and
+    // mark with `+` (ASCII) or `┼` (Unicode). The marker overwrites
+    // whatever was at that cell (border or content).
+    let active = if sel.active_is_anchor {
+        sel.anchor
+    } else {
+        sel.cursor
+    };
+    let (cx, cy) = (
+        (inner.x as f32 + active.x * inner.width as f32).round() as u16,
+        (inner.y as f32 + active.y * inner.height as f32).round() as u16,
+    );
+    if cx < inner.right() && cy < inner.bottom() {
+        let marker = if is_ascii() { "+" } else { "┼" };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                marker,
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            )),
+            Rect::new(cx, cy, 1, 1),
+        );
+    }
+
+    // Phase hint: show the current phase + keybinding at the bottom
+    // of the pane's inner rect so the user knows what to do next.
+    let phase_hint = match sel.phase {
+        SelectionPhase::ChoosingAnchor => {
+            "rect: move anchor · Enter confirm · Tab switch · Esc cancel"
+        }
+        SelectionPhase::ChoosingExtent => {
+            "rect: move extent · Enter confirm · Tab switch · Esc cancel"
+        }
+        SelectionPhase::Confirming => "rect: pick module · Esc cancel",
+    };
+    if inner.height >= 2 {
+        let hint_area = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                phase_hint,
+                Style::default().fg(dim),
+            )))
+            .alignment(ratatui::layout::Alignment::Center),
+            hint_area,
+        );
+    }
 }
 
 #[cfg(test)]

@@ -16,13 +16,20 @@
 //! Overlay key handlers for `PaneSplitDirection` and `PaneModulePicker`
 //! also live here (they're pane-edit-mode sub-modes).
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::tui::app::{App, Overlay};
 use crate::tui::pane::focus::move_focus_directional;
 use crate::tui::pane::layout::resolve_rects;
 use crate::tui::pane::model::{Direction, ModuleId, Side, UiMode};
+use crate::tui::pane::selection::{
+    NormalizedPoint, RectangleSelection, SelectionInput, SelectionPhase,
+};
 use crate::tui::pane::{PaneWorkspace, RESIZE_STEP};
+
+/// The keyboard step for rectangle selection: 2% per press (matches
+/// `RESIZE_STEP` for consistency). Shift+arrow moves 4x = 8%.
+const SELECTION_STEP: f32 = 0.02;
 
 /// Result of a prefix-key handler: did we consume the key?
 pub struct PrefixResult(bool);
@@ -145,9 +152,25 @@ pub fn handle_pane_edit_key(app: &mut App, key: KeyEvent) -> bool {
         }
     }
 
+    // Rectangle selection sub-mode: when active, route all keys to the
+    // selection handler. It consumes the keys it cares about (arrows,
+    // hjkl, Tab, Enter, Esc, r) and the playback keys fall through to
+    // the normal pane-edit handler below. Other keys are swallowed so
+    // they don't accidentally split/close the pane being selected.
+    if app.rectangle_selection.is_some() && handle_rectangle_selection_key(app, key) {
+        return true;
+    }
+    // Playback keys fall through to the normal pane-edit handler (so
+    // Space/>/</,/. /+/-/q keep working during selection).
+
     // Esc: exit pane edit mode.
     if matches!(key.code, KeyCode::Esc) {
         app.pane_workspace.exit_edit_mode();
+        // Defensive: clear any stale selection (shouldn't be set here,
+        // since the rectangle selection handler above would have
+        // cleared it; but a future code path might re-enter edit mode
+        // with a stale selection).
+        app.rectangle_selection = None;
         return true;
     }
     // `Ctrl+w, e`: exit (alias for Esc).
@@ -236,6 +259,17 @@ pub fn handle_pane_edit_key(app: &mut App, key: KeyEvent) -> bool {
                 cursor: 0,
             });
             app.pane_workspace.set_mode(UiMode::PaneModulePicker);
+            return true;
+        }
+        // `r` enters rectangle selection mode. The anchor + cursor
+        // start at the center of the focused pane; the user picks a
+        // sub-region with arrows / hjkl + Enter, then chooses a module
+        // from the picker. The selection is converted to split-tree
+        // ops so the result is a proportional split tree (no floating
+        // rectangles). See [`crate::tui::pane::selection`].
+        KeyCode::Char('r') if key.modifiers == KeyModifiers::NONE => {
+            let target = app.pane_workspace.focused_pane;
+            app.rectangle_selection = Some(RectangleSelection::new(target));
             return true;
         }
         // Tab / Shift+Tab cycle pane focus.
@@ -391,7 +425,13 @@ pub fn handle_module_picker_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Enter => {
             let module = modules[cursor.min(n - 1)];
-            if let Some(side) = pending_split {
+            if let Some(selection) = app.rectangle_selection.take() {
+                // Rectangle selection confirmed: convert the rectangle
+                // to split-tree ops + install the chosen module in the
+                // center pane. The surrounding panes get Placeholder.
+                app.pane_workspace
+                    .apply_rectangle_selection(&selection, module);
+            } else if let Some(side) = pending_split {
                 // Split + assign module.
                 let _ = app.pane_workspace.split(target_pane, side, module);
             } else {
@@ -411,4 +451,300 @@ pub fn handle_module_picker_key(app: &mut App, key: KeyEvent) -> bool {
         cursor,
     });
     true
+}
+
+// ---------------------------------------------------------------------------
+// Rectangle selection (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Handle a key while a rectangle selection is active. Returns true if
+/// the key was consumed (so the caller doesn't fall through to the
+/// normal pane-edit handler). Returns false for playback keys (Space,
+/// `>`, `<`, `,`, `.`, `+`, `-`, `q`) so they keep working during
+/// selection — the caller lets them fall through to the normal handler.
+///
+/// Keys consumed:
+/// - `Esc` — cancel selection (clear `app.rectangle_selection`).
+/// - Arrows / `hjkl` — move the active corner by [`SELECTION_STEP`].
+/// - Shift+Arrows / `HJKL` — move the active corner 4x faster.
+/// - `Tab` — switch the active corner (anchor ↔ cursor).
+/// - `Enter` — confirm: anchor → extent → confirming (opens module
+///   picker if the selection is valid, else shows a "too small" toast).
+/// - `r` — restart the selection (reset to center).
+/// - All other non-playback keys are swallowed (no-op) so they don't
+///   accidentally split/close the pane being selected.
+pub fn handle_rectangle_selection_key(app: &mut App, key: KeyEvent) -> bool {
+    // Reserved Ctrl-* keys: never bind (mirrors the top of
+    // `handle_pane_edit_key`). Let them fall through to the global
+    // handler so Ctrl+C etc. keep working.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('c')
+            | KeyCode::Char('z')
+            | KeyCode::Char('\\')
+            | KeyCode::Char('s')
+            | KeyCode::Char('q') => return false,
+            _ => {}
+        }
+    }
+
+    // Playback keys fall through so they keep working during selection.
+    // (Mirrors the pane-edit playback passthrough.) `Enter` is NOT a
+    // playback key here — it confirms the selection.
+    if is_playback_key(key) {
+        return false;
+    }
+
+    // Esc: cancel selection (don't exit edit mode).
+    if matches!(key.code, KeyCode::Esc) {
+        app.rectangle_selection = None;
+        return true;
+    }
+
+    // `r`: restart the selection (reset to center).
+    if matches!(key.code, KeyCode::Char('r')) && key.modifiers == KeyModifiers::NONE {
+        let target = app.pane_workspace.focused_pane;
+        app.rectangle_selection = Some(RectangleSelection::new(target));
+        return true;
+    }
+
+    // Arrows / hjkl: move the active corner.
+    let dir = direction_for_key(key);
+    if let Some(dir) = dir {
+        if let Some(sel) = app.rectangle_selection.as_mut() {
+            sel.move_cursor(dir, SELECTION_STEP, false);
+        }
+        return true;
+    }
+
+    // Shift+Arrows / HJKL: move the active corner 4x faster.
+    let fast_dir = fast_direction_for_key(key);
+    if let Some(dir) = fast_dir {
+        if let Some(sel) = app.rectangle_selection.as_mut() {
+            sel.move_cursor(dir, SELECTION_STEP, true);
+        }
+        return true;
+    }
+
+    // Tab: switch the active corner (anchor ↔ cursor).
+    if matches!(key.code, KeyCode::Tab) {
+        if let Some(sel) = app.rectangle_selection.as_mut() {
+            sel.switch_corner();
+        }
+        return true;
+    }
+
+    // Enter: confirm. The behavior depends on the phase.
+    if matches!(key.code, KeyCode::Enter) {
+        // Take the selection out so we can call `is_valid` + open the
+        // overlay without a borrow conflict.
+        let mut sel = match app.rectangle_selection.take() {
+            Some(s) => s,
+            None => return true,
+        };
+        match sel.phase {
+            SelectionPhase::ChoosingAnchor => {
+                sel.confirm_anchor();
+                app.rectangle_selection = Some(sel);
+            }
+            SelectionPhase::ChoosingExtent => {
+                let pane_inner = focused_pane_inner_rect(app)
+                    .unwrap_or(ratatui::layout::Rect::new(0, 0, 80, 24));
+                if sel.is_valid(pane_inner) {
+                    sel.confirm();
+                    let target_pane = sel.target_pane;
+                    app.rectangle_selection = Some(sel);
+                    app.overlay = Some(Overlay::PaneModulePicker {
+                        target_pane,
+                        // No pending split — the rectangle selection
+                        // drives the conversion via
+                        // `apply_rectangle_selection`.
+                        pending_split: None,
+                        cursor: 0,
+                    });
+                    app.pane_workspace.set_mode(UiMode::PaneModulePicker);
+                } else {
+                    // Too small: stay in ChoosingExtent, show a toast.
+                    // Don't open the picker.
+                    app.rectangle_selection = Some(sel);
+                    app.set_status_toast("selection too small".into());
+                }
+            }
+            SelectionPhase::Confirming => {
+                // Already confirming. The picker should be open; if it
+                // isn't (defensive), open it.
+                let target_pane = sel.target_pane;
+                app.rectangle_selection = Some(sel);
+                if app.overlay.is_none() {
+                    app.overlay = Some(Overlay::PaneModulePicker {
+                        target_pane,
+                        pending_split: None,
+                        cursor: 0,
+                    });
+                    app.pane_workspace.set_mode(UiMode::PaneModulePicker);
+                }
+            }
+        }
+        return true;
+    }
+
+    // All other keys are swallowed (no-op) so they don't accidentally
+    // split/close the pane being selected. The user must Esc out of
+    // selection mode first to use s/v/x/d/m/etc.
+    true
+}
+
+/// True if `key` is a playback key (Space, `>`, `<`, `,`, `.`, `+`, `-`,
+/// `q`). These fall through to the normal pane-edit handler so they
+/// keep working during rectangle selection. Ctrl-prefixed variants
+/// are NOT playback keys here (Ctrl+Q is reserved, etc.).
+fn is_playback_key(key: KeyEvent) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    matches!(
+        key.code,
+        KeyCode::Char(' ')
+            | KeyCode::Char('>')
+            | KeyCode::Char('<')
+            | KeyCode::Char(',')
+            | KeyCode::Char('.')
+            | KeyCode::Char('+')
+            | KeyCode::Char('-')
+            | KeyCode::Char('q')
+    )
+}
+
+/// Map an arrow / hjkl key (no Shift) to a direction. Returns None if
+/// the key isn't a direction key.
+fn direction_for_key(key: KeyEvent) -> Option<Direction> {
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Left | KeyCode::Char('h') if key.modifiers == KeyModifiers::NONE => {
+            Some(Direction::Left)
+        }
+        KeyCode::Right | KeyCode::Char('l') if key.modifiers == KeyModifiers::NONE => {
+            Some(Direction::Right)
+        }
+        KeyCode::Up | KeyCode::Char('k') if key.modifiers == KeyModifiers::NONE => {
+            Some(Direction::Up)
+        }
+        KeyCode::Down | KeyCode::Char('j') if key.modifiers == KeyModifiers::NONE => {
+            Some(Direction::Down)
+        }
+        _ => None,
+    }
+}
+
+/// Map a Shift+arrow / HJKL key to a direction (fast movement). Returns
+/// None if the key isn't a fast-direction key.
+fn fast_direction_for_key(key: KeyEvent) -> Option<Direction> {
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Left => return Some(Direction::Left),
+            KeyCode::Right => return Some(Direction::Right),
+            KeyCode::Up => return Some(Direction::Up),
+            KeyCode::Down => return Some(Direction::Down),
+            _ => {}
+        }
+    }
+    match key.code {
+        KeyCode::Char('H') => Some(Direction::Left),
+        KeyCode::Char('J') => Some(Direction::Down),
+        KeyCode::Char('K') => Some(Direction::Up),
+        KeyCode::Char('L') => Some(Direction::Right),
+        _ => None,
+    }
+}
+
+/// Compute the focused pane's INNER rect (after border) in terminal
+/// coordinates. Used by the rectangle selection handler for
+/// `is_valid` checks + by the mouse handler to convert (col, row) to
+/// normalized coords. Returns None if the focused pane isn't found
+/// (defensive — shouldn't happen).
+pub fn focused_pane_inner_rect(app: &App) -> Option<ratatui::layout::Rect> {
+    let area = app.pane_content_area();
+    let panes = resolve_rects(&app.pane_workspace.root, area);
+    let focused = panes
+        .iter()
+        .find(|p| p.pane_id == app.pane_workspace.focused_pane)?;
+    // Subtract the border (1 cell each side) to get the inner area.
+    Some(ratatui::layout::Rect::new(
+        focused.rect.x.saturating_add(1),
+        focused.rect.y.saturating_add(1),
+        focused.rect.width.saturating_sub(2),
+        focused.rect.height.saturating_sub(2),
+    ))
+}
+
+/// Handle a mouse event during rectangle selection. `pane_inner` is the
+/// focused pane's inner rect (the caller has already verified the
+/// mouse is inside it). Routes:
+/// - `Down(Left)` — start drag: anchor + cursor at the click position,
+///   phase = ChoosingExtent, input_source = Mouse.
+/// - `Drag(Left)` — update cursor.
+/// - `Up(Left)` — confirm; if valid, open the module picker, else
+///   show a "too small" toast.
+/// - `Down(Right)` — cancel: clear the selection.
+pub fn handle_rectangle_selection_mouse(
+    app: &mut App,
+    m: MouseEvent,
+    pane_inner: ratatui::layout::Rect,
+) {
+    let mut sel = match app.rectangle_selection.take() {
+        Some(s) => s,
+        None => return,
+    };
+
+    // Convert (col, row) to normalized coords relative to pane_inner.
+    let nx = (m.column as f32 - pane_inner.x as f32) / pane_inner.width.max(1) as f32;
+    let ny = (m.row as f32 - pane_inner.y as f32) / pane_inner.height.max(1) as f32;
+    let pt = NormalizedPoint::new(nx, ny);
+
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            sel.anchor = pt;
+            sel.cursor = pt;
+            sel.phase = SelectionPhase::ChoosingExtent;
+            sel.input_source = SelectionInput::Mouse;
+            sel.active_is_anchor = false;
+            app.rectangle_selection = Some(sel);
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            sel.cursor = pt;
+            app.rectangle_selection = Some(sel);
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            sel.confirm();
+            let is_valid = sel.is_valid(pane_inner);
+            if is_valid {
+                let target_pane = sel.target_pane;
+                app.rectangle_selection = Some(sel);
+                app.overlay = Some(Overlay::PaneModulePicker {
+                    target_pane,
+                    pending_split: None,
+                    cursor: 0,
+                });
+                app.pane_workspace.set_mode(UiMode::PaneModulePicker);
+            } else {
+                // Too small: don't open the picker. Stay in
+                // ChoosingExtent so the user can adjust. (Reset the
+                // phase since `confirm` advanced it to Confirming.)
+                sel.phase = SelectionPhase::ChoosingExtent;
+                app.rectangle_selection = Some(sel);
+                app.set_status_toast("selection too small".into());
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            // Cancel: drop the selection entirely.
+            app.set_status_toast("rectangle selection cancelled".into());
+        }
+        _ => {
+            // Other mouse events (scroll, middle-click, etc.) don't
+            // affect the selection — put it back.
+            app.rectangle_selection = Some(sel);
+        }
+    }
 }
