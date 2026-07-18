@@ -35,6 +35,16 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-fmt-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: cargo-fmt-
+
       - name: cargo fmt --check
         run: cargo fmt --check
 
@@ -70,7 +80,9 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-clippy-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
-          restore-keys: cargo-clippy-${{ matrix.os }}-
+          restore-keys: |
+            cargo-clippy-${{ matrix.os }}-
+            cargo-build-${{ matrix.os }}-
 
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -105,7 +117,10 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-test-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
-          restore-keys: cargo-test-${{ matrix.os }}-
+          restore-keys: |
+            cargo-test-${{ matrix.os }}-
+            cargo-clippy-${{ matrix.os }}-
+            cargo-build-${{ matrix.os }}-
 
       - name: cargo test
         run: cargo test --all-features
@@ -173,7 +188,10 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-build-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
-          restore-keys: cargo-build-${{ matrix.os }}-
+          restore-keys: |
+            cargo-build-${{ matrix.os }}-
+            cargo-test-${{ matrix.os }}-
+            cargo-clippy-${{ matrix.os }}-
 
       - name: cargo build --release
         run: cargo build --release --locked
