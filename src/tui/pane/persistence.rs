@@ -21,6 +21,14 @@ pub struct PaneWorkspaceDto {
     pub root: PaneNode,
     pub focused_pane: PaneId,
     pub next_id: u64,
+    /// Whether the PANE EDIT status line is visible. Defaults to `true`
+    /// on old DTOs that don't have the field (pre-feature state).
+    #[serde(default = "default_status_line_visible")]
+    pub status_line_visible: bool,
+}
+
+fn default_status_line_visible() -> bool {
+    true
 }
 
 impl From<&PaneWorkspace> for PaneWorkspaceDto {
@@ -29,6 +37,7 @@ impl From<&PaneWorkspace> for PaneWorkspaceDto {
             root: ws.root.clone(),
             focused_pane: ws.focused_pane,
             next_id: ws.next_id,
+            status_line_visible: ws.status_line_visible,
         }
     }
 }
@@ -50,6 +59,7 @@ impl From<PaneWorkspaceDto> for PaneWorkspace {
             focused_pane,
             mode: UiMode::Normal,
             next_id,
+            status_line_visible: dto.status_line_visible,
         }
     }
 }
@@ -130,6 +140,7 @@ mod tests {
             },
             focused_pane: PaneId(99), // not in tree
             next_id: 1,
+            status_line_visible: true,
         };
         let ws: PaneWorkspace = dto.into();
         assert_eq!(ws.focused_pane, PaneId(0), "should fall back to first leaf");
@@ -146,6 +157,7 @@ mod tests {
             },
             focused_pane: PaneId(5),
             next_id: 1, // collides: 1 < 5+1
+            status_line_visible: true,
         };
         let ws: PaneWorkspace = dto.into();
         assert_eq!(ws.next_id, 6, "next_id should be max+1");
@@ -183,6 +195,7 @@ mod tests {
             },
             focused_pane: PaneId(99), // not in tree
             next_id: 5,
+            status_line_visible: true,
         };
         let ws: PaneWorkspace = dto.into();
         // First leaf of the split is PaneId(0).
@@ -210,6 +223,7 @@ mod tests {
             },
             focused_pane: PaneId(1),
             next_id: 5,
+            status_line_visible: true,
         };
         let ws: PaneWorkspace = dto.into();
         assert_eq!(ws.focused_pane, PaneId(1));

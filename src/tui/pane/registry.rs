@@ -87,6 +87,7 @@ impl ModuleRegistry {
         reg.register(Box::new(PlaylistsModule));
         reg.register(Box::new(QueueModule));
         reg.register(Box::new(YoutubeModule));
+        reg.register(Box::new(NowPlayingModule));
         reg.register(Box::new(PlaceholderModule));
         reg
     }
@@ -235,6 +236,44 @@ impl PaneModule for YoutubeModule {
     }
 }
 
+/// "Now Playing" pane module: the big player bar as a pane. Renders the
+/// full-size now-playing view (title, artist, album, quality, big
+/// progress bar, transport, source badge, next-up preview) into a pane.
+///
+/// Uses [`crate::tui::view::player_bar_big::render_big`] when the pane
+/// is tall enough (>= `BIG_BAR_HEIGHT` = 10 rows), otherwise falls back
+/// to the side [`crate::tui::view::now_playing_panel::render`] which
+/// fits a narrower/shorter pane. Unlike the browse modules, this one
+/// doesn't swap `app.view` — the now-playing view is view-independent.
+pub struct NowPlayingModule;
+
+impl PaneModule for NowPlayingModule {
+    fn id(&self) -> ModuleId {
+        ModuleId::NowPlaying
+    }
+    fn title(&self) -> &'static str {
+        "Now Playing"
+    }
+    fn render(&self, frame: &mut Frame, area: Rect, app: &mut App) {
+        use crate::tui::view::now_playing_panel as npp;
+        use crate::tui::view::player_bar_big as pbb;
+
+        // The big player bar is designed for a 10-row-tall area at the
+        // bottom of the screen. In a pane, the pane's inner rect (after
+        // the pane border) may be smaller. Use the big renderer when
+        // the pane is tall enough; otherwise use the side panel
+        // renderer (which is more compact and works at any size).
+        if area.height >= pbb::BIG_BAR_HEIGHT {
+            pbb::render_big(frame, area, app);
+        } else {
+            npp::render(frame, area, app);
+        }
+    }
+    fn handle_key(&self, _key: KeyEvent, _app: &mut App) -> bool {
+        false
+    }
+}
+
 /// Demo / placeholder module. Rendered as a centered "Press `m` to choose
 /// a module" hint. Used as the default for a fresh split (the user
 /// hasn't picked a real module yet). Proves third-party modules can be
@@ -341,6 +380,7 @@ mod tests {
                 ModuleId::Playlists,
                 ModuleId::Queue,
                 ModuleId::Youtube,
+                ModuleId::NowPlaying,
                 ModuleId::Placeholder,
             ]
         );

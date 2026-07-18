@@ -412,6 +412,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 switch_view(app, View::Youtube);
             }
         }
+        // `5` is only bound when the pane workspace is active — it
+        // changes the focused pane's module to Now Playing. There's no
+        // global `5` view to switch to (only 1-4 map to top-level
+        // views), so in the legacy single-view mode `5` is unbound.
+        (KeyCode::Char('5'), m) if m == KeyModifiers::NONE && app.pane_workspace.is_active() => {
+            app.pane_workspace.set_module(
+                app.pane_workspace.focused_pane,
+                crate::tui::pane::ModuleId::NowPlaying,
+            );
+            // No else: in legacy mode `5` falls through to `_ => {}`.
+        }
 
         // Tab / Shift+Tab cycle view forward / backward.
         (KeyCode::Tab, m) if m.contains(KeyModifiers::SHIFT) => cycle_view(app, false),

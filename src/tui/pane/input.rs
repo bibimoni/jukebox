@@ -72,6 +72,13 @@ pub fn handle_prefix_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Right => move_focus(app, Direction::Right),
         // `Ctrl+w, Tab` / `Ctrl+w, Shift+Tab` — cycle pane focus.
         KeyCode::Tab => cycle_focus(app, !key.modifiers.contains(KeyModifiers::SHIFT)),
+        // `Ctrl+w, S` (capital) toggles the PANE EDIT status line in
+        // any mode. Distinct from `s` (lowercase) which would fall
+        // through to the global `S` discover overlay.
+        KeyCode::Char('S') => {
+            app.pane_workspace.toggle_status_line();
+            true
+        }
         // All other keys after `Ctrl+w` are not pane commands — let them
         // fall through to normal dispatch.
         _ => false,
@@ -132,7 +139,7 @@ fn module_to_view(module: ModuleId) -> Option<crate::tui::app::View> {
         ModuleId::Playlists => Some(crate::tui::app::View::Playlists),
         ModuleId::Queue => Some(crate::tui::app::View::Queue),
         ModuleId::Youtube => Some(crate::tui::app::View::Youtube),
-        ModuleId::Placeholder => None,
+        ModuleId::NowPlaying | ModuleId::Placeholder => None,
     }
 }
 
@@ -206,6 +213,12 @@ pub fn handle_pane_edit_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('J') => return resize_focused(app, Direction::Down),
         KeyCode::Char('K') => return resize_focused(app, Direction::Up),
         KeyCode::Char('L') => return resize_focused(app, Direction::Right),
+        // `S` (capital) toggles the PANE EDIT status line. Distinct
+        // from `s` (lowercase) which opens the split picker.
+        KeyCode::Char('S') => {
+            app.pane_workspace.toggle_status_line();
+            return true;
+        }
         _ => {}
     }
 
@@ -290,6 +303,11 @@ pub fn handle_pane_edit_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('4') if key.modifiers == KeyModifiers::NONE => {
             return change_focused_module(app, ModuleId::Youtube);
+        }
+        // `5` changes the focused pane's module to Now Playing (big
+        // player bar). Mirrors 1-4 for Artists/Playlists/Queue/YouTube.
+        KeyCode::Char('5') if key.modifiers == KeyModifiers::NONE => {
+            return change_focused_module(app, ModuleId::NowPlaying);
         }
         _ => {}
     }

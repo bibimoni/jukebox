@@ -33,6 +33,12 @@ pub enum ModuleId {
     Playlists,
     Queue,
     Youtube,
+    /// The big "Now Playing" player bar as a pane module. Renders the
+    /// full-size now-playing view (title, artist, album, quality, big
+    /// progress bar, transport, source badge, next-up preview) into a
+    /// pane. Useful for dedicating a pane to playback status. Wraps
+    /// `view::player_bar_big::render_big` + `view::now_playing_panel`.
+    NowPlaying,
     /// Demo / placeholder module proving third-party modules can register.
     /// Rendered as a "Press `m` to choose a module" hint.
     Placeholder,
@@ -42,12 +48,13 @@ impl ModuleId {
     /// All registered built-in modules, in the order they appear in the
     /// module picker. `Placeholder` is last (it's the "no choice" default
     /// for a fresh split) so the user sees real modules first.
-    pub fn all() -> [ModuleId; 5] {
+    pub fn all() -> [ModuleId; 6] {
         [
             ModuleId::Artists,
             ModuleId::Playlists,
             ModuleId::Queue,
             ModuleId::Youtube,
+            ModuleId::NowPlaying,
             ModuleId::Placeholder,
         ]
     }
@@ -59,6 +66,7 @@ impl ModuleId {
             ModuleId::Playlists => "Playlists",
             ModuleId::Queue => "Queue",
             ModuleId::Youtube => "YouTube",
+            ModuleId::NowPlaying => "Now Playing",
             ModuleId::Placeholder => "Placeholder",
         }
     }
@@ -212,6 +220,11 @@ pub struct PaneWorkspace {
     /// it (the DTO must restore the counter to avoid id reuse after a
     /// restart).
     pub next_id: u64,
+    /// Whether the PANE EDIT status line (the one-line keymap hint at the
+    /// bottom of the workspace) is visible. Toggled by `Ctrl+w, S` or `S`
+    /// in PaneEdit mode. Persisted across sessions via
+    /// [`crate::tui::pane::persistence::PaneWorkspaceDto`]. Default true.
+    pub status_line_visible: bool,
 }
 
 impl PaneWorkspace {
@@ -229,6 +242,7 @@ impl PaneWorkspace {
             focused_pane: PaneId(0),
             mode: UiMode::Normal,
             next_id: 1,
+            status_line_visible: true,
         }
     }
 
@@ -264,6 +278,13 @@ impl PaneWorkspace {
         self.mode = mode;
     }
 
+    /// Toggle the PANE EDIT status line (the one-line keymap hint at the
+    /// bottom of the workspace). Bound to `Ctrl+w, S` (any mode) and `S`
+    /// (PaneEdit mode only, since `s` lowercase is the split picker).
+    /// Persisted across sessions via the DTO.
+    pub fn toggle_status_line(&mut self) {
+        self.status_line_visible = !self.status_line_visible;
+    }
     /// True if `pane` is a leaf id in the tree.
     pub fn contains(&self, pane: PaneId) -> bool {
         find_path(&self.root, pane).is_some()
@@ -1157,8 +1178,9 @@ mod tests {
     fn module_id_all_returns_picker_order() {
         let all = ModuleId::all();
         assert_eq!(all[0], ModuleId::Artists);
-        assert_eq!(all[4], ModuleId::Placeholder);
-        assert_eq!(all.len(), 5);
+        assert_eq!(all[4], ModuleId::NowPlaying);
+        assert_eq!(all[5], ModuleId::Placeholder);
+        assert_eq!(all.len(), 6);
     }
 
     /// `Default::default()` for PaneWorkspace equals `new()`.

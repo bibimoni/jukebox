@@ -67,6 +67,7 @@ pub fn render_pane_workspace(f: &mut Frame, area: Rect, app: &mut App) {
     let root_clone = app.pane_workspace.root.clone();
     let focused_pane = app.pane_workspace.focused_pane;
     let mode = app.pane_workspace.mode;
+    let status_line_visible = app.pane_workspace.status_line_visible;
     let panes = resolve_rects(&root_clone, area);
 
     // Tiny workspace: render the focused pane only with a too-small toast.
@@ -83,8 +84,11 @@ pub fn render_pane_workspace(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    // Reserve space for the status line in PaneEdit mode.
-    let content_area = if mode == UiMode::PaneEdit && area.height > STATUS_LINE_H + MIN_PANE_HEIGHT
+    // Reserve space for the status line in PaneEdit mode (only when
+    // the user hasn't hidden it via `Ctrl+w, S`).
+    let content_area = if mode == UiMode::PaneEdit
+        && status_line_visible
+        && area.height > STATUS_LINE_H + MIN_PANE_HEIGHT
     {
         Rect::new(area.x, area.y, area.width, area.height - STATUS_LINE_H)
     } else {
@@ -116,8 +120,11 @@ pub fn render_pane_workspace(f: &mut Frame, area: Rect, app: &mut App) {
         f.render_widget(block, p.rect);
     }
 
-    // Status line.
-    if mode == UiMode::PaneEdit && area.height > STATUS_LINE_H + MIN_PANE_HEIGHT {
+    // Status line. Only rendered when the user hasn't hidden it.
+    if mode == UiMode::PaneEdit
+        && status_line_visible
+        && area.height > STATUS_LINE_H + MIN_PANE_HEIGHT
+    {
         let status_area = Rect::new(
             area.x,
             area.bottom().saturating_sub(STATUS_LINE_H),
