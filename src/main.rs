@@ -24,7 +24,22 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Play => {
             let cfg = cli::ensure_config()?;
-            let cat = catalog::Catalog::load(&cfg.filtered_dir.join("catalog.json"))?;
+            let cat_path = cfg.filtered_dir.join("catalog.json");
+            // A missing/empty catalog means the user hasn't run `jukebox sync`
+            // yet (or the last sync indexed 0 tracks). Surface a clear recovery
+            // hint and exit gracefully instead of launching the TUI into a
+            // mid-playback "file not found" state.
+            let cat = match catalog::Catalog::load_for_playback(&cat_path)? {
+                Some(c) => c,
+                None => {
+                    eprintln!(
+                        "No playable catalog found at {}.\n\
+                         Run `jukebox sync` first to index your library, then `jukebox`.",
+                        cat_path.display()
+                    );
+                    return Ok(());
+                }
+            };
             // The search index may not exist yet on a fresh install (the user
             // hasn't run `jukebox sync`); treat that as "no search" rather than
             // blocking playback.
@@ -78,6 +93,21 @@ fn main() -> anyhow::Result<()> {
             // footer / view layer can render the right amount of chrome.
             app.verbosity = verbosity;
 
+            // Restore the session's track_cache from disk IMMEDIATELY after
+            // creating the app, BEFORE the layout/resume-hint block below.
+            // The track_cache holds video_id → title/artist mappings from the
+            // previous session. Without this, the resume hint shows the raw
+            // video_id instead of the real title, and the Queue view shows
+            // "Resuming…" for all tracks. The cache must also be re-restored
+            // after the browser re-spawn below (which replaces the session
+            // with a fresh one — empty cache).
+            let cached_tracks = jukebox::yt::cache::load_track_cache();
+            if !cached_tracks.is_empty() {
+                if let Some(session) = app.yt_session.as_mut() {
+                    session.restore_track_cache(cached_tracks.clone());
+                }
+            }
+
             // Restore persisted layout + transport modes. Best-effort: a missing
             // or corrupt DB just falls back to defaults. At startup the transport
             // context is empty (no track_ids), so the shuffle mode's order-rebuild
@@ -114,30 +144,156 @@ fn main() -> anyhow::Result<()> {
                     _ => View::Artists,
                 };
                 app.source_mode = jukebox::mode::SourceMode::parse_mode(&layout.source_mode);
-                // Restore the saved browser-auth preference. We do NOT re-spawn
-                // `spawn_browser` here (that re-reads Chrome's Keychain-encrypted
-                // cookie store → a password prompt every launch). Instead the
-                // launch spawn above used `load_cookies()`, which reads the
-                // decrypted cookies `:yt auth browser` persisted to our config
-                // `cookies_file()` (0600) — no Keychain, no prompt. Only re-read
-                // the browser when that cache is missing/empty (first launch
-                // after choosing the browser, or cookies expired): then the one
-                // Keychain prompt is expected, and it re-persists the cache.
+                // RC11-DEF-014: restore the last-focused browse cursors so the
+                // user returns to the last-played track instead of track 1.
+                // clamp_cursors (called per-frame + on play) keeps them valid
+                // if the catalog changed since the save.
+                app.cursors.artist = layout.last_cursor_artist;
+                app.cursors.album = layout.last_cursor_album;
+                app.cursors.track = layout.last_cursor_track;
+                app.cursors.playlist = layout.last_cursor_playlist;
+                app.player_bar_state.big_pref = layout.player_bar_mode == "big";
+                app.player_bar_state.track_layout =
+                    jukebox::tui::view::player_bar_big::TrackLayoutMode::parse(
+                        &layout.track_layout_mode,
+                    );
+                app.sidebar_visible = layout.sidebar_visible;
+                app.playlist_col = jukebox::tui::app::PlaylistColumnState {
+                    width: layout.playlist_col.width,
+                    group_by_type: layout.playlist_col.group_by_type,
+                    show_counts: layout.playlist_col.show_counts,
+                };
+                let (tw, _) = crossterm::terminal::size().unwrap_or((0, 0));
+                app.playlist_col.clamp_width(tw.max(1));
+                // RC11-DEF-014: restore the last-played track + position so a
+                // "resume" hint can show and `resume_last()` (R / Enter on the
+                // restored cursor) can seek to the saved position. The hint
+                // is built from the catalog title + a M:SS position; when the
+                // track id is gone (catalog changed) or no track was played
+                // yet, no hint is shown.
+                app.last_played_track_id = layout.last_played_track_id.clone();
+                app.last_played_position = layout.last_played_position;
+                app.last_played_context_ids = layout.last_played_context_ids.clone();
+                app.last_played_context_tracks = layout.last_played_context_tracks.clone();
+                app.last_played_context_key = layout.last_played_context_key.clone();
+                // Populate the session's track_cache from the persisted
+                // context tracks so the Queue view + now-playing bar show
+                // real titles immediately — no need to wait for
+                // get_playlist/search to fire. This is the key fix: the
+                // metadata travels with the context, not just the video_ids.
+                if !layout.last_played_context_tracks.is_empty() {
+                    if let Some(session) = app.yt_session.as_mut() {
+                        for t in &layout.last_played_context_tracks {
+                            if !t.video_id.is_empty() && session.track_for(&t.video_id).is_none() {
+                                session.cache_track_pub(&jukebox::yt::proto::RemoteTrackSummary {
+                                    video_id: t.video_id.clone(),
+                                    title: t.title.clone(),
+                                    artist: t.artist.clone(),
+                                    album: t.album.clone(),
+                                    dur: None,
+                                    isrc: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                app.player_bar_state.big_pref =
+                    crate::tui::view::player_bar_big::PlayerBarMode::parse(&layout.player_bar_mode)
+                        == crate::tui::view::player_bar_big::PlayerBarMode::Big;
+                app.player_bar_state.track_layout =
+                    crate::tui::view::player_bar_big::TrackLayoutMode::parse(
+                        &layout.track_layout_mode,
+                    );
+                if let Some(id) = &layout.last_played_track_id {
+                    // Resolve the title from the local catalog, the session's
+                    // restored track_cache, the persisted context tracks.
+                    let title = app
+                        .track_by_id_fast(id)
+                        .map(|t| t.title.clone())
+                        .or_else(|| {
+                            app.yt_session
+                                .as_ref()
+                                .and_then(|s| s.track_for(id))
+                                .map(|t| t.title.clone())
+                        })
+                        .or_else(|| {
+                            layout
+                                .last_played_context_tracks
+                                .iter()
+                                .find(|t| &t.video_id == id)
+                                .map(|t| t.title.clone())
+                        })
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_else(|| "previous track".to_string());
+                    let pos = layout.last_played_position.max(0.0);
+                    let m = (pos as u64) / 60;
+                    let s = (pos as u64) % 60;
+                    app.resume_hint = Some(format!("resume: {title} at {m}:{s:02} · R to resume"));
+                    app.pending_resume = Some((id.clone(), pos));
+                    // Remember the track id so on_tick can fire a
+                    // get_watch_playlist to fetch the radio queue (which
+                    // caches track metadata) after the browser re-spawn
+                    // completes. The hint will update when the metadata lands.
+                    app.pending_metadata_fetch = Some(id.clone());
+                    // Re-fetch the source YouTube playlist so ALL context
+                    // tracks get real titles (not "Loading…"). The previous
+                    // session may have saved context tracks with empty titles
+                    // (metadata hadn't landed before exit). get_playlist(key)
+                    // re-caches every track's metadata.
+                    if let Some(key) = &app.last_played_context_key {
+                        app.pending_context_playlist_fetch = Some(key.clone());
+                    }
+                }
+                // Restore the saved browser-auth preference and re-spawn with
+                // browser auth. We ALWAYS use spawn_browser when yt_browser is
+                // set — the persisted cookies file (yt-cookies.txt) does NOT
+                // authenticate for all YouTube endpoints (get_liked_songs and
+                // get_library_playlists fail with pasted cookies because
+                // YouTube requires the full browser session cookies for those
+                // endpoints, not just SAPISID). browser_cookie3 reads the
+                // full browser cookie jar (including SID, HSID, SSID that
+                // those endpoints need), so browser auth works everywhere.
+                // The macOS Keychain prompt is a one-time cost per launch;
+                // browser_cookie3 caches the jar for the process lifetime.
                 app.yt_browser = layout.yt_browser.clone();
-                let cached_cookies = jukebox::yt::session::load_cookies();
-                if !app.yt_browser.is_empty() && cached_cookies.is_none() {
-                    // No cached cookies yet — read from the browser now (prompt)
-                    // and persist, so future launches are prompt-free.
+                if !app.yt_browser.is_empty() {
+                    // Re-spawn with browser auth (reads the browser cookie jar).
                     if let Ok(s) = jukebox::yt::session::Session::spawn_browser(
                         &app.yt_python,
                         &app.yt_script,
                         app.yt_browser.clone(),
                     ) {
                         app.yt_session = Some(s);
+                        // Re-restore the track cache + context tracks into the
+                        // new session (spawn_browser replaced the session with
+                        // a fresh one — empty track_cache).
+                        if !cached_tracks.is_empty() {
+                            if let Some(session) = app.yt_session.as_mut() {
+                                session.restore_track_cache(cached_tracks.clone());
+                            }
+                        }
+                        if !layout.last_played_context_tracks.is_empty() {
+                            if let Some(session) = app.yt_session.as_mut() {
+                                for t in &layout.last_played_context_tracks {
+                                    if !t.video_id.is_empty()
+                                        && session.track_for(&t.video_id).is_none()
+                                    {
+                                        session.cache_track_pub(
+                                            &jukebox::yt::proto::RemoteTrackSummary {
+                                                video_id: t.video_id.clone(),
+                                                title: t.title.clone(),
+                                                artist: t.artist.clone(),
+                                                album: t.album.clone(),
+                                                dur: None,
+                                                isrc: None,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         // Authenticated but NOT synced — the credential hasn't
-                        // been verified by a data fetch yet. The old code set
-                        // yt_status = "connected via {browser}" here (yt-recon §8
-                        // location 1), which was false-ready. The probe below (or
+                        // been verified by a data fetch yet. The probe below (or
                         // refresh_yt_lists) must succeed to promote to Ready.
                         app.yt_state = jukebox::yt::state::YtState::AuthenticatedNotSynced;
                     } else {
@@ -151,12 +307,6 @@ fn main() -> anyhow::Result<()> {
                         app.yt_browser.clear();
                         app.yt_state = jukebox::yt::state::YtState::Failed;
                     }
-                } else if !app.yt_browser.is_empty() && app.yt_session.is_some() {
-                    // Cached cookies loaded — the sidecar spawned with them, but
-                    // we have NOT verified the credential works yet. Set
-                    // AuthenticatedNotSynced (not "connected") until the probe
-                    // below confirms. This fixes yt-recon §8 location 2.
-                    app.yt_state = jukebox::yt::state::YtState::AuthenticatedNotSynced;
                 }
             }
             if let Ok(pls) = state::load_playlists() {
@@ -169,6 +319,22 @@ fn main() -> anyhow::Result<()> {
                 app.command_history = hist;
             }
 
+            // DEF-034: load the listening-event history from state.db so the
+            // recommendation profile survives restarts. Best-effort: a missing
+            // or corrupt DB falls back to an empty profile (cold start). After
+            // loading, enable per-event persistence so new events are saved.
+            if let Ok(events) = state::load_events(10_000) {
+                app.reco_events.extend_from(events);
+                let evs: Vec<_> = app
+                    .reco_events
+                    .recent(app.reco_events.len())
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                app.reco_profile = jukebox::reco::profile::UserProfile::build_from_events(&evs);
+            }
+            app.persist_events = true;
+
             // Load cached YT lists from state.db so a launch while offline
             // shows cached playlists immediately. load_yt_lists_from_cache
             // also marks the state ReadyStale when the sidecar couldn't start
@@ -176,6 +342,9 @@ fn main() -> anyhow::Result<()> {
             // refresh below overwrites the cached lists with fresh data and
             // promotes to Ready when the network is up.
             app.load_yt_lists_from_cache();
+
+            // Track cache was already restored above (before the resume hint).
+            // No need to re-load here.
 
             // Fire-and-forget YT refresh at launch. Replaces the old blocking
             // library_playlists() probe, which (a) hung launch on a network
@@ -233,9 +402,35 @@ fn main() -> anyhow::Result<()> {
                 continue_mode: app.transport.continue_mode,
                 source_mode: app.source_mode,
                 yt_browser: &app.yt_browser,
+                // RC11-DEF-014: persist the last-played track + position +
+                // browse cursors so the next launch can offer a resume.
+                last_played_track_id: app.last_played_track_id.as_deref(),
+                last_played_position: app.last_played_position,
+                last_played_context_ids: &app.last_played_context_ids,
+                last_played_context_tracks: &app.last_played_context_tracks,
+                last_played_context_key: app.last_played_context_key.as_deref(),
+                last_cursor_artist: app.cursors.artist,
+                last_cursor_album: app.cursors.album,
+                last_cursor_track: app.cursors.track,
+                last_cursor_playlist: app.cursors.playlist,
+                player_bar_mode: if app.player_bar_state.big_pref {
+                    "big"
+                } else {
+                    "mini"
+                },
+                track_layout_mode: app.player_bar_state.track_layout.as_str(),
+                sidebar_visible: app.sidebar_visible,
+                playlist_col: &app.playlist_col,
             });
             let _ = state::save_playlists(&app.playlists);
             let _ = state::save_command_history(&app.command_history);
+            // Persist the session's track_cache so the next launch can restore
+            // track titles/artists for resume (the in-memory cache doesn't
+            // survive a restart).
+            if let Some(session) = &app.yt_session {
+                let tracks = session.all_cached_tracks();
+                jukebox::yt::cache::save_track_cache(&tracks);
+            }
         }
         Cmd::Sync => {
             let cfg = cli::ensure_config()?;
@@ -259,9 +454,16 @@ fn main() -> anyhow::Result<()> {
                 ])
                 .status()?;
             if !status.success() {
-                anyhow::bail!("standardize.sh failed");
+                anyhow::bail!(
+                    "standardize.sh failed — see output above; run `jukebox sync` \
+                     again once the source dir has playable .flac files"
+                );
             }
             let cat = catalog::Catalog::load(&cfg.filtered_dir.join("catalog.json"))?;
+            // Defense in depth: standardize.sh exits non-zero on 0 tracks, but a
+            // stale empty catalog (e.g. from a pre-fix sync) must not be reported
+            // as "synced: 0 tracks" success.
+            cat.require_tracks()?;
             search::build_index(&cat, &cfg.filtered_dir.join("search-index"))?;
             println!("synced: {} tracks", cat.tracks.len());
         }

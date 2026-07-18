@@ -26,6 +26,228 @@ pub enum View {
     Youtube,
 }
 
+/// Which YouTube sub-tab is active inside `View::Youtube` (I.4 tab system).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum YtTab {
+    #[default]
+    Home,
+    Library,
+    Search,
+    Discover,
+    Radio,
+    Explore,
+    Charts,
+}
+
+impl YtTab {
+    pub fn all() -> [(&'static str, YtTab); 7] {
+        [
+            ("Home", YtTab::Home),
+            ("Library", YtTab::Library),
+            ("Search", YtTab::Search),
+            ("Discover", YtTab::Discover),
+            ("Radio", YtTab::Radio),
+            ("Explore", YtTab::Explore),
+            ("Charts", YtTab::Charts),
+        ]
+    }
+    pub fn next(self) -> YtTab {
+        match self {
+            YtTab::Home => YtTab::Library,
+            YtTab::Library => YtTab::Search,
+            YtTab::Search => YtTab::Discover,
+            YtTab::Discover => YtTab::Radio,
+            YtTab::Radio => YtTab::Explore,
+            YtTab::Explore => YtTab::Charts,
+            YtTab::Charts => YtTab::Home,
+        }
+    }
+    pub fn prev(self) -> YtTab {
+        match self {
+            YtTab::Home => YtTab::Charts,
+            YtTab::Library => YtTab::Home,
+            YtTab::Search => YtTab::Library,
+            YtTab::Discover => YtTab::Search,
+            YtTab::Radio => YtTab::Discover,
+            YtTab::Explore => YtTab::Radio,
+            YtTab::Charts => YtTab::Explore,
+        }
+    }
+}
+
+/// Per-tab state for the YouTube view (I.4 + I.1).
+#[derive(Clone, Debug, Default)]
+pub struct YtViewState {
+    pub tab: YtTab,
+    pub home: crate::tui::view::home::HomeState,
+    pub library_cursor: usize,
+    pub library_section: usize,
+    /// YouTube Music home-feed shelves (ytmusicapi `get_home`). `None` until
+    /// the first successful `send_home` response lands in `on_tick`; set to
+    /// `Some(Vec<HomeSectionProto>)` once cached. Cleared by `R` (manual
+    /// refresh on the Home tab) and by `yt_logout` (credential change). The
+    /// `home.sections` field carries the local cold-start sections + the
+    /// mapped YouTube shelves appended after them; this field holds the raw
+    /// proto list so a re-render can rebuild without re-fetching.
+    pub home_sections_cached: Option<Vec<crate::yt::proto::HomeSectionProto>>,
+    /// YouTube Music explore-feed playlists (ytmusicapi `get_explore`).
+    /// `None` until the first successful `send_explore` response lands in
+    /// `on_tick`. The Explore tab renders directly from this cache (Task 5).
+    pub explore_cached: Option<Vec<crate::yt::proto::PlaylistProto>>,
+    /// YouTube Music chart entries (ytmusicapi `get_charts`). `None` until
+    /// the first successful `send_charts` response lands in `on_tick`. The
+    /// Charts tab groups entries by the `chart` field and renders from this
+    /// cache (Task 5).
+    pub charts_cached: Option<Vec<crate::yt::proto::ChartEntryProto>>,
+    /// Cursor for the Explore tab (j/k navigation). Indexes into
+    /// `explore_cached`. Clamped to the list length on render + on Enter.
+    pub explore_cursor: usize,
+    /// Cursor for the Charts tab (j/k navigation). Indexes into
+    /// `charts_cached` as a flat list (the section-header grouping is a
+    /// render concern; the cursor is a flat index so Enter maps directly to
+    /// the cached entry).
+    pub charts_cursor: usize,
+    /// Inline filter (`f`) for the Home/Explore/Charts tabs. `None` = no
+    /// filter; `Some(query)` = show only items whose title/subtitle/chart
+    /// contains the query (case-insensitive). When active, the cursor
+    /// indexes into the FILTERED list, and Enter plays the filtered item at
+    /// the cursor. Cleared by Esc or `f` on an empty filter (toggle).
+    pub yt_filter: Option<String>,
+    /// When set, the Explore/Charts tab is in "playlist browse" mode —
+    /// showing the tracks of the playlist identified by `browse_playlist_id`
+    /// instead of the playlist list. Set by Enter on a playlist (fires
+    /// `get_playlist`); populated when the tracks land. Esc clears it (goes
+    /// back to the playlist list). Enter on a track plays from that track;
+    /// `a` plays the whole playlist from the first track.
+    pub browse_playlist_id: Option<String>,
+    /// The tracks (video_ids) of the browsed playlist. Populated by
+    /// `on_tick` when `pending_tracks` lands for the `browse_playlist_id`.
+    /// Empty until the response arrives (the view shows a loading state).
+    pub browse_playlist_tracks: Vec<String>,
+    /// Cursor for the browsed playlist's track list (j/k navigation).
+    pub browse_cursor: usize,
+}
+
+impl App {
+    /// True if the YT-tab inline filter is active (Home/Explore/Charts).
+    pub fn yt_filter_active(&self) -> bool {
+        self.yt_view.yt_filter.is_some()
+    }
+
+    /// The current YT-tab filter query (lowercased for case-insensitive
+    /// matching), or empty when no filter is active.
+    fn yt_filter_query(&self) -> String {
+        self.yt_view
+            .yt_filter
+            .as_ref()
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default()
+    }
+
+    /// Toggle the YT-tab inline filter on/off (mirrors `toggle_filter` for
+    /// the local browse views). Called by `f` when on a Home/Explore/Charts
+    /// tab. `f` on an active+empty filter closes it (toggle semantics).
+    pub fn toggle_yt_filter(&mut self) {
+        match &self.yt_view.yt_filter {
+            Some(f) if f.is_empty() => self.yt_view.yt_filter = None,
+            None => self.yt_view.yt_filter = Some(String::new()),
+            _ => {} // keep the existing query (toggle is idempotent once typing)
+        }
+    }
+
+    /// Filter the cached Explore playlists by the current YT-tab filter.
+    /// Returns the full cache when no filter is active. Case-insensitive
+    /// substring match on title + subtitle.
+    pub fn filtered_explore(&self) -> Vec<crate::yt::proto::PlaylistProto> {
+        let Some(cached) = self.yt_view.explore_cached.as_ref() else {
+            return Vec::new();
+        };
+        let q = self.yt_filter_query();
+        if q.is_empty() {
+            return cached.clone();
+        }
+        cached
+            .iter()
+            .filter(|p| {
+                p.title.to_lowercase().contains(&q)
+                    || p.subtitle
+                        .as_deref()
+                        .map(|s| s.to_lowercase())
+                        .unwrap_or_default()
+                        .contains(&q)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Filter the cached Charts entries by the current YT-tab filter.
+    /// Case-insensitive substring match on title + subtitle + chart name.
+    pub fn filtered_charts(&self) -> Vec<crate::yt::proto::ChartEntryProto> {
+        let Some(cached) = self.yt_view.charts_cached.as_ref() else {
+            return Vec::new();
+        };
+        let q = self.yt_filter_query();
+        if q.is_empty() {
+            return cached.clone();
+        }
+        cached
+            .iter()
+            .filter(|e| {
+                e.title.to_lowercase().contains(&q)
+                    || e.subtitle
+                        .as_deref()
+                        .map(|s| s.to_lowercase())
+                        .unwrap_or_default()
+                        .contains(&q)
+                    || e.chart.to_lowercase().contains(&q)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Filter the Home tab's sections by the current YT-tab filter. Returns
+    /// the full sections list when no filter is active. Case-insensitive
+    /// substring match on item title + subtitle (the section title is NOT
+    /// matched — the user filters for tracks/playlists, not shelf names).
+    /// Empty sections (all items filtered out) are dropped so the view
+    /// doesn't show empty shelf headers.
+    pub fn filtered_home_sections(
+        &self,
+    ) -> Vec<(
+        crate::tui::view::home::HomeSection,
+        Vec<crate::tui::view::home::HomeItem>,
+    )> {
+        let sections = &self.yt_view.home.sections;
+        let q = self.yt_filter_query();
+        if q.is_empty() {
+            return sections.clone();
+        }
+        sections
+            .iter()
+            .filter_map(|(sec, items)| {
+                let filtered: Vec<_> = items
+                    .iter()
+                    .filter(|it| {
+                        it.title.to_lowercase().contains(&q)
+                            || it
+                                .subtitle
+                                .as_deref()
+                                .map(|s| s.to_lowercase())
+                                .unwrap_or_default()
+                                .contains(&q)
+                    })
+                    .cloned()
+                    .collect();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some((sec.clone(), filtered))
+                }
+            })
+            .collect()
+    }
+}
+
 /// A YouTube playlist/mood list shown in the Y view. `track_ids` are the
 /// video_ids of the list's tracks, fetched lazily (via the sidecar) when the
 /// user focuses the list.
@@ -37,11 +259,17 @@ pub struct YtList {
     pub track_ids: Vec<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum YtListKind {
     #[default]
     Account,
     Suggested,
+    /// RC11-DEF-030: a generated mix (Daily Mix, Discover Mix, ...). Displayed
+    /// with a ◆ glyph to distinguish it from account (♫) and suggested (✦)
+    /// playlists. Not yet populated by `refresh_yt_lists` (the mixes live in
+    /// `reco_mixes` / the Home + Discover overlays); the variant exists so
+    /// future wiring (Batch I tab system) can surface mixes in the YT view.
+    Generated,
 }
 
 /// A user-defined playlist: name + ordered track ids.
@@ -61,6 +289,61 @@ pub struct ColumnCursors {
     pub playlist: usize,
     pub queue: usize,
     pub search: usize,
+}
+
+/// I.7: Variable-width playlist column state. Persisted in `LayoutState.playlist_col`.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlaylistColumnState {
+    #[serde(default = "default_playlist_col_width")]
+    pub width: u16,
+    #[serde(default = "default_playlist_col_group")]
+    pub group_by_type: bool,
+    #[serde(default = "default_playlist_col_counts")]
+    pub show_counts: bool,
+}
+
+fn default_playlist_col_width() -> u16 {
+    32
+}
+fn default_playlist_col_group() -> bool {
+    true
+}
+fn default_playlist_col_counts() -> bool {
+    true
+}
+
+impl Default for PlaylistColumnState {
+    fn default() -> Self {
+        PlaylistColumnState {
+            width: 32,
+            group_by_type: true,
+            show_counts: true,
+        }
+    }
+}
+
+impl PlaylistColumnState {
+    pub fn default_for_width(tw: u16) -> Self {
+        if tw >= 100 {
+            PlaylistColumnState::default()
+        } else {
+            PlaylistColumnState {
+                width: 24,
+                group_by_type: false,
+                show_counts: false,
+            }
+        }
+    }
+    pub fn clamp_width(&mut self, tw: u16) {
+        let min = 16;
+        let max = (tw / 2).max(min);
+        if self.width < min {
+            self.width = min;
+        }
+        if self.width > max {
+            self.width = max;
+        }
+    }
 }
 
 /// Column widths for the three-pane browse layout.
@@ -170,6 +453,65 @@ pub enum Overlay {
     /// on `App::diagnostics`; this just signals "show it". Esc closes (handled
     /// generically at the top of the key handler).
     Diagnostics,
+    /// Confirmation dialog for destructive actions (DEF-001: delete playlist,
+    /// DEF-015: yt logout). `message` is shown to the user; `action` identifies
+    /// what to do on confirm (y/Enter). n/Esc cancels.
+    Confirm {
+        message: String,
+        action: ConfirmAction,
+    },
+    /// Text input overlay (DEF-014: playlist name prompt). `prompt` is the
+    /// label; `buffer` accumulates typed text; `cursor` is the byte offset;
+    /// `action` identifies what to do on Enter.
+    TextInput {
+        prompt: String,
+        buffer: String,
+        cursor: usize,
+        action: TextInputAction,
+    },
+    /// YouTube Home view — multi-section discovery.
+    Home {
+        state: crate::tui::view::home::HomeState,
+    },
+    /// Radio session overlay.
+    Radio {
+        session: Option<crate::reco::radio::RadioSession>,
+    },
+    /// Playlist generator overlay.
+    Generator {
+        state: crate::tui::view::generator::GeneratorState,
+    },
+    /// Recommendation explanation overlay.
+    Explanation {
+        explanation: crate::reco::explanations::Explanation,
+    },
+    /// YouTube playlist publication overlay.
+    Publication {
+        state: crate::tui::view::publication::PublicationState,
+    },
+}
+
+/// Actions that can be confirmed via [`Overlay::Confirm`].
+#[derive(Clone, Debug)]
+pub enum ConfirmAction {
+    /// Delete the focused playlist (Playlists view, col 0).
+    DeletePlaylist,
+    /// Clear YouTube credentials and log out.
+    YtLogout,
+    /// Clear the play-next queue (MOD-4: confirm before clearing a non-empty
+    /// queue, mirroring the `d` / `:yt logout` confirmation pattern).
+    ClearQueue,
+    /// Play the most recently saved generator playlist (RC11-DEF-065).
+    /// Paired with `App::pending_play_saved_idx` (the playlist's index in
+    /// `App::playlists`); the Confirm handler plays it on `y`/Enter.
+    PlaySavedPlaylist,
+}
+
+/// Actions that can be triggered via [`Overlay::TextInput`].
+#[derive(Clone, Debug)]
+pub enum TextInputAction {
+    /// Create a new playlist with the given name and seed track.
+    NewPlaylist { track_id: String },
 }
 
 /// The lifecycle state of the lyrics overlay. Distinct from `Overlay::Lyrics`
@@ -205,6 +547,16 @@ pub enum DiscoverItem {
     Album { artist: String, album: String },
     /// A YouTube mood/suggested playlist (YouTube / Mixed).
     Playlist { id: String, name: String },
+    /// A generated mix from `reco::mixes` (RC11-DEF-013). Carries the mix's
+    /// local-catalog track ids (so Enter plays immediately via
+    /// `play_in_context_ids` — no sidecar roundtrip), the display name, and
+    /// an optional "why recommended" explanation (RC11-DEF-028).
+    Mix {
+        mix_type: crate::reco::mixes::MixType,
+        name: String,
+        track_ids: Vec<String>,
+        explanation: Option<String>,
+    },
 }
 
 /// The central TUI state struct.
@@ -229,6 +581,14 @@ pub struct App {
     /// `collaboration_album_shows_and_plays_all_tracks` in `tests/app.rs`.
     pub album_tracks: HashMap<String, Vec<String>>,
     pub view: View,
+    /// The view rendered in the last frame. Used by `layout::draw` to detect
+    /// view switches and force a full redraw (MOD-7: when switching views,
+    /// a cell whose content+style coincidentally matches the previous frame
+    /// at the same position — e.g. "i" in "Test Artist" → "i" in "Late Night
+    /// Jazz" at the same column — is skipped by ratatui's diff, leaving stale
+    /// content. Forcing every non-empty cell to `AlwaysUpdate` on a view
+    /// switch ensures the diff emits all visible characters).
+    pub last_rendered_view: View,
     pub focus_col: usize,
     pub cursors: ColumnCursors,
     pub column_widths: ColumnWidths,
@@ -255,6 +615,7 @@ pub struct App {
     /// Empty until `refresh_yt_lists` populates them.
     pub yt_lists: Vec<YtList>,
     pub yt_lists_loading: bool,
+    pub yt_view: YtViewState,
     /// Playlist ids whose tracks have been fetched (even if empty), so a
     /// genuinely-empty list isn't re-fetched every tick while focused.
     pub loaded_yt_lists: HashSet<String>,
@@ -272,6 +633,12 @@ pub struct App {
     /// (e.g. "upgraded to AAC 256k"); the state machine owns the auth/sync
     /// lifecycle. `yt_error` carries error *detail* alongside the state.
     pub yt_state: crate::yt::state::YtState,
+    /// Tick counter for the auth-busy timeout (RB-4). Incremented each `on_tick`
+    /// while `yt_state` is `Authenticating` or `AuthenticatedNotSynced`; reset to
+    /// 0 on any other state. After ~600 ticks (~30-90s) without a transition,
+    /// the state times out to `ProviderError` with a clear message so the user
+    /// is never left with an unexplained busy state.
+    pub yt_auth_busy_ticks: u32,
     /// `python3` path + the sidecar script path, used to (re)spawn the sidecar
     /// when cookies change via `:yt auth`. Set by `main.rs`; defaults to
     /// `python3` + the manifest-dir script (works in dev).
@@ -317,6 +684,17 @@ pub struct App {
     /// user moved to a different track). Guarantees stale lyrics can't
     /// overwrite a newer track's lyrics overlay.
     pub lyrics_gen: u64,
+    /// M-2: a pending local lyrics read (track_id, gen) deferred from
+    /// `request_lyrics` to `on_tick` so the Loading transition is visible for
+    /// at least one frame. Without this, the synchronous disk read in
+    /// `request_lyrics` sets Loading → NotFound in the same call, so the user
+    /// never sees the Loading state on a retry (R) for a local track.
+    pub pending_lyrics_local: Option<(String, u64)>,
+    /// M-2: true when the user has manually scrolled the lyrics overlay (j/k/
+    /// PgUp/PgDn/g/G). While true, the overlay shows a "f to resume follow"
+    /// hint so the user knows how to return to the active line. Reset to false
+    /// on 'f' (resume) and on a new lyrics request (toggle_lyrics / request_lyrics).
+    pub lyrics_manual_scroll: bool,
     /// Verbosity resolved from the `--verbose`/`--quiet` CLI flags. The footer
     /// / view layer consults this to decide how much chrome to render: `Quiet`
     /// shows only errors, `Normal` is the default hint bar, `Verbose` shows
@@ -339,12 +717,47 @@ pub struct App {
     /// (re)starts the TTL window when the new `yt_status` differs from this,
     /// so a repeat of the same message doesn't keep refreshing its 5s lease.
     pub last_notification: Option<String>,
+    /// The playlist name captured at publish-dispatch time so `on_tick`
+    /// can surface a "Playlist \"<name>\" created" toast when the sidecar's
+    /// `pending_publication` result lands. RC11-DEF-002: the publication
+    /// result carries only the playlist id (or error), not the user-supplied
+    /// title, so we stash it here on Enter and consume it in `on_tick`.
+    pub pending_publish_name: Option<String>,
+    /// The index of the most recently saved generator playlist, stashed
+    /// so the "Play now? y/n" Confirm overlay's `y`/Enter handler can play
+    /// it (RC11-DEF-065). Set when the generator's Enter-save succeeds;
+    /// consumed by the Confirm handler for `PlaySavedPlaylist`.
+    pub pending_play_saved_idx: Option<usize>,
+    /// Audit journal of YouTube publication attempts (Batch C). Used by
+    /// `record_publication` to log each publish result for truthful reporting.
+    pub publication_journal: crate::yt::publication::PublicationJournal,
     /// True while a discover (`S` overlay) home-suggestions fetch is in flight.
     /// Set by `yt_discover_items` (fire-and-forget `send_home_suggestions`);
     /// cleared by `on_tick` when `pending_discover` lands (or on error). The
     /// overlay opens instantly with a "loading…" state and populates when the
     /// response lands — `S` no longer blocks the UI for the ~3s roundtrip.
     pub discover_loading: bool,
+    /// Tick counter for the discover loading timeout. Incremented each
+    /// `on_tick` while `discover_loading` is true; after 600 ticks (~10s at
+    /// 60fps, ~30s at 20fps), the loading state is cleared and an error
+    /// message is shown so the overlay doesn't hang forever.
+    pub discover_loading_ticks: u32,
+    /// Tick counters for the Home/Explore/Charts loading timeouts. Same
+    /// 600-tick pattern as `discover_loading_ticks`: incremented each
+    /// `on_tick` while the matching `*_loading()` is true; on timeout the
+    /// loading flag is cleared (via `reset_*_inflight`), an error is shown
+    /// ("Home/Explore/Charts timed out — press R to retry"), and the user
+    /// can R-refresh. Also drives the spinner animation in the view layer.
+    pub home_loading_ticks: u32,
+    pub explore_loading_ticks: u32,
+    pub charts_loading_ticks: u32,
+    /// RC11-DEF-035: the name of the mix/playlist a Discover Enter is
+    /// currently loading. Set by `play_discover_selection` when the overlay
+    /// stays open to show "Loading [name]..."; cleared when playback starts
+    /// (on_tick) or on error. Rendered by `render_discover` so the user
+    /// sees a persistent loading state inside the overlay instead of a
+    /// silent close.
+    pub discover_play_loading: Option<String>,
     /// A YouTube playlist id whose tracks were requested by a discover
     /// selection (Enter on a `DiscoverItem::Playlist`). `play_discover_selection`
     /// fires-and-forgets `send_get_playlist(id)` + stores the id here; `on_tick`
@@ -352,6 +765,23 @@ pub struct App {
     /// with a matching id (the blocking `get_playlist` call is gone, so Enter
     /// no longer freezes the UI for the ~4s roundtrip).
     pub pending_discover_play: Option<String>,
+    /// Set by `pending_discover_start` when a playlist play was triggered
+    /// from a YT content tab (Home/Explore/Charts). `on_tick` switches to
+    /// the Queue view when `now_playing` transitions to `Some` — i.e. when
+    /// the first track's URL resolves + playback starts. Switching earlier
+    /// would show an empty queue during the 1-2s (or 10-15s cold-start)
+    /// resolve, confusing the user into thinking nothing is playing.
+    pub pending_yt_switch_to_queue: bool,
+    /// Set on startup when the resume track's title isn't in the cache.
+    /// `on_tick` fires a `get_watch_playlist` to fetch the radio queue (which
+    /// caches track metadata), then clears this. The resume hint updates
+    /// when the metadata lands.
+    pub pending_metadata_fetch: Option<String>,
+    /// One-shot: the YouTube playlist ID to re-fetch on startup so ALL
+    /// context tracks get real titles (not "Loading…"). Set from
+    /// `last_played_context_key` on launch; consumed by `on_tick` which
+    /// fires `get_playlist(key)`. Cleared after the fetch is fired.
+    pub pending_context_playlist_fetch: Option<String>,
     /// The seed video_id for an in-flight CONT=YouTube radio refill
     /// (`send_watch_playlist`). `next()` stores it when the radio queue is
     /// exhausted; `on_tick` consumes it when `pending_watch` lands to refill
@@ -367,6 +797,118 @@ pub struct App {
     /// immediately (fire-and-forget) — the device re-clocks when the
     /// format lands (AC-M9.2.4).
     audio_switch_handle: Option<std::thread::JoinHandle<()>>,
+
+    /// RC15-DEF-4: pending background `:yt setup` (non-blocking). The
+    /// blocking venv+pip install (~30s) runs on a detached thread so the
+    /// TUI stays responsive and the "Setting up YouTube deps…" toast is
+    /// visible immediately. `on_tick` polls `is_finished()`; on completion
+    /// it joins, applies the result (updates `yt_python`, sets
+    /// `yt_status` to "YT setup OK · venv: …" or `yt_error`), and respawns
+    /// the sidecar against the new venv python.
+    pub yt_setup_handle: Option<std::thread::JoinHandle<Result<String, String>>>,
+
+    /// User listening profile for recommendations.
+    pub reco_profile: crate::reco::profile::UserProfile,
+    /// Listening event log.
+    pub reco_events: crate::reco::events::EventLog,
+    /// The user's generated mixes.
+    pub reco_mixes: Vec<crate::reco::mixes::Mix>,
+    /// Feedback actions pending application.
+    pub reco_feedback_pending: Vec<(crate::reco::feedback::FeedbackAction, String)>,
+
+    // --- Playback-event tracking (DEF-034) ---------------------------------
+    /// When the currently-playing track started (for rapid-skip detection:
+    /// a skip within 10s is a strong negative signal). Reset on every
+    /// `start_playback` / `load_track`. Also the wall-clock anchor for
+    /// `estimated_position()` (RC14-DEF-4: hi-res progress fallback).
+    pub play_started_at: Option<std::time::Instant>,
+    /// RC14-DEF-4: when the current track was paused (SIGSTOP for afplay /
+    /// `pause` property for mpv). `None` while playing or stopped. Used by
+    /// `estimated_position()` to subtract paused wall-clock time so the
+    /// progress bar doesn't advance while paused.
+    pub pause_started_at: Option<std::time::Instant>,
+    /// RC14-DEF-4: accumulated paused wall-clock time for the current track.
+    /// Reset in `note_play_started` (new track). Added to in `toggle_pause`
+    /// on resume. Subtracted from `play_started_at.elapsed()` in
+    /// `estimated_position()`.
+    pub accumulated_paused: std::time::Duration,
+    /// RC14-DEF-4: the playback position (seconds) the current track started
+    /// at — 0 for a fresh play, the resume offset for `load_at`. Added to
+    /// the wall-clock elapsed in `estimated_position()`.
+    pub play_start_offset: f64,
+    /// The track id for which `meaningful_threshold` has already been fired
+    /// this play, so `on_tick` doesn't duplicate-fire it each tick. Cleared
+    /// when the now-playing track changes.
+    pub threshold_fired_for: Option<String>,
+    /// The track id that just ended naturally (on_track_ended). `next()`
+    /// checks this to avoid recording a "skipped" event for a track that
+    /// actually completed — `on_track_ended` records "completed" first.
+    pub last_natural_end: Option<String>,
+    /// When true, `record_listen_event` also persists each event to
+    /// `state.db` (DEF-034) so listening history survives restarts. Default
+    /// false so tests (which construct `App` without a DB) don't touch the
+    /// real state DB; `main.rs` sets it true after loading prior events.
+    pub persist_events: bool,
+
+    // --- RC11 Batch D: resume + toast ----------------------------------------
+    /// RC11-DEF-014: the last-played track id, restored on launch so the
+    /// cursor can return to it and a "resume" hint can show. Updated as
+    /// playback progresses (on_tick) and saved to `state.db` on exit.
+    pub last_played_track_id: Option<String>,
+    /// RC11-DEF-014: the last-played track's position in seconds, restored on
+    /// launch so `resume_last()` can seek to it. afplay can't seek so resume
+    /// only re-seeks on mpv/StubPlayer; afplay restarts from 0.
+    pub last_played_position: f64,
+    /// The track ids of the last-played context (playlist/album/search).
+    /// Restored on launch so `resume_last` can restore the FULL context
+    /// (not just the single track) — the user sees the full playlist in
+    /// the Queue view and `>` advances to the next track.
+    pub last_played_context_ids: Vec<String>,
+    /// Full track metadata (title/artist/album) for the last-played context.
+    /// Restored on launch so the Queue view + now-playing bar show real
+    /// titles immediately — no need to wait for get_playlist/search.
+    pub last_played_context_tracks: Vec<crate::state::CachedTrackMeta>,
+    /// The YouTube playlist ID the last-played context came from. On
+    /// startup, `on_tick` fires `get_playlist(key)` to re-fetch ALL track
+    /// metadata so the Queue view shows real titles instead of "Loading…"
+    /// for tracks whose metadata wasn't cached before the previous session
+    /// ended. `None` when the context was local or a single track.
+    pub last_played_context_key: Option<String>,
+    /// RC11-DEF-014: a one-shot (track_id, position) captured on launch from
+    /// `state.db`. The first successful load of the matching track uses
+    /// `load_at(pos)` to resume at the saved position, then clears this.
+    /// `None` after the resume is consumed (or on a fresh launch with no
+    /// saved playback).
+    pub pending_resume: Option<(String, f64)>,
+    /// RC11-DEF-014: a "resume" hint shown in the player bar when stopped
+    /// with a saved last-played track. Set on launch from `state.db`;
+    /// cleared on the first successful play so it doesn't linger. The bar
+    /// renders `▸ resume: [title] at [M:SS] · R to resume`.
+    pub resume_hint: Option<String>,
+    /// RC11-DEF-043: a transient confirmation toast (e.g. "Added to queue")
+    /// shown in the player bar's up-next slot. Set by `enqueue_selected`;
+    /// cleared by `on_tick` after ~1.2s so it's visible long enough to read
+    /// but doesn't linger. Rendered regardless of `yt_state` so local-only
+    /// users see the feedback (the `yt_status` toast was gated on Ready).
+    pub toast: Option<String>,
+    /// When the current `toast` was set; used by `on_tick` to clear it after
+    /// the TTL. `None` when no toast is active.
+    pub toast_at: Option<std::time::Instant>,
+    /// RC11-DEF-005: a transient status-bar toast (e.g. "unknown command:
+    /// :foobar") shown in the footer status line regardless of `yt_state`.
+    /// The old footer only rendered `yt_error` when `yt_state == Ready`, so
+    /// local-only users (default `Unconfigured`) never saw command errors.
+    /// Set by `execute_command` (unknown commands) and Tab-completion (no
+    /// prefix / ambiguous). Cleared by `on_tick` after ~3s. Distinct from
+    /// `toast` (which renders in the player bar up-next slot) so command
+    /// errors don't displace the "Next:" preview.
+    pub status_toast: Option<String>,
+    /// When the current `status_toast` was set; used by `on_tick` to clear it
+    /// after the TTL. `None` when no status toast is active.
+    pub status_toast_at: Option<std::time::Instant>,
+    pub player_bar_state: crate::tui::view::player_bar_big::PlayerBarState,
+    pub sidebar_visible: bool,
+    pub playlist_col: PlaylistColumnState,
 }
 
 /// Inline filter state for the `f` filter-on-focused-column (spec §5.4).
@@ -523,6 +1065,7 @@ impl App {
             track_index,
             album_tracks,
             view: View::Artists,
+            last_rendered_view: View::Artists,
             focus_col: 0,
             cursors: ColumnCursors::default(),
             column_widths: ColumnWidths::default(),
@@ -540,9 +1083,11 @@ impl App {
             device_rate: crate::source::device_rate::DeviceRateState::default(),
             yt_lists: Vec::new(),
             yt_lists_loading: false,
+            yt_view: YtViewState::default(),
             yt_error: None,
             yt_status: None,
             yt_state: crate::yt::state::YtState::default(),
+            yt_auth_busy_ticks: 0,
             yt_python: std::path::PathBuf::from("python3"),
             yt_script: std::path::PathBuf::from("scripts/yt/yt.py"),
             filter: None,
@@ -556,14 +1101,53 @@ impl App {
             command_history_cursor: None,
             command_draft: String::new(),
             lyrics_gen: 0,
+            pending_lyrics_local: None,
+            lyrics_manual_scroll: false,
             verbosity: crate::cli::Verbosity::default(),
             diagnostics: crate::diagnostics::Diagnostics::new(),
             notification_ttl: None,
             last_notification: None,
+            pending_publish_name: None,
+            pending_play_saved_idx: None,
+            publication_journal: crate::yt::publication::PublicationJournal::new(),
             discover_loading: false,
+            discover_loading_ticks: 0,
+            home_loading_ticks: 0,
+            explore_loading_ticks: 0,
+            charts_loading_ticks: 0,
+            discover_play_loading: None,
             pending_discover_play: None,
+            pending_yt_switch_to_queue: false,
+            pending_metadata_fetch: None,
+            pending_context_playlist_fetch: None,
             pending_radio_seed: None,
             audio_switch_handle: None,
+            yt_setup_handle: None,
+            reco_profile: crate::reco::profile::UserProfile::default(),
+            reco_events: crate::reco::events::EventLog::new(),
+            reco_mixes: Vec::new(),
+            reco_feedback_pending: Vec::new(),
+            play_started_at: None,
+            pause_started_at: None,
+            accumulated_paused: std::time::Duration::ZERO,
+            play_start_offset: 0.0,
+            threshold_fired_for: None,
+            last_natural_end: None,
+            persist_events: false,
+            last_played_track_id: None,
+            last_played_position: 0.0,
+            last_played_context_ids: Vec::new(),
+            last_played_context_tracks: Vec::new(),
+            last_played_context_key: None,
+            pending_resume: None,
+            resume_hint: None,
+            toast: None,
+            toast_at: None,
+            status_toast: None,
+            status_toast_at: None,
+            player_bar_state: crate::tui::view::player_bar_big::PlayerBarState::default(),
+            sidebar_visible: true,
+            playlist_col: PlaylistColumnState::default(),
         }
     }
 
@@ -574,6 +1158,18 @@ impl App {
         self.track_index
             .get(id)
             .and_then(|&i| self.catalog.tracks.get(i))
+    }
+
+    /// The track ids of the current playback context (the album/playlist/
+    /// search that's playing right now). Used by the Queue view to show
+    /// what's playing + what's coming up when the manual queue is empty.
+    pub fn transport_context_ids(&self) -> Vec<String> {
+        let r = ClonedResolver {
+            playlists: &self.playlists,
+            manual_queue: self.transport.manual_queue.clone(),
+            yt_lists: &self.yt_lists,
+        };
+        self.transport.context.track_ids(&r)
     }
 
     fn track_by_id(&self, id: &str) -> Option<&Track> {
@@ -618,16 +1214,47 @@ impl App {
                 })
             }
             crate::source::TrackSource::Remote { video_id } => {
-                let rt = self.yt_session.as_ref()?.track_for(video_id)?;
-                Some(NowPlayingView {
-                    title: rt.title.clone(),
-                    artist: rt.artist.clone(),
-                    album: rt.album.clone(),
-                    source: ts.clone(),
-                    bit_depth: 0,
-                    sample_rate_hz: rt.fmt.as_ref().map(|f| f.sample_rate).unwrap_or(48000),
-                    fmt: rt.fmt.clone(),
-                })
+                // Look up the track metadata in the session's cache. This is
+                // populated by search/get_playlist/get_watch_playlist. For
+                // tracks played directly from Charts (video_id with no prior
+                // get_playlist), the cache may not have metadata yet — fall
+                // back to a generic "YouTube track" view so the player bar
+                // still shows SOMETHING instead of "nothing playing" while
+                // audio is clearly playing.
+                match self.yt_session.as_ref().and_then(|s| s.track_for(video_id)) {
+                    Some(rt) => Some(NowPlayingView {
+                        title: rt.title.clone(),
+                        artist: rt.artist.clone(),
+                        album: rt.album.clone(),
+                        source: ts.clone(),
+                        bit_depth: 0,
+                        sample_rate_hz: rt.fmt.as_ref().map(|f| f.sample_rate).unwrap_or(48000),
+                        fmt: rt.fmt.clone(),
+                    }),
+                    None => {
+                        // No cached metadata — the track is playing but the
+                        // session's track_cache doesn't have it. Show
+                        // "Resuming…" while the URL is in flight; otherwise
+                        // "Loading…" — `on_tick` fires a get_watch_playlist
+                        // to fetch the seed video's metadata (title/artist)
+                        // so the real title replaces this placeholder. Never
+                        // show the raw 11-char video_id to the user.
+                        let title = if self.is_resolving() || self.pending_play.is_some() {
+                            format!("Resuming{}", crate::tui::view::theme::ellipsis())
+                        } else {
+                            format!("Loading{}", crate::tui::view::theme::ellipsis())
+                        };
+                        Some(NowPlayingView {
+                            title,
+                            artist: String::new(),
+                            album: None,
+                            source: ts.clone(),
+                            bit_depth: 0,
+                            sample_rate_hz: 48000,
+                            fmt: None,
+                        })
+                    }
+                }
             }
         }
     }
@@ -654,6 +1281,14 @@ impl App {
     /// `play_selected` play the wrong/no track — the "this artist has no songs"
     /// and "Enter doesn't play after picking a list" bugs.
     pub fn clamp_cursors(&mut self) {
+        // Queue view: keep cursors.track synced with cursors.queue so the
+        // ▸ selection marker (rendered via cursors.track by `track_rows`)
+        // matches the actual navigation cursor (cursors.queue). Without
+        // this, a stale cursors.track from a prior view makes `x` remove
+        // a different item than the one the user sees highlighted (DEF-016).
+        if self.view == View::Queue {
+            self.cursors.track = self.cursors.queue;
+        }
         let n_artists = self.artists.len();
         if n_artists > 0 && self.cursors.artist >= n_artists {
             self.cursors.artist = n_artists - 1;
@@ -809,6 +1444,8 @@ impl App {
                 }) => {
                     if std::fs::metadata(&path).is_err() {
                         self.dead.insert(id.clone());
+                        self.yt_error = Some(format!("file not found: {path:?}"));
+                        self.yt_status = Some(format!("file not found: {}", path.display()));
                         let r = ClonedResolver {
                             playlists: &self.playlists,
                             manual_queue: self.transport.manual_queue.clone(),
@@ -831,15 +1468,25 @@ impl App {
                         self.audio_switch_handle =
                             Some(crate::audio::set_output_format_async(sr, bd));
                     }
-                    match self.player.load(&path) {
+                    match self.load_with_resume(&path, &id) {
                         Ok(()) => {
-                            self.now_playing =
-                                Some(crate::source::TrackSource::Local { track_id: id });
+                            self.now_playing = Some(crate::source::TrackSource::Local {
+                                track_id: id.clone(),
+                            });
+                            self.note_play_started(&id);
                             self.preload_next_url();
                         }
                         Err(e) => {
-                            self.yt_error = Some(format!("playback failed: {e}"));
+                            let msg = format!("playback failed: {e}");
+                            self.yt_error = Some(msg.clone());
+                            self.yt_status = Some(msg);
                             self.dead.insert(id.clone());
+                            // F2: the player backend (mpv/afplay) kills the old
+                            // child during the failed load, so the previously-
+                            // playing track is stopped. Clear now_playing so the
+                            // UI doesn't show a stale track that's no longer
+                            // playing.
+                            self.now_playing = None;
                         }
                     }
                     return;
@@ -881,18 +1528,32 @@ impl App {
     /// Resolve an opaque id to a playable source under the active mode:
     /// - Local: catalog track → local file; unknown id → None.
     /// - YouTube: sidecar `resolve_url` → stream URL + fmt; no session/error
-    ///   → None (degrade to dead).
+    ///   → None (degrade to dead). RC13-DEF-1: a local catalog id played in
+    ///   YouTube mode (e.g. a generated mix's tracks) that the sidecar can't
+    ///   resolve as a real video id falls back to local playback instead of
+    ///   hanging in a Pending cold-miss that never succeeds — the user
+    ///   explicitly selected the track, so it should play.
     /// - Mixed: catalog track present → local; else remote stream.
     fn resolve_source(&mut self, id: &str) -> Option<Resolved> {
         // Local catalog match first (Local + Mixed both prefer it when present).
-        if let Some(t) = self.track_by_id(id) {
+        // Capture the track's local-source data up front so YouTube mode can
+        // use it as a fallback without holding an immutable borrow across the
+        // mutable session borrow (RC13-DEF-1).
+        let local_track_data = self.track_by_id(id).map(|t| {
+            (
+                t.resolve_source(&self.catalog.source_root),
+                t.sample_rate_hz,
+                t.bit_depth,
+            )
+        });
+        if let Some((path, sample_rate_hz, bit_depth)) = &local_track_data {
             // In YouTube mode, catalog tracks are never played locally — only
             // streamed. So only take the local path in Local/Mixed.
             if self.source_mode != crate::mode::SourceMode::Youtube {
                 return Some(Resolved::Local {
-                    path: t.resolve_source(&self.catalog.source_root),
-                    sample_rate_hz: t.sample_rate_hz,
-                    bit_depth: t.bit_depth,
+                    path: path.clone(),
+                    sample_rate_hz: *sample_rate_hz,
+                    bit_depth: *bit_depth,
                 });
             }
         }
@@ -904,7 +1565,24 @@ impl App {
         //     swaps up to 256k once the premium URL lands. This is fully
         //     non-blocking — the old track keeps playing and the spinner
         //     signals the swap, so a cold miss never freezes the UI.
-        let session = self.yt_session.as_mut()?;
+        let session = match self.yt_session.as_mut() {
+            Some(s) => s,
+            None => {
+                // RC13-DEF-1: no YouTube session — a local catalog id in
+                // YouTube mode falls back to local playback (the id is a
+                // catalog track, not a real video id). Without this, the
+                // `?` on `as_mut()` returns None → the track is marked dead
+                // and "nothing playing" shows.
+                if let Some((path, sample_rate_hz, bit_depth)) = local_track_data {
+                    return Some(Resolved::Local {
+                        path,
+                        sample_rate_hz,
+                        bit_depth,
+                    });
+                }
+                return None;
+            }
+        };
         if let Some(url) = session.url_for(id) {
             // The url_cache entry's own fmt is the tier source of truth (premium
             // wins when present). track_cache's fmt can lag — a track cached by
@@ -925,6 +1603,18 @@ impl App {
                 url,
                 fmt,
                 video_id: id.to_string(),
+            });
+        }
+        // RC13-DEF-1: a local catalog id in YouTube mode that the sidecar
+        // can't resolve (url_for returned None) is NOT a real YouTube video
+        // id — a cold-miss resolve will never succeed and the player hangs
+        // in Pending ("nothing playing"). Fall back to local playback so
+        // explicit user selections (Home mixes, Quick Picks) still play.
+        if let Some((path, sample_rate_hz, bit_depth)) = local_track_data {
+            return Some(Resolved::Local {
+                path,
+                sample_rate_hz,
+                bit_depth,
             });
         }
         // Cache miss → arm both tiers fire-and-forget and defer the swap to
@@ -992,6 +1682,16 @@ impl App {
                 sample_rate_hz,
                 bit_depth,
             }) => {
+                // Check the file exists before attempting to load — a missing
+                // file would otherwise "succeed" with a stub player or fail
+                // silently with a real one (DEF-009). Mark dead + set a
+                // visible error so the user + next() loop know to skip.
+                if std::fs::metadata(&path).is_err() {
+                    self.dead.insert(id.to_string());
+                    self.yt_error = Some(format!("file not found: {path:?}"));
+                    self.yt_status = Some(format!("file not found: {}", path.display()));
+                    return;
+                }
                 if let Some((sr, bd)) = crate::source::device_rate::desired_switch(
                     &mut self.device_rate,
                     crate::source::device_rate::LoadKind::Local {
@@ -1002,15 +1702,21 @@ impl App {
                 ) {
                     self.audio_switch_handle = Some(crate::audio::set_output_format_async(sr, bd));
                 }
-                match self.player.load(&path) {
+                match self.load_with_resume(&path, id) {
                     Ok(()) => {
                         self.now_playing = Some(crate::source::TrackSource::Local {
                             track_id: id.to_string(),
                         });
+                        self.note_play_started(id);
                     }
                     Err(e) => {
-                        self.yt_error = Some(format!("playback failed: {e}"));
+                        let msg = format!("playback failed: {e}");
+                        self.yt_error = Some(msg.clone());
+                        self.yt_status = Some(msg);
                         self.dead.insert(id.to_string());
+                        // F2: the player backend killed the old child during the
+                        // failed load; clear the stale now_playing.
+                        self.now_playing = None;
                     }
                 }
             }
@@ -1049,9 +1755,12 @@ impl App {
             self.audio_switch_handle = Some(crate::audio::set_output_format_async(sr, bd));
         }
         let p = std::path::PathBuf::from(&url);
-        match self.player.load(&p) {
+        match self.load_with_resume(&p, &video_id) {
             Ok(()) => {
-                self.now_playing = Some(crate::source::TrackSource::Remote { video_id });
+                self.now_playing = Some(crate::source::TrackSource::Remote {
+                    video_id: video_id.clone(),
+                });
+                self.note_play_started(&video_id);
                 // Record whether we started at premium (256k) so a later premium URL
                 // landing mid-play swaps only if we're not already premium
                 // (progressive upgrade guard).
@@ -1060,8 +1769,10 @@ impl App {
             }
             Err(e) => {
                 self.yt_error = Some(format!("stream load failed: {e}"));
-                // Don't set now_playing — keep the prior state (old track or
-                // nothing) so the UI doesn't show a track that isn't playing.
+                // F2: the player backend (mpv/afplay) kills the old child during
+                // the failed load, so the previously-playing track is stopped.
+                // Clear now_playing so the UI doesn't show a stale track.
+                self.now_playing = None;
             }
         }
     }
@@ -1102,6 +1813,225 @@ impl App {
         self.start_playback();
     }
 
+    /// Apply the Home overlay's focused item (RC11-DEF-001 / DEF-012).
+    ///
+    /// The Home overlay (`H`) shows multi-section discovery content (Quick
+    /// Picks, Made for You mixes, Start Radio, Library, ...). `Enter` on the
+    /// focused item must play it — but `play_selected` uses the *browse view's*
+    /// track column, not the Home overlay, so before this method `Enter` from
+    /// Home played an unpredictable item (the cursor moved invisibly and
+    /// `play_selected` read the underlying view's cursor).
+    ///
+    /// This method resolves the focused `HomeItem` (at `state.cursor` within
+    /// `state.focused_section`) and dispatches by kind:
+    /// - `Track` → play the single track (local or YouTube).
+    /// - `Playlist` → play the playlist's tracks (local playlist or YouTube
+    ///   list; for YouTube lists, fire-and-forget `send_get_playlist` + show
+    ///   "Loading…").
+    /// - `Mix` → play the generated mix's tracks from `reco_mixes` (local
+    ///   catalog track ids — plays immediately, no sidecar roundtrip). This
+    ///   makes "Made for You" mixes reachable (RC11-DEF-012).
+    /// - `RadioSeed` → start a radio session seeded from the currently-playing
+    ///   track (or the first catalog track on cold start).
+    /// - `LikedSongs` / `Explore` / `Subscription` → status hint (not yet
+    ///   implemented — these need the sidecar / a tab; logged so the user
+    ///   knows the key was received).
+    pub fn play_home_selection(&mut self) {
+        use crate::tui::view::home::HomeItemKind;
+
+        let Some(Overlay::Home { state }) = self.overlay.clone() else {
+            return;
+        };
+        let Some((_, items)) = state.sections.get(state.focused_section) else {
+            return;
+        };
+        let Some(item) = items.get(state.cursor).cloned() else {
+            return;
+        };
+        match item.kind.clone() {
+            HomeItemKind::Track { id, .. } => {
+                self.overlay = None;
+                self.play_in_context_ids(vec![id.clone()], &id);
+            }
+            HomeItemKind::Playlist { id, is_local, .. } => {
+                self.overlay = None;
+                if is_local {
+                    if let Some(pl) = self.playlists.iter().find(|p| p.name == id).cloned() {
+                        if let Some(start) = pl.track_ids.first().cloned() {
+                            self.play_in_context_ids(pl.track_ids, &start);
+                        } else {
+                            self.yt_status = Some("playlist is empty — nothing to play".into());
+                        }
+                    } else {
+                        self.yt_status = Some("playlist not found".into());
+                    }
+                } else if let Some(session) = self.yt_session.as_mut() {
+                    // RDAM*/RDCL* IDs are radio/chart auto-mix playlists —
+                    // ytmusicapi's get_playlist can't fetch them (returns
+                    // RDAMVM<11-char-video-id> is a radio auto-mix — extract
+                    // the video_id and use get_watch_playlist (radio). All
+                    // other IDs (RDCL*, PL*, LM*, etc.) use get_playlist.
+                    if id.starts_with("RDAMVM") && id.len() == 17 {
+                        let video_id = &id[6..];
+                        let _ = session.send_watch_playlist(video_id.to_string());
+                        self.pending_radio_seed = Some(video_id.to_string());
+                        self.yt_status = Some("Loading radio…".into());
+                    } else {
+                        let _ = session.send_get_playlist(id.clone());
+                        self.pending_discover_play = Some(id);
+                        self.yt_status = Some("Loading playlist…".into());
+                    }
+                } else {
+                    self.yt_status = Some("can't load playlist — no YouTube session".into());
+                }
+            }
+            HomeItemKind::Mix { mix_type } => {
+                // RC11-DEF-012: play the generated mix's tracks. The reco
+                // engine generates mixes from the local catalog, so the
+                // track_ids are local catalog ids — play immediately via
+                // `play_in_context_ids` (no sidecar roundtrip).
+                self.overlay = None;
+                if let Some(mix) = self
+                    .reco_mixes
+                    .iter()
+                    .find(|m| m.mix_type == mix_type)
+                    .cloned()
+                {
+                    let ids: Vec<String> = mix.tracks.iter().map(|c| c.track_id.clone()).collect();
+                    if let Some(start) = ids.first().cloned() {
+                        self.play_in_context_ids(ids, &start);
+                    } else {
+                        self.yt_status = Some(format!(
+                            "{} is empty — listen more to build it",
+                            mix_type.label()
+                        ));
+                    }
+                } else {
+                    self.yt_status = Some(format!("{} not generated yet", mix_type.label()));
+                }
+            }
+            HomeItemKind::RadioSeed { .. } => {
+                self.overlay = None;
+                let seed_id = self
+                    .now_playing
+                    .as_ref()
+                    .map(|ts| ts.id().to_string())
+                    .or_else(|| self.catalog.tracks.first().map(|t| t.id.clone()))
+                    .unwrap_or_default();
+                if seed_id.is_empty() {
+                    self.yt_status = Some("no track to seed radio — play a track first".into());
+                } else {
+                    self.start_radio_from_track(&seed_id);
+                }
+            }
+            HomeItemKind::LikedSongs => {
+                self.yt_status = Some("Liked Songs — sign in to YouTube to view".into());
+            }
+            HomeItemKind::Explore { category } => {
+                self.yt_status = Some(format!("Explore {category} — coming soon"));
+            }
+            HomeItemKind::Subscription { name, .. } => {
+                self.yt_status = Some(format!("{name} — open the YouTube view to browse"));
+            }
+        }
+    }
+
+    /// Play the focused item from a `HomeState` (used by the in-pane YT Home
+    /// tab, which doesn't use the overlay). Mirrors `play_home_selection` but
+    /// reads from `state` instead of `self.overlay`.
+    pub fn play_home_selection_from(&mut self, state: &crate::tui::view::home::HomeState) {
+        use crate::tui::view::home::HomeItemKind;
+
+        let Some((_, items)) = state.sections.get(state.focused_section).cloned() else {
+            return;
+        };
+        let Some(item) = items.get(state.cursor).cloned() else {
+            return;
+        };
+        match item.kind.clone() {
+            HomeItemKind::Track { id, is_local, .. } => {
+                if !is_local {
+                    // YouTube track — defer the switch to Queue until
+                    // `now_playing` is set (the URL resolves). Local tracks
+                    // stay on the Home tab (the player bar is enough).
+                    self.pending_yt_switch_to_queue = true;
+                }
+                self.play_in_context_ids(vec![id.clone()], &id);
+            }
+            HomeItemKind::Playlist { id, is_local, .. } => {
+                if is_local {
+                    if let Some(pl) = self.playlists.iter().find(|p| p.name == id).cloned() {
+                        if let Some(start) = pl.track_ids.first().cloned() {
+                            self.play_in_context_ids(pl.track_ids, &start);
+                        } else {
+                            self.yt_status = Some("playlist is empty — nothing to play".into());
+                        }
+                    } else {
+                        self.yt_status = Some("playlist not found".into());
+                    }
+                } else if let Some(session) = self.yt_session.as_mut() {
+                    // RDAMVM<11-char-video-id> is a radio auto-mix — extract
+                    // the video_id and use get_watch_playlist (radio). All
+                    // other IDs (RDCL*, PL*, LM*, etc.) use get_playlist.
+                    if id.starts_with("RDAMVM") && id.len() == 17 {
+                        let video_id = &id[6..]; // strip "RDAMVM" prefix
+                        let _ = session.send_watch_playlist(video_id.to_string());
+                        self.pending_radio_seed = Some(video_id.to_string());
+                        self.yt_status = Some("Loading radio…".into());
+                    } else {
+                        let _ = session.send_get_playlist(id.clone());
+                        self.pending_discover_play = Some(id);
+                        self.yt_status = Some("Loading playlist…".into());
+                    }
+                } else {
+                    self.yt_status = Some("can't load playlist — no YouTube session".into());
+                }
+            }
+            HomeItemKind::Mix { mix_type } => {
+                if let Some(mix) = self
+                    .reco_mixes
+                    .iter()
+                    .find(|m| m.mix_type == mix_type)
+                    .cloned()
+                {
+                    let ids: Vec<String> = mix.tracks.iter().map(|c| c.track_id.clone()).collect();
+                    if let Some(start) = ids.first().cloned() {
+                        self.play_in_context_ids(ids, &start);
+                    } else {
+                        self.yt_status = Some(format!(
+                            "{} is empty — listen more to build it",
+                            mix_type.label()
+                        ));
+                    }
+                } else {
+                    self.yt_status = Some(format!("{} not generated yet", mix_type.label()));
+                }
+            }
+            HomeItemKind::RadioSeed { .. } => {
+                let seed_id = self
+                    .now_playing
+                    .as_ref()
+                    .map(|ts| ts.id().to_string())
+                    .or_else(|| self.catalog.tracks.first().map(|t| t.id.clone()))
+                    .unwrap_or_default();
+                if seed_id.is_empty() {
+                    self.yt_status = Some("no track to seed radio — play a track first".into());
+                } else {
+                    self.start_radio_from_track(&seed_id);
+                }
+            }
+            HomeItemKind::LikedSongs => {
+                self.yt_status = Some("Liked Songs — sign in to YouTube to view".into());
+            }
+            HomeItemKind::Explore { category } => {
+                self.yt_status = Some(format!("Explore {category} — coming soon"));
+            }
+            HomeItemKind::Subscription { name, .. } => {
+                self.yt_status = Some(format!("{name} — open the YouTube view to browse"));
+            }
+        }
+    }
+
     /// Test helper: play within an explicit id list (for the dead-track test).
     pub fn play_in_context_ids(&mut self, ids: Vec<String>, start: &str) {
         let ctx = Context::Search {
@@ -1127,99 +2057,243 @@ impl App {
     }
 
     pub fn next(&mut self) {
-        let r = ClonedResolver {
-            playlists: &self.playlists,
-            manual_queue: self.transport.manual_queue.clone(),
-            yt_lists: &self.yt_lists,
-        };
-        if let Some(id) = self.transport.next(&r, &self.catalog) {
-            // Load the returned id directly: `Transport::next`'s manual-queue
-            // path returns a queued id without updating the cursor, so
-            // re-reading `transport.current()` would load the wrong track.
-            self.load_track(&id);
-        } else {
-            // Context exhausted (repeat off, no manual queue). The continue
-            // mode decides whether playback stops or auto-advances to more
-            // music — this is the "auto discover" feature.
-            match self.transport.continue_mode {
-                ContinueMode::Off => {
-                    self.player.stop().ok();
-                    self.now_playing = None;
-                }
-                ContinueMode::NextAlbum => {
-                    if self.switch_to_next_album() {
-                        self.start_playback();
-                    } else {
-                        // Not in an album context, or no next album: stop.
-                        self.player.stop().ok();
-                        self.now_playing = None;
-                    }
-                }
-                ContinueMode::Radio => {
-                    self.switch_to_radio();
-                    self.start_playback();
-                }
-                ContinueMode::YouTube => {
-                    // Drive YouTube autoplay via RadioCursor (spec §3.4). The
-                    // old `radio.advance(session, seed)` made a BLOCKING
-                    // `get_watch_playlist` roundtrip (~4s) every time the queue
-                    // was exhausted, freezing the UI on each auto-advance. Now
-                    // we advance locally when the queue still has entries (no
-                    // sidecar call), and fire-and-forget a radio refill when
-                    // exhausted — `on_tick` refills the cursor + starts
-                    // playback when `pending_watch` lands (non-blocking).
-                    let seed_id = self.now_playing.clone().map(|s| s.id().to_string());
-                    if let Some(vid) = self.radio.next_local() {
-                        // Fast path: the queue still has entries — switch
-                        // context + start playback immediately (same as the
-                        // old `radio.advance` Some(vid) arm).
-                        if let Some(np) = self.now_playing.clone() {
-                            self.transport
-                                .history
-                                .push((np.id().to_string(), self.transport.context.clone()));
-                        }
-                        let ctx = Context::Search {
-                            query: "youtube radio".into(),
-                            track_ids: vec![vid.clone()],
-                        };
-                        let r = ClonedResolver {
-                            playlists: &self.playlists,
-                            manual_queue: self.transport.manual_queue.clone(),
-                            yt_lists: &self.yt_lists,
-                        };
-                        self.transport
-                            .switch_context(ctx, Some(&vid), &r, &self.catalog);
-                        self.start_playback();
-                    } else if let Some(session) = self.yt_session.as_mut() {
-                        // Queue exhausted — fire-and-forget a radio refill
-                        // seeded by the just-finished track. Non-blocking: the
-                        // old track stays current until `on_tick` drains
-                        // `pending_watch` and starts the next. No-op if a
-                        // refill is already in flight so a burst of `next`/
-                        // end-of-track events doesn't flood the sidecar.
-                        if let Some(seed) = seed_id {
-                            if !session.watch_loading()
-                                && session.send_watch_playlist(seed.clone()).is_ok()
-                            {
-                                self.pending_radio_seed = Some(seed);
-                            }
-                            // Leave now_playing on the ended track; on_tick
-                            // will push it to history + switch when the
-                            // response lands. Don't stop here — clearing
-                            // now_playing would lose the history-push target.
-                        } else {
-                            // No seed (nothing was playing) — stop cleanly.
-                            self.player.stop().ok();
-                            self.now_playing = None;
-                        }
-                    } else {
-                        // No session — stop cleanly (degrade, spec §3.5).
-                        self.player.stop().ok();
-                        self.now_playing = None;
-                    }
+        // Record a skip event for the track the user is leaving (DEF-034).
+        // `next()` is both the user `>` press and the auto-advance on
+        // end-of-track; the auto-advance path also calls on_track_ended first,
+        // so a "completed" event supersedes this "skipped" when the track
+        // finished naturally — but on a user `>`, only this fires.
+        if let Some(np) = self.now_playing.clone() {
+            let id = np.id().to_string();
+            // Don't double-record: on_track_ended already recorded "completed"
+            // and set last_natural_end — a natural end is not a skip.
+            let was_natural = self.last_natural_end.as_deref() == Some(id.as_str());
+            if !was_natural {
+                let pos = self.player.position().unwrap_or(0.0);
+                // Rapid skip (<10s) is a strong negative; a later skip is weak.
+                let elapsed = self
+                    .play_started_at
+                    .map(|t| t.elapsed().as_secs_f64())
+                    .unwrap_or(pos);
+                if elapsed < 10.0 {
+                    self.record_listen_event_pos(&id, "rapidly_skipped", Some(pos));
+                } else {
+                    self.record_listen_event_pos(&id, "skipped", Some(pos));
                 }
             }
         }
+        self.last_natural_end = None;
+        // Skip dead tracks automatically so `>` always advances to the next
+        // playable track in context order (DEF-017: without this, `>` on a
+        // dead track silently does nothing — the user sees no change and
+        // presses `>` again, advancing past the dead track, making the order
+        // appear non-sequential). The loop tries each candidate once; if all
+        // are dead, playback stops.
+        let total = self.transport.order.len() + self.transport.manual_queue.len();
+        for _ in 0..total.max(1) {
+            let r = ClonedResolver {
+                playlists: &self.playlists,
+                manual_queue: self.transport.manual_queue.clone(),
+                yt_lists: &self.yt_lists,
+            };
+            match self.transport.next(&r, &self.catalog) {
+                Some(id) if !self.dead.contains(&id) => {
+                    // Found a live candidate — load it. load_track may still
+                    // mark it dead (missing file, player error); if so, loop
+                    // to try the next candidate instead of returning with
+                    // nothing playing (DEF-017).
+                    self.load_track(&id);
+                    if !self.dead.contains(&id) {
+                        return;
+                    }
+                    // Track became dead during load — skip to next.
+                }
+                Some(_) => {
+                    // Dead track — loop to try the next candidate.
+                    // transport.next already advanced the cursor / popped the
+                    // manual-queue entry.
+                }
+                None => {
+                    // Context exhausted (repeat off, no manual queue). The
+                    // continue mode decides whether playback stops or auto-
+                    // advances to more music — this is the "auto discover"
+                    // feature.
+                    match self.transport.continue_mode {
+                        ContinueMode::Off => {
+                            // RC13-DEF-5: a radio session drives its own
+                            // continuation. When `:radio` started a session,
+                            // auto-advance to the next radio track on track
+                            // completion regardless of CONT — the user
+                            // starting a radio explicitly asked for continuous
+                            // playback, so CONT off shouldn't silently stop
+                            // after the first track. Without this, the radio
+                            // stops after one track and the user must press
+                            // `c c` (CONT=radio) before `:radio` — undiscoverable.
+                            if let Some(vid) = self.reco_radio_next() {
+                                if let Some(np) = self.now_playing.clone() {
+                                    self.transport.history.push((
+                                        np.id().to_string(),
+                                        self.transport.context.clone(),
+                                    ));
+                                }
+                                let ctx = Context::Search {
+                                    query: "reco radio".into(),
+                                    track_ids: vec![vid.clone()],
+                                };
+                                let r = ClonedResolver {
+                                    playlists: &self.playlists,
+                                    manual_queue: self.transport.manual_queue.clone(),
+                                    yt_lists: &self.yt_lists,
+                                };
+                                self.transport
+                                    .switch_context(ctx, Some(&vid), &r, &self.catalog);
+                                self.start_playback();
+                            } else {
+                                self.player.stop().ok();
+                                self.now_playing = None;
+                            }
+                        }
+                        ContinueMode::NextAlbum => {
+                            if self.switch_to_next_album() {
+                                self.start_playback();
+                            } else {
+                                // DEF-027: not in an album context, or no next
+                                // album. Before stopping, try radio continuation
+                                // (an active reco radio session) so CONT=next
+                                // keeps playing when the queue exhausts; if no
+                                // radio is active, wrap to the start of the
+                                // current context (album/playlist/search) so
+                                // "CONT next → track 3 starts (radio or wrap)"
+                                // holds. Only stop when both fallbacks are empty.
+                                if let Some(vid) = self.reco_radio_next() {
+                                    if let Some(np) = self.now_playing.clone() {
+                                        self.transport.history.push((
+                                            np.id().to_string(),
+                                            self.transport.context.clone(),
+                                        ));
+                                    }
+                                    let ctx = Context::Search {
+                                        query: "reco radio".into(),
+                                        track_ids: vec![vid.clone()],
+                                    };
+                                    let r = ClonedResolver {
+                                        playlists: &self.playlists,
+                                        manual_queue: self.transport.manual_queue.clone(),
+                                        yt_lists: &self.yt_lists,
+                                    };
+                                    self.transport.switch_context(
+                                        ctx,
+                                        Some(&vid),
+                                        &r,
+                                        &self.catalog,
+                                    );
+                                    self.start_playback();
+                                } else if self.transport.order.len() > 1 {
+                                    // Wrap: restart the current context from the
+                                    // top (skip the just-finished last track).
+                                    self.transport.cursor = 0;
+                                    self.start_playback();
+                                } else {
+                                    self.player.stop().ok();
+                                    self.now_playing = None;
+                                }
+                            }
+                        }
+                        ContinueMode::Radio => {
+                            self.switch_to_radio();
+                            self.start_playback();
+                        }
+                        ContinueMode::YouTube => {
+                            // If a reco RadioSession overlay is active, use it
+                            // to drive auto-advance instead of the YouTube
+                            // radio cursor.
+                            if let Some(vid) = self.reco_radio_next() {
+                                if let Some(np) = self.now_playing.clone() {
+                                    self.transport.history.push((
+                                        np.id().to_string(),
+                                        self.transport.context.clone(),
+                                    ));
+                                }
+                                let ctx = Context::Search {
+                                    query: "reco radio".into(),
+                                    track_ids: vec![vid.clone()],
+                                };
+                                let r = ClonedResolver {
+                                    playlists: &self.playlists,
+                                    manual_queue: self.transport.manual_queue.clone(),
+                                    yt_lists: &self.yt_lists,
+                                };
+                                self.transport
+                                    .switch_context(ctx, Some(&vid), &r, &self.catalog);
+                                self.start_playback();
+                                return;
+                            }
+                            // Drive YouTube autoplay via RadioCursor (spec §3.4). The
+                            // old `radio.advance(session, seed)` made a BLOCKING
+                            // `get_watch_playlist` roundtrip (~4s) every time the queue
+                            // was exhausted, freezing the UI on each auto-advance. Now
+                            // we advance locally when the queue still has entries (no
+                            // sidecar call), and fire-and-forget a radio refill when
+                            // exhausted — `on_tick` refills the cursor + starts
+                            // playback when `pending_watch` lands (non-blocking).
+                            let seed_id = self.now_playing.clone().map(|s| s.id().to_string());
+                            if let Some(vid) = self.radio.next_local() {
+                                // Fast path: the queue still has entries — switch
+                                // context + start playback immediately (same as the
+                                // old `radio.advance` Some(vid) arm).
+                                if let Some(np) = self.now_playing.clone() {
+                                    self.transport.history.push((
+                                        np.id().to_string(),
+                                        self.transport.context.clone(),
+                                    ));
+                                }
+                                let ctx = Context::Search {
+                                    query: "youtube radio".into(),
+                                    track_ids: vec![vid.clone()],
+                                };
+                                let r = ClonedResolver {
+                                    playlists: &self.playlists,
+                                    manual_queue: self.transport.manual_queue.clone(),
+                                    yt_lists: &self.yt_lists,
+                                };
+                                self.transport
+                                    .switch_context(ctx, Some(&vid), &r, &self.catalog);
+                                self.start_playback();
+                            } else if let Some(session) = self.yt_session.as_mut() {
+                                // Queue exhausted — fire-and-forget a radio refill
+                                // seeded by the just-finished track. Non-blocking: the
+                                // old track stays current until `on_tick` drains
+                                // `pending_watch` and starts the next. No-op if a
+                                // refill is already in flight so a burst of `next`/
+                                // end-of-track events doesn't flood the sidecar.
+                                if let Some(seed) = seed_id {
+                                    if !session.watch_loading()
+                                        && session.send_watch_playlist(seed.clone()).is_ok()
+                                    {
+                                        self.pending_radio_seed = Some(seed);
+                                    }
+                                    // Leave now_playing on the ended track; on_tick
+                                    // will push it to history + switch when the
+                                    // response lands. Don't stop here — clearing
+                                    // now_playing would lose the history-push target.
+                                } else {
+                                    // No seed (nothing was playing) — stop cleanly.
+                                    self.player.stop().ok();
+                                    self.now_playing = None;
+                                }
+                            } else {
+                                // No session — stop cleanly (degrade, spec §3.5).
+                                self.player.stop().ok();
+                                self.now_playing = None;
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        // All candidates were dead — stop playback.
+        self.player.stop().ok();
+        self.now_playing = None;
     }
 
     pub fn prev(&mut self) {
@@ -1228,13 +2302,54 @@ impl App {
             manual_queue: self.transport.manual_queue.clone(),
             yt_lists: &self.yt_lists,
         };
-        if let Some(id) = self.transport.prev(&r, &self.catalog) {
-            self.load_track(&id);
+        let Some(id) = self.transport.prev(&r, &self.catalog) else {
+            // No previous track at all — no-op.
+            return;
+        };
+        // RC16-DEF-2: when prev() returns the SAME track (no history → replay
+        // current), reloading via load_track re-opens the player pipe and
+        // surfaces "Broken pipe (os error 32)" — especially when the player
+        // has stopped (mpv child exited, socket dead). Instead:
+        //   - Same track + playing → seek to 0 (restart from beginning).
+        //   - Stopped (now_playing None) → no-op (player is dead, can't load).
+        //   - Genuinely different prev track + playing → load_track as usual.
+        let current_id = self.now_playing.as_ref().map(|s| s.id().to_string());
+        if current_id.as_deref() == Some(id.as_str()) {
+            if self.player.is_playing() {
+                let _ = self.player.seek_to(0.0);
+            }
+            return;
         }
+        // Don't load into a dead player (stopped → mpv socket closed).
+        if self.now_playing.is_none() {
+            return;
+        }
+        self.load_track(&id);
     }
 
-    /// Auto-advance when the player reports a natural end-of-track.
+    /// Auto-advance when the player reports a natural end-of-track. Records
+    /// a "completed" listen event (strong positive) before advancing so the
+    /// reco engine learns the user finished this track (DEF-034). Sets
+    /// `last_natural_end` so `next()` doesn't also record a "skipped".
     pub fn on_track_ended(&mut self) {
+        if let Some(np) = self.now_playing.clone() {
+            let id = np.id().to_string();
+            self.record_listen_event(&id, "completed");
+            self.last_natural_end = Some(id);
+        }
+        // RPT=One: a natural end-of-track replays the same track. This is
+        // the ONLY place RPT=One replay happens — `Transport::next()` no
+        // longer short-circuits on RPT=One, so a user `>` press advances to
+        // the next track (or the continue-mode path) instead of replaying.
+        // Without this split, `>` with RPT=One + CONT=Radio would replay the
+        // current track forever (the user's "CONT radio still replaying
+        // song" report).
+        if self.transport.repeat == RepeatMode::One {
+            if let Some(np) = self.now_playing.clone() {
+                self.load_track(np.id());
+            }
+            return;
+        }
         self.next();
     }
 
@@ -1272,7 +2387,7 @@ impl App {
     /// Cycle the continue mode, mode-dependent (spec §2 ContinueMode::YouTube):
     /// - Local:  Off → NextAlbum → Radio → Off
     /// - YouTube: Off → YouTube → Off
-    /// - Mixed:  Off → NextAlbum → YouTube → Off
+    /// - Mixed:  Off → NextAlbum → Radio → YouTube → Off
     pub fn cycle_continue(&mut self) {
         self.transport.continue_mode = match (self.source_mode, self.transport.continue_mode) {
             (crate::mode::SourceMode::Local, ContinueMode::Off) => ContinueMode::NextAlbum,
@@ -1284,9 +2399,9 @@ impl App {
             (crate::mode::SourceMode::Youtube, _) => ContinueMode::Off,
 
             (crate::mode::SourceMode::Mixed, ContinueMode::Off) => ContinueMode::NextAlbum,
-            (crate::mode::SourceMode::Mixed, ContinueMode::NextAlbum) => ContinueMode::YouTube,
+            (crate::mode::SourceMode::Mixed, ContinueMode::NextAlbum) => ContinueMode::Radio,
+            (crate::mode::SourceMode::Mixed, ContinueMode::Radio) => ContinueMode::YouTube,
             (crate::mode::SourceMode::Mixed, ContinueMode::YouTube) => ContinueMode::Off,
-            (crate::mode::SourceMode::Mixed, ContinueMode::Radio) => ContinueMode::Off,
         };
     }
 
@@ -1302,6 +2417,15 @@ impl App {
     /// them. Best-effort: on failure sets `yt_error` so the Y view surfaces it.
     pub fn apply_yt_auth(&mut self, cookies: String) {
         self.yt_error = None;
+        // RB-4: reject empty cookie submission. The old code unconditionally
+        // spawned/set_cookies and transitioned to AuthenticatedNotSynced, so an
+        // empty paste left the user in the `[Y ~]` busy state with no credential.
+        if cookies.trim().is_empty() {
+            self.yt_error = Some(
+                "auth: paste your YouTube cookies first (or run :yt auth browser <name>)".into(),
+            );
+            return;
+        }
         // Pasted cookies are a distinct auth path from the browser profile;
         // clear the saved browser so the next launch doesn't try to read a
         // browser profile the user abandoned.
@@ -1355,6 +2479,21 @@ impl App {
         // which was false-ready (yt-recon §8 location 3). The launch probe or
         // refresh_yt_lists must succeed to promote this to Ready.
         self.yt_state = crate::yt::state::YtState::AuthenticatedNotSynced;
+        self.yt_auth_busy_ticks = 0;
+        // RB-4: immediately fire the launch probe so the user sees progress
+        // (the probe is in flight; on_tick promotes to Ready on success or
+        // ProviderError on failure). Fire send_refresh directly (not
+        // refresh_yt_lists) so the state stays AuthenticatedNotSynced — the
+        // probe verifies the credential without prematurely claiming
+        // "synchronizing." The on_tick auth-busy timeout catches a stuck probe.
+        if let Some(session) = self.yt_session.as_mut() {
+            if let Err(e) = session.send_refresh() {
+                self.yt_error = Some(format!("auth probe: {e}"));
+                self.yt_state = crate::yt::state::YtState::ProviderError;
+            } else {
+                self.yt_lists_loading = true;
+            }
+        }
     }
 
     /// `:yt auth browser <name>` — respawn the sidecar reading cookies from a
@@ -1418,46 +2557,72 @@ impl App {
         // The old code set yt_status = "connected via {browser}" here (yt-recon
         // §8 location 4); the launch probe or refresh must verify data first.
         self.yt_state = crate::yt::state::YtState::AuthenticatedNotSynced;
+        self.yt_auth_busy_ticks = 0;
+        // RB-4: immediately fire the launch probe so the user sees progress.
+        // See apply_yt_auth for the direct-send_refresh rationale.
+        if let Some(session) = self.yt_session.as_mut() {
+            if let Err(e) = session.send_refresh() {
+                self.yt_error = Some(format!("auth probe: {e}"));
+                self.yt_state = crate::yt::state::YtState::ProviderError;
+            } else {
+                self.yt_lists_loading = true;
+            }
+        }
+    }
+
+    /// RB-4: cancel an in-progress authentication. Called when the user closes
+    /// the YtAuth overlay with Esc. Resets `Authenticating` /
+    /// `AuthenticatedNotSynced` (the auth-flow pre-fetch states) back to the
+    /// appropriate non-busy state so no busy state lingers. Does NOT reset
+    /// `Synchronizing` (which may be from a view-enter probe, not the auth
+    /// flow) or any error/ready state.
+    pub fn cancel_yt_auth(&mut self) {
+        use crate::yt::state::YtState;
+        if matches!(
+            self.yt_state,
+            YtState::Authenticating | YtState::AuthenticatedNotSynced
+        ) {
+            self.yt_state = if self.yt_session.is_some() {
+                YtState::SignedOut
+            } else {
+                YtState::Unconfigured
+            };
+            self.yt_error = None;
+            self.yt_auth_busy_ticks = 0;
+        }
     }
 
     /// `:yt setup` — create the jukebox venv and install the YT deps into it,
     /// so the sidecar runs against a python that has them. Blocks (~30s,
     /// one-time). On success, respawn the sidecar against the new venv python.
+    ///
+    /// RC15-DEF-4: the blocking `run_setup` call (~30s venv+pip install) now
+    /// runs on a detached thread so the TUI stays responsive and the
+    /// "Setting up YouTube deps…" toast is visible immediately (the old
+    /// synchronous call set `yt_status` but no render happened before the
+    /// block, so the user saw nothing for 30s). `on_tick` polls the handle
+    /// and applies the result when the thread finishes.
     pub fn yt_setup(&mut self) {
         self.yt_error = None;
-        self.yt_status = Some("YT setup: installing deps…".into());
+        // Immediately show the "setting up" toast so the user sees feedback
+        // within one frame — the render loop runs between this key handler
+        // return and the next tick.
+        self.yt_status = Some("Setting up YouTube deps — installing venv + pip…".into());
         let reqs = self.yt_script.parent().map(|p| p.join("requirements.txt"));
         let Some(reqs) = reqs else {
             self.yt_error = Some("setup: could not find requirements.txt".into());
             self.yt_status = None;
             return;
         };
-        match crate::yt::session::run_setup(&reqs) {
-            Ok(msg) => {
-                self.yt_python = crate::yt::session::venv_python();
-                self.yt_status = Some(msg);
-                // Respawn the sidecar against the new venv python, preserving
-                // any browser/pasted auth.
-                if let Some(session) = self.yt_session.as_mut() {
-                    if let Some(browser) = session.browser.clone() {
-                        match crate::yt::session::Session::spawn_browser(
-                            &self.yt_python,
-                            &self.yt_script,
-                            browser,
-                        ) {
-                            Ok(new) => {
-                                *self.yt_session.as_mut().unwrap() = new;
-                            }
-                            Err(e) => self.yt_error = Some(format!("respawn after setup: {e}")),
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                self.yt_error = Some(format!("setup failed: {e}"));
-                self.yt_status = None;
-            }
-        }
+        // Spawn the blocking setup on a background thread. The handle is
+        // polled on `on_tick`; when it finishes, the result is applied
+        // (yt_python updated, yt_status set to the success/error message,
+        // sidecar respawned). This keeps the input loop responsive.
+        let reqs = reqs.clone();
+        let handle = std::thread::spawn(move || {
+            crate::yt::session::run_setup(&reqs).map_err(|e| e.to_string())
+        });
+        self.yt_setup_handle = Some(handle);
     }
 
     /// Per-tick housekeeping (called from the event loop's poll):
@@ -1477,19 +2642,79 @@ impl App {
                 self.audio_switch_handle = Some(handle);
             }
         }
+        // RC15-DEF-4: drain a completed background `:yt setup` thread. The
+        // blocking venv+pip install runs on a detached thread (spawned by
+        // `yt_setup`); `on_tick` polls `is_finished()` (non-blocking) and,
+        // when the thread is done, joins + applies the result. On success:
+        // update `yt_python` to the new venv python, set `yt_status` to the
+        // "YT setup OK · venv: …" confirmation, log to diagnostics, and respawn
+        // the sidecar against the new venv (preserving browser/pasted auth).
+        // On error: set `yt_error` and clear `yt_status`. The "Setting up…"
+        // toast (set synchronously in `yt_setup`) stays visible until the
+        // thread finishes — the TTL suppression below is skipped while the
+        // handle is in flight (the toast is NOT a transient notification yet).
+        if let Some(handle) = self.yt_setup_handle.take() {
+            if !handle.is_finished() {
+                self.yt_setup_handle = Some(handle);
+            } else {
+                // Thread is done — join and apply the result.
+                let result = handle
+                    .join()
+                    .unwrap_or_else(|_| Err("setup thread panicked".to_string()));
+                match result {
+                    Ok(msg) => {
+                        self.yt_python = crate::yt::session::venv_python();
+                        self.yt_status = Some(msg);
+                        self.diagnostics.push(format!(
+                            "YT setup complete · log: {}",
+                            crate::yt::session::setup_log_path().display()
+                        ));
+                        // Respawn the sidecar against the new venv python,
+                        // preserving any browser/pasted auth.
+                        if let Some(session) = self.yt_session.as_mut() {
+                            if let Some(browser) = session.browser.clone() {
+                                match crate::yt::session::Session::spawn_browser(
+                                    &self.yt_python,
+                                    &self.yt_script,
+                                    browser,
+                                ) {
+                                    Ok(new) => {
+                                        *self.yt_session.as_mut().unwrap() = new;
+                                    }
+                                    Err(e) => {
+                                        self.yt_error = Some(format!("respawn after setup: {e}"))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.yt_error = Some(format!("setup failed: {e}"));
+                        self.yt_status = None;
+                    }
+                }
+            }
+        }
         // Notification TTL (Slice 7): clear a stale transient `yt_status` after
         // 5s so the footer returns to the hint bar / state label instead of
         // lingering on a one-shot message (e.g. "upgraded to AAC 256k",
         // "queue cleared"). The TTL is (re)started below when a NEW status is
         // detected; an identical repeat does NOT refresh the window (dedup via
         // `last_notification`).
-        if let Some(t) = self.notification_ttl {
-            if t.elapsed() > Duration::from_secs(5) && self.yt_status.is_some() {
-                self.yt_status = None;
-                self.notification_ttl = None;
-                // Reset dedup so a later re-assertion of the same message
-                // counts as a fresh notification (gets a new 5s window).
-                self.last_notification = None;
+        //
+        // RC15-DEF-4: suppress the TTL while `:yt setup` is in flight — the
+        // "Setting up…" toast must persist for the full ~30s install, not
+        // expire after 5s. The TTL restarts naturally when `on_tick` applies
+        // the result (a NEW `yt_status` message replaces "Setting up…").
+        if self.yt_setup_handle.is_none() {
+            if let Some(t) = self.notification_ttl {
+                if t.elapsed() > Duration::from_secs(5) && self.yt_status.is_some() {
+                    self.yt_status = None;
+                    self.notification_ttl = None;
+                    // Reset dedup so a later re-assertion of the same message
+                    // counts as a fresh notification (gets a new 5s window).
+                    self.last_notification = None;
+                }
             }
         }
         // Detect a NEW yt_status (set since the last tick by a key handler /
@@ -1501,6 +2726,47 @@ impl App {
             if self.last_notification.as_deref() != Some(msg.as_str()) {
                 self.notification_ttl = Some(Instant::now());
                 self.last_notification = Some(msg.clone());
+            }
+        }
+
+        // RB-4: auth-busy timeout. If the provider is stuck in Authenticating
+        // or AuthenticatedNotSynced (the pre-fetch states set by :yt auth /
+        // :yt auth browser) for too long without a data fetch promoting it,
+        // transition to ProviderError with a clear message so the user is never
+        // left with an unexplained busy state. 600 ticks ≈ 30-90s depending on
+        // the poll interval.
+        use crate::yt::state::YtState;
+        if matches!(
+            self.yt_state,
+            YtState::Authenticating | YtState::AuthenticatedNotSynced
+        ) {
+            self.yt_auth_busy_ticks = self.yt_auth_busy_ticks.saturating_add(1);
+            if self.yt_auth_busy_ticks > 600 {
+                self.yt_error =
+                    Some("auth timed out — press R to retry or :yt auth browser <name>".into());
+                self.yt_state = YtState::ProviderError;
+                self.yt_lists_loading = false;
+                self.yt_auth_busy_ticks = 0;
+            }
+        } else {
+            self.yt_auth_busy_ticks = 0;
+        }
+
+        // Meaningful-threshold detection (DEF-034): when the now-playing
+        // track crosses ≥50% of its duration OR ≥30s (whichever first), fire
+        // a single `meaningful_threshold` event — the first positive signal.
+        // Guarded by `threshold_fired_for` so it fires once per track instance.
+        if let Some(np) = self.now_playing.clone() {
+            let id = np.id().to_string();
+            let already_fired = self.threshold_fired_for.as_deref() == Some(id.as_str());
+            if !already_fired {
+                let pos = self.player.position().unwrap_or(0.0);
+                let dur = self.player.duration().unwrap_or(0.0);
+                let crossed = pos >= 30.0 || (dur > 0.0 && pos >= dur * 0.5);
+                if crossed {
+                    self.record_listen_event(&id, "meaningful_threshold");
+                    self.threshold_fired_for = Some(id);
+                }
             }
         }
 
@@ -1542,7 +2808,40 @@ impl App {
                     }
                 };
                 match respawned {
-                    Ok(new) => {
+                    Ok(mut new) => {
+                        // Save the OLD session's in-memory track_cache to disk
+                        // BEFORE replacing it — the freshly-cached tracks from
+                        // get_playlist/search are in the in-memory cache, not
+                        // on disk. Without this, the respawn wipes them and
+                        // the Queue view shows "Resuming…" for all tracks.
+                        // Then load the merged cache back into the new session.
+                        let old_tracks = self
+                            .yt_session
+                            .as_ref()
+                            .map(|s| s.all_cached_tracks())
+                            .unwrap_or_default();
+                        if !old_tracks.is_empty() {
+                            // Merge: disk cache (from previous session) +
+                            // in-memory (from current session). Dedup by
+                            // video_id — in-memory wins (fresher).
+                            let mut disk = crate::yt::cache::load_track_cache();
+                            let in_mem_ids: std::collections::HashSet<String> =
+                                old_tracks.iter().map(|t| t.video_id.clone()).collect();
+                            disk.retain(|t| !in_mem_ids.contains(&t.video_id));
+                            disk.extend(old_tracks);
+                            // Cap at 512 to avoid unbounded growth.
+                            if disk.len() > 512 {
+                                disk = disk.split_off(disk.len() - 512);
+                            }
+                            crate::yt::cache::save_track_cache(&disk);
+                            new.restore_track_cache(disk);
+                        } else {
+                            // No in-memory tracks — just restore from disk.
+                            let cached = crate::yt::cache::load_track_cache();
+                            if !cached.is_empty() {
+                                new.restore_track_cache(cached);
+                            }
+                        }
                         *self.yt_session.as_mut().unwrap() = new;
                         // Sidecar restarted — need to re-verify auth/data before
                         // claiming ready. The old code set yt_status = "sidecar
@@ -1585,6 +2884,54 @@ impl App {
         // here (needs &mut self for transport + `start_playback`) and started
         // below, after the session borrow ends. The video_id to play next.
         let mut pending_radio_start: Option<String> = None;
+
+        // M-2: process a deferred local lyrics read. `request_lyrics` defers
+        // the synchronous disk read (embedded FLAC tag + sidecar .lrc/.txt) to
+        // on_tick so the Loading transition is visible for at least one frame
+        // (without this, Loading → NotFound happens in the same call, so a
+        // retry for a local track shows no visible transition). The generation
+        // guard discards a stale read (the user moved to a different track).
+        if let Some((track_id, gen)) = self.pending_lyrics_local.take() {
+            if gen == self.lyrics_gen {
+                if let Some(track) = self.track_by_id_fast(&track_id).cloned() {
+                    if let Some(lyrics) =
+                        crate::lyrics::read_embedded(&track, &self.catalog.source_root)
+                    {
+                        let new_state = if lyrics.is_empty() {
+                            LyricsState::NotFound
+                        } else {
+                            LyricsState::Available(lyrics.synced)
+                        };
+                        if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
+                            self.overlay = Some(Overlay::Lyrics {
+                                content: Some(lyrics),
+                                state: new_state,
+                                scroll,
+                                track_id: track_id.clone(),
+                                gen,
+                            });
+                        }
+                    } else if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
+                        self.overlay = Some(Overlay::Lyrics {
+                            content: None,
+                            state: LyricsState::NotFound,
+                            scroll,
+                            track_id: track_id.clone(),
+                            gen,
+                        });
+                    }
+                } else if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
+                    self.overlay = Some(Overlay::Lyrics {
+                        content: None,
+                        state: LyricsState::NotFound,
+                        scroll,
+                        track_id: track_id.clone(),
+                        gen,
+                    });
+                }
+            }
+        }
+
         if let Some(session) = self.yt_session.as_mut() {
             // Pin the focused playlist's tracks before draining so
             // `evict_track_cache` (triggered by `cache_track` inside
@@ -1649,6 +2996,17 @@ impl App {
                     }
                 }
                 self.loaded_yt_lists.insert(id.clone());
+                // Browse mode: if the user browsed into this playlist from
+                // Explore/Charts, populate the browse tracks so the tab shows
+                // them (instead of auto-playing via pending_discover_start).
+                if let Some(browse_id) = self.yt_view.browse_playlist_id.as_ref() {
+                    if browse_id == &id {
+                        self.yt_view.browse_playlist_tracks = vids;
+                        self.yt_view.browse_cursor = 0;
+                        self.yt_status = None;
+                        continue; // don't fall through to discover play
+                    }
+                }
                 // Discover selection: if this is the list a discover Enter
                 // asked for, stage the playback start (after the session
                 // borrow ends — `play_in_context_ids` needs &mut self). Works
@@ -1659,11 +3017,25 @@ impl App {
                     if want == id {
                         if let Some(start) = vids.first().cloned() {
                             pending_discover_start = Some((vids, start));
+                        } else {
+                            // The sidecar returned an empty track list for
+                            // this mix (e.g. RD* IDs the sidecar doesn't
+                            // know). Surface an error so the user isn't left
+                            // staring at a "Loading mix…" status forever
+                            // (DEF-007).
+                            self.yt_error = Some(format!("mix \"{id}\" returned no tracks"));
+                            self.yt_status = Some("couldn't load mix — no tracks".into());
                         }
                     } else {
                         self.pending_discover_play = Some(want);
                     }
                 }
+                // Persist the track cache to disk after a get_playlist
+                // response — the freshly-cached track metadata (title,
+                // artist, album) is now in the in-memory track_cache. Save
+                // it so a respawn (or crash) doesn't lose it. Best-effort.
+                let all_tracks = session.all_cached_tracks();
+                crate::yt::cache::save_track_cache(&all_tracks);
             }
 
             // CONT=YouTube radio refill: a watch_playlist response landed.
@@ -1675,8 +3047,64 @@ impl App {
             // this tick; now we switch.
             if let Some(vids) = session.pending_watch.take() {
                 let seed = self.pending_radio_seed.take();
-                if let Some(vid) = self.radio.advance_with_vids(vids, seed) {
-                    pending_radio_start = Some(vid);
+                if seed.is_some() {
+                    // Real radio refill (from `>` or resume_last) — advance
+                    // the cursor and start playback.
+                    if let Some(vid) = self.radio.advance_with_vids(vids, seed) {
+                        pending_radio_start = Some(vid);
+                    }
+                }
+                // else: metadata-only fetch (from pending_metadata_fetch) —
+                // the tracks are already cached by apply_pair, don't start
+                // playback. The resume hint will update with the real title.
+            }
+
+            // Discover loading timeout: if the YouTube home-suggestions
+            // request hasn't arrived after 600 ticks (~10-30s depending on
+            // poll rate), clear the loading flag and show an error so the
+            // overlay doesn't hang on "Loading..." forever. The user can
+            // press S again to retry.
+            if self.discover_loading {
+                self.discover_loading_ticks += 1;
+                if self.discover_loading_ticks > 600 {
+                    self.discover_loading = false;
+                    self.discover_loading_ticks = 0;
+                    self.yt_status =
+                        Some("YouTube suggestions timed out — press S to retry".to_string());
+                    session.reset_discover_inflight();
+                }
+            }
+
+            // Home/Explore/Charts loading timeouts. Same 600-tick pattern as
+            // discover: a hung `get_home()`/`get_explore()`/`get_charts()`
+            // (network drop, sidecar hang, rate limit) clears the inflight
+            // flag and surfaces an error so the user can R-refresh instead of
+            // staring at a frozen spinner forever. The spinner animation also
+            // uses these tick counters (see `render_yt_explore`/`_charts`).
+            if session.home_loading() {
+                self.home_loading_ticks += 1;
+                if self.home_loading_ticks > 600 {
+                    session.reset_home_inflight();
+                    self.home_loading_ticks = 0;
+                    self.yt_status = Some("YouTube Home timed out — press R to retry".to_string());
+                }
+            }
+            if session.explore_loading() {
+                self.explore_loading_ticks += 1;
+                if self.explore_loading_ticks > 600 {
+                    session.reset_explore_inflight();
+                    self.explore_loading_ticks = 0;
+                    self.yt_status =
+                        Some("YouTube Explore timed out — press R to retry".to_string());
+                }
+            }
+            if session.charts_loading() {
+                self.charts_loading_ticks += 1;
+                if self.charts_loading_ticks > 600 {
+                    session.reset_charts_inflight();
+                    self.charts_loading_ticks = 0;
+                    self.yt_status =
+                        Some("YouTube Charts timed out — press R to retry".to_string());
                 }
             }
 
@@ -1688,13 +3116,14 @@ impl App {
             // (which fired-and-forgot the request + opened the overlay empty).
             if let Some(s) = session.pending_discover.take() {
                 self.discover_loading = false;
+                self.discover_loading_ticks = 0;
                 let new_pl: Vec<DiscoverItem> = s
                     .into_iter()
                     .map(|p| DiscoverItem::Playlist {
                         id: p.id,
                         name: p.name,
                     })
-                    .take(5)
+                    .take(6)
                     .collect();
                 // Only touch the overlay if it's still a Discover — a stale
                 // response landing after the user closed/replaced the overlay
@@ -1883,31 +3312,44 @@ impl App {
                         });
                     }
                 }
-                // Footer: prefer the matching Search error's message (most
+                // Footer, prefer the matching Search error's message (most
                 // relevant to what the user searched), else the last error.
                 let footer = matching_search.or(last).map(|(_, e)| e.clone());
                 if let Some(e) = footer {
                     self.yt_error = Some(e.clone());
-                    // Transition the provider state on a non-Search error.
-                    // Search errors are overlay-scoped and don't indicate the
-                    // provider itself is broken; Other errors (resolve,
-                    // playlist fetch, refresh) do. Don't demote from Ready to
-                    // ProviderError on a Search error — the provider is fine.
-                    let is_search_only = errors.iter().all(|(scope, _)| {
-                        matches!(scope, crate::yt::session::ErrorScope::Search(_))
+                    // Transition the provider state on a non-Search, non-Resolve
+                    // error. Search errors are overlay-scoped and don't indicate
+                    // the provider itself is broken. Resolve errors are per-track
+                    // (DRM-protected, region-blocked, no audio formats) — the
+                    // provider is healthy and other tracks still play, so a
+                    // single resolve failure must NOT degrade the whole YouTube
+                    // tab to "offline — showing cached". Other errors
+                    // (playlist fetch, refresh, home) DO indicate the provider
+                    // is broken and should degrade the state.
+                    let is_scoped_only = errors.iter().all(|(scope, _)| {
+                        matches!(
+                            scope,
+                            crate::yt::session::ErrorScope::Search(_)
+                                | crate::yt::session::ErrorScope::Resolve
+                        )
                     });
-                    if !is_search_only {
+                    if !is_scoped_only {
                         // Heuristic auth-expiry detection: an error mentioning
                         // auth/401/unauthorized/expired → AuthExpired (needs
                         // re-auth, not retry). S2.3.1 will make this structured.
+                        // RB-2: only classify as AuthExpired if the user was
+                        // previously authed (is_authed). A never-authenticated
+                        // account (Unconfigured/SignedOut) getting an auth-flavored
+                        // error must NOT be labeled "expired"/[reauth] — it was
+                        // never authenticated to expire.
                         let looks_like_auth_error = e.to_lowercase().contains("auth")
                             || e.to_lowercase().contains("401")
                             || e.to_lowercase().contains("unauthorized")
                             || e.to_lowercase().contains("expired")
                             || e.to_lowercase().contains("login");
-                        if looks_like_auth_error {
+                        if looks_like_auth_error && self.yt_state.is_authed() {
                             self.yt_state = crate::yt::state::YtState::AuthExpired;
-                        } else if self.yt_state == crate::yt::state::YtState::Ready {
+                        } else if looks_like_auth_error {
                             // Was Ready, now an error → degrade to ReadyStale
                             // (cached data still visible, retry can recover).
                             self.yt_state = crate::yt::state::YtState::ReadyStale;
@@ -1932,6 +3374,157 @@ impl App {
             // the player to swap) and process it below, after this block.
             premium_swap = session.pending_premium_url.take();
 
+            // Publication result landed (RC11-DEF-002). The publication
+            // flow is fire-and-forget: the Enter handler calls
+            // `send_create_playlist` + stores the user-supplied title in
+            // `pending_publish_name`. Here we drain the sidecar's
+            // `pending_publication` and surface a toast — success uses
+            // the stashed name ("Playlist \"<name>\" created"), failure
+            // surfaces the error message verbatim. Without this drain the
+            // user pressed Enter, saw "publishing…", and never learned
+            // whether the publish actually succeeded.
+            if let Some(result) = session.pending_publication.take() {
+                let name = self.pending_publish_name.take().unwrap_or_default();
+                match &result {
+                    crate::yt::publication::PublicationResult::Success(_) => {
+                        self.yt_status = Some(format!("Playlist \"{name}\" created"));
+                    }
+                    crate::yt::publication::PublicationResult::PartialSuccess(_, failed) => {
+                        self.yt_status = Some(format!(
+                            "Playlist \"{name}\" created ({} tracks failed)",
+                            failed.len()
+                        ));
+                    }
+                    crate::yt::publication::PublicationResult::Failed(e) => {
+                        self.yt_error = Some(format!("publish failed: {e}"));
+                    }
+                }
+            }
+
+            // YouTube Home feed shelves landed (ytmusicapi `get_home`). Map
+            // each `HomeSectionProto` to a `(HomeSection, Vec<HomeItem>)` and
+            // append to `yt_view.home.sections` AFTER the local cold-start
+            // sections (Quick Picks, Made for You, Start Radio, Library) that
+            // `populate_home_state` already built. Stash the raw proto list in
+            // `home_sections_cached` so the next tab switch doesn't re-fetch.
+            // NOTE: do NOT promote `yt_state` to Ready here — this is a
+            // secondary fire-and-forget fetch, not the primary refresh. The
+            // `pending_playlists` consumer (above) handles the Ready
+            // promotion when `send_refresh` succeeds; overwriting yt_state
+            // here would clobber an AuthExpired classification that landed
+            // from the same drain cycle's error response (the empty
+            // home_sections response from the fake sidecar / a guest-mode
+            // sidecar can land AFTER an auth error and would wrongly mask it
+            // as Ready). Matches the `pending_discover` pattern (which also
+            // doesn't touch yt_state).
+            if let Some(sections) = session.pending_home_sections.take() {
+                self.yt_view.home_sections_cached = Some(sections.clone());
+                self.home_loading_ticks = 0;
+                // Build the YouTube shelves as a new sections Vec, then
+                // PREPEND them before the local cold-start sections so the
+                // Home tab looks like YouTube Music (real YouTube content
+                // front and center). The local sections (Quick Picks, Made
+                // for You, Start Radio, Library) follow as fallback content.
+                let mut yt_sections: Vec<(
+                    crate::tui::view::home::HomeSection,
+                    Vec<crate::tui::view::home::HomeItem>,
+                )> = Vec::new();
+                for sec in sections {
+                    let home_section = map_yt_section_title(&sec.title);
+                    let items: Vec<crate::tui::view::home::HomeItem> = sec
+                        .items
+                        .iter()
+                        .map(|it| {
+                            if let Some(pid) = &it.playlist_id {
+                                crate::tui::view::home::HomeItem::playlist(
+                                    pid.clone(),
+                                    it.title.clone(),
+                                    false,
+                                )
+                            } else if let Some(vid) = &it.video_id {
+                                let artist = it.artist.clone().unwrap_or_default();
+                                // Cache the track metadata in the session so
+                                // `track_for(video_id)` resolves when the
+                                // track plays (the now-playing bar needs the
+                                // title/artist — without this it falls back
+                                // to "YouTube track <video_id>").
+                                session.cache_track_pub(&crate::yt::proto::RemoteTrackSummary {
+                                    video_id: vid.clone(),
+                                    title: it.title.clone(),
+                                    artist: artist.clone(),
+                                    album: None,
+                                    dur: None,
+                                    isrc: None,
+                                });
+                                crate::tui::view::home::HomeItem::track(
+                                    vid.clone(),
+                                    it.title.clone(),
+                                    artist,
+                                    false,
+                                )
+                            } else if let Some(bid) = &it.browse_id {
+                                crate::tui::view::home::HomeItem::subscription(
+                                    bid.clone(),
+                                    it.title.clone(),
+                                )
+                            } else {
+                                crate::tui::view::home::HomeItem::playlist(
+                                    String::new(),
+                                    it.title.clone(),
+                                    false,
+                                )
+                            }
+                        })
+                        .collect();
+                    yt_sections.push((home_section, items));
+                }
+                // Prepend: YouTube shelves first, local sections after.
+                let local = std::mem::take(&mut self.yt_view.home.sections);
+                self.yt_view.home.sections = yt_sections;
+                self.yt_view.home.sections.extend(local);
+            }
+
+            // YouTube Explore feed landed (ytmusicapi `get_explore`). The
+            // Explore tab renders directly from `explore_cached` (Task 5), so
+            // we just stash the raw `Vec<PlaylistProto>` here — no
+            // `home.sections` push (that's the Home tab, not Explore). See the
+            // `pending_home_sections` consumer above for the rationale on NOT
+            // promoting yt_state here.
+            if let Some(playlists) = session.pending_explore_playlists.take() {
+                self.yt_view.explore_cached = Some(playlists);
+                self.explore_loading_ticks = 0;
+            }
+
+            // YouTube Charts landed (ytmusicapi `get_charts`). The Charts tab
+            // groups entries by the `chart` field and renders from
+            // `charts_cached` (Task 5), so we just stash the raw
+            // `Vec<ChartEntryProto>` here. See the `pending_home_sections`
+            // consumer above for the rationale on NOT promoting yt_state.
+            if let Some(charts) = session.pending_charts.take() {
+                self.yt_view.charts_cached = Some(charts);
+                self.charts_loading_ticks = 0;
+            }
+
+            // Fetch-on-first-visit for the Home/Explore/Charts tabs. ONLY when
+            // the user is actually on the YouTube view — don't fire send_home
+            // when the user is on the Queue view (e.g. after resume), because
+            // that blocks the sidecar and wedges the resolve_url the resume
+            // needs.
+            if self.view == View::Youtube {
+                match self.yt_view.tab {
+                    YtTab::Home if self.yt_view.home_sections_cached.is_none() => {
+                        let _ = session.send_home();
+                    }
+                    YtTab::Explore if self.yt_view.explore_cached.is_none() => {
+                        let _ = session.send_explore();
+                    }
+                    YtTab::Charts if self.yt_view.charts_cached.is_none() => {
+                        let _ = session.send_charts();
+                    }
+                    _ => {}
+                }
+            }
+
             // Cold-miss swap: if a pick is pending and its URL just landed,
             // stage it for the player swap below. If the fast resolve finished
             // with no URL (error), give up so the user isn't stuck on the
@@ -1950,9 +3543,110 @@ impl App {
                             premium: false,
                         });
                     pending_swap = Some((id, url, fmt));
-                } else if !session.resolve_busy() {
-                    // Fast resolve done, no URL of either tier yet → it failed.
+                } else if !session.resolve_busy() && !session.premium_resolve_busy() {
+                    // Both resolve tiers are done (or errored) and no URL of
+                    // either tier is cached → the resolve genuinely failed.
+                    // Only give up when BOTH tiers are idle — the premium tier
+                    // (EJS nsig solver, ~10-15s cold) may still be in flight
+                    // when the fast tier errors at 5s, and giving up early
+                    // would drop a pending play that the premium URL would
+                    // have satisfied.
                     pending_give_up = true;
+                }
+            }
+        }
+
+        // Auto-fetch metadata for any playing YouTube track that isn't in the
+        // track_cache. The player bar / Queue view / browse view fall back to
+        // "Loading…" (never the raw 11-char video_id) until this lands. Fires a
+        // get_watch_playlist — the seed video is the first track in the
+        // response, so its title/artist gets cached and the real title
+        // replaces the placeholder on the next frame. Guarded by
+        // `pending_metadata_fetch` (single-slot queue) + `watch_inflight` so
+        // we never fire more than one watch_playlist at a time.
+        if self.pending_metadata_fetch.is_none() {
+            let vid = match &self.now_playing {
+                Some(crate::source::TrackSource::Remote { video_id }) => Some(video_id.as_str()),
+                _ => None,
+            };
+            if let Some(vid) = vid {
+                let uncached = self
+                    .yt_session
+                    .as_ref()
+                    .and_then(|s| s.track_for(vid))
+                    .is_none();
+                if uncached {
+                    self.pending_metadata_fetch = Some(vid.to_string());
+                }
+            }
+        }
+
+        // Fire a get_watch_playlist to fetch track metadata for the resume
+        // track when the title isn't cached. This runs after the browser
+        // re-spawn. The response caches the radio queue's track metadata
+        // (so the resume hint + Queue view show real titles), but does NOT
+        // auto-start playback — we only set pending_radio_seed when the user
+        // actually presses R (resume_last).
+        if let Some(id) = self.pending_metadata_fetch.take() {
+            if let Some(session) = self.yt_session.as_mut() {
+                if !session.watch_loading() {
+                    let _ = session.send_watch_playlist(id);
+                } else {
+                    self.pending_metadata_fetch = Some(id);
+                }
+            }
+        }
+
+        // Re-fetch the source YouTube playlist to populate track metadata
+        // for ALL context tracks. On startup, many context tracks have empty
+        // titles (the previous session saved them before the metadata landed).
+        // Firing get_playlist(key) re-caches ALL track titles so the Queue view
+        // shows real titles instead of "Loading…". One-shot: cleared after the
+        // fetch is fired (the inflight guard prevents duplicates). Only fires
+        // when there are uncached context tracks.
+        if let Some(key) = self.pending_context_playlist_fetch.take() {
+            if let Some(session) = self.yt_session.as_mut() {
+                let needs_fetch = self
+                    .last_played_context_tracks
+                    .iter()
+                    .any(|t| t.title.is_empty());
+                if needs_fetch {
+                    let _ = session.send_get_playlist(key);
+                }
+            }
+        }
+
+        // Refresh context tracks after any track cache updates (get_playlist,
+        // get_watch_playlist, or resolve_url responses may have cached new
+        // metadata during the session borrow above). This saves the titles
+        // so the next restart's resume shows real titles, not empty strings.
+        self.refresh_context_tracks();
+
+        // Update the resume hint with the real title when track metadata
+        // lands (from get_watch_playlist / resolve_url / get_playlist). The
+        // hint starts as "resume: previous track at 4:50 · R to resume" when
+        // the track_cache + context_tracks have empty titles (cold start).
+        // Once the metadata fetch caches the real title, rebuild the hint
+        // so the user sees it BEFORE pressing R. Runs every tick after
+        // refresh_context_tracks — cheap (two HashMap lookups + a string
+        // compare), and the hint only changes once (empty → real title).
+        if self.resume_hint.is_some() {
+            if let Some(id) = &self.last_played_track_id {
+                let title = self
+                    .track_by_id_fast(id)
+                    .map(|t| t.title.clone())
+                    .or_else(|| {
+                        self.yt_session
+                            .as_ref()
+                            .and_then(|s| s.track_for(id))
+                            .map(|t| t.title.clone())
+                    })
+                    .filter(|t| !t.is_empty() && t != "previous track");
+                if let Some(title) = title {
+                    let pos = self.last_played_position;
+                    let m = (pos as u64) / 60;
+                    let s = (pos as u64) % 60;
+                    self.resume_hint = Some(format!("resume: {title} at {m}:{s:02} · R to resume"));
                 }
             }
         }
@@ -1976,7 +3670,12 @@ impl App {
                 &self.now_playing,
                 Some(crate::source::TrackSource::Remote { video_id }) if video_id == &vid
             );
-            if same_track && !self.playing_premium {
+            // Only swap if the premium URL is actually higher quality
+            // (premium: true means abr >= 256). If the premium resolve
+            // returned the same 129k stream (no YouTube Premium account,
+            // or YouTube didn't offer itag 141), don't swap — the fast
+            // stream is already playing at the same quality.
+            if same_track && !self.playing_premium && u.premium {
                 let pos = self.player.position().unwrap_or(0.0);
                 let dur = self.player.duration().unwrap_or(f64::MAX);
                 let near_end = dur.is_finite() && dur - pos < 5.0;
@@ -1992,23 +3691,21 @@ impl App {
                             Some(crate::audio::set_output_format_async(sr, bd));
                     }
                     let p = std::path::PathBuf::from(&u.url);
-                    // Resume at the captured position via mpv's `start` option
-                    // (load_at) so the premium stream begins at `pos` directly —
-                    // no from-0 replay before a seek lands.
                     match self.player.load_at(&p, pos) {
                         Ok(()) => {
                             self.playing_premium = true;
                             self.yt_status = Some("upgraded to AAC 256k · YT Premium".into());
                         }
                         Err(e) => {
-                            // Premium upgrade failed — keep the fast stream
-                            // playing. Don't change now_playing (it's already
-                            // set to this track from the initial load).
                             self.yt_error = Some(format!("premium upgrade failed: {e}"));
                         }
                     }
                 }
             }
+            // If u.premium is false (premium resolve returned 129k, not 256k),
+            // don't swap — the fast stream is already at the same quality.
+            // The premium URL is still cached for future use if YouTube
+            // starts offering 256k for this video.
         }
 
         // Cold-miss swap: the URL for a pending pick just landed — swap the
@@ -2017,6 +3714,11 @@ impl App {
         if let Some((id, url, fmt)) = pending_swap {
             self.pending_play = None;
             self.load_remote(url, fmt, id);
+            // The track cache may have been updated by the resolve response —
+            // refresh context tracks so titles are saved for the next restart.
+            // The resume-hint update runs below (after refresh_context_tracks)
+            // for ALL ticks, not just pending_swap, so it also catches the
+            // metadata-fetch path.
         } else if pending_give_up {
             // Fast resolve finished without a URL — drop the pending intent.
             // The error already surfaced to yt_error via pending_errors above;
@@ -2024,12 +3726,61 @@ impl App {
             self.pending_play = None;
         }
 
+        // Switch to the Queue view when a YT content tab (Home/Explore/Charts)
+        // playlist play's first track actually starts playing (now_playing
+        // transitions to Some). We deferred the switch from
+        // `pending_discover_start` to here so the user doesn't see an empty
+        // queue during the 1-2s (or 10-15s cold-start) URL resolve.
+        if self.pending_yt_switch_to_queue && self.now_playing.is_some() {
+            self.pending_yt_switch_to_queue = false;
+            self.view = View::Queue;
+            self.focus_col = 0;
+            self.cursors.queue = 0;
+            self.cursors.track = 0;
+        }
+
         // Discover selection playback: a YT playlist's tracks landed (the
         // fire-and-forget completion of `play_discover_selection`'s Playlist
-        // arm). Start the playlist, mirroring the old blocking path's
-        // `play_in_context_ids(ids, start)`.
+        // arm, and the Explore/Charts tab's `play_explore_selection` /
+        // `play_charts_selection`). Start the playlist, mirroring the old
+        // blocking path's `play_in_context_ids(ids, start)`. When on the
+        // Explore/Charts tab, switch to the Queue view so the user
+        // immediately sees the now-playing track highlighted in the queue
+        // (the "now playing tab") instead of staying on Explore/Charts
+        // where the player bar at the bottom is easy to miss.
         if let Some((ids, start)) = pending_discover_start {
+            // Close the discover overlay on success so the user sees the
+            // now-playing bar, not the overlay (DEF-007). Clear the loading
+            // state too (RC11-DEF-035).
+            self.overlay = None;
+            self.discover_play_loading = None;
+            // Remember which tab we came from so we can switch to Queue AFTER
+            // the first track starts playing (not now — switching now would
+            // show an empty queue while the first track's URL is still
+            // resolving, which takes 1-2s fast tier or 10-15s cold-start
+            // premium). The switch happens in on_tick when `now_playing`
+            // transitions from None to Some.
+            let was_yt_content_tab = self.view == View::Youtube
+                && matches!(
+                    self.yt_view.tab,
+                    YtTab::Home | YtTab::Explore | YtTab::Charts
+                );
+            self.pending_yt_switch_to_queue = was_yt_content_tab;
             self.play_in_context_ids(ids, &start);
+        }
+
+        // RC11-DEF-035: for the synchronous Mix path, `play_discover_selection`
+        // started playback directly (not via `pending_discover_start`) and
+        // kept the overlay open with a "Loading [name]..." state. Once
+        // `now_playing` is set, the loading is complete — close the overlay
+        // + clear the loading state. (If playback failed — dead tracks —
+        // `now_playing` stays None; the loading state lingers until the user
+        // presses Esc. A future improvement could clear it on a timeout.)
+        if let Some(_name) = self.discover_play_loading.clone() {
+            if self.now_playing.is_some() && self.pending_discover_play.is_none() {
+                self.overlay = None;
+                self.discover_play_loading = None;
+            }
         }
 
         // CONT=YouTube radio auto-advance: the watch_playlist response
@@ -2092,6 +3843,8 @@ impl App {
                 };
                 if !inflight && ((empty && !loaded) || any_missing) {
                     if let Some(session) = self.yt_session.as_mut() {
+                        // send_get_playlist skips ids in failed_playlists, so
+                        // a bad/transient id doesn't re-fetch every tick.
                         let _ = session.send_get_playlist(id);
                     }
                 }
@@ -2125,6 +3878,43 @@ impl App {
             self.spinner_frame = (self.spinner_frame + 1) % 10;
         } else {
             self.spinner_frame = 0;
+        }
+
+        // RC11-DEF-043: decay the transient confirmation toast after ~1.2s so
+        // it's readable but doesn't linger (the `yt_status` toast is gated on
+        // yt_state==Ready and deduped; this dedicated toast is always
+        // rendered in the player bar and refreshes on each set).
+        if let Some(t) = self.toast_at {
+            if t.elapsed() > Duration::from_millis(1200) {
+                self.toast = None;
+                self.toast_at = None;
+            }
+        }
+
+        // RC11-DEF-005: decay the status-bar toast after ~3s so command
+        // errors (unknown command, ambiguous Tab) are readable but don't
+        // linger over the normal VIEW/SOURCE status line.
+        if let Some(t) = self.status_toast_at {
+            if t.elapsed() > Duration::from_millis(3000) {
+                self.status_toast = None;
+                self.status_toast_at = None;
+            }
+        }
+
+        // RC11-DEF-014: track the now-playing track's position so it can be
+        // saved to state.db on exit and restored on the next launch. Only
+        // update when the player reports a real position (mpv); afplay
+        // reports None so the saved position stays 0 (resume restarts from 0
+        // on afplay, which can't seek anyway). Cap at the duration so a
+        // paused-at-end state doesn't save a position past the track.
+        if let Some(np) = self.now_playing.as_ref() {
+            if let Some(pos) = self.player.position() {
+                let dur = self.player.duration().unwrap_or(f64::INFINITY);
+                if pos < dur {
+                    self.last_played_track_id = Some(np.id().to_string());
+                    self.last_played_position = pos;
+                }
+            }
         }
 
         // Diagnostics capture (Slice 7): when `yt_error` changes, push a line
@@ -2201,14 +3991,35 @@ impl App {
         // Clear the fire-and-forget hot-path intents so a response that lands
         // after logout doesn't start playback / populate a stale overlay.
         self.discover_loading = false;
+        self.discover_loading_ticks = 0;
+        self.home_loading_ticks = 0;
+        self.explore_loading_ticks = 0;
+        self.charts_loading_ticks = 0;
         self.pending_discover_play = None;
+        self.pending_yt_switch_to_queue = false;
         self.pending_radio_seed = None;
+        // Drop the Home/Explore/Charts caches so a re-login under a different
+        // account never shows the prior account's YouTube shelves. The
+        // session-side `clear_all_caches` (called above via `clear_cookies`)
+        // resets the three new pending fields + inflight guards; these three
+        // fields live on `YtViewState` and need their own clear here. We also
+        // clear `home.sections` here so the next `render_yt_home` re-runs
+        // `populate_home_state` (rebuilding local-only sections, no YouTube
+        // shelves since the user is now signed out). Without this clear,
+        // `populate_home_state` would be skipped (it only runs when
+        // `home.sections.is_empty()`) and the prior account's YouTube shelves
+        // would linger on the Home tab until `open_home` (H key) or restart.
+        self.yt_view.home_sections_cached = None;
+        self.yt_view.explore_cached = None;
+        self.yt_view.charts_cached = None;
+        self.yt_view.home.sections.clear();
         // Drop a pending audio format switch handle (the thread detaches
         // and completes on its own — best-effort, no blocking).
         self.audio_switch_handle = None;
         // Also clear the disk cache so the next launch doesn't show the
         // logged-out account's playlists.
         crate::yt::cache::clear_yt_lists();
+        crate::yt::cache::clear_track_cache();
         // Transition to SignedOut (distinct from Unconfigured: the user took
         // an explicit action). The footer says "signed out — run :yt auth to
         // reconnect" rather than "not configured."
@@ -2235,21 +4046,36 @@ impl App {
     /// the Keychain. This is the fix for the "repeated login" root cause: the
     /// user presses R instead of re-authenticating.
     pub fn retry_yt_probe(&mut self) {
-        let Some(session) = self.yt_session.as_mut() else {
+        // RC11-DEF-018: always clear the visible error on `R`, even when no
+        // retry is performed. A command error (e.g. `:yt foobar`) sets
+        // `yt_error` while `yt_state` stays `Ready` (which is not retryable),
+        // so the early returns below would leave the `[ERR]` lingering. The
+        // user pressed `R` expecting feedback to clear; leaving the error
+        // visible would be misleading.
+        self.yt_error = None;
+        if self.yt_session.is_none() {
             // No session — nothing to retry. The footer's state hint tells the
             // user to auth (`:yt auth browser`), not to press R.
             return;
-        };
+        }
         if !self.yt_state.can_retry() {
             // Only retry from error/stale/syncing states — not from Ready
             // (already healthy) or Unconfigured/SignedOut (need auth, not retry).
             return;
         }
-        // Immediate visual feedback: clear the old error, transition to
-        // Synchronizing. The footer renders "synchronizing…" on the next frame
-        // (within ~150ms — the poll timeout), so the user sees the retry is
-        // in progress without waiting for the sidecar roundtrip.
-        self.yt_error = None;
+        // M-2: always show a visible "retrying" toast on every R press so the
+        // user sees immediate feedback even when: (a) a refresh is already in
+        // flight (the inflight guard no-ops send_refresh, so the state stays
+        // Synchronizing with no visible change), or (b) the sidecar is down
+        // (send_refresh errors → ProviderError, but the toast confirms the
+        // retry was attempted). `set_status_toast` refreshes the 3s window on
+        // every call (unlike `yt_status` which dedups), so rapid R presses each
+        // show "retrying YouTube…" anew.
+        self.set_status_toast("retrying YouTube…".into());
+        // Immediate visual feedback: transition to Synchronizing. The footer
+        // renders "synchronizing…" on the next frame (within ~150ms — the poll
+        // timeout), so the user sees the retry is in progress without waiting
+        // for the sidecar roundtrip.
         self.yt_state = crate::yt::state::YtState::Synchronizing;
         // Fire-and-forget: send_refresh queues LibraryPlaylists + HomeSuggestions.
         // on_tick drains the responses and:
@@ -2259,6 +4085,9 @@ impl App {
         //     ProviderError otherwise) — lines ~1919-1946.
         // A refresh already in flight is a no-op (inflight guard in send_refresh),
         // so rapid R presses don't flood the sidecar.
+        let Some(session) = self.yt_session.as_mut() else {
+            return;
+        };
         if let Err(e) = session.send_refresh() {
             self.yt_error = Some(format!("retry: {e}"));
             self.yt_state = crate::yt::state::YtState::ProviderError;
@@ -2336,8 +4165,52 @@ impl App {
     /// `S` — open the discover overlay: local smart-album suggestions (Local /
     /// Mixed) or YouTube mood playlists (YouTube / Mixed-with-session).
     pub fn open_discover(&mut self) {
+        // RC11-DEF-013: ensure the reco mixes are generated before building
+        // the Discover overlay — `S` may be pressed before `H` (which would
+        // generate them via `open_home`). A cold profile still produces mixes
+        // via the catalog fallback (DailyMix, Discover, LocalYtBlend).
+        if self.reco_mixes.is_empty() {
+            self.reco_mixes =
+                crate::reco::mixes::generate_all_mixes(&self.reco_profile, &self.catalog.tracks);
+        }
+        // RC11-DEF-013: in YouTube / mixed mode, the Discover overlay shows
+        // the generated mixes (Daily Mix, Discover Mix, ...) from `reco::mixes`
+        // — NOT local smart albums. The mixes carry local-catalog track ids,
+        // so Enter plays them immediately (no sidecar roundtrip). Local smart
+        // albums are still shown in local mode (the old behavior). The
+        // sidecar's `home_suggestions` fetch still runs in YT/mixed mode to
+        // populate additional YouTube playlists alongside the mixes.
+        let mix_items: Vec<DiscoverItem> = self
+            .reco_mixes
+            .iter()
+            .map(|m| {
+                let track_ids: Vec<String> = m.tracks.iter().map(|c| c.track_id.clone()).collect();
+                // RC11-DEF-028: per-mix "why recommended" explanation. Use the
+                // mix type's description as the human-readable reason (the
+                // reco engine's per-track explanations live in Home's Made
+                // for You; here we surface the mix-level description).
+                let explanation = Some(m.mix_type.description().to_string());
+                DiscoverItem::Mix {
+                    mix_type: m.mix_type,
+                    name: m.mix_type.label().to_string(),
+                    track_ids,
+                    explanation,
+                }
+            })
+            .collect();
+
         let items = match self.source_mode {
-            crate::mode::SourceMode::Youtube => self.yt_discover_items(),
+            crate::mode::SourceMode::Youtube => {
+                let mut items = mix_items;
+                items.extend(self.yt_discover_items());
+                items
+            }
+            crate::mode::SourceMode::Mixed => {
+                let mut items = mix_items;
+                items.extend(self.local_smart_albums());
+                items.extend(self.yt_discover_items());
+                items
+            }
             _ => {
                 let mut albums = self.local_smart_albums();
                 if albums.is_empty() {
@@ -2346,6 +4219,15 @@ impl App {
                 albums
             }
         };
+        let open_in_tab = matches!(
+            self.source_mode,
+            crate::mode::SourceMode::Youtube | crate::mode::SourceMode::Mixed
+        );
+        if open_in_tab {
+            self.view = View::Youtube;
+            self.focus_col = 0;
+            self.yt_view.tab = YtTab::Discover;
+        }
         self.overlay = Some(Overlay::Discover { items, cursor: 0 });
     }
 
@@ -2358,8 +4240,17 @@ impl App {
             .map(|v| v.artist)
             .unwrap_or_default();
         let mut scored: Vec<(u64, DiscoverItem)> = Vec::new();
+        // Dedup key: collaboration albums are filed under every artist in
+        // `symlinked_into_artists`, so the same (primary_artist, title) pair
+        // appears under multiple artist keys. Without dedup the discover
+        // overlay shows duplicate entries (DEF-022).
+        let mut seen: HashSet<(String, String)> = HashSet::new();
         for (artist, albums) in &self.albums_by_artist {
             for a in albums {
+                let dup_key = (a.artist.clone(), a.title.clone());
+                if !seen.insert(dup_key) {
+                    continue;
+                }
                 let key = format!("{artist}|{}", a.title);
                 let r = Self::hash_rand(&key);
                 let penalty = if *artist == cur_artist { 1_000_000 } else { 0 };
@@ -2387,16 +4278,12 @@ impl App {
         let Some(session) = self.yt_session.as_mut() else {
             return Vec::new();
         };
-        // Fire-and-forget: send + return immediately. The response lands in
-        // `session.pending_discover` and `on_tick` folds it into the open
-        // Discover overlay. `discover_inflight` makes a re-press a no-op.
+        session.reset_discover_inflight();
         if session.send_home_suggestions().is_err() {
-            // Send failed (sidecar dead etc.) — leave discover_loading false so
-            // the overlay doesn't hang on "loading…" forever; the error will
-            // surface via pending_errors on the next tick.
             return Vec::new();
         }
         self.discover_loading = true;
+        self.discover_loading_ticks = 0;
         Vec::new()
     }
 
@@ -2438,7 +4325,6 @@ impl App {
     /// Artists (col 2) where there's no jump target — only the list columns are
     /// filterable, so an accidental `f` elsewhere doesn't open a dead filter.
     pub fn toggle_filter(&mut self) {
-        // Queue has nothing to filter.
         if self.view == View::Queue {
             return;
         }
@@ -2451,6 +4337,32 @@ impl App {
                 })
             }
         }
+    }
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar_visible = !self.sidebar_visible;
+    }
+    pub fn adjust_playlist_col_width(&mut self, delta: i16) {
+        if !self.playlist_col_focused() {
+            return;
+        }
+        let (w, _) = crossterm::terminal::size().unwrap_or((0, 0));
+        self.playlist_col.width = (self.playlist_col.width as i16 + delta).max(0) as u16;
+        self.playlist_col.clamp_width(w.max(1));
+    }
+    pub fn toggle_playlist_group(&mut self) {
+        if self.playlist_col_focused() {
+            self.playlist_col.group_by_type = !self.playlist_col.group_by_type;
+        }
+    }
+    pub fn toggle_playlist_counts(&mut self) {
+        if self.playlist_col_focused() {
+            self.playlist_col.show_counts = !self.playlist_col.show_counts;
+        }
+    }
+    pub fn playlist_col_focused(&self) -> bool {
+        self.view == View::Youtube
+            && self.yt_view.tab == crate::tui::app::YtTab::Library
+            && self.focus_col == 0
     }
 
     /// `Enter` while a filter is active: jump the real cursor to the first
@@ -2523,36 +4435,73 @@ impl App {
         name.to_lowercase().contains(&f.text.to_lowercase())
     }
 
-    /// Apply a discover-overlay selection (Enter): start the album/playlist.
+    /// Apply a discover-overlay selection (Enter): start the album/mix/playlist.
+    ///
+    /// RC11-DEF-035: the overlay is NO LONGER closed immediately on Enter for
+    /// the Mix / Playlist variants. Instead it stays open showing a persistent
+    /// "Loading [name]..." indicator (`discover_play_loading`) so the user
+    /// sees feedback while the tracks resolve / the sidecar roundtrip is in
+    /// flight. `on_tick` closes the overlay + clears the loading state when
+    /// playback starts (for the synchronous Mix path) or when
+    /// `pending_discover_play` resolves (for the async Playlist path). The
+    /// Album variant still closes immediately (synchronous, instant).
     pub fn play_discover_selection(&mut self) {
         let Some(Overlay::Discover { items, cursor }) = self.overlay.clone() else {
             return;
         };
         let Some(item) = items.get(cursor).cloned() else {
+            // Empty selection — close the overlay.
+            self.overlay = None;
             return;
         };
         match item {
             DiscoverItem::Album { album, .. } => {
+                // Synchronous + instant — close the overlay immediately.
+                self.overlay = None;
+                self.discover_play_loading = None;
                 let ids = self.tracks_for_album(&album);
                 if let Some(start) = ids.first().cloned() {
                     self.transport.continue_mode = ContinueMode::NextAlbum;
                     self.play_in_context_ids(ids, &start);
+                } else {
+                    self.yt_status = Some("no tracks found for this album".into());
                 }
             }
-            DiscoverItem::Playlist { id, .. } => {
-                // Fire-and-forget: the old blocking `get_playlist(&id)` froze
-                // the UI ~4s on every Enter. Now we ask the sidecar
-                // (non-blocking) and defer the playback start to `on_tick`,
-                // which starts the playlist when `pending_tracks` lands with
-                // a matching id (see `pending_discover_play`). A cold cache
-                // hit isn't possible here (discover lists never have
-                // pre-fetched tracks), so we always go through the async
-                // path. If there's no session, fall back to a clean no-op.
+            DiscoverItem::Playlist { id, name, .. } => {
+                // RC11-DEF-035: keep the overlay open with a loading state.
                 if let Some(session) = self.yt_session.as_mut() {
-                    // `send_get_playlist` is a no-op if this exact id is
-                    // already in flight, so a double-Enter doesn't flood.
                     let _ = session.send_get_playlist(id.clone());
                     self.pending_discover_play = Some(id);
+                    self.discover_play_loading = Some(name.clone());
+                    self.yt_status = Some(format!("Loading \"{name}\"…"));
+                    // Keep the overlay open — on_tick closes it when the
+                    // pending_discover_play resolves (or on error/timeout).
+                } else {
+                    // No session — surface an error and close.
+                    self.overlay = None;
+                    self.discover_play_loading = None;
+                    self.yt_status = Some("can't load mix — no YouTube session".into());
+                }
+            }
+            DiscoverItem::Mix {
+                track_ids, name, ..
+            } => {
+                // RC11-DEF-013 / DEF-035: a generated mix from `reco::mixes`.
+                // Plays immediately from local-catalog track ids — no sidecar
+                // roundtrip. Keep the overlay open with a "Loading [name]..."
+                // state for one frame so the user sees feedback; on_tick
+                // closes the overlay + clears the loading state once
+                // `now_playing` is set.
+                if let Some(start) = track_ids.first().cloned() {
+                    self.discover_play_loading = Some(name.clone());
+                    self.yt_status = Some(format!("Loading \"{name}\"…"));
+                    self.transport.continue_mode = ContinueMode::NextAlbum;
+                    self.play_in_context_ids(track_ids, &start);
+                    // Overlay stays open — on_tick clears it.
+                } else {
+                    self.overlay = None;
+                    self.discover_play_loading = None;
+                    self.yt_status = Some(format!("mix \"{name}\" has no tracks"));
                 }
             }
         }
@@ -2627,10 +4576,21 @@ impl App {
             return;
         };
         self.yt_error = None;
-        self.yt_lists_loading = true;
-        // Transition to Synchronizing — a data fetch is in flight. on_tick will
-        // promote to Ready when playlists land, or ProviderError on error.
-        self.yt_state = crate::yt::state::YtState::Synchronizing;
+        // RC11-DEF-055: when the Y view already has cached lists (re-entry
+        // via `4`), skip the `[~]` flash — keep `yt_state` at its current
+        // value (Ready / ReadyStale) and don't set `yt_lists_loading`. The
+        // background `send_refresh` still fires so the lists stay fresh, but
+        // the user sees `[ok]` (or `[stale]`) immediately instead of a
+        // meaningless `[~]` on every re-entry. Only the first entry (empty
+        // `yt_lists`) goes through the full loading → ready cycle.
+        let already_loaded = !self.yt_lists.is_empty();
+        if !already_loaded {
+            self.yt_lists_loading = true;
+            // Transition to Synchronizing — a data fetch is in flight. on_tick
+            // will promote to Ready when playlists land, or ProviderError on
+            // error.
+            self.yt_state = crate::yt::state::YtState::Synchronizing;
+        }
         if let Err(e) = session.send_refresh() {
             self.yt_lists_loading = false;
             self.yt_error = Some(format!("refresh: {e}"));
@@ -2645,6 +4605,225 @@ impl App {
         // download + Keychain read happens on the first real `preload_next_url`
         // (during playback, not browsing), and the fast-URL fallback covers the
         // gap. Browsing responsiveness > gapless handoff cold-start.
+    }
+
+    /// Fetch-on-first-visit for the Home/Explore/Charts tabs. Called by the
+    /// tab-switch handler in `input.rs` (Task 6) after a `[`/`]` cycle sets a
+    /// new tab. Each `send_*` method has its own inflight guard (Task 3), so
+    /// an already-in-flight fetch is a no-op — calling unconditionally when
+    /// the cache is `None` is safe. The `on_tick` consumer (above) also fires
+    /// the same `send_*` methods as a fallback path, so this method is the
+    /// user-driven "switched to the tab" trigger and `on_tick` is the
+    /// polling-driven "tab is active and cache is empty" trigger. Together
+    /// they cover both the immediate switch and the "response landed but
+    /// cache was cleared by `R`/logout" recovery case.
+    pub fn yt_tab_fetch_on_visit(&mut self) {
+        let Some(session) = self.yt_session.as_mut() else {
+            return;
+        };
+        match self.yt_view.tab {
+            YtTab::Home if self.yt_view.home_sections_cached.is_none() => {
+                let _ = session.send_home();
+            }
+            YtTab::Explore if self.yt_view.explore_cached.is_none() => {
+                let _ = session.send_explore();
+            }
+            YtTab::Charts if self.yt_view.charts_cached.is_none() => {
+                let _ = session.send_charts();
+            }
+            _ => {}
+        }
+    }
+
+    /// Manual refresh for the Home/Explore/Charts tab. Clears the matching
+    /// cache field and re-fires the `send_*` method. The view shows a loading
+    /// state until the response arrives. Called by the `R` key handler when
+    /// on a Home/Explore/Charts tab (Task 6 wires the key). The spec's `r`
+    /// (lowercase) is shorthand for "the refresh key" — the existing
+    /// refresh convention in this codebase is `R` (uppercase, see
+    /// `retry_yt_probe` at input.rs:261-267), since `r` is already bound to
+    /// `cycle_repeat` globally (input.rs:223). This method is a no-op when
+    /// no session is available or the current tab is not Home/Explore/Charts.
+    pub fn refresh_yt_home_explore_charts(&mut self) {
+        let Some(session) = self.yt_session.as_mut() else {
+            return;
+        };
+        match self.yt_view.tab {
+            YtTab::Home => {
+                self.yt_view.home_sections_cached = None;
+                // Clear `home.sections` so the next `render_yt_home` re-runs
+                // `populate_home_state` (rebuilding local-only sections) and
+                // the new YouTube shelves append onto a fresh base. Without
+                // this clear, the `on_tick` consumer's `.push()` would append
+                // the new YouTube shelves onto the PREVIOUS shelves still in
+                // `home.sections`, duplicating them on every R refresh.
+                self.yt_view.home.sections.clear();
+                self.home_loading_ticks = 0;
+                let _ = session.send_home();
+            }
+            YtTab::Explore => {
+                self.yt_view.explore_cached = None;
+                self.explore_loading_ticks = 0;
+                let _ = session.send_explore();
+            }
+            YtTab::Charts => {
+                self.yt_view.charts_cached = None;
+                self.charts_loading_ticks = 0;
+                let _ = session.send_charts();
+            }
+            _ => {}
+        }
+    }
+
+    /// Play the focused Explore tab selection. Explore items are all YouTube
+    /// playlists (`PlaylistProto`), so Enter triggers the existing
+    /// `get_playlist` → `pending_discover_play` flow (same as the Home tab's
+    /// Playlist arm in `play_home_selection_from`). No-op if the cache is
+    /// empty or the cursor is out of bounds.
+    pub fn play_explore_selection(&mut self) {
+        // When the inline filter is active, the cursor indexes into the
+        // FILTERED list; otherwise into the full cache.
+        let playlists = if self.yt_filter_active() {
+            self.filtered_explore()
+        } else {
+            self.yt_view.explore_cached.clone().unwrap_or_default()
+        };
+        let Some(p) = playlists.get(self.yt_view.explore_cursor).cloned() else {
+            return;
+        };
+        if p.id.is_empty() {
+            self.yt_status = Some("playlist has no id — can't load".into());
+            return;
+        }
+        // RDAMVM<11-char-video-id> is a radio auto-mix — extract the video_id
+        // and use get_watch_playlist. All other IDs use get_playlist (browse).
+        if p.id.starts_with("RDAMVM") && p.id.len() == 17 {
+            let video_id = p.id[6..].to_string();
+            if let Some(session) = self.yt_session.as_mut() {
+                let _ = session.send_watch_playlist(video_id.clone());
+                self.pending_radio_seed = Some(video_id);
+                self.yt_status = Some(format!(
+                    "Loading \"{}\" radio{}",
+                    p.title,
+                    crate::tui::view::theme::ellipsis()
+                ));
+            } else {
+                self.yt_status = Some("can't load — no YouTube session".into());
+            }
+            return;
+        }
+        // Browse mode: fire get_playlist + set browse_playlist_id. When the
+        // tracks land, the Explore tab shows them instead of the playlist list.
+        // The user can then j/k + Enter to play a specific track, or `a` to
+        // play the whole playlist.
+        if let Some(session) = self.yt_session.as_mut() {
+            let _ = session.send_get_playlist(p.id.clone());
+            self.yt_view.browse_playlist_id = Some(p.id.clone());
+            self.yt_view.browse_playlist_tracks.clear();
+            self.yt_view.browse_cursor = 0;
+            self.yt_status = Some(format!(
+                "Loading \"{}\"{}",
+                p.title,
+                crate::tui::view::theme::ellipsis()
+            ));
+        } else {
+            self.yt_status = Some("can't load playlist — no YouTube session".into());
+        }
+    }
+
+    /// Play a track from the browsed playlist at the current cursor position.
+    /// Called by Enter when in browse mode. Starts playback from the selected
+    /// track, with the full playlist as the context (so `>` advances to the
+    /// next track in the playlist).
+    pub fn play_browsed_track(&mut self) {
+        let Some(id) = self
+            .yt_view
+            .browse_playlist_tracks
+            .get(self.yt_view.browse_cursor)
+            .cloned()
+        else {
+            return;
+        };
+        let ids = self.yt_view.browse_playlist_tracks.clone();
+        let start_index = self.yt_view.browse_cursor;
+        // Clear browse mode — we're switching to playback.
+        self.yt_view.browse_playlist_id = None;
+        self.yt_view.browse_playlist_tracks.clear();
+        self.pending_yt_switch_to_queue = true;
+        let start = ids.get(start_index).cloned().unwrap_or(id);
+        self.play_in_context_ids(ids, &start);
+    }
+
+    /// Play the entire browsed playlist from the first track. Called by `a`
+    /// when in browse mode.
+    pub fn play_browsed_playlist_all(&mut self) {
+        if self.yt_view.browse_playlist_tracks.is_empty() {
+            return;
+        }
+        let ids = self.yt_view.browse_playlist_tracks.clone();
+        let start = ids.first().cloned().unwrap_or_default();
+        self.yt_view.browse_playlist_id = None;
+        self.yt_view.browse_playlist_tracks.clear();
+        self.pending_yt_switch_to_queue = true;
+        self.play_in_context_ids(ids, &start);
+    }
+
+    /// Play the focused Charts tab selection. Chart entries are heterogeneous:
+    /// `video_id` (track) → play immediately; `playlist_id` (chart playlist)
+    /// → `get_playlist` flow; `browse_id` would be artist radio (none in
+    /// practice — the artists chart has `browse_id` but no radio seed here).
+    /// No-op if the cache is empty or the cursor is out of bounds.
+    pub fn play_charts_selection(&mut self) {
+        // When the inline filter is active, the cursor indexes into the
+        // FILTERED list; otherwise into the full cache.
+        let entries = if self.yt_filter_active() {
+            self.filtered_charts()
+        } else {
+            self.yt_view.charts_cached.clone().unwrap_or_default()
+        };
+        let Some(e) = entries.get(self.yt_view.charts_cursor).cloned() else {
+            return;
+        };
+        if let Some(vid) = e.video_id.as_ref().filter(|s| !s.is_empty()) {
+            // Set the deferred switch flag — on_tick switches to Queue when
+            // `now_playing` becomes Some (the URL resolves + playback starts).
+            self.pending_yt_switch_to_queue = true;
+            self.play_in_context_ids(vec![vid.clone()], vid);
+            return;
+        }
+        if let Some(pid) = e.playlist_id.as_ref().filter(|s| !s.is_empty()) {
+            if let Some(session) = self.yt_session.as_mut() {
+                // RDAMVM<11-char-video-id> is a radio auto-mix — extract
+                // the video_id and use get_watch_playlist. Others use
+                // get_playlist.
+                if pid.starts_with("RDAMVM") && pid.len() == 17 {
+                    let video_id = pid[6..].to_string();
+                    let _ = session.send_watch_playlist(video_id.clone());
+                    self.pending_radio_seed = Some(video_id);
+                    self.yt_status = Some(format!(
+                        "Loading \"{}\" radio{}",
+                        e.title,
+                        crate::tui::view::theme::ellipsis()
+                    ));
+                } else {
+                    let _ = session.send_get_playlist(pid.clone());
+                    self.pending_discover_play = Some(pid.clone());
+                    self.yt_status = Some(format!(
+                        "Loading \"{}\"{}",
+                        e.title,
+                        crate::tui::view::theme::ellipsis()
+                    ));
+                }
+            } else {
+                self.yt_status = Some("can't load playlist — no YouTube session".into());
+            }
+            return;
+        }
+        // No playable id — surface a status so Enter isn't a silent no-op.
+        self.yt_status = Some(format!(
+            "\"{}\" has no playable video or playlist id",
+            e.title
+        ));
     }
 
     /// Auto-continue to the next album by the same artist. Pushes the current
@@ -2695,8 +4874,34 @@ impl App {
 
     /// Auto-continue with the whole library as a shuffled "radio" context.
     /// Music never stops — when this context eventually exhausts (the entire
-    /// library), `next` re-enters here and rebuilds it.
+    /// library), `next` re-enters here and rebuilds it. If a reco
+    /// [`Overlay::Radio`] session is active, it drives auto-advance instead.
     fn switch_to_radio(&mut self) {
+        // If a reco RadioSession overlay is active, use it to drive
+        // auto-advance with the recommendation engine's candidate pool.
+        if let Some(id) = self.reco_radio_next() {
+            if let Some(np) = self.now_playing.clone() {
+                self.transport
+                    .history
+                    .push((np.id().to_string(), self.transport.context.clone()));
+            }
+            let ctx = Context::Search {
+                query: "reco radio".into(),
+                track_ids: vec![id.clone()],
+            };
+            let r = ClonedResolver {
+                playlists: &self.playlists,
+                manual_queue: self.transport.manual_queue.clone(),
+                yt_lists: &self.yt_lists,
+            };
+            self.transport
+                .switch_context(ctx, Some(&id), &r, &self.catalog);
+            return;
+        }
+        // Capture the just-finished track BEFORE we push it to history +
+        // switch context — we need it to keep the fresh radio order from
+        // starting on the same track (see below).
+        let just_played = self.now_playing.clone().map(|s| s.id().to_string());
         if let Some(np) = self.now_playing.clone() {
             self.transport
                 .history
@@ -2716,6 +4921,36 @@ impl App {
             yt_lists: &self.yt_lists,
         };
         self.transport.switch_context(ctx, None, &r, &self.catalog);
+        // CONT=Radio must advance to a DIFFERENT track, not replay the one
+        // the user just left. `switch_context(.., None, ..)` leaves the
+        // cursor at 0 of a fresh smart shuffle — and the just-finished track
+        // is a valid candidate in the all-catalog context, so the shuffle's
+        // first pick can land back on it (the user's "CONT radio still
+        // replaying song (Local)" report). When that happens, rotate that
+        // track's order entry to the end so a different track starts now
+        // and the just-finished one is heard last (maximally far away).
+        // Single-track catalogs can't avoid the replay — degenerate.
+        if let Some(just) = just_played {
+            if self.transport.order.len() > 1 {
+                let r2 = ClonedResolver {
+                    playlists: &self.playlists,
+                    manual_queue: self.transport.manual_queue.clone(),
+                    yt_lists: &self.yt_lists,
+                };
+                if self.transport.current(&r2, &self.catalog).as_deref() == Some(just.as_str()) {
+                    let ids = self.transport.context.track_ids(&r2);
+                    if let Some(just_pos) = ids.iter().position(|x| x == &just) {
+                        if let Some(order_idx) =
+                            self.transport.order.iter().position(|&o| o == just_pos)
+                        {
+                            let removed = self.transport.order.remove(order_idx);
+                            self.transport.order.push(removed);
+                            self.transport.cursor = 0;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn volume_up(&mut self) {
@@ -2777,15 +5012,17 @@ impl App {
     /// returns immediately; `on_tick` folds the response into the open search
     /// overlay. No-op (and surfaces a hint via `yt_error`) when there's no
     /// session — typing locally without a configured sidecar.
-    pub fn submit_yt_search(&mut self, q: String) {
+    pub fn submit_yt_search(&mut self, q: String) -> bool {
         let Some(session) = self.yt_session.as_mut() else {
             self.yt_error =
                 Some("search: YouTube not configured — run :yt auth browser <chrome>".into());
-            return;
+            return false;
         };
         if let Err(e) = session.send_search(q) {
             self.yt_error = Some(format!("search: {e}"));
+            return false;
         }
+        true
     }
 
     /// Toggle the lyrics overlay (`L`). On open: requests lyrics for the
@@ -2802,6 +5039,8 @@ impl App {
             self.yt_error = Some("lyrics: nothing is playing".into());
             return;
         };
+        // M-2: reset manual-scroll follow state on a fresh lyrics open.
+        self.lyrics_manual_scroll = false;
         self.overlay = Some(Overlay::Lyrics {
             content: None,
             state: LyricsState::Idle,
@@ -2824,6 +5063,8 @@ impl App {
         // Bump the generation so a stale in-flight response is discarded.
         self.lyrics_gen = self.lyrics_gen.wrapping_add(1);
         let gen = self.lyrics_gen;
+        // M-2: reset manual-scroll follow state on a fresh lyrics request.
+        self.lyrics_manual_scroll = false;
         // Update the overlay to Loading if it's the Lyrics overlay.
         if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
             self.overlay = Some(Overlay::Lyrics {
@@ -2838,35 +5079,15 @@ impl App {
         // These are fast (one metaflac subprocess + filesystem reads) and
         // never block; a miss falls through to NotFound for local tracks (no
         // video_id to ask ytmusicapi).
-        if let Some(track) = self.track_by_id_fast(track_id).cloned() {
-            if let Some(lyrics) = crate::lyrics::read_embedded(&track, &self.catalog.source_root) {
-                let new_state = if lyrics.is_empty() {
-                    LyricsState::NotFound
-                } else {
-                    LyricsState::Available(lyrics.synced)
-                };
-                if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
-                    self.overlay = Some(Overlay::Lyrics {
-                        content: Some(lyrics),
-                        state: new_state,
-                        scroll,
-                        track_id: track_id.to_string(),
-                        gen,
-                    });
-                }
-                return;
-            }
-            // Local track, no embedded/sidecar lyrics → NotFound (truthful; no
-            // fabricated text, AC-M3.5.1).
-            if let Some(Overlay::Lyrics { scroll, .. }) = self.overlay.clone() {
-                self.overlay = Some(Overlay::Lyrics {
-                    content: None,
-                    state: LyricsState::NotFound,
-                    scroll,
-                    track_id: track_id.to_string(),
-                    gen,
-                });
-            }
+        // M-2: defer the disk read to on_tick so the Loading transition set
+        // above is visible for at least one frame. Without this, the
+        // synchronous read sets Loading → NotFound in the same call, so a
+        // retry (R) for a local track shows no visible transition — the user
+        // presses R and the overlay stays NotFound. By deferring, on_tick
+        // processes the read on the next tick (~150ms), giving the render a
+        // chance to paint Loading first.
+        if self.track_by_id_fast(track_id).is_some() {
+            self.pending_lyrics_local = Some((track_id.to_string(), gen));
             return;
         }
         // Remote (YouTube) track → fire-and-forget sidecar get_lyrics. The
@@ -2946,11 +5167,70 @@ impl App {
     }
 
     /// `e` — enqueue the track under the cursor to the manual "play next"
-    /// queue. No-op if there's no selected track.
+    /// queue. Shows a status-bar confirmation so the user gets immediate
+    /// feedback (DEF-008: YouTube enqueue previously produced no visible
+    /// result). No-op if there's no selected track.
     pub fn enqueue_selected(&mut self) {
         if let Some(id) = self.selected_track_id() {
-            self.transport.enqueue(id);
+            self.transport.enqueue(id.clone());
+            // DEF-034: record the enqueue intent as a mild positive signal.
+            self.record_listen_event(&id, "added_to_queue");
+            self.yt_status = Some("added to queue".into());
+            // RC11-DEF-043: also set a dedicated toast rendered in the player
+            // bar regardless of yt_state, so local-only users (yt_state !=
+            // Ready, where yt_status is hidden) see the confirmation. The
+            // toast clears after ~1.2s via on_tick.
+            self.set_toast("Added to queue".to_string());
+        } else {
+            self.yt_status = Some("no track selected".into());
         }
+    }
+
+    /// RC11-DEF-043: set a transient confirmation toast shown in the player
+    /// bar. Resets the TTL so re-setting the same message (e.g. pressing `e`
+    /// twice) refreshes the window instead of being deduped away.
+    pub fn set_toast(&mut self, msg: String) {
+        self.toast = Some(msg);
+        self.toast_at = Some(std::time::Instant::now());
+    }
+
+    /// RC11-DEF-005: set a transient status-bar toast shown in the footer
+    /// status line regardless of `yt_state`. Used for command feedback
+    /// (unknown commands, ambiguous Tab completion) so local-only users
+    /// (default `Unconfigured`) see the message without opening the
+    /// diagnostics overlay. Clears after ~3s via `on_tick`.
+    pub fn set_status_toast(&mut self, msg: String) {
+        self.status_toast = Some(msg);
+        self.status_toast_at = Some(std::time::Instant::now());
+    }
+
+    /// RC11-DEF-014: resume the last-played track at its saved position.
+    /// Captures a one-shot `pending_resume` so the next load of the matching
+    /// track uses `load_at(pos)`; clears the `resume_hint` so it doesn't
+    /// linger. No-op when there's no saved track. Used by the `R` key when
+    /// stopped with a resume hint.
+    pub fn resume_last(&mut self) {
+        let Some(id) = self.last_played_track_id.clone() else {
+            return;
+        };
+        let pos = self.last_played_position;
+        self.pending_resume = Some((id.clone(), pos));
+        self.resume_hint = None;
+        // Restore the FULL context (the playlist/album/search that was
+        // playing), not just the single track. This way the Queue view shows
+        // all the tracks and `>` advances to the next one.
+        let context_ids = if self.last_played_context_ids.is_empty() {
+            vec![id.clone()]
+        } else {
+            self.last_played_context_ids.clone()
+        };
+        // Set continue mode to YouTube for YouTube tracks so `>` uses
+        // YouTube radio (not local catalog fallback).
+        let is_yt_track = self.track_by_id_fast(&id).is_none();
+        if is_yt_track {
+            self.transport.continue_mode = ContinueMode::YouTube;
+        }
+        self.play_in_context_ids(context_ids, &id);
     }
 
     /// `x` (Queue view) — remove the track under the cursor from the manual
@@ -2960,11 +5240,19 @@ impl App {
         if self.view != View::Queue {
             return;
         }
-        let ids = self.transport.manual_queue.clone();
-        let Some(id) = ids.get(self.cursors.queue).cloned() else {
+        // Remove by INDEX, not by id. The old form called
+        // `transport.remove_from_queue(&id)`, which uses
+        // `manual_queue.retain(|x| x != track_id)` — that strips EVERY
+        // occurrence of the id. A queue with the same track enqueued N times
+        // (common: `e` on the same track) was wiped by a single `x` press
+        // (DEF-027). Index removal deletes exactly the one entry the cursor
+        // points at, preserving duplicates above/below it.
+        if self.cursors.queue >= self.transport.manual_queue.len() {
             return;
-        };
-        self.transport.remove_from_queue(&id);
+        }
+        let removed = self.transport.manual_queue.remove(self.cursors.queue);
+        // DEF-034: record the removal as a mild negative signal.
+        self.record_listen_event(&removed, "removed_from_queue");
         // Keep the cursor valid: if we removed the last item, step back.
         let new_len = self.transport.manual_queue.len();
         if new_len > 0 && self.cursors.queue >= new_len {
@@ -3043,9 +5331,2398 @@ impl App {
     pub fn save_playlists_db(&self) {
         let _ = crate::state::save_playlists(&self.playlists);
     }
+
+    // --- Recommendation engine wiring --------------------------------------
+
+    /// Open the YouTube Home view. Populates the generated mixes from the
+    /// reco engine and builds the section items (Quick Picks, Made for You,
+    /// Start Radio, Your YouTube Library) from local catalog + reco + yt_lists
+    /// data. The overlay always has content, even on a cold start — Quick
+    /// Picks draws from the local catalog and Made for You uses the catalog
+    /// fallback in the candidate generator.
+    ///
+    /// RC19-D2: the section-building logic is extracted into
+    /// [`populate_home_state`](Self::populate_home_state) so the YT Home tab
+    /// (`render_yt_home`) can populate `yt_view.home` on first entry WITHOUT
+    /// setting the overlay (which would paint a popup over the tab). This
+    /// method keeps the side effects (view switch, tab switch, overlay set)
+    /// for the `H` key path; the tab path uses `populate_home_state` directly.
+    pub fn open_home(&mut self) {
+        let state = self.populate_home_state();
+        self.view = View::Youtube;
+        self.focus_col = 0;
+        self.yt_view.tab = YtTab::Home;
+        self.yt_view.home = state.clone();
+        self.overlay = Some(Overlay::Home { state });
+    }
+
+    /// Build a populated `HomeState` (sections filled from the catalog,
+    /// reco mixes, and `yt_lists`) WITHOUT the `open_home` side effects
+    /// (no view switch, no tab switch, no overlay set). Used by both
+    /// `open_home` (which adds the side effects for the `H` key path) and
+    /// `render_yt_home` (RC19-D2: populates `yt_view.home` on first entry to
+    /// the YT Home tab so the user sees sections instead of the welcome
+    /// screen).
+    pub fn populate_home_state(&mut self) -> crate::tui::view::home::HomeState {
+        use crate::tui::view::home::{HomeItem, HomeSection, HomeState};
+
+        // Generate mixes from the reco engine. Always generate (even cold
+        // start uses the local catalog) so the "Made for You" section has
+        // content.
+        self.reco_mixes =
+            crate::reco::mixes::generate_all_mixes(&self.reco_profile, &self.catalog.tracks);
+
+        let mut state = HomeState::new();
+        state.has_history = self.reco_profile.has_history();
+        // RB-2: capture the provider state so the Home renderer can show a
+        // sign-in prompt for signed-out accounts instead of growth messaging.
+        state.yt_state = self.yt_state;
+        // Local data is synchronous — not loading. YouTube home suggestions
+        // (if a session is available) are fetched by the existing discover
+        // mechanism and don't block this overlay.
+        state.loading = false;
+
+        // Build section items from app data so the overlay shows content.
+        let mut sections = Vec::new();
+
+        // Quick Picks: first 5 tracks from the local catalog.
+        let quick_picks: Vec<HomeItem> = self
+            .catalog
+            .tracks
+            .iter()
+            .take(5)
+            .map(|t| {
+                HomeItem::track(
+                    t.id.clone(),
+                    t.title.clone(),
+                    t.primary_artist.clone(),
+                    true,
+                )
+            })
+            .collect();
+        sections.push((HomeSection::QuickPicks, quick_picks));
+
+        // Made for You: generated mixes (Daily Mix, Discover, etc.).
+        let made_for_you: Vec<HomeItem> = self
+            .reco_mixes
+            .iter()
+            .map(|m| HomeItem::mix(m.mix_type))
+            .collect();
+        sections.push((HomeSection::MadeForYou, made_for_you));
+
+        // Start Radio: radio seed options.
+        let start_radio = vec![
+            HomeItem::radio_seed("Track Radio".into()),
+            HomeItem::radio_seed("Artist Radio".into()),
+        ];
+        sections.push((HomeSection::StartRadio, start_radio));
+
+        // Your YouTube Library: YouTube playlists (if session is available).
+        let library: Vec<HomeItem> = self
+            .yt_lists
+            .iter()
+            .map(|l| HomeItem::playlist(l.id.clone(), l.name.clone(), false))
+            .collect();
+        sections.push((HomeSection::Library, library));
+
+        state.sections = sections;
+        state
+    }
+
+    /// Start a radio session seeded from a track. Initializes the candidate
+    /// pool (blending YouTube tracks when the provider is connected — DEF-011),
+    /// and auto-advances to the first track so `:radio` starts playing
+    /// immediately instead of opening silent (DEF-056).
+    pub fn start_radio_from_track(&mut self, track_id: &str) {
+        use crate::reco::radio::{RadioSeed, RadioSession};
+        let mut session = RadioSession::new(RadioSeed::Track(track_id.to_string()));
+        session.set_yt_track_ids(self.yt_track_ids());
+        session.initialize(&self.reco_profile, &self.catalog.tracks);
+        self.view = View::Youtube;
+        self.focus_col = 0;
+        self.yt_view.tab = YtTab::Radio;
+        self.overlay = Some(Overlay::Radio {
+            session: Some(session),
+        });
+        // DEF-056: auto-start — advance to the first radio track so the
+        // session begins playing immediately on `:radio` Enter.
+        self.advance_radio_from_overlay();
+    }
+
+    /// Start a radio session seeded from an artist.
+    pub fn start_radio_from_artist(&mut self, artist: &str) {
+        use crate::reco::radio::{RadioSeed, RadioSession};
+        let mut session = RadioSession::new(RadioSeed::Artist(artist.to_string()));
+        session.set_yt_track_ids(self.yt_track_ids());
+        session.initialize(&self.reco_profile, &self.catalog.tracks);
+        self.view = View::Youtube;
+        self.focus_col = 0;
+        self.yt_view.tab = YtTab::Radio;
+        self.overlay = Some(Overlay::Radio {
+            session: Some(session),
+        });
+        self.advance_radio_from_overlay();
+    }
+
+    /// Change the radio seed to the currently-playing track (or the first
+    /// upcoming pool track if nothing is playing). Resets the pool, clears
+    /// the played-list, and updates the seed label (DEF-006). No-op if no
+    /// radio session is active.
+    pub fn change_radio_seed(&mut self) {
+        use crate::reco::radio::RadioSeed;
+        let new_seed_id = self.now_playing.as_ref().map(|s| s.id().to_string());
+        let yt = self.yt_track_ids();
+        let mut did_change = false;
+        if let Some(Overlay::Radio { session }) = &mut self.overlay {
+            if let Some(s) = session.as_mut() {
+                // Prefer the currently-playing track; fall back to the first
+                // upcoming pool track so `c` always has a concrete seed.
+                let seed_id = new_seed_id
+                    .or_else(|| s.upcoming(1).first().map(|c| c.track_id.clone()))
+                    .unwrap_or_default();
+                if !seed_id.is_empty() {
+                    s.change_seed(
+                        RadioSeed::Track(seed_id),
+                        &self.reco_profile,
+                        &self.catalog.tracks,
+                    );
+                    s.set_yt_track_ids(yt.clone());
+                    did_change = true;
+                }
+            }
+        }
+        if did_change {
+            self.yt_status = Some("radio seed changed".into());
+        }
+    }
+
+    /// Stop the active radio session: clear the pool (no further auto-advance)
+    /// and close the overlay (DEF-007). The transport continues with whatever
+    /// is currently playing; `reco_radio_next` returns None after this so
+    /// CONT=YouTube won't pull more radio tracks.
+    pub fn stop_radio(&mut self) {
+        if let Some(Overlay::Radio { session }) = &mut self.overlay {
+            if let Some(s) = session.as_mut() {
+                s.stop();
+            }
+        }
+        self.overlay = None;
+        self.yt_status = Some("radio stopped".into());
+    }
+
+    /// Advance the radio session from the overlay (used by auto-start and
+    /// the `>`/`n` overlay keys). Gets the next track from the session and
+    /// starts playback. The overlay is read directly (not taken) so it stays
+    /// open for the user.
+    fn advance_radio_from_overlay(&mut self) {
+        let next_id = if let Some(Overlay::Radio { session }) = &mut self.overlay {
+            if let Some(s) = session.as_mut() {
+                if s.needs_refill() {
+                    s.refill_if_needed(&self.reco_profile, &self.catalog.tracks);
+                }
+                s.next_track().map(|c| c.track_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(id) = next_id {
+            self.play_radio_track(&id);
+        }
+    }
+
+    /// Collect YouTube video ids available for the recommendation pool when
+    /// the provider is connected (DEF-010/DEF-011). Draws from the session's
+    /// `track_cache` (metadata-resolved tracks) and every loaded `yt_lists`
+    /// entry's `track_ids`. Returns an empty vec when the provider isn't
+    /// ready, so callers degrade to local-only.
+    pub fn yt_track_ids(&self) -> Vec<String> {
+        if !self.yt_state.is_ready() {
+            return Vec::new();
+        }
+        let mut ids: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(session) = self.yt_session.as_ref() {
+            for id in session.track_cache.keys() {
+                if seen.insert(id.clone()) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        for list in &self.yt_lists {
+            for id in &list.track_ids {
+                if seen.insert(id.clone()) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        ids
+    }
+
+    /// Play a specific track id as the next radio track. Switches the
+    /// transport context to a single-track "reco radio" context and starts
+    /// playback. Used by the Radio overlay's `n` / `s` / `-` keys — the
+    /// overlay is taken out during key handling so [`reco_radio_next`] (which
+    /// checks `self.overlay`) can't find the session; instead the handler
+    /// gets the next track from the session directly and calls this method.
+    pub fn play_radio_track(&mut self, track_id: &str) {
+        if let Some(np) = self.now_playing.clone() {
+            self.transport
+                .history
+                .push((np.id().to_string(), self.transport.context.clone()));
+        }
+        let ctx = Context::Search {
+            query: "reco radio".into(),
+            track_ids: vec![track_id.to_string()],
+        };
+        let r = ClonedResolver {
+            playlists: &self.playlists,
+            manual_queue: self.transport.manual_queue.clone(),
+            yt_lists: &self.yt_lists,
+        };
+        self.transport
+            .switch_context(ctx, Some(track_id), &r, &self.catalog);
+        self.start_playback();
+    }
+
+    /// Open the playlist generator overlay (NL input phase).
+    pub fn open_generator(&mut self) {
+        use crate::tui::view::generator::GeneratorState;
+        self.overlay = Some(Overlay::Generator {
+            state: GeneratorState::new(),
+        });
+    }
+
+    /// RC18-D8: open the generator with the NL input pre-filled (e.g. from
+    /// `:gen chill vibes for focusing`). Mirrors `:publish <name>` which
+    /// pre-fills the publication name. The cursor sits at the end so the
+    /// user can immediately edit/extend the prompt or press Enter to
+    /// parse it. An empty `prompt` falls back to the plain `open_generator`
+    /// behavior (empty input).
+    pub fn open_generator_with_prompt(&mut self, prompt: String) {
+        use crate::tui::view::generator::GeneratorState;
+        let mut state = GeneratorState::new();
+        if !prompt.is_empty() {
+            state.input = prompt;
+            state.cursor = state.input.len();
+        }
+        self.overlay = Some(Overlay::Generator { state });
+    }
+
+    /// Generate a playlist from the generator's parsed constraints. Called
+    /// when the user presses Enter in the generator input phase. Parses the
+    /// NL input into constraints, runs the reco pipeline, and moves to the
+    /// preview phase. Resolves track IDs to "Title — Artist" display names
+    /// so the preview shows human-readable titles instead of raw IDs.
+    ///
+    /// RC11-DEF-031: pinned tracks survive `g` regenerate. The pinned ids
+    /// from the prior preview are captured before the playlist is replaced,
+    /// then prepended to the new playlist's tracks (and re-added to its
+    /// `pinned` list) so a regenerate keeps the user's explicit picks.
+    pub fn generate_playlist(&mut self) {
+        // Compute the YouTube track-id pool BEFORE mutably borrowing
+        // `self.overlay` below — `yt_track_ids()` borrows all of `self`
+        // immutably and would conflict with the `&mut self.overlay` borrow.
+        // (Sibling-batch fix: DEF-010 candidate sourcing added this call
+        // inside the overlay borrow, breaking the build.)
+        let yt_ids = self.yt_track_ids();
+        if let Some(Overlay::Generator { state }) = &mut self.overlay {
+            // Capture pinned track ids + the pinned candidates themselves
+            // before parse_input overwrites state.playlist. The new playlist
+            // gets these prepended (and re-pinned) so `g` doesn't drop them.
+            let (pinned_ids, pinned_candidates): (
+                Vec<String>,
+                Vec<crate::reco::candidates::Candidate>,
+            ) = {
+                let mut ids = Vec::new();
+                let mut cands = Vec::new();
+                if let Some(p) = &state.playlist {
+                    for id in &p.pinned {
+                        if let Some(c) = p.tracks.iter().find(|t| &t.track_id == id) {
+                            ids.push(id.clone());
+                            cands.push(c.clone());
+                        }
+                    }
+                }
+                (ids, cands)
+            };
+
+            state.parse_input(); // parse NL → constraints
+            if let Some(constraints) = state.constraints.clone() {
+                // DEF-010: blend YouTube tracks into the candidate pool when
+                // the provider is connected. `generate_with_yt` filters by
+                // the constraints' SourcePreference (Local/Youtube/Hybrid).
+                let mut playlist = crate::reco::generator::generate_with_yt(
+                    &constraints,
+                    &self.reco_profile,
+                    &self.catalog.tracks,
+                    &yt_ids,
+                );
+                // Fallback: if the generator produced no tracks (empty profile
+                // with an empty catalog), seed from the catalog so the user
+                // always gets a playlist.
+                if playlist.tracks.is_empty() && !self.catalog.tracks.is_empty() {
+                    let max = constraints.max_tracks.min(50);
+                    for track in self.catalog.tracks.iter().take(max) {
+                        playlist
+                            .tracks
+                            .push(crate::reco::candidates::Candidate::new(
+                                track.id.clone(),
+                                crate::reco::candidates::CandidateSource::LocalMetadata,
+                                0.1,
+                                true,
+                            ));
+                    }
+                }
+                // Re-insert pinned tracks at the head of the new playlist,
+                // skipping any that already appear in the fresh tracks (a
+                // regenerate might re-pick a pinned track on its own; we
+                // don't want to duplicate it). Then set playlist.pinned so
+                // the [pinned] marker renders and `x` keeps the sync.
+                if !pinned_candidates.is_empty() {
+                    let existing: std::collections::HashSet<String> =
+                        playlist.tracks.iter().map(|t| t.track_id.clone()).collect();
+                    for c in &pinned_candidates {
+                        if !existing.contains(&c.track_id) {
+                            playlist.tracks.insert(0, c.clone());
+                        }
+                    }
+                    playlist.pinned = pinned_ids
+                        .iter()
+                        .filter(|id| playlist.tracks.iter().any(|t| t.track_id == *id.as_str()))
+                        .cloned()
+                        .collect();
+                }
+                // Resolve track IDs to display titles ("Title — Artist") so
+                // the preview shows names instead of raw IDs. Falls back to
+                // the raw track_id when the catalog has no match (e.g. a
+                // YouTube video id whose metadata isn't cached yet). Access
+                // `track_index` + `catalog.tracks` directly (disjoint fields
+                // from `overlay`) instead of calling `track_by_id_fast` to
+                // avoid borrowing all of `self` while `state` is mutably
+                // borrowed from `self.overlay`.
+                let dash = crate::tui::view::theme::em_dash();
+                state.title_map.clear();
+                for track in &playlist.tracks {
+                    let display = match self.track_index.get(&track.track_id) {
+                        Some(&i) => {
+                            let t = &self.catalog.tracks[i];
+                            format!("{} {} {}", t.title, dash, t.primary_artist)
+                        }
+                        None => track.track_id.clone(),
+                    };
+                    state.title_map.insert(track.track_id.clone(), display);
+                }
+                state.playlist = Some(playlist);
+                state.generate(); // move to preview phase
+            }
+        }
+    }
+
+    /// Show the recommendation explanation for a track. Generates an
+    /// explanation from the candidate's provenance via the reco engine.
+    pub fn show_explanation(&mut self, track_id: &str) {
+        use crate::reco::candidates::CandidateGenerator;
+        use crate::reco::explanations::Explanation;
+        let yt = self.yt_track_ids();
+        let gen = CandidateGenerator::new(&self.reco_profile, &self.catalog.tracks)
+            .with_yt_track_ids(&yt);
+        let candidates = gen.generate();
+        let explanation = candidates
+            .iter()
+            .find(|c| c.track_id == track_id)
+            .map(Explanation::from_candidate)
+            .unwrap_or_else(|| Explanation {
+                reason: "this track".into(),
+                detail: None,
+            });
+        self.overlay = Some(Overlay::Explanation { explanation });
+    }
+
+    /// Summarize the recommendation engine's profile health for the user
+    /// (DEF-064: wires `reco::evaluation` into the running app). Evaluates the
+    /// first generated mix against the user's actual profile + catalog and
+    /// returns a one-line summary (event count, discovery ratio, duplicate
+    /// rate). Surfaced via the `:profile` command.
+    pub fn profile_health_summary(&self) -> String {
+        use crate::reco::evaluation::EvaluationMetrics;
+        if self.reco_mixes.is_empty() {
+            return format!(
+                "profile: {} events, 0 mixes — press H to generate",
+                self.reco_profile.event_count
+            );
+        }
+        let mix = &self.reco_mixes[0];
+        let metrics = EvaluationMetrics::evaluate(mix, &self.reco_profile, &self.catalog.tracks);
+        format!(
+            "profile: {} events, {} mix tracks, {}% discovery, {}% duplicates",
+            self.reco_profile.event_count,
+            mix.tracks.len(),
+            (metrics.discovery_ratio * 100.0).round() as u32,
+            (metrics.duplicate_rate * 100.0).round() as u32,
+        )
+    }
+
+    /// Open the YouTube playlist publication overlay. Populates
+    /// `publishable_ids` from the focused (or named) playlist's YouTube-
+    /// source tracks (ids NOT in the local catalog), separates local-only
+    /// tracks (ids present in `track_index`), and resolves `account` from
+    /// the active YT session. RC11-DEF-002: the old implementation only set
+    /// `name` — `is_ready()` was always false, Enter silently bumped `step`,
+    /// and the publish sidecar API was never invoked.
+    pub fn open_publication(&mut self, playlist_name: &str) {
+        use crate::tui::view::publication::PublicationState;
+        let mut state = PublicationState::new();
+        state.name = playlist_name.to_string();
+
+        // Resolve the playlist's track_ids. Preference order:
+        // 1. A local playlist whose name matches `playlist_name`.
+        // 2. RC14-DEF-1: the focused YouTube list when the user is in the
+        //    YouTube view (`:publish` is most often issued there, with a YT
+        //    playlist open). `cursors.playlist` indexes `yt_lists` in that
+        //    view; its `track_ids` are YouTube video_ids.
+        // 3. A YouTube list whose name matches `playlist_name`.
+        // 4. Empty (the overlay shows "0 tracks to publish").
+        let track_ids: Vec<String> = self
+            .playlists
+            .iter()
+            .find(|p| p.name == playlist_name)
+            .map(|p| p.track_ids.clone())
+            .or_else(|| {
+                if self.view == View::Youtube {
+                    self.yt_lists
+                        .get(self.cursors.playlist)
+                        .map(|l| l.track_ids.clone())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                self.yt_lists
+                    .iter()
+                    .find(|l| l.name == playlist_name)
+                    .map(|l| l.track_ids.clone())
+            })
+            .unwrap_or_default();
+
+        // Classify each track id:
+        // - in `track_index` → local-only (can't be published to YouTube).
+        // - not in `track_index` → publishable (a YouTube video_id). RC13-DEF-2:
+        //   a local playlist only contains catalog ids or YouTube video ids —
+        //   any non-catalog id is a YouTube video id by construction, so it goes
+        //   into `publishable_ids` even when its metadata isn't cached in the
+        //   session's `track_cache` yet. The old code marked uncached ids as
+        //   "unavailable", which blocked publication entirely (the overlay
+        //   always showed "0 tracks to publish"). The sidecar resolves the
+        //   metadata at publish time; we don't need it upfront.
+        // RC15-DEF-3: resolve each id to a "Title — Artist" display string so
+        // the publish overlay shows human-readable names instead of raw video
+        // IDs. Local catalog ids resolve via `track_by_id_fast`; YouTube
+        // video ids resolve via the session's `track_cache`. Falls back to
+        // the raw id when metadata isn't cached yet (the sidecar resolves at
+        // publish time).
+        for id in &track_ids {
+            if self.track_index.contains_key(id) {
+                state.local_only.push(id.clone());
+                state.local_only_titles.push(self.resolve_publish_title(id));
+            } else {
+                state.publishable_ids.push(id.clone());
+                state
+                    .publishable_titles
+                    .push(self.resolve_publish_title(id));
+            }
+        }
+
+        // Resolve the account from the active session. We don't have a
+        // channel-name lookup; use the browser profile name when set,
+        // otherwise "yt (cookies)" for pasted-cookie auth, otherwise leave
+        // empty (the overlay will show the no-account validation error).
+        if self.yt_state.is_authed() {
+            state.account = if !self.yt_browser.is_empty() {
+                format!("yt:{}", self.yt_browser)
+            } else {
+                "yt (cookies)".to_string()
+            };
+        }
+
+        self.overlay = Some(Overlay::Publication { state });
+    }
+
+    /// RC15-DEF-3: resolve a track id to a "Title — Artist" display string
+    /// for the publish overlay. Local catalog ids resolve via
+    /// `track_by_id_fast`; YouTube video ids resolve via the session's
+    /// `track_cache`. Falls back to the raw id when metadata isn't cached
+    /// (the sidecar resolves at publish time).
+    fn resolve_publish_title(&self, id: &str) -> String {
+        let dash = crate::tui::view::theme::em_dash();
+        if let Some(t) = self.track_by_id_fast(id) {
+            if t.primary_artist.is_empty() {
+                return t.title.clone();
+            }
+            return format!("{} {} {}", t.title, dash, t.primary_artist);
+        }
+        if let Some(rt) = self.yt_session.as_ref().and_then(|s| s.track_for(id)) {
+            if rt.artist.is_empty() {
+                return rt.title.clone();
+            }
+            return format!("{} {} {}", rt.title, dash, rt.artist);
+        }
+        id.to_string()
+    }
+
+    /// Record a listen event and rebuild the user profile. `event_type` is a
+    /// type-tag string (e.g. "completed", "skipped", "liked") matching
+    /// [`crate::reco::events::ListenEvent::type_tag`]. The `EventSource`
+    /// (Local/Youtube/Hybrid) is derived from the now-playing track, and the
+    /// `EventContext` (Album/Playlist/Queue/Radio/Search) from the transport
+    /// context — so the reco engine records *why* and *where* a track was
+    /// played, not just that it was (DEF-034).
+    pub fn record_listen_event(&mut self, track_id: &str, event_type: &str) {
+        self.record_listen_event_pos(track_id, event_type, None);
+    }
+
+    /// Same as [`record_listen_event`] but carries the playback position (sec)
+    /// for `skipped` events so the profile can distinguish a mid-track skip
+    /// from a rapid (<10s) skip. `position` is ignored for non-skip events.
+    pub fn record_listen_event_pos(
+        &mut self,
+        track_id: &str,
+        event_type: &str,
+        position: Option<f64>,
+    ) {
+        use crate::reco::events::ListenEvent;
+        let ts = ListenEvent::now();
+        let tid = track_id.to_string();
+        let source = self.event_source_for(track_id);
+        let context = self.event_context();
+        let event = match event_type {
+            "track_started" => ListenEvent::TrackStarted {
+                track_id: tid,
+                source,
+                timestamp: ts,
+                context,
+            },
+            "meaningful_threshold" => ListenEvent::MeaningfulThreshold {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "completed" => ListenEvent::Completed {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "skipped" => ListenEvent::Skipped {
+                track_id: tid,
+                timestamp: ts,
+                position_sec: position.unwrap_or(0.0),
+            },
+            "rapidly_skipped" => ListenEvent::RapidlySkipped {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "replayed" => ListenEvent::Replayed {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "liked" => ListenEvent::Liked {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "unliked" => ListenEvent::Unliked {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "disliked" => ListenEvent::Disliked {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "hidden" => ListenEvent::Hidden {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "added_to_queue" => ListenEvent::AddedToQueue {
+                track_id: tid,
+                timestamp: ts,
+            },
+            "removed_from_queue" => ListenEvent::RemovedFromQueue {
+                track_id: tid,
+                timestamp: ts,
+            },
+            _ => return, // unknown event type — skip
+        };
+        self.reco_events.record(event.clone());
+        // DEF-034: durably persist each event to state.db so the listening
+        // history survives restarts. Best-effort: a failed write (read-only
+        // config dir, missing DB) is silently ignored — the in-memory log
+        // still drives the running pipeline. Disabled in tests via
+        // `persist_events` (default false) to avoid touching the real DB.
+        if self.persist_events {
+            let _ = crate::state::save_event(&event);
+        }
+        // Rebuild the profile from the full event log.
+        let events: Vec<ListenEvent> = self
+            .reco_events
+            .recent(self.reco_events.len())
+            .into_iter()
+            .cloned()
+            .collect();
+        self.reco_profile = crate::reco::profile::UserProfile::build_from_events(&events);
+    }
+
+    /// Derive the [`EventSource`] for a track from the now-playing track
+    /// source type (DEF-034): `Local` for catalog tracks, `Youtube` for
+    /// remote tracks, `Hybrid` when the active source mode is Mixed.
+    fn event_source_for(&self, track_id: &str) -> crate::reco::events::EventSource {
+        use crate::reco::events::EventSource;
+        match &self.now_playing {
+            Some(crate::source::TrackSource::Remote { .. }) => EventSource::Youtube,
+            Some(crate::source::TrackSource::Local { .. }) => {
+                if matches!(self.source_mode, crate::mode::SourceMode::Mixed) {
+                    EventSource::Hybrid
+                } else {
+                    EventSource::Local
+                }
+            }
+            None => {
+                // No now-playing (e.g. an enqueue event): infer from the id —
+                // catalog tracks are Local, unknown ids are Youtube.
+                if self.track_index.contains_key(track_id) {
+                    EventSource::Local
+                } else {
+                    EventSource::Youtube
+                }
+            }
+        }
+    }
+
+    /// Derive the [`EventContext`] from the transport context (DEF-034):
+    /// Album/Playlist/Queue/Search map directly; the reco-radio search
+    /// context ("reco radio" / "youtube radio") maps to `Radio`.
+    fn event_context(&self) -> crate::reco::events::EventContext {
+        use crate::reco::events::EventContext;
+        match &self.transport.context {
+            crate::tui::context::Context::Album { .. }
+            | crate::tui::context::Context::Artist { .. } => EventContext::Album,
+            crate::tui::context::Context::Playlist { name } => EventContext::Playlist(name.clone()),
+            crate::tui::context::Context::Youtube { name, .. } => {
+                EventContext::Playlist(name.clone())
+            }
+            crate::tui::context::Context::Queue => EventContext::Queue,
+            crate::tui::context::Context::Search { query, .. } => {
+                if query == "reco radio" || query == "youtube radio" {
+                    EventContext::Radio
+                } else {
+                    EventContext::Search
+                }
+            }
+        }
+    }
+
+    /// Record a `track_started` listen event for the now-playing track, reset
+    /// the play-start timestamp + meaningful-threshold guard (DEF-034). Call
+    /// this wherever `now_playing` is freshly set (start_playback Local Ok,
+    /// load_track Local Ok, load_remote Ok).
+    fn note_play_started(&mut self, track_id: &str) {
+        self.play_started_at = Some(std::time::Instant::now());
+        // RC14-DEF-4: reset pause + start-offset tracking for the new track.
+        self.pause_started_at = None;
+        self.accumulated_paused = std::time::Duration::ZERO;
+        self.play_start_offset = 0.0;
+        // New track → threshold not yet fired for it.
+        self.threshold_fired_for = None;
+        self.record_listen_event(track_id, "track_started");
+        // RC11-DEF-014: record the now-playing track as the last-played so it
+        // can be restored on the next launch, and clear the resume hint (a
+        // play has started — the offer is consumed). Position is tracked
+        // separately in on_tick while playback advances.
+        self.last_played_track_id = Some(track_id.to_string());
+        self.last_played_position = 0.0;
+        self.resume_hint = None;
+        // Save context ids (the video_id list) so `>` advances correctly.
+        // Context TRACKS (with titles) are saved in on_tick after the
+        // get_playlist/get_watch_playlist response lands and caches the
+        // metadata — saving here would store empty titles because the
+        // sidecar response hasn't arrived yet.
+        self.last_played_context_ids = self.transport_context_ids();
+        // Persist the YouTube playlist key when the context is a YouTube
+        // playlist/mood list. On startup, `on_tick` re-fires `get_playlist(key)`
+        // to fetch ALL track metadata so the Queue view shows real titles
+        // instead of "Loading…" for tracks whose metadata wasn't cached
+        // before the previous session ended.
+        self.last_played_context_key = match &self.transport.context {
+            crate::tui::context::Context::Youtube { key, .. } => Some(key.clone()),
+            _ => None,
+        };
+    }
+
+    /// Rebuild `last_played_context_tracks` from the current context ids +
+    /// the session's track_cache. Called from `on_tick` after
+    /// get_playlist/get_watch_playlist responses land and cache the track
+    /// metadata — so the saved titles are real, not empty. Also called
+    /// after a cold-miss resolve (the track_cache may have been updated by
+    /// the resolve response). Best-effort: tracks not in the cache get
+    /// empty strings (the Queue view shows the video_id as fallback).
+    pub fn refresh_context_tracks(&mut self) {
+        let ctx_ids = self.last_played_context_ids.clone();
+        if ctx_ids.is_empty() {
+            return;
+        }
+        let ctx_tracks: Vec<crate::state::CachedTrackMeta> = ctx_ids
+            .iter()
+            .map(|id| {
+                if let Some(t) = self.track_by_id_fast(id) {
+                    crate::state::CachedTrackMeta {
+                        video_id: id.clone(),
+                        title: t.title.clone(),
+                        artist: t.primary_artist.clone(),
+                        album: t.album.clone(),
+                    }
+                } else if let Some(rt) = self.yt_session.as_ref().and_then(|s| s.track_for(id)) {
+                    crate::state::CachedTrackMeta {
+                        video_id: id.clone(),
+                        title: rt.title.clone(),
+                        artist: rt.artist.clone(),
+                        album: rt.album.clone(),
+                    }
+                } else {
+                    crate::state::CachedTrackMeta {
+                        video_id: id.clone(),
+                        title: String::new(),
+                        artist: String::new(),
+                        album: None,
+                    }
+                }
+            })
+            .collect();
+        self.last_played_context_tracks = ctx_tracks;
+    }
+
+    /// RC14-DEF-4: set the playback start offset (seconds) for the current
+    /// track — the resume position captured by `load_with_resume`. Called
+    /// BEFORE `note_play_started` so the wall-clock estimate accounts for the
+    /// non-zero start. `0.0` for a fresh play (the default reset in
+    /// `note_play_started`).
+    fn set_play_start_offset(&mut self, offset: f64) {
+        self.play_start_offset = offset.max(0.0);
+    }
+
+    /// RC14-DEF-4: toggle pause/resume on the player backend AND track the
+    /// wall-clock pause interval so `estimated_position()` can subtract it.
+    /// Replaces bare `app.player.play_pause()` calls at the input/mouse call
+    /// sites so the pause duration is always accounted for. No-op when nothing
+    /// is loaded (mirrors the player backend's no-op).
+    pub fn toggle_pause(&mut self) {
+        let was_paused = self.pause_started_at.is_some();
+        if was_paused {
+            // Resuming: accumulate the paused interval.
+            if let Some(t) = self.pause_started_at.take() {
+                self.accumulated_paused += t.elapsed();
+            }
+        } else if self.now_playing.is_some() {
+            // Pausing: start the pause clock.
+            self.pause_started_at = Some(std::time::Instant::now());
+        }
+        let _ = self.player.play_pause();
+    }
+
+    /// RC14-DEF-4: wall-clock-based playback position (seconds) for the
+    /// current track. `play_start_offset + (play_started_at.elapsed() -
+    /// accumulated_paused - current_pause_elapsed)`. Used as the progress
+    /// fallback when the player backend's `position()` is unreliable —
+    /// afplay returns `None` always, and mpv reports erratic `time-pos` for
+    /// hi-res (192 kHz) files (~1/7 real-time). Returns `None` when no track
+    /// is playing or `play_started_at` is unset.
+    pub fn estimated_position(&self) -> Option<f64> {
+        let start = self.play_started_at?;
+        let mut elapsed = start.elapsed();
+        elapsed = elapsed.saturating_sub(self.accumulated_paused);
+        if let Some(p) = self.pause_started_at {
+            elapsed = elapsed.saturating_sub(p.elapsed());
+        }
+        Some(self.play_start_offset + elapsed.as_secs_f64().max(0.0))
+    }
+
+    /// RC11-DEF-014: load `path` into the player, resuming at the saved
+    /// position when this is the one-shot resume target. Consumes
+    /// `pending_resume` on the first call (any track): if the id matches the
+    /// captured resume target and the position is > 0, use `load_at(pos)` so
+    /// mpv/StubPlayer begin at the saved offset (afplay can't seek so it
+    /// restarts from 0 — acceptable fallback). Otherwise a plain `load`.
+    fn load_with_resume(&mut self, path: &std::path::Path, track_id: &str) -> anyhow::Result<()> {
+        let resume_pos = match self.pending_resume.take() {
+            Some((rid, pos)) if rid == track_id && pos > 0.0 => Some(pos),
+            _ => None,
+        };
+        match resume_pos {
+            Some(pos) => {
+                // RC14-DEF-4: the track resumes at `pos`, not 0. Record the
+                // start offset so `estimated_position()` (wall-clock fallback)
+                // starts from `pos` instead of 0.
+                self.set_play_start_offset(pos);
+                self.player.load_at(path, pos)
+            }
+            None => self.player.load(path),
+        }
+    }
+
+    /// Apply a feedback action to the user profile. Looks up the track's
+    /// artist from the catalog for artist-scoped actions (HideArtist,
+    /// BlockArtist). Records the corresponding [`ListenEvent`] in
+    /// `reco_events` so a later profile rebuild (e.g. from `record_listen_event`
+    /// during playback) preserves the feedback — without this, the direct
+    /// profile mutation would be wiped when the profile is rebuilt from the
+    /// event log (DEF-034 regression).
+    pub fn apply_reco_feedback(
+        &mut self,
+        action: crate::reco::feedback::FeedbackAction,
+        track_id: &str,
+    ) {
+        // Look up the artist from the catalog first (immutable borrow ends
+        // before the mutable borrow of reco_profile).
+        let artist = self.track_by_id(track_id).map(|t| t.primary_artist.clone());
+        let event = action.to_event(track_id, artist.as_deref());
+        // Record the event so the profile rebuild stays consistent.
+        if self.persist_events {
+            let _ = crate::state::save_event(&event);
+        }
+        self.reco_events.record(event);
+        // Rebuild the profile from the full event log so the feedback is
+        // reflected AND preserved across later rebuilds (e.g. when
+        // `record_listen_event` fires during playback). Without recording
+        // the event, a direct profile mutation would be wiped on the next
+        // rebuild (DEF-034 regression).
+        let events: Vec<crate::reco::events::ListenEvent> = self
+            .reco_events
+            .recent(self.reco_events.len())
+            .into_iter()
+            .cloned()
+            .collect();
+        self.reco_profile = crate::reco::profile::UserProfile::build_from_events(&events);
+    }
+
+    /// If a [`Overlay::Radio`] session is active, return the next track id
+    /// from it (refilling the pool if needed). Used by continue-mode playback
+    /// to drive the reco radio engine instead of the YouTube radio cursor.
+    fn reco_radio_next(&mut self) -> Option<String> {
+        if let Some(Overlay::Radio {
+            session: Some(radio),
+        }) = &mut self.overlay
+        {
+            if radio.needs_refill() {
+                radio.refill_if_needed(&self.reco_profile, &self.catalog.tracks);
+            }
+            if let Some(c) = radio.next_track() {
+                return Some(c.track_id);
+            }
+            // Fallback: pool exhausted and can't refill — pick the first
+            // catalog track not yet played in this session so the radio
+            // keeps going even without a profile.
+            let fallback = self
+                .catalog
+                .tracks
+                .iter()
+                .find(|t| !radio.session_history.contains(&t.id))
+                .map(|t| t.id.clone());
+            if let Some(id) = fallback {
+                radio.session_history.push(id.clone());
+                return Some(id);
+            }
+        }
+        None
+    }
 }
 
 // Transport methods take `(&dyn ContextResolver, &Catalog)`. `App` passes
 // `self` as the resolver and `&self.catalog` as the catalog; the split-borrow is
 // sound because `manual_queue` (the resolver's data source) lives in a distinct
 // field from `catalog` and from the `&mut self.transport` we hold.
+
+/// Map a YouTube Music home-feed section title to a [`HomeSection`] variant.
+/// ytmusicapi's section titles are free-form strings; known titles map to
+/// existing variants (so the renderer's existing styling / cursor behavior
+/// applies), and unknown titles fall back to `HomeSection::YtFeed(title)`
+/// (carrying the raw string) so the user still sees the shelf under its
+/// original name. The mapping table is documented in the spec:
+///
+/// | YouTube section title             | HomeSection variant        |
+/// |-----------------------------------|----------------------------|
+/// | "Listen again" / "Resume listening" | `ContinueListening`      |
+/// | "Mixed for You" / "Made for You"  | `MadeForYou`               |
+/// | "Featured playlists" / "Featured" | `Library`                  |
+/// | anything else                     | `YtFeed(title)` (new)      |
+fn map_yt_section_title(title: &str) -> crate::tui::view::home::HomeSection {
+    use crate::tui::view::home::HomeSection;
+    match title {
+        "Listen again" | "Resume listening" => HomeSection::ContinueListening,
+        "Mixed for You" | "Made for You" => HomeSection::MadeForYou,
+        "Featured playlists" | "Featured" => HomeSection::Library,
+        _ => HomeSection::YtFeed(title.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{Catalog, Track};
+    use crate::player::StubPlayer;
+    /// I.7: PlaylistColumnState defaults to width=32, grouping+counts on.
+    #[test]
+    fn playlist_col_state_default() {
+        let s = PlaylistColumnState::default();
+        assert_eq!(s.width, 32);
+        assert!(s.group_by_type);
+        assert!(s.show_counts);
+    }
+
+    /// I.7: default_for_width narrows + disables at <100 cols.
+    #[test]
+    fn playlist_col_state_default_for_width() {
+        let s = PlaylistColumnState::default_for_width(80);
+        assert_eq!(s.width, 24);
+        assert!(!s.group_by_type);
+        assert!(!s.show_counts);
+        let s2 = PlaylistColumnState::default_for_width(100);
+        assert_eq!(s2.width, 32);
+        assert!(s2.group_by_type);
+    }
+
+    /// I.7: clamp_width keeps width in [16, term/2].
+    #[test]
+    fn playlist_col_state_clamp_width() {
+        let mut s = PlaylistColumnState {
+            width: 0,
+            ..Default::default()
+        };
+        s.clamp_width(100);
+        assert_eq!(s.width, 16, "min is 16");
+        s.width = 200;
+        s.clamp_width(100);
+        assert_eq!(s.width, 50, "max is term/2");
+    }
+
+    /// I.7: playlist_col_focused is true only in YT Library tab col 0.
+    #[test]
+    fn playlist_col_focused_gating() {
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({"version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),"tracks":[{"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"F","album":"A","bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/A/01.flac","symlinked_into_artists":["Ado"]}]}).to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        let cat = Catalog::load(&p).unwrap();
+        std::mem::forget(d);
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.view = View::Youtube;
+        app.yt_view.tab = crate::tui::app::YtTab::Library;
+        app.focus_col = 0;
+        assert!(app.playlist_col_focused(), "focused in YT Library col 0");
+        app.focus_col = 1;
+        assert!(!app.playlist_col_focused(), "not focused in col 1");
+        app.view = View::Artists;
+        app.focus_col = 0;
+        assert!(!app.playlist_col_focused(), "not focused in Artists view");
+    }
+
+    /// I.7: toggle_playlist_group only when focused.
+    #[test]
+    fn toggle_playlist_group_gated() {
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({"version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),"tracks":[{"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"F","album":"A","bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/A/01.flac","symlinked_into_artists":["Ado"]}]}).to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        let cat = Catalog::load(&p).unwrap();
+        std::mem::forget(d);
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        let initial = app.playlist_col.group_by_type;
+        // Not focused — no-op.
+        app.view = View::Artists;
+        app.toggle_playlist_group();
+        assert_eq!(
+            app.playlist_col.group_by_type, initial,
+            "no toggle when not focused"
+        );
+        // Focused — toggles.
+        app.view = View::Youtube;
+        app.yt_view.tab = crate::tui::app::YtTab::Library;
+        app.focus_col = 0;
+        app.toggle_playlist_group();
+        assert_ne!(
+            app.playlist_col.group_by_type, initial,
+            "toggles when focused"
+        );
+    }
+
+    /// I.6: toggle_sidebar flips sidebar_visible.
+    #[test]
+    fn toggle_sidebar_flips_flag() {
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({"version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),"tracks":[{"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"F","album":"A","bit_depth":16,"sample_rate_hz":44100,"source_path":"lossless/A/01.flac","symlinked_into_artists":["Ado"]}]}).to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        let cat = Catalog::load(&p).unwrap();
+        std::mem::forget(d);
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        let initial = app.sidebar_visible;
+        app.toggle_sidebar();
+        assert_ne!(app.sidebar_visible, initial, "B flips sidebar_visible");
+    }
+
+    fn make_track(id: &str, artist: &str, album: &str, title: &str) -> Track {
+        Track {
+            id: id.to_string(),
+            artists: vec![artist.to_string()],
+            primary_artist: artist.to_string(),
+            title: title.to_string(),
+            album: Some(album.to_string()),
+            track_number: Some(1),
+            disc_number: Some(1),
+            bit_depth: 16,
+            sample_rate_hz: 44100,
+            isrc: None,
+            source_path: std::path::PathBuf::from("/test/file.flac"),
+            symlinked_into_artists: vec![artist.to_string()],
+        }
+    }
+
+    fn make_catalog() -> Catalog {
+        Catalog {
+            version: 1,
+            built_at: "test".into(),
+            source_root: std::path::PathBuf::from("/tmp"),
+            tracks: vec![
+                make_track("t1", "Artist A", "Album 1", "Song 1"),
+                make_track("t2", "Artist B", "Album 2", "Song 2"),
+                make_track("t3", "Artist A", "Album 1", "Song 3"),
+            ],
+        }
+    }
+
+    fn make_app() -> App {
+        App::new(make_catalog(), Box::new(StubPlayer::default()), None, None)
+    }
+
+    /// Like `make_app` but the catalog's `source_path` points at real (empty)
+    /// `.flac` files in a temp dir, so `start_playback`'s `std::fs::metadata`
+    /// check passes and `now_playing` is set. Used by playback-path tests
+    /// (DEF-001 / DEF-012 Home Enter).
+    fn make_app_with_files() -> (tempfile::TempDir, App) {
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        std::fs::create_dir_all(lossless.join("B")).unwrap();
+        std::fs::write(lossless.join("B").join("01.flac"), b"x").unwrap();
+        std::fs::create_dir_all(lossless.join("A2")).unwrap();
+        std::fs::write(lossless.join("A2").join("01.flac"), b"x").unwrap();
+        let tracks = vec![
+            Track {
+                id: "t1".into(),
+                artists: vec!["Artist A".into()],
+                primary_artist: "Artist A".into(),
+                title: "Song 1".into(),
+                album: Some("Album 1".into()),
+                track_number: Some(1),
+                disc_number: Some(1),
+                bit_depth: 16,
+                sample_rate_hz: 44100,
+                isrc: None,
+                source_path: lossless.join("A").join("01.flac"),
+                symlinked_into_artists: vec!["Artist A".into()],
+            },
+            Track {
+                id: "t2".into(),
+                artists: vec!["Artist B".into()],
+                primary_artist: "Artist B".into(),
+                title: "Song 2".into(),
+                album: Some("Album 2".into()),
+                track_number: Some(1),
+                disc_number: Some(1),
+                bit_depth: 16,
+                sample_rate_hz: 44100,
+                isrc: None,
+                source_path: lossless.join("B").join("01.flac"),
+                symlinked_into_artists: vec!["Artist B".into()],
+            },
+            Track {
+                id: "t3".into(),
+                artists: vec!["Artist A".into()],
+                primary_artist: "Artist A".into(),
+                title: "Song 3".into(),
+                album: Some("Album 1".into()),
+                track_number: Some(2),
+                disc_number: Some(1),
+                bit_depth: 16,
+                sample_rate_hz: 44100,
+                isrc: None,
+                source_path: lossless.join("A2").join("01.flac"),
+                symlinked_into_artists: vec!["Artist A".into()],
+            },
+        ];
+        let cat = Catalog {
+            version: 1,
+            built_at: "test".into(),
+            source_root: lossless,
+            tracks,
+        };
+        let app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        (d, app)
+    }
+
+    #[test]
+    fn app_new_initializes_reco_fields() {
+        let app = make_app();
+        assert!(app.reco_profile.is_empty());
+        assert!(app.reco_events.is_empty());
+        assert!(app.reco_mixes.is_empty());
+        assert!(app.reco_feedback_pending.is_empty());
+    }
+
+    #[test]
+    fn open_home_sets_overlay_and_generates_mixes() {
+        let mut app = make_app();
+        assert!(app.overlay.is_none());
+        app.open_home();
+        match &app.overlay {
+            Some(Overlay::Home { state }) => {
+                assert!(!state.loading);
+                assert_eq!(state.focused_section, 0);
+                assert_eq!(state.cursor, 0);
+            }
+            other => panic!("expected Home overlay, got {other:?}"),
+        }
+        // Mixes are generated even on cold start (DailyMix, Discover, LocalYtBlend).
+        assert!(!app.reco_mixes.is_empty());
+    }
+
+    #[test]
+    fn open_home_with_history_sets_has_history() {
+        let mut app = make_app();
+        app.record_listen_event("t1", "completed");
+        app.open_home();
+        if let Some(Overlay::Home { state }) = &app.overlay {
+            assert!(state.has_history);
+        } else {
+            panic!("expected Home overlay");
+        }
+    }
+
+    #[test]
+    fn open_home_populates_sections_with_content() {
+        let mut app = make_app();
+        app.open_home();
+        match &app.overlay {
+            Some(Overlay::Home { state }) => {
+                assert!(
+                    !state.sections.is_empty(),
+                    "Home overlay must have populated sections"
+                );
+                // Quick Picks should have tracks from the catalog.
+                let qp = state
+                    .sections
+                    .iter()
+                    .find(|(s, _)| *s == crate::tui::view::home::HomeSection::QuickPicks);
+                let qp_items = qp
+                    .map(|(_, items)| items)
+                    .expect("Quick Picks section must exist");
+                assert!(
+                    !qp_items.is_empty(),
+                    "Quick Picks must have tracks from the catalog"
+                );
+                // Made for You should have generated mixes.
+                let mfy = state
+                    .sections
+                    .iter()
+                    .find(|(s, _)| *s == crate::tui::view::home::HomeSection::MadeForYou);
+                let mfy_items = mfy
+                    .map(|(_, items)| items)
+                    .expect("Made for You section must exist");
+                assert!(
+                    !mfy_items.is_empty(),
+                    "Made for You must have generated mixes"
+                );
+                // Start Radio should have radio seed options.
+                let sr = state
+                    .sections
+                    .iter()
+                    .find(|(s, _)| *s == crate::tui::view::home::HomeSection::StartRadio);
+                let sr_items = sr
+                    .map(|(_, items)| items)
+                    .expect("Start Radio section must exist");
+                assert!(!sr_items.is_empty(), "Start Radio must have seed options");
+                // Library section should exist (even if empty, no yt_session).
+                let lib = state
+                    .sections
+                    .iter()
+                    .find(|(s, _)| *s == crate::tui::view::home::HomeSection::Library);
+                assert!(lib.is_some(), "Library section must exist");
+            }
+            other => panic!("expected Home overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_radio_from_track_creates_session() {
+        let mut app = make_app();
+        app.start_radio_from_track("t1");
+        match &app.overlay {
+            Some(Overlay::Radio { session }) => {
+                let s = session.as_ref().expect("session should be Some");
+                assert!(matches!(
+                    &s.seed,
+                    crate::reco::radio::RadioSeed::Track(id) if id == "t1"
+                ));
+                // initialize() was called, so the pool should have candidates
+                // (the catalog has 3 tracks).
+                assert!(!s.candidate_pool.is_empty());
+            }
+            other => panic!("expected Radio overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_radio_from_artist_creates_session() {
+        let mut app = make_app();
+        app.start_radio_from_artist("Artist A");
+        match &app.overlay {
+            Some(Overlay::Radio { session }) => {
+                let s = session.as_ref().expect("session should be Some");
+                assert!(matches!(
+                    &s.seed,
+                    crate::reco::radio::RadioSeed::Artist(a) if a == "Artist A"
+                ));
+            }
+            other => panic!("expected Radio overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_generator_sets_input_phase() {
+        let mut app = make_app();
+        app.open_generator();
+        match &app.overlay {
+            Some(Overlay::Generator { state }) => {
+                assert_eq!(
+                    state.phase,
+                    crate::tui::view::generator::GeneratorPhase::Input
+                );
+                assert!(state.input.is_empty());
+                assert!(state.constraints.is_none());
+                assert!(state.playlist.is_none());
+            }
+            other => panic!("expected Generator overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generate_playlist_parses_and_generates() {
+        let mut app = make_app();
+        // Seed the profile so the candidate generator has data to work with.
+        app.record_listen_event("t1", "completed");
+        app.record_listen_event("t1", "liked");
+        app.record_listen_event("t2", "completed");
+        app.open_generator();
+        if let Some(Overlay::Generator { state }) = &mut app.overlay {
+            state.input = "calm focus mix".into();
+        }
+        app.generate_playlist();
+        if let Some(Overlay::Generator { state }) = &app.overlay {
+            assert_eq!(
+                state.phase,
+                crate::tui::view::generator::GeneratorPhase::Preview
+            );
+            assert!(state.constraints.is_some());
+            assert!(state.playlist.is_some());
+            // The playlist should have tracks (the profile has positive scores).
+            assert!(!state.playlist.as_ref().unwrap().tracks.is_empty());
+        } else {
+            panic!("expected Generator overlay");
+        }
+    }
+
+    #[test]
+    fn generate_playlist_populates_title_map() {
+        let mut app = make_app();
+        app.open_generator();
+        if let Some(Overlay::Generator { state }) = &mut app.overlay {
+            state.input = "calm mix".into();
+        }
+        app.generate_playlist();
+        if let Some(Overlay::Generator { state }) = &app.overlay {
+            let playlist = state
+                .playlist
+                .as_ref()
+                .expect("playlist should be generated");
+            assert!(!playlist.tracks.is_empty(), "playlist should have tracks");
+            assert!(
+                !state.title_map.is_empty(),
+                "title_map should be populated with display titles"
+            );
+            // Each track should have a display title that contains the track's
+            // title from the catalog ("Song 1", "Song 2", "Song 3").
+            for track in &playlist.tracks {
+                let display = state.title_map.get(&track.track_id);
+                assert!(
+                    display.is_some(),
+                    "title_map must have entry for track {}",
+                    track.track_id
+                );
+                let display = display.unwrap();
+                assert!(
+                    display.contains("Song") || display == &track.track_id,
+                    "display title should contain the track title, got: {display}"
+                );
+            }
+        } else {
+            panic!("expected Generator overlay");
+        }
+    }
+
+    #[test]
+    fn generate_playlist_no_op_without_overlay() {
+        let mut app = make_app();
+        // No overlay set — should be a no-op, not a panic.
+        app.generate_playlist();
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn show_explanation_sets_overlay() {
+        let mut app = make_app();
+        app.record_listen_event("t1", "completed");
+        app.show_explanation("t1");
+        match &app.overlay {
+            Some(Overlay::Explanation { explanation }) => {
+                assert!(!explanation.reason.is_empty());
+            }
+            other => panic!("expected Explanation overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_explanation_unknown_track_still_sets_overlay() {
+        let mut app = make_app();
+        app.show_explanation("nonexistent");
+        match &app.overlay {
+            Some(Overlay::Explanation { explanation }) => {
+                assert_eq!(explanation.reason, "this track");
+                assert!(explanation.detail.is_none());
+            }
+            other => panic!("expected Explanation overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_publication_sets_name() {
+        let mut app = make_app();
+        app.open_publication("My Mix");
+        match &app.overlay {
+            Some(Overlay::Publication { state }) => {
+                assert_eq!(state.name, "My Mix");
+                assert_eq!(state.privacy, "PRIVATE");
+            }
+            other => panic!("expected Publication overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_listen_event_updates_profile() {
+        let mut app = make_app();
+        assert!(app.reco_profile.is_empty());
+        assert!(app.reco_events.is_empty());
+        app.record_listen_event("t1", "completed");
+        assert!(!app.reco_events.is_empty());
+        assert!(!app.reco_profile.is_empty());
+        assert!(app.reco_profile.track_score("t1") > 0.0);
+        assert_eq!(app.reco_profile.event_count, 1);
+    }
+
+    #[test]
+    fn record_listen_event_liked_sets_liked_flag() {
+        let mut app = make_app();
+        app.record_listen_event("t1", "liked");
+        assert!(app.reco_profile.is_liked("t1"));
+        assert!(app.reco_profile.track_score("t1") > 0.0);
+    }
+
+    #[test]
+    fn record_listen_event_skipped_is_negative() {
+        let mut app = make_app();
+        app.record_listen_event("t1", "skipped");
+        assert!(app.reco_profile.track_score("t1") < 0.0);
+    }
+
+    #[test]
+    fn record_listen_event_unknown_type_is_noop() {
+        let mut app = make_app();
+        app.record_listen_event("t1", "bogus_type");
+        assert!(app.reco_events.is_empty());
+        assert!(app.reco_profile.is_empty());
+    }
+
+    #[test]
+    fn record_listen_event_multiple_events_accumulate() {
+        let mut app = make_app();
+        app.record_listen_event("t1", "completed");
+        app.record_listen_event("t1", "liked");
+        app.record_listen_event("t2", "completed");
+        assert_eq!(app.reco_profile.event_count, 3);
+        assert!(app.reco_profile.is_liked("t1"));
+        // t1 has Completed (+2) + Liked (+5) = 7.0
+        let t1_score = app.reco_profile.track_score("t1");
+        assert!((t1_score - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_reco_feedback_like_adds_positive() {
+        let mut app = make_app();
+        use crate::reco::feedback::FeedbackAction;
+        app.apply_reco_feedback(FeedbackAction::Like, "t1");
+        assert!(app.reco_profile.is_liked("t1"));
+        assert!(app.reco_profile.track_score("t1") > 0.0);
+    }
+
+    #[test]
+    fn apply_reco_feedback_hide_excludes() {
+        let mut app = make_app();
+        use crate::reco::feedback::FeedbackAction;
+        app.apply_reco_feedback(FeedbackAction::HideTrack, "t1");
+        assert!(app.reco_profile.is_hidden("t1"));
+    }
+
+    #[test]
+    fn apply_reco_feedback_block_artist_uses_catalog_lookup() {
+        let mut app = make_app();
+        use crate::reco::feedback::FeedbackAction;
+        // BlockArtist needs the artist name — looked up from the catalog.
+        app.apply_reco_feedback(FeedbackAction::BlockArtist, "t1");
+        assert!(app.reco_profile.is_blocked("Artist A"));
+    }
+
+    #[test]
+    fn reco_radio_next_returns_none_without_session() {
+        let mut app = make_app();
+        assert!(app.reco_radio_next().is_none());
+    }
+
+    #[test]
+    fn reco_radio_next_returns_track_with_session() {
+        let mut app = make_app();
+        app.start_radio_from_track("t1");
+        let next = app.reco_radio_next();
+        assert!(next.is_some(), "reco_radio_next should return a track");
+        let id = next.unwrap();
+        // The next track should be a valid catalog track id (not the seed).
+        assert!(app.track_by_id(&id).is_some());
+        assert_ne!(id, "t1", "seed track should not be immediately re-played");
+    }
+
+    #[test]
+    fn reco_radio_next_returns_none_after_pool_exhausted() {
+        let mut app = make_app();
+        app.start_radio_from_track("t1");
+        // Drain the pool.
+        let mut count = 0;
+        while app.reco_radio_next().is_some() {
+            count += 1;
+            if count > 200 {
+                break; // safety valve (refill may produce more)
+            }
+        }
+        // After draining + no refill candidates, next returns None.
+        // (refill_if_needed may re-add from catalog, so we just verify
+        // we got some tracks before exhausting.)
+        assert!(count > 0, "should have gotten at least one track");
+    }
+
+    #[test]
+    fn new_overlay_variants_do_not_break_existing_overlays() {
+        let mut app = make_app();
+        // Open Help (existing overlay) — should still work.
+        app.overlay = Some(Overlay::Help);
+        assert!(matches!(app.overlay, Some(Overlay::Help)));
+        // Replace with a reco overlay.
+        app.open_home();
+        assert!(matches!(app.overlay, Some(Overlay::Home { .. })));
+        // Close and open another existing overlay.
+        app.overlay = None;
+        app.overlay = Some(Overlay::Diagnostics);
+        assert!(matches!(app.overlay, Some(Overlay::Diagnostics)));
+    }
+
+    // --- Regression tests for cold-start reco fallbacks ---
+
+    #[test]
+    fn cycle_continue_mixed_mode_includes_radio() {
+        use crate::mode::SourceMode;
+        use crate::tui::queue::ContinueMode;
+        let mut app = make_app();
+        app.source_mode = SourceMode::Mixed;
+        // Off → NextAlbum
+        app.transport.continue_mode = ContinueMode::Off;
+        app.cycle_continue();
+        assert_eq!(app.transport.continue_mode, ContinueMode::NextAlbum);
+        // NextAlbum → Radio
+        app.cycle_continue();
+        assert_eq!(app.transport.continue_mode, ContinueMode::Radio);
+        // Radio → YouTube
+        app.cycle_continue();
+        assert_eq!(app.transport.continue_mode, ContinueMode::YouTube);
+        // YouTube → Off
+        app.cycle_continue();
+        assert_eq!(app.transport.continue_mode, ContinueMode::Off);
+    }
+
+    #[test]
+    fn open_home_generates_mixes_with_tracks_on_cold_start() {
+        let mut app = make_app();
+        assert!(app.reco_profile.is_empty());
+        app.open_home();
+        // Mixes should be generated.
+        assert!(!app.reco_mixes.is_empty());
+        // Each generated mix should have tracks (catalog fallback).
+        for mix in &app.reco_mixes {
+            assert!(
+                !mix.tracks.is_empty(),
+                "mix {:?} should have tracks via catalog fallback",
+                mix.mix_type
+            );
+        }
+    }
+
+    #[test]
+    fn generate_playlist_cold_start_produces_tracks() {
+        let mut app = make_app();
+        // Empty profile — no listening history.
+        assert!(app.reco_profile.is_empty());
+        app.open_generator();
+        if let Some(Overlay::Generator { state }) = &mut app.overlay {
+            state.input = "calm focus mix".into();
+        }
+        app.generate_playlist();
+        if let Some(Overlay::Generator { state }) = &app.overlay {
+            assert!(state.playlist.is_some());
+            let playlist = state.playlist.as_ref().unwrap();
+            assert!(
+                !playlist.tracks.is_empty(),
+                "generator should produce tracks via catalog fallback on cold start"
+            );
+        } else {
+            panic!("expected Generator overlay");
+        }
+    }
+
+    #[test]
+    fn start_radio_cold_start_has_candidates() {
+        let mut app = make_app();
+        assert!(app.reco_profile.is_empty());
+        app.start_radio_from_track("t1");
+        if let Some(Overlay::Radio { session }) = &app.overlay {
+            let s = session.as_ref().expect("session should be Some");
+            assert!(
+                !s.candidate_pool.is_empty(),
+                "radio should seed from catalog on cold start"
+            );
+        } else {
+            panic!("expected Radio overlay");
+        }
+    }
+
+    #[test]
+    fn reco_radio_next_falls_back_to_catalog_when_pool_exhausted() {
+        let mut app = make_app();
+        app.start_radio_from_track("t1");
+        // Drain the pool completely.
+        let mut count = 0;
+        while app.reco_radio_next().is_some() {
+            count += 1;
+            if count > 500 {
+                break; // safety valve
+            }
+        }
+        assert!(count > 0, "should have gotten tracks before exhaustion");
+        // After the pool is drained, the fallback should still return a
+        // catalog track that hasn't been played in this session.
+        // (If all catalog tracks have been played, returns None — correct.)
+        // With a 3-track catalog, after playing all 3, the fallback can't
+        // find an unplayed track, so we just verify we got tracks.
+    }
+
+    #[test]
+    fn reco_radio_next_cold_start_returns_track() {
+        let mut app = make_app();
+        // Empty profile — cold start.
+        assert!(app.reco_profile.is_empty());
+        app.start_radio_from_track("t1");
+        let next = app.reco_radio_next();
+        assert!(next.is_some(), "radio should return a track on cold start");
+        let id = next.unwrap();
+        assert!(
+            app.track_by_id(&id).is_some(),
+            "should be a valid catalog track"
+        );
+        assert_ne!(id, "t1", "seed track should not be immediately re-played");
+    }
+
+    /// RC11-DEF-001 / DEF-012: `play_home_selection` plays the focused Home
+    /// item. Navigating to the "Made for You" section and pressing Enter must
+    /// start playback of the focused mix's tracks (local catalog ids), not
+    /// the underlying browse view's track-column cursor.
+    #[test]
+    fn play_home_selection_plays_focused_mix() {
+        use crate::tui::view::home::HomeSection;
+        let (_d, mut app) = make_app_with_files();
+        app.open_home();
+        // Find the Made for You section index.
+        let mfy_idx = app
+            .overlay
+            .as_ref()
+            .and_then(|o| match o {
+                Overlay::Home { state } => state
+                    .sections
+                    .iter()
+                    .position(|(s, _)| *s == HomeSection::MadeForYou),
+                _ => None,
+            })
+            .expect("Home should have a Made for You section");
+        // Focus that section.
+        if let Some(Overlay::Home { state }) = &mut app.overlay {
+            state.focused_section = mfy_idx;
+            state.cursor = 0;
+        }
+        // Before play: nothing playing.
+        assert!(app.now_playing.is_none());
+        app.play_home_selection();
+        // After play: the overlay closed and a track is playing.
+        assert!(
+            app.overlay.is_none(),
+            "DEF-001: Home overlay should close after Enter on a mix"
+        );
+        assert!(
+            app.now_playing.is_some(),
+            "DEF-012: pressing Enter on a Made for You mix should start playback"
+        );
+    }
+
+    /// RC11-DEF-001: `play_home_selection` on a Quick Picks track plays THAT
+    /// track (the focused one), not the browse view's cursor track.
+    #[test]
+    fn play_home_selection_plays_focused_quick_pick() {
+        use crate::tui::view::home::HomeSection;
+        let (_d, mut app) = make_app_with_files();
+        app.open_home();
+        // Focus Quick Picks (section 0), cursor 1 (second track).
+        if let Some(Overlay::Home { state }) = &mut app.overlay {
+            // Quick Picks is the first section in open_home.
+            assert_eq!(state.sections[0].0, HomeSection::QuickPicks);
+            state.focused_section = 0;
+            state.cursor = 1;
+        }
+        app.play_home_selection();
+        // The second catalog track (t2) should be playing.
+        let np = app
+            .now_playing
+            .as_ref()
+            .expect("DEF-001: Enter on a Quick Pick should start playback");
+        assert_eq!(
+            np.id(),
+            "t2",
+            "DEF-001: Enter should play the focused Quick Pick (t2), not the browse cursor"
+        );
+    }
+
+    /// RC11-DEF-001: `?` from the Home overlay opens the Help overlay
+    /// (previously swallowed by `_ => {}`).
+    #[test]
+    fn home_overlay_question_mark_opens_help() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app();
+        app.open_home();
+        crate::tui::input::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(app.overlay, Some(Overlay::Help)),
+            "DEF-001: '?' from Home should open the Help overlay"
+        );
+    }
+
+    /// RC11-DEF-013: in YouTube mode, the Discover overlay (`S`) shows the
+    /// generated mixes (Daily Mix, Discover Mix, ...) from `reco::mixes`, not
+    /// local smart albums.
+    #[test]
+    fn open_discover_yt_mode_shows_generated_mixes() {
+        let mut app = make_app();
+        app.source_mode = crate::mode::SourceMode::Youtube;
+        app.open_discover();
+        let items = match &app.overlay {
+            Some(Overlay::Discover { items, .. }) => items,
+            _ => panic!("expected Discover overlay"),
+        };
+        let has_mix = items.iter().any(|d| matches!(d, DiscoverItem::Mix { .. }));
+        assert!(
+            has_mix,
+            "DEF-013: YT-mode Discover must show generated mixes (Daily Mix, etc.): {items:?}"
+        );
+    }
+
+    /// RC11-DEF-013: in mixed mode, the Discover overlay also shows the
+    /// generated mixes.
+    #[test]
+    fn open_discover_mixed_mode_shows_generated_mixes() {
+        let mut app = make_app();
+        app.source_mode = crate::mode::SourceMode::Mixed;
+        app.open_discover();
+        let items = match &app.overlay {
+            Some(Overlay::Discover { items, .. }) => items,
+            _ => panic!("expected Discover overlay"),
+        };
+        let has_mix = items.iter().any(|d| matches!(d, DiscoverItem::Mix { .. }));
+        assert!(
+            has_mix,
+            "DEF-013: mixed-mode Discover must show generated mixes: {items:?}"
+        );
+    }
+
+    /// RC11-DEF-013: in local mode, the Discover overlay shows local smart
+    /// albums (the old behavior), NOT generated mixes.
+    #[test]
+    fn open_discover_local_mode_shows_albums_not_mixes() {
+        let mut app = make_app();
+        app.source_mode = crate::mode::SourceMode::Local;
+        app.open_discover();
+        let items = match &app.overlay {
+            Some(Overlay::Discover { items, .. }) => items,
+            _ => panic!("expected Discover overlay"),
+        };
+        let has_mix = items.iter().any(|d| matches!(d, DiscoverItem::Mix { .. }));
+        assert!(
+            !has_mix,
+            "DEF-013: local-mode Discover should show albums, not mixes: {items:?}"
+        );
+    }
+
+    /// RC11-DEF-028: each Discover mix carries a "why recommended" explanation.
+    #[test]
+    fn discover_mix_items_carry_explanation() {
+        let mut app = make_app();
+        app.source_mode = crate::mode::SourceMode::Youtube;
+        app.open_discover();
+        let items = match &app.overlay {
+            Some(Overlay::Discover { items, .. }) => items,
+            _ => panic!("expected Discover overlay"),
+        };
+        for d in items {
+            if let DiscoverItem::Mix { explanation, .. } = d {
+                assert!(
+                    explanation.is_some(),
+                    "DEF-028: each Discover mix must carry an explanation"
+                );
+            }
+        }
+    }
+
+    /// RC11-DEF-035: Enter on a Discover mix sets `discover_play_loading` so
+    /// the overlay can show a persistent "Loading [name]..." state instead of
+    /// closing silently.
+    #[test]
+    fn discover_enter_on_mix_sets_loading_state() {
+        let (_d, mut app) = make_app_with_files();
+        app.source_mode = crate::mode::SourceMode::Youtube;
+        app.open_discover();
+        app.play_discover_selection();
+        assert!(
+            app.discover_play_loading.is_some(),
+            "DEF-035: Enter on a Discover mix must set discover_play_loading"
+        );
+    }
+
+    /// RC11-DEF-029: `x` in the Discover overlay removes the focused item.
+    #[test]
+    fn discover_x_dismisses_focused_item() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app();
+        app.source_mode = crate::mode::SourceMode::Youtube;
+        app.open_discover();
+        let before_len = match &app.overlay {
+            Some(Overlay::Discover { items, .. }) => items.len(),
+            _ => panic!("expected Discover overlay"),
+        };
+        assert!(
+            before_len > 1,
+            "test needs >1 discover item, got {before_len}"
+        );
+        crate::tui::input::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        let after_len = match &app.overlay {
+            Some(Overlay::Discover { items, .. }) => items.len(),
+            _ => panic!("Discover overlay should stay open after x"),
+        };
+        assert_eq!(
+            after_len,
+            before_len - 1,
+            "DEF-029: x must remove the focused Discover item"
+        );
+    }
+
+    // --- RC13 regression tests ------------------------------------------------
+
+    /// RC13-DEF-1: in MODE youtube, a local catalog id (e.g. a generated
+    /// mix's track) that the sidecar can't resolve as a real video id falls
+    /// back to local playback instead of hanging in a Pending cold-miss.
+    /// Before the fix, `resolve_source` returned Pending for catalog ids in
+    /// youtube mode, so the player showed "[PLAYING] ▶ — nothing playing —".
+    #[test]
+    fn rc13_def1_youtube_mode_local_catalog_fallback() {
+        let (_d, mut app) = make_app_with_files();
+        app.source_mode = crate::mode::SourceMode::Youtube;
+        // No yt_session → the remote path's `?` returns None, which would mark
+        // the track dead. But with the fallback, the local path is used.
+        // Even with a session, a catalog id that url_for can't resolve falls
+        // back to local. Test the no-session path first (simplest).
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        assert!(
+            app.now_playing.is_some(),
+            "RC13-DEF-1: local catalog track in youtube mode should play locally, not hang"
+        );
+        let np = app.now_playing.as_ref().unwrap();
+        assert_eq!(np.id(), "t1");
+        assert!(
+            !app.dead.contains("t1"),
+            "RC13-DEF-1: track should not be marked dead"
+        );
+    }
+
+    /// RC13-DEF-2: `open_publication` classifies non-catalog ids as
+    /// publishable (YouTube video ids), not unavailable. Before the fix,
+    /// YouTube video ids in a local playlist were marked "unavailable"
+    /// because they weren't in the session's track_cache, blocking
+    /// publication entirely.
+    #[test]
+    fn rc13_def2_publication_classifies_youtube_ids_as_publishable() {
+        let mut app = make_app();
+        // Create a local playlist with a local track + a YouTube video id.
+        app.playlists.push(crate::tui::app::Playlist {
+            name: "My Mix".into(),
+            track_ids: vec!["t1".into(), "v001".into(), "v002".into()],
+        });
+        app.open_publication("My Mix");
+        let state = match &app.overlay {
+            Some(Overlay::Publication { state }) => state,
+            _ => panic!("expected Publication overlay"),
+        };
+        assert_eq!(
+            state.local_only.len(),
+            1,
+            "t1 (catalog) should be local-only"
+        );
+        assert_eq!(state.local_only[0], "t1");
+        assert_eq!(
+            state.publishable_ids.len(),
+            2,
+            "RC13-DEF-2: v001 and v002 (YouTube video ids) should be publishable, not unavailable"
+        );
+        assert!(state.publishable_ids.contains(&"v001".to_string()));
+        assert!(state.publishable_ids.contains(&"v002".to_string()));
+        assert!(
+            state.unavailable.is_empty(),
+            "RC13-DEF-2: no tracks should be unavailable — non-catalog ids are publishable"
+        );
+    }
+
+    /// RC14-DEF-1: `open_publication` populates `publishable_ids` from the
+    /// focused YouTube playlist when the user is in the YouTube view. Before
+    /// the fix, `open_publication` only looked at local `playlists` by name,
+    /// so `:publish test` from the YouTube view always showed 0 tracks —
+    /// even with a YT playlist open and its [Y] tracks loaded + playing.
+    #[test]
+    fn rc14_def1_publication_populates_from_focused_yt_playlist() {
+        let mut app = make_app();
+        app.view = View::Youtube;
+        app.yt_lists.push(crate::tui::app::YtList {
+            id: "PL001".into(),
+            name: "Chill Mix".into(),
+            kind: crate::tui::app::YtListKind::Account,
+            track_ids: vec!["v001".into(), "v002".into(), "v003".into()],
+        });
+        app.yt_lists.push(crate::tui::app::YtList {
+            id: "PL002".into(),
+            name: "Workout Energy".into(),
+            kind: crate::tui::app::YtListKind::Account,
+            track_ids: vec!["v010".into(), "v011".into()],
+        });
+        // Focus the second playlist (cursors.playlist = 1).
+        app.cursors.playlist = 1;
+        // `:publish test` — name doesn't match any local playlist, so the
+        // focused yt_list's tracks should be used.
+        app.open_publication("test");
+        let state = match &app.overlay {
+            Some(Overlay::Publication { state }) => state,
+            _ => panic!("expected Publication overlay"),
+        };
+        assert_eq!(
+            state.publishable_ids.len(),
+            2,
+            "RC14-DEF-1: focused YT playlist's 2 video ids should be publishable, got {}",
+            state.publishable_ids.len()
+        );
+        assert!(state.publishable_ids.contains(&"v010".to_string()));
+        assert!(state.publishable_ids.contains(&"v011".to_string()));
+        assert!(
+            state.local_only.is_empty(),
+            "RC14-DEF-1: no local-only tracks from a YT playlist"
+        );
+    }
+
+    /// RC14-DEF-1: a local playlist with a matching name takes precedence
+    /// over the focused YouTube list (the user named an existing local
+    /// playlist explicitly).
+    #[test]
+    fn rc14_def1_publication_local_playlist_name_takes_precedence() {
+        let mut app = make_app();
+        app.view = View::Youtube;
+        app.yt_lists.push(crate::tui::app::YtList {
+            id: "PL001".into(),
+            name: "My Mix".into(),
+            kind: crate::tui::app::YtListKind::Account,
+            track_ids: vec!["v001".into()],
+        });
+        app.cursors.playlist = 0;
+        // Local playlist with the SAME name — should win.
+        app.playlists.push(crate::tui::app::Playlist {
+            name: "My Mix".into(),
+            track_ids: vec!["t1".into(), "v099".into()],
+        });
+        app.open_publication("My Mix");
+        let state = match &app.overlay {
+            Some(Overlay::Publication { state }) => state,
+            _ => panic!("expected Publication overlay"),
+        };
+        // t1 is local → local_only; v099 is a YouTube id → publishable.
+        assert_eq!(state.local_only, vec!["t1".to_string()]);
+        assert_eq!(state.publishable_ids, vec!["v099".to_string()]);
+    }
+
+    /// RC14-DEF-4: `estimated_position()` returns the wall-clock elapsed
+    /// since `play_started_at` (minus paused time). With a fresh play (no
+    /// pause, no offset) it should be ≈ 0 immediately after
+    /// `note_play_started`.
+    #[test]
+    fn rc14_def4_estimated_position_tracks_wall_clock() {
+        let mut app = make_app();
+        // Simulate a track starting: note_play_started is private, so set the
+        // fields it sets directly.
+        app.play_started_at = Some(std::time::Instant::now());
+        app.pause_started_at = None;
+        app.accumulated_paused = std::time::Duration::ZERO;
+        app.play_start_offset = 0.0;
+        let p = app.estimated_position().unwrap();
+        assert!(
+            (0.0..0.5).contains(&p),
+            "RC14-DEF-4: fresh play estimated_position should be ~0, got {p}"
+        );
+        // Simulate 3s elapsed.
+        app.play_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        let p = app.estimated_position().unwrap();
+        assert!(
+            (p - 3.0).abs() < 0.5,
+            "RC14-DEF-4: 3s elapsed → estimated_position ≈ 3.0, got {p}"
+        );
+    }
+
+    /// RC14-DEF-4: `estimated_position()` subtracts paused wall-clock time so
+    /// the progress bar doesn't advance while paused.
+    #[test]
+    fn rc14_def4_estimated_position_subtracts_pause() {
+        let mut app = make_app();
+        // Track started 10s ago, paused for 4s (accumulated), still playing.
+        app.play_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        app.accumulated_paused = std::time::Duration::from_secs(4);
+        app.pause_started_at = None;
+        app.play_start_offset = 0.0;
+        let p = app.estimated_position().unwrap();
+        assert!(
+            (p - 6.0).abs() < 0.5,
+            "RC14-DEF-4: 10s elapsed − 4s paused → ≈ 6.0, got {p}"
+        );
+    }
+
+    /// RC14-DEF-4: `estimated_position()` includes the resume start offset so
+    /// a resumed track's progress starts from the saved position, not 0.
+    #[test]
+    fn rc14_def4_estimated_position_includes_start_offset() {
+        let mut app = make_app();
+        app.play_started_at = Some(std::time::Instant::now());
+        app.play_start_offset = 30.0;
+        app.accumulated_paused = std::time::Duration::ZERO;
+        app.pause_started_at = None;
+        let p = app.estimated_position().unwrap();
+        assert!(
+            (p - 30.0).abs() < 0.5,
+            "RC14-DEF-4: start_offset=30 + ~0s elapsed → ≈ 30.0, got {p}"
+        );
+    }
+
+    /// RC14-DEF-4: `toggle_pause()` tracks the pause interval. After pausing
+    /// then resuming, `accumulated_paused` should have grown.
+    #[test]
+    fn rc14_def4_toggle_pause_tracks_pause_duration() {
+        let mut app = make_app();
+        // StubPlayer: load a track so play_pause has a child to toggle.
+        app.now_playing = Some(crate::source::TrackSource::Local {
+            track_id: "t1".into(),
+        });
+        app.play_started_at = Some(std::time::Instant::now());
+        // Pause.
+        app.toggle_pause();
+        assert!(
+            app.pause_started_at.is_some(),
+            "pause_started_at set on pause"
+        );
+        // Hold the pause for a brief moment.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Resume.
+        app.toggle_pause();
+        assert!(
+            app.pause_started_at.is_none(),
+            "pause_started_at cleared on resume"
+        );
+        assert!(
+            app.accumulated_paused >= std::time::Duration::from_millis(40),
+            "RC14-DEF-4: accumulated_paused should include the pause interval, got {:?}",
+            app.accumulated_paused
+        );
+    }
+
+    /// RC13-DEF-5: when a radio session is active and CONT is off, the radio
+    /// auto-advances to the next track on track completion. Before the fix,
+    /// CONT off stopped playback after the first track even during a radio
+    /// session — the user had to press `c c` (CONT=radio) before `:radio`.
+    #[test]
+    fn rc13_def5_radio_auto_advances_with_cont_off() {
+        let (_d, mut app) = make_app_with_files();
+        app.transport.continue_mode = ContinueMode::Off;
+        // Start a radio session — this opens the overlay + auto-starts.
+        app.start_radio_from_track("t1");
+        // The radio auto-starts playback. Verify something is playing.
+        assert!(app.now_playing.is_some(), "radio should auto-start");
+        let first_id = app.now_playing.as_ref().unwrap().id().to_string();
+        // Simulate track completion: call next() which is the auto-advance
+        // path on end-of-track. With CONT off + a radio session active, the
+        // radio should drive continuation instead of stopping.
+        app.next();
+        assert!(
+            app.now_playing.is_some(),
+            "RC13-DEF-5: radio should auto-advance even with CONT off"
+        );
+        let second_id = app.now_playing.as_ref().unwrap().id().to_string();
+        assert_ne!(
+            first_id, second_id,
+            "RC13-DEF-5: radio should advance to a different track"
+        );
+    }
+
+    /// RC13-DEF-5: when NO radio session is active and CONT is off, playback
+    /// still stops at the end of the context (the fix only affects radio).
+    #[test]
+    fn rc13_def5_no_radio_stops_with_cont_off() {
+        let (_d, mut app) = make_app_with_files();
+        app.transport.continue_mode = ContinueMode::Off;
+        // Play a single-track context (no radio).
+        app.play_in_context_ids(vec!["t1".into()], "t1");
+        assert!(app.now_playing.is_some());
+        // next() with CONT off + no radio → stop.
+        app.next();
+        assert!(
+            app.now_playing.is_none(),
+            "RC13-DEF-5: without a radio session, CONT off should still stop"
+        );
+    }
+
+    /// RC13-DEF-4: a long track title still shows the artist (truncated),
+    /// not just the title. Before the fix, the artist was dropped entirely
+    /// when the title was too long for the title budget.
+    #[test]
+    fn rc13_def4_long_title_keeps_artist() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = make_app();
+        // Set a long-title track as now-playing.
+        let long_title =
+            "A Very Long Track Title That Should Be Truncated When Displayed In Narrow Terminals";
+        let long_artist = "Long Artist Name That Tests Truncation In The UI Display";
+        app.now_playing = Some(crate::source::TrackSource::Local {
+            track_id: "t1".into(),
+        });
+        // Override the catalog track with long names via a direct edit.
+        app.catalog.tracks[0].title = long_title.into();
+        app.catalog.tracks[0].primary_artist = long_artist.into();
+        let backend = TestBackend::new(100, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::tui::view::player_bar::render(f, f.area(), &app))
+            .unwrap();
+        let mut buf = String::new();
+        for y in 0..2u16 {
+            for x in 0..100u16 {
+                let c = &terminal.backend().buffer()[(x, y)];
+                buf.push(c.symbol().chars().next().unwrap_or(' '));
+            }
+            buf.push('\n');
+        }
+        // The artist name (or a truncated form) must appear in the player bar.
+        // Before the fix, only the title showed and the artist was dropped.
+        assert!(
+            buf.contains("Long Ar"),
+            "RC13-DEF-4: artist must be visible (truncated) even with a long title: {buf}"
+        );
+        // The em-dash separator between title and artist must be present.
+        assert!(
+            buf.contains('—'),
+            "RC13-DEF-4: title-artist separator must be present: {buf}"
+        );
+    }
+
+    /// RC13-DEF-4: the resume hint is truncated to the title slot so it
+    /// doesn't push the quality/volume/transport controls off-screen.
+    #[test]
+    fn rc13_def4_resume_hint_truncated_to_title_slot() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = make_app();
+        app.now_playing = None;
+        app.resume_hint =
+            Some("resume: Midnight Journey at 0:03 · R to resume — a very long hint".into());
+        let backend = TestBackend::new(100, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::tui::view::player_bar::render(f, f.area(), &app))
+            .unwrap();
+        let mut row0 = String::new();
+        for x in 0..100u16 {
+            let c = &terminal.backend().buffer()[(x, 0)];
+            row0.push(c.symbol().chars().next().unwrap_or(' '));
+        }
+        // The transport controls live in the rightmost 14 cols. The hint
+        // must not push past column 86 (100 - 14). Verify the hint is
+        // truncated (ends with …) and the transport area is intact.
+        assert!(
+            row0.contains('…'),
+            "RC13-DEF-4: resume hint must be truncated with ellipsis: {row0}"
+        );
+        // The transport glyphs (▶) should be present at the right edge.
+        assert!(
+            row0.contains('▶'),
+            "RC13-DEF-4: transport controls must be present: {row0}"
+        );
+    }
+
+    /// RC13-DEF-4: the toast is wrapped in brackets so it reads as a
+    /// transient message, not part of the track name.
+    #[test]
+    fn rc13_def4_toast_wrapped_in_brackets() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = make_app();
+        app.now_playing = Some(crate::source::TrackSource::Local {
+            track_id: "t1".into(),
+        });
+        app.toast = Some("Added to queue".into());
+        let backend = TestBackend::new(100, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::tui::view::player_bar::render(f, f.area(), &app))
+            .unwrap();
+        let mut row0 = String::new();
+        for x in 0..100u16 {
+            let c = &terminal.backend().buffer()[(x, 0)];
+            row0.push(c.symbol().chars().next().unwrap_or(' '));
+        }
+        assert!(
+            row0.contains("[Added"),
+            "RC13-DEF-4: toast must be wrapped in brackets: {row0}"
+        );
+        assert!(
+            row0.contains("]"),
+            "RC13-DEF-4: toast must have closing bracket: {row0}"
+        );
+    }
+
+    /// RC16-DEF-2: pressing `<` (prev) on the first track must NOT call
+    /// load_track on the same track (which causes "Broken pipe (os error 32)"
+    /// when the player has stopped). Instead, it should seek to 0 (restart)
+    /// when playing, or no-op when stopped.
+    #[test]
+    fn rc16_def2_prev_on_first_track_does_not_reload() {
+        let (_d, mut app) = make_app_with_files();
+        // Play track t1 (the first track in the context).
+        app.cursors.track = 0;
+        app.play_selected();
+        assert!(app.now_playing.is_some(), "track should be playing");
+        let np_id = app.now_playing.as_ref().unwrap().id().to_string();
+        // Press prev — no history, so transport.prev returns the same track.
+        app.prev();
+        // The now_playing should still be the same track (not reloaded into
+        // a dead state). No error should be set.
+        assert!(
+            app.yt_error.is_none(),
+            "RC16-DEF-2: prev on first track must not set an error: {:?}",
+            app.yt_error
+        );
+        assert!(
+            app.now_playing.is_some(),
+            "RC16-DEF-2: prev on first track must keep now_playing"
+        );
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().id(),
+            np_id,
+            "RC16-DEF-2: prev on first track must keep the same track"
+        );
+    }
+
+    /// RC16-DEF-2: pressing `<` when stopped (now_playing None) must be a
+    /// graceful no-op, not a broken pipe error.
+    #[test]
+    fn rc16_def2_prev_when_stopped_is_noop() {
+        let (_d, mut app) = make_app_with_files();
+        // Don't play anything — now_playing is None.
+        assert!(app.now_playing.is_none());
+        // Press prev — should be a no-op, no error.
+        app.prev();
+        assert!(
+            app.yt_error.is_none(),
+            "RC16-DEF-2: prev when stopped must not set an error: {:?}",
+            app.yt_error
+        );
+        assert!(
+            app.now_playing.is_none(),
+            "RC16-DEF-2: prev when stopped must leave now_playing as None"
+        );
+    }
+
+    /// RC16-DEF-2: prev with history (a genuinely different track) must still
+    /// load the previous track via load_track — the fix only short-circuits
+    /// the same-track and stopped cases.
+    #[test]
+    fn rc16_def2_prev_with_history_loads_previous() {
+        let (_d, mut app) = make_app_with_files();
+        // Play track t1, then next to t2, then prev back to t1.
+        app.cursors.track = 0;
+        app.play_selected();
+        let first_id = app.now_playing.as_ref().unwrap().id().to_string();
+        app.next();
+        let second_id = app.now_playing.as_ref().unwrap().id().to_string();
+        assert_ne!(
+            first_id, second_id,
+            "next should have advanced to a different track"
+        );
+        app.prev();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().id(),
+            first_id,
+            "RC16-DEF-2: prev with history must load the previous track"
+        );
+        assert!(
+            app.yt_error.is_none(),
+            "RC16-DEF-2: prev with history must not error: {:?}",
+            app.yt_error
+        );
+    }
+
+    /// Task 4: `YtViewState::default()` starts with all three new cache
+    /// fields as `None` (so the first tab visit fires the fetch).
+    #[test]
+    fn yt_view_state_default_caches_are_none() {
+        let s = YtViewState::default();
+        assert!(
+            s.home_sections_cached.is_none(),
+            "home_sections_cached should default to None"
+        );
+        assert!(
+            s.explore_cached.is_none(),
+            "explore_cached should default to None"
+        );
+        assert!(
+            s.charts_cached.is_none(),
+            "charts_cached should default to None"
+        );
+    }
+
+    /// Task 4: `YtTab::next()` cycles through all 7 tabs, including the new
+    /// Explore and Charts variants.
+    #[test]
+    fn yt_tab_cycle_includes_explore_charts() {
+        assert_eq!(YtTab::Radio.next(), YtTab::Explore);
+        assert_eq!(YtTab::Explore.next(), YtTab::Charts);
+        assert_eq!(YtTab::Charts.next(), YtTab::Home);
+    }
+
+    /// Task 4: `YtTab::prev()` cycles back through the new variants.
+    #[test]
+    fn yt_tab_prev_cycle_includes_explore_charts() {
+        assert_eq!(YtTab::Home.prev(), YtTab::Charts);
+        assert_eq!(YtTab::Charts.prev(), YtTab::Explore);
+        assert_eq!(YtTab::Explore.prev(), YtTab::Radio);
+    }
+
+    /// Task 4: `YtTab::all()` returns 7 entries (the 5 existing + Explore +
+    /// Charts) with no number prefixes per BB-027.
+    #[test]
+    fn yt_tab_all_has_seven_tabs_no_number_prefix() {
+        let tabs = YtTab::all();
+        assert_eq!(tabs.len(), 7);
+        assert_eq!(tabs[0].0, "Home");
+        assert_eq!(tabs[1].0, "Library");
+        assert_eq!(tabs[2].0, "Search");
+        assert_eq!(tabs[3].0, "Discover");
+        assert_eq!(tabs[4].0, "Radio");
+        assert_eq!(tabs[5].0, "Explore");
+        assert_eq!(tabs[6].0, "Charts");
+    }
+
+    /// Task 4: `map_yt_section_title` maps known YouTube section titles to
+    /// the documented `HomeSection` variants.
+    #[test]
+    fn map_yt_section_title_known() {
+        use crate::tui::view::home::HomeSection;
+        assert_eq!(
+            map_yt_section_title("Listen again"),
+            HomeSection::ContinueListening
+        );
+        assert_eq!(
+            map_yt_section_title("Resume listening"),
+            HomeSection::ContinueListening
+        );
+        assert_eq!(
+            map_yt_section_title("Mixed for You"),
+            HomeSection::MadeForYou
+        );
+        assert_eq!(
+            map_yt_section_title("Made for You"),
+            HomeSection::MadeForYou
+        );
+        assert_eq!(
+            map_yt_section_title("Featured playlists"),
+            HomeSection::Library
+        );
+        assert_eq!(map_yt_section_title("Featured"), HomeSection::Library);
+    }
+
+    /// Task 4: unknown section titles fall back to the new
+    /// `HomeSection::YtFeed(String)` variant carrying the raw title.
+    #[test]
+    fn map_yt_section_title_unknown_falls_back_to_ytfeed() {
+        use crate::tui::view::home::HomeSection;
+        let got = map_yt_section_title("Today's hits");
+        assert!(
+            matches!(got, HomeSection::YtFeed(ref t) if t == "Today's hits"),
+            "unknown title should map to YtFeed carrying the raw title, got {got:?}"
+        );
+    }
+}

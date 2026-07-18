@@ -47,6 +47,18 @@ for line in sys.stdin:
     if cmd == "home_suggestions":
         print(json.dumps({{"ok": True, "data": {{"suggestions": []}}}}), flush=True)
         continue
+    # Task 4: auto-respond to home/explore/charts with empty payloads so the
+    # new on_tick fetch-on-first-visit (Home tab) doesn't block the pending
+    # queue. See e2e_yt::fake_sidecar for the full rationale.
+    if cmd == "home":
+        print(json.dumps({{"ok": True, "data": {{"home_sections": []}}}}), flush=True)
+        continue
+    if cmd == "explore":
+        print(json.dumps({{"ok": True, "data": {{"explore_playlists": []}}}}), flush=True)
+        continue
+    if cmd == "charts":
+        print(json.dumps({{"ok": True, "data": {{"charts": []}}}}), flush=True)
+        continue
     if cmd == "get_playlist":
         pid = req.get("id", "")
         time.sleep(delay / 1000.0)
@@ -84,7 +96,18 @@ fn local_cat() -> (tempfile::TempDir, jukebox::catalog::Catalog) {
     (d, jukebox::catalog::Catalog::load(&p).unwrap())
 }
 
+/// Isolate `XDG_CONFIG_HOME` to a temp dir so `on_tick`'s `save_yt_lists()`
+/// (which writes to `state::db_path()`) can't leak fake `PL1`–`PL5` stubs
+/// into the user's real `~/Library/Application Support/jukebox/state.db`.
+/// Must be called before `App::new` / `on_tick` in every test here.
+fn isolate_xdg() -> tempfile::TempDir {
+    let d = tempfile::tempdir().unwrap();
+    std::env::set_var("XDG_CONFIG_HOME", d.path());
+    d
+}
+
 fn yt_app(script: &std::path::Path) -> App {
+    let _xdg = isolate_xdg();
     let session = Session::spawn(std::path::Path::new("python3"), script, None).unwrap();
     let (_d, cat) = local_cat();
     let mut app = App::new(
@@ -442,7 +465,9 @@ fn rapid_switch_then_settle_each_playlist_correct() {
 //   2. Stale `pending` FIFO entries cause wrong-track pairing
 //
 // This test demonstrates bug #1: after clear_cookies (logout), the stale
-// inflight guard from a previous get_playlist blocks all future fetches.
+// SYNC-48 FIX VERIFIED: clear_cookies now calls clear_all_caches() before
+// respawn, so stale inflight guards are cleared. After respawn, new
+// get_playlist calls work normally.
 
 #[test]
 fn stale_inflight_guard_after_respawn_blocks_all_fetches() {
@@ -457,9 +482,8 @@ fn stale_inflight_guard_after_respawn_blocks_all_fetches() {
         "PL1 should be inflight after first on_tick"
     );
 
-    // Simulate logout: clear_cookies respawns the sidecar but does NOT clear
-    // playlist_inflight (the bug). The old sidecar's in-flight response won't
-    // arrive (old process killed), so the guard is never cleared by apply_pair.
+    // Simulate logout: clear_cookies respawns the sidecar AND clears
+    // playlist_inflight via clear_all_caches() (the SYNC-48 fix).
     let script_path = std::path::PathBuf::from(&script);
     let _ = app
         .yt_session
@@ -467,35 +491,20 @@ fn stale_inflight_guard_after_respawn_blocks_all_fetches() {
         .unwrap()
         .clear_cookies(std::path::Path::new("python3"), &script_path);
 
-    // The stale guard is STILL SET — this is the bug.
+    // The stale guard should be CLEARED by the fix.
     assert!(
-        app.yt_session.as_ref().unwrap().playlist_loading("PL1"),
-        "BUG: PL1 inflight guard should have been cleared on respawn but is STILL SET \
-         — this blocks ALL future get_playlist calls (stuck on syncing forever)"
+        !app.yt_session.as_ref().unwrap().playlist_loading("PL1"),
+        "FIX VERIFIED: PL1 inflight guard was cleared on respawn \
+         (clear_all_caches called before respawn)"
     );
 
-    // Try to fetch PL2 — should be blocked by the stale guard.
+    // Try to fetch PL2 — should NOT be blocked by stale guard.
     app.cursors.playlist = 1;
     app.on_tick();
     assert!(
-        !app.yt_session.as_ref().unwrap().playlist_loading("PL2"),
-        "BUG: PL2 fetch was blocked by stale PL1 guard — send_get_playlist is a no-op \
-         because `!playlist_inflight.is_empty()` is true (PL1's stale guard)"
-    );
-
-    // Pump on_tick for 5s — PL2 should NEVER load (stale guard blocks it).
-    let pl2_loaded = tick_until(&mut app, 100, |app| {
-        app.yt_lists
-            .get(1)
-            .map(|l| !l.track_ids.is_empty())
-            .unwrap_or(false)
-    });
-
-    assert!(
-        !pl2_loaded,
-        "BUG CONFIRMED: PL2 never loads because stale PL1 inflight guard blocks \
-         ALL get_playlist calls after sidecar respawn. This is the 'stuck on \
-         syncing' / 'long loading time' root cause after re-auth/logout."
+        app.yt_session.as_ref().unwrap().playlist_loading("PL2"),
+        "FIX VERIFIED: PL2 fetch was NOT blocked — send_get_playlist works \
+         after respawn because clear_all_caches cleared the stale guard"
     );
 
     let _ = std::fs::remove_file(&script);
@@ -557,6 +566,94 @@ fn rapid_switch_all_five_should_load() {
             i + 1
         );
     }
+
+    let _ = std::fs::remove_file(&script);
+}
+
+/// Regression: a playlist id that the sidecar errors on (e.g. a poisoned
+/// cache of fake "PL1" stubs) must NOT cause on_tick to re-fetch every tick
+/// forever (the 72k-loop / 3.6MB-log bug). After the error lands, the id is
+/// added to `failed_playlists` and subsequent on_tick calls skip it.
+#[test]
+fn failed_playlist_does_not_refetch_every_tick() {
+    let script = std::env::temp_dir().join(format!(
+        "fail-pl-{}-{}.py",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut f = std::fs::File::create(&script).unwrap();
+    write!(
+        f,
+        r#"import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: req = json.loads(line)
+    except Exception: continue
+    cmd = req.get("cmd")
+    if cmd == "ping":
+        print(json.dumps({{"ok": True, "data": {{"pong": True}}}}), flush=True)
+        continue
+    if cmd == "auth_status":
+        print(json.dumps({{"ok": True, "data": {{"auth": {{"ok": True, "premium": False, "account": False, "valid": True, "expired": False, "reason": None}}}}}}), flush=True)
+        continue
+    if cmd == "get_playlist":
+        print(json.dumps({{"ok": False, "error": "Unable to find contents - not a real playlist id"}}), flush=True)
+        continue
+    # Task 4: auto-respond to home/explore/charts with empty payloads so the
+    # new on_tick fetch-on-first-visit (Home tab) doesn't block the pending
+    # queue. See e2e_yt::fake_sidecar for the full rationale.
+    if cmd == "home":
+        print(json.dumps({{"ok": True, "data": {{"home_sections": []}}}}), flush=True)
+        continue
+    if cmd == "explore":
+        print(json.dumps({{"ok": True, "data": {{"explore_playlists": []}}}}), flush=True)
+        continue
+    if cmd == "charts":
+        print(json.dumps({{"ok": True, "data": {{"charts": []}}}}), flush=True)
+        continue
+"#
+    )
+    .unwrap();
+    writeln!(f).unwrap();
+    let mut app = yt_app(&script);
+    app.yt_lists = vec![YtList {
+        id: "PLFAKE".into(),
+        name: "Fake".into(),
+        kind: YtListKind::Account,
+        track_ids: Vec::new(),
+    }];
+    app.cursors.playlist = 0;
+    app.loaded_yt_lists.clear();
+
+    // First on_tick fires get_playlist("PLFAKE").
+    app.on_tick();
+    // Let the error response land.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    app.on_tick();
+    // After the error: PLFAKE must be in failed_playlists.
+    assert!(
+        app.yt_session
+            .as_ref()
+            .map(|s| s.failed_playlists.contains("PLFAKE"))
+            .unwrap_or(false),
+        "PLFAKE should be in failed_playlists after get_playlist error"
+    );
+
+    // Run 20 more on_tick calls — NONE should re-send (the infinite-loop bug).
+    for _ in 0..20 {
+        app.on_tick();
+    }
+    assert!(
+        !app.yt_session
+            .as_ref()
+            .map(|s| s.playlist_loading("PLFAKE"))
+            .unwrap_or(false),
+        "failed playlist must NOT be re-fetched every tick (infinite-loop regression)"
+    );
 
     let _ = std::fs::remove_file(&script);
 }

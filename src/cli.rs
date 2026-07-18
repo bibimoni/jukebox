@@ -58,7 +58,7 @@ pub enum Cmd {
     Sync,
     /// Build/rebuild the Tantivy search index from catalog.json.
     Index,
-    /// Re-run the directory prompt, or set a field.
+    /// Open configuration (re-run the source-directory prompt if not yet set).
     Config {
         /// e.g. `set source_dir <path>`
         #[arg(trailing_var_arg = true)]
@@ -85,6 +85,12 @@ pub fn ensure_config() -> Result<Config> {
     Config::load()?.ok_or_else(|| anyhow::anyhow!("config still missing after first-run"))
 }
 
+/// Printed after first-run saves the config. The catalog is not built until
+/// `jukebox sync` runs, so without this hint a fresh setup terminates with a
+/// saved config but no library and no obvious next step.
+pub const NEXT_STEP_HINT: &str =
+    "Next: run `jukebox sync` to index your library, then `jukebox` to play.";
+
 fn first_run() -> Result<()> {
     eprintln!("Welcome to jukebox. Let's configure your library.");
     let default = dirs::home_dir()
@@ -94,5 +100,6 @@ fn first_run() -> Result<()> {
     let cfg = Config::default_for(source);
     cfg.save()?;
     eprintln!("Saved config to {}", config_path().display());
+    eprintln!("{NEXT_STEP_HINT}");
     Ok(())
 }

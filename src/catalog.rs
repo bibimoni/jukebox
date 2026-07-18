@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -39,6 +39,36 @@ impl Catalog {
         let c: Catalog = serde_json::from_str(&text)
             .with_context(|| format!("parsing catalog {}", path.display()))?;
         Ok(c)
+    }
+
+    /// Load a catalog for playback. Returns `Ok(Some(cat))` when the catalog
+    /// exists and has at least one track, `Ok(None)` when it is missing or
+    /// empty so the caller can print a recovery hint instead of crashing into
+    /// a mid-playback "file not found", and `Err` only for a read/parse error
+    /// that isn't "missing" (so a corrupt catalog isn't silently treated as
+    /// absent).
+    pub fn load_for_playback(path: &Path) -> Result<Option<Catalog>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let cat = Self::load(path)?;
+        if cat.tracks.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(cat))
+    }
+
+    /// Reject an empty catalog with an actionable message so `jukebox sync`
+    /// fails loudly instead of reporting silent success ("synced: 0 tracks").
+    pub fn require_tracks(&self) -> Result<()> {
+        if self.tracks.is_empty() {
+            return Err(anyhow!(
+                "sync produced 0 tracks — check that the source dir contains \
+                 playable .flac files and that ffprobe/metaflac are installed, \
+                 then run `jukebox sync` again"
+            ));
+        }
+        Ok(())
     }
 }
 

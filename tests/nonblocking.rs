@@ -12,7 +12,7 @@
 
 use jukebox::source::TrackSource;
 use jukebox::tui::app::{App, DiscoverItem, Overlay};
-use jukebox::tui::queue::ContinueMode;
+use jukebox::tui::queue::{ContinueMode, RepeatMode};
 use jukebox::yt::session::Session;
 use std::io::Write;
 
@@ -49,6 +49,15 @@ for line in sys.stdin:
     if cmd == "resolve_url":
         vid = req.get("video_id", "")
         key = json.dumps({"ok": True, "data": {"resolve": {"url": "https://x/" + vid, "expires_at": None, "codec": "AAC", "abr": 256, "sample_rate": 48000, "container": "m4a", "premium": True}}})
+    # Task 4: auto-respond to home/explore/charts with empty payloads so the
+    # new on_tick fetch-on-first-visit (Home tab) doesn't block the pending
+    # queue. See e2e_yt::fake_sidecar for the full rationale.
+    if cmd == "home" and key is None:
+        key = json.dumps({"ok": True, "data": {"home_sections": []}})
+    if cmd == "explore" and key is None:
+        key = json.dumps({"ok": True, "data": {"explore_playlists": []}})
+    if cmd == "charts" and key is None:
+        key = json.dumps({"ok": True, "data": {"charts": []}})
     if key is not None:
         print(key, flush=True)
 "#
@@ -117,10 +126,18 @@ fn discover_opens_instantly_and_populates_on_tick() {
     app.source_mode = jukebox::mode::SourceMode::Youtube;
 
     // Open discover — must return instantly (no blocking roundtrip). The
-    // overlay opens empty with discover_loading = true.
+    // overlay opens with the generated Mix items (synchronous, from
+    // reco::mixes — RC11-DEF-013) + discover_loading = true (the sidecar's
+    // home_suggestions fetch is still in flight).
     app.open_discover();
-    let (items_empty, loading) = match &app.overlay {
-        Some(Overlay::Discover { items, .. }) => (items.is_empty(), app.discover_loading),
+    let (has_mix, has_playlist, loading) = match &app.overlay {
+        Some(Overlay::Discover { items, .. }) => (
+            items.iter().any(|d| matches!(d, DiscoverItem::Mix { .. })),
+            items
+                .iter()
+                .any(|d| matches!(d, DiscoverItem::Playlist { .. })),
+            app.discover_loading,
+        ),
         other => panic!("expected Discover overlay, got {other:?}"),
     };
     assert!(
@@ -128,8 +145,12 @@ fn discover_opens_instantly_and_populates_on_tick() {
         "discover should be loading (fire-and-forget in flight)"
     );
     assert!(
-        items_empty,
-        "overlay should open empty — items land on tick, not synchronously"
+        has_mix,
+        "RC11-DEF-013: overlay should open with generated Mix items (synchronous)"
+    );
+    assert!(
+        !has_playlist,
+        "Playlist items should NOT be present yet — they land on tick"
     );
 
     // Pump on_tick until the home_suggestions response lands + populates the
@@ -196,9 +217,18 @@ fn discover_playlist_selection_starts_playback_on_tick() {
         "discover items should land"
     );
 
-    // Enter on the first (Playlist) item. Must return instantly — the old
+    // Enter on the first Playlist item. Must return instantly — the old
     // blocking get_playlist is gone. The intent is staged in
     // pending_discover_play; playback starts on a later tick.
+    // RC11-DEF-013: navigate to the first Playlist item (Mix items come first
+    // now, so cursor 0 is a Mix, not the sidecar's Playlist).
+    if let Some(Overlay::Discover { items, cursor }) = &mut app.overlay {
+        let pl_idx = items
+            .iter()
+            .position(|d| matches!(d, DiscoverItem::Playlist { .. }))
+            .expect("test requires at least one Playlist item");
+        *cursor = pl_idx;
+    }
     app.play_discover_selection();
     assert_eq!(
         app.pending_discover_play,
@@ -291,6 +321,69 @@ fn cont_youtube_auto_advance_non_blocking() {
     assert!(
         advanced,
         "CONT=YouTube should advance to yt2 on tick, got {:?}",
+        app.now_playing
+    );
+
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&map_file);
+}
+
+/// Regression: with RPT=all on a single-track context (the one the
+/// CONT=YouTube radio continuation builds — `Context::Search { track_ids:
+/// vec![vid] }`), `>` must still advance the radio, not replay the lone
+/// track. Before the fix, `Transport::next()` wrapped the single-element
+/// order and returned the same id, so `App::next()`'s radio-continuation
+/// `None`-arm never fired and `load_track` reloaded the same track (replay).
+/// The sibling test `cont_youtube_auto_advance_non_blocking` only passes
+/// because it leaves repeat at the default Off.
+#[test]
+fn cont_youtube_next_advances_radio_with_repeat_all_single_track() {
+    let wp = r#"{"get_watch_playlist":"{\"ok\":true,\"data\":{\"watch_playlist\":[{\"video_id\":\"yt1\",\"title\":\"A\",\"artist\":\"X\",\"album\":null,\"dur\":null,\"isrc\":null},{\"video_id\":\"yt2\",\"title\":\"B\",\"artist\":\"X\",\"album\":null,\"dur\":null,\"isrc\":null}]}}"}"#;
+    let (script, map_file) = fake_sidecar(wp);
+    let session = spawn_session(&script);
+    let (_d, cat) = local_cat();
+    let mut app = App::new(
+        cat,
+        Box::new(jukebox::player::StubPlayer::default()),
+        None,
+        Some(session),
+    );
+    app.source_mode = jukebox::mode::SourceMode::Youtube;
+    app.transport.continue_mode = ContinueMode::YouTube;
+    // The user's setting from the report: RPT all. This is what diverges from
+    // `cont_youtube_auto_advance_non_blocking` (repeat Off) and triggers the
+    // wrap-to-same-track path in `Transport::next`.
+    app.transport.set_repeat(RepeatMode::All);
+
+    // Play yt1 (cold miss → URL lands on tick).
+    app.play_in_context_ids(vec!["yt1".into()], "yt1");
+    assert!(
+        tick_until(&mut app, 100, |a| a.now_playing.is_some()),
+        "yt1 should resolve+play via the fake sidecar"
+    );
+
+    // `>` on the single-track context with RPT=all: must stage the radio
+    // seed (advance), NOT replay yt1. Before the fix, the wrap returned
+    // Some("yt1") so the None-arm never ran and pending_radio_seed stayed
+    // None.
+    app.next();
+    assert_eq!(
+        app.pending_radio_seed,
+        Some("yt1".into()),
+        "next() with RPT=all on a single-track context should stage the \
+         radio seed (advance), not replay the lone track"
+    );
+
+    // Pump on_tick until the radio advances to yt2.
+    let advanced = tick_until(&mut app, 100, |a| {
+        matches!(
+            a.now_playing,
+            Some(TrackSource::Remote { ref video_id }) if video_id == "yt2"
+        )
+    });
+    assert!(
+        advanced,
+        "CONT=YouTube + RPT=all should advance to yt2 on tick, got {:?}",
         app.now_playing
     );
 

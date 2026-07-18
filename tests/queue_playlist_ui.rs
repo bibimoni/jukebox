@@ -188,6 +188,13 @@ fn queue_clear_command_empties_manual_queue() {
     app.transport.enqueue("t2".into());
     assert_eq!(app.transport.manual_queue.len(), 2);
     open_command(&mut app, "queue clear");
+    // MOD-4: `:queue clear` on a non-empty queue opens a confirmation dialog.
+    // Confirm with 'y' to actually clear.
+    assert!(
+        matches!(app.overlay, Some(Overlay::Confirm { .. })),
+        "queue clear on non-empty queue should open confirm dialog"
+    );
+    handle_key(&mut app, key('y'));
     assert!(app.transport.manual_queue.is_empty());
 }
 
@@ -198,7 +205,24 @@ fn queue_clear_sets_status_message() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     app.transport.enqueue("t1".into());
     open_command(&mut app, "queue clear");
+    // MOD-4: confirm the clear — the status is set only after confirming.
+    handle_key(&mut app, key('y'));
     assert_eq!(app.yt_status.as_deref(), Some("queue cleared"));
+}
+
+#[test]
+fn queue_clear_empty_queue_no_confirmation() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    assert!(app.transport.manual_queue.is_empty());
+    open_command(&mut app, "queue clear");
+    // MOD-4: clearing an already-empty queue is a no-op — no confirmation.
+    assert!(
+        app.overlay.is_none(),
+        "queue clear on empty queue should not open a dialog"
+    );
+    assert!(app.transport.manual_queue.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -230,13 +254,26 @@ fn a_enter_on_new_playlist_creates_playlist_with_track() {
     handle_key(&mut app, key('a'));
     // No existing playlists → the only entry is "+ new playlist..." at cursor 0.
     handle_key(&mut app, key_code(KeyCode::Enter));
-    assert!(app.overlay.is_none(), "Enter should close the picker");
+    // DEF-014: Enter on "+ new playlist..." opens a text input for the name.
+    assert!(
+        matches!(app.overlay, Some(Overlay::TextInput { .. })),
+        "Enter on '+ new playlist...' should open a text input overlay"
+    );
+    // Type a custom name.
+    handle_key(&mut app, key('M'));
+    handle_key(&mut app, key('y'));
+    handle_key(&mut app, key(' '));
+    handle_key(&mut app, key('J'));
+    handle_key(&mut app, key('a'));
+    handle_key(&mut app, key('m'));
+    handle_key(&mut app, key('s'));
+    handle_key(&mut app, key_code(KeyCode::Enter));
+    assert!(app.overlay.is_none(), "Enter should close the text input");
     assert_eq!(app.playlists.len(), 1);
     assert_eq!(app.playlists[0].track_ids, vec!["t1".to_string()]);
-    assert!(
-        app.playlists[0].name.starts_with("New Playlist"),
-        "name should be 'New Playlist N', got {}",
-        app.playlists[0].name
+    assert_eq!(
+        app.playlists[0].name, "My Jams",
+        "playlist should use the typed name"
     );
 }
 
@@ -276,8 +313,20 @@ fn a_arrow_down_then_enter_creates_new_playlist() {
     // Down to "+ new playlist..." (cursor 1).
     handle_key(&mut app, key_code(KeyCode::Down));
     handle_key(&mut app, key_code(KeyCode::Enter));
+    // DEF-014: text input opens. Type a name and confirm.
+    assert!(
+        matches!(app.overlay, Some(Overlay::TextInput { .. })),
+        "should open text input for playlist name"
+    );
+    handle_key(&mut app, key('C'));
+    handle_key(&mut app, key('h'));
+    handle_key(&mut app, key('i'));
+    handle_key(&mut app, key('l'));
+    handle_key(&mut app, key('l'));
+    handle_key(&mut app, key_code(KeyCode::Enter));
     assert_eq!(app.playlists.len(), 2);
     assert_eq!(app.playlists[1].track_ids, vec!["t1".to_string()]);
+    assert_eq!(app.playlists[1].name, "Chill");
 }
 
 #[test]
@@ -330,7 +379,15 @@ fn d_deletes_focused_playlist_in_playlists_view() {
     app.view = View::Playlists;
     app.focus_col = 0;
     app.cursors.playlist = 0; // "Faves"
+                              // DEF-001: `d` opens a confirmation dialog, not immediate deletion.
     handle_key(&mut app, key('d'));
+    assert!(
+        matches!(app.overlay, Some(Overlay::Confirm { .. })),
+        "`d` should open a confirmation dialog"
+    );
+    assert_eq!(app.playlists.len(), 2, "no deletion until confirmed");
+    // Confirm.
+    handle_key(&mut app, key('y'));
     assert_eq!(app.playlists.len(), 1);
     assert_eq!(app.playlists[0].name, "Night");
 }
@@ -368,7 +425,13 @@ fn d_sets_status_message() {
     app.view = View::Playlists;
     app.focus_col = 0;
     app.cursors.playlist = 0;
+    // DEF-001: `d` opens confirmation; status is set only after confirming.
     handle_key(&mut app, key('d'));
+    assert!(
+        matches!(app.overlay, Some(Overlay::Confirm { .. })),
+        "should open confirmation dialog"
+    );
+    handle_key(&mut app, key('y'));
     assert!(
         app.yt_status
             .as_deref()
@@ -428,7 +491,9 @@ fn delete_playlist_removes_from_app_state() {
     app.view = View::Playlists;
     app.focus_col = 0;
     app.cursors.playlist = 0; // "Faves"
+                              // DEF-001: confirm before deletion.
     handle_key(&mut app, key('d'));
+    handle_key(&mut app, key('y'));
     // Verify the in-memory state: only "Night" remains.
     assert_eq!(app.playlists.len(), 1);
     assert_eq!(app.playlists[0].name, "Night");
@@ -444,9 +509,21 @@ fn add_to_playlist_updates_app_state() {
     focus_track_col(&mut app);
     handle_key(&mut app, key('a'));
     handle_key(&mut app, key_code(KeyCode::Enter));
+    // DEF-014: text input opens. Type a name and confirm.
+    assert!(
+        matches!(app.overlay, Some(Overlay::TextInput { .. })),
+        "should open text input for playlist name"
+    );
+    handle_key(&mut app, key('V'));
+    handle_key(&mut app, key('i'));
+    handle_key(&mut app, key('b'));
+    handle_key(&mut app, key('e'));
+    handle_key(&mut app, key('s'));
+    handle_key(&mut app, key_code(KeyCode::Enter));
     // Verify the in-memory state: one playlist with t1.
     assert_eq!(app.playlists.len(), 1);
     assert_eq!(app.playlists[0].track_ids, vec!["t1".to_string()]);
+    assert_eq!(app.playlists[0].name, "Vibes");
 }
 
 // ---------------------------------------------------------------------------

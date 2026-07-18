@@ -9,7 +9,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use jukebox::catalog::Catalog;
 use jukebox::player::StubPlayer;
-use jukebox::tui::app::{App, Playlist, View};
+use jukebox::tui::app::{App, Overlay, Playlist, View};
 use jukebox::tui::input::handle_key;
 
 fn key(c: char) -> KeyEvent {
@@ -116,12 +116,26 @@ fn d_deletes_in_playlists_view_col0() {
     app.focus_col = 0;
     app.cursors.playlist = 0;
     let before = app.playlists.len();
+    // DEF-001: `d` now opens a confirmation dialog, not immediate deletion.
     handle_key(&mut app, key('d'));
+    // A Confirm overlay should be open, not deleted yet.
+    assert!(
+        matches!(app.overlay, Some(Overlay::Confirm { .. })),
+        "`d` in Playlists view col 0 should open a confirmation dialog"
+    );
+    assert_eq!(
+        app.playlists.len(),
+        before,
+        "playlist must not be deleted until user confirms"
+    );
+    // Confirm with 'y' → deletion happens.
+    handle_key(&mut app, key('y'));
     assert_eq!(
         app.playlists.len(),
         before - 1,
-        "`d` in Playlists view col 0 should delete the focused playlist"
+        "`y` should confirm the deletion"
     );
+    assert!(app.overlay.is_none(), "overlay should close after confirm");
 }
 
 // ---------------------------------------------------------------------------

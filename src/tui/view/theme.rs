@@ -43,11 +43,57 @@
 //! A [`Theme::high_contrast`] constructor provides a pure black-on-white /
 //! white-on-black palette for users who need maximum contrast.
 
+use std::cell::RefCell;
+
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::border;
+
+use crate::tui::view::icons::{FontMode, Icon};
 
 /// True when NO_COLOR is set (no-color.org). Colors must not be the only signal.
 pub fn no_color() -> bool {
     std::env::var_os("NO_COLOR").is_some()
+}
+
+// RC18-D1: thread-local cache of the startup font mode. The previous
+// `is_ascii()` path constructed a fresh `Theme::default()` on every call,
+// which in turn called `FontMode::auto_detect()` on every call — reading
+// `JUKEBOX_FONT_MODE` / `TERM` / `TERM_FONT` env vars each time. The result
+// was deterministic for a given env, but the reviewer observed "flaky
+// Unicode/ASCII rendering between launches" because the PTY driver passed
+// `--ascii` for some runs (test 17-ascii) and not others, and any process
+// that mutated the env mid-session could flip the glyph vocabulary. We
+// now read the env ONCE per thread at the first `is_ascii()` call and
+// freeze it for the thread's lifetime, so the glyph vocabulary is stable
+// within a session regardless of later env changes. The TUI event loop
+// is single-threaded, so thread-local == process-stable in production.
+// Tests that mutate `JUKEBOX_FONT_MODE` call [`reset_font_mode_cache`] so
+// the next read on their thread re-reads the env.
+thread_local! {
+    static FONT_MODE: RefCell<Option<FontMode>> = const { RefCell::new(None) };
+}
+
+/// Read the cached startup font mode, initializing it from
+/// `FontMode::auto_detect()` on first call (per thread). Public so callers
+/// that need the raw (uncached) detection can still reach
+/// `FontMode::auto_detect()`.
+pub fn cached_font_mode() -> FontMode {
+    FONT_MODE.with(|cell| {
+        if let Some(m) = *cell.borrow() {
+            return m;
+        }
+        let m = FontMode::auto_detect();
+        *cell.borrow_mut() = Some(m);
+        m
+    })
+}
+
+/// Reset the cached font mode for the calling thread so the next
+/// [`cached_font_mode`] / [`is_ascii`] call re-reads the env vars. Intended
+/// for tests that mutate `JUKEBOX_FONT_MODE` / `TERM` / `TERM_FONT` between
+/// assertions (the cache is thread-stable in production).
+pub fn reset_font_mode_cache() {
+    FONT_MODE.with(|cell| *cell.borrow_mut() = None);
 }
 
 /// True when `JUKEBOX_HIGH_CONTRAST` is set (any value). When set,
@@ -81,6 +127,10 @@ pub struct Theme {
     pub source_local: Color, // local source badge
     pub source_yt: Color,    // YouTube source badge
     pub surface: Color,      // panel background accent
+    /// The font mode for icon rendering (NerdFont / Unicode / Ascii).
+    /// Auto-detected at startup; can be changed at runtime via
+    /// `set_font_mode`. Used by `icon()` to render glyphs.
+    pub font_mode: FontMode,
 }
 
 impl Default for Theme {
@@ -115,6 +165,7 @@ impl Default for Theme {
                 source_local: Color::Reset,
                 source_yt: Color::Reset,
                 surface: Color::Black, // subtle zebra background
+                font_mode: FontMode::auto_detect(),
             }
         } else {
             Theme {
@@ -138,6 +189,7 @@ impl Default for Theme {
                 // was only ~2.1:1 vs Gray text — below WCAG. See columns.rs
                 // zebra_bg usage.
                 surface: Color::Indexed(236),
+                font_mode: FontMode::auto_detect(),
             }
         }
     }
@@ -169,7 +221,25 @@ impl Theme {
             source_local: Color::White,
             source_yt: Color::White,
             surface: Color::Black,
+            font_mode: FontMode::auto_detect(),
         }
+    }
+
+    /// Get the glyph for an icon using the theme's font mode. Essential
+    /// meaning never depends only on the glyph — callers always pair it
+    /// with a text label for accessibility.
+    pub fn icon(&self, icon: Icon) -> &'static str {
+        icon.glyph(self.font_mode)
+    }
+
+    /// Set the font mode at runtime (e.g. when the user cycles modes).
+    pub fn set_font_mode(&mut self, mode: FontMode) {
+        self.font_mode = mode;
+    }
+
+    /// Get the current font mode.
+    pub fn font_mode(&self) -> FontMode {
+        self.font_mode
     }
 
     /// Selection style as a method (method-form entry point for callers that
@@ -481,4 +551,214 @@ pub fn pad_between(left: &str, right: &str, width: usize) -> String {
     let rw = disp_width(right);
     let pad = width.saturating_sub(lw + rw);
     format!("{}{}{}", left, " ".repeat(pad), right)
+}
+
+// ---------------------------------------------------------------------------
+// ASCII font mode helpers (DEF-006)
+// ---------------------------------------------------------------------------
+
+/// ASCII border set: `+`, `-`, `|` characters instead of Unicode box-drawing.
+/// Used when `JUKEBOX_FONT_MODE=ascii` so the TUI is fully ASCII-compatible.
+pub const ASCII_BORDER_SET: border::Set = border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+};
+
+/// True when the active font mode is ASCII (`JUKEBOX_FONT_MODE=ascii`).
+/// D2: `NO_COLOR` no longer triggers ASCII mode — it only disables colors
+/// (see `theme::no_color`). Use `JUKEBOX_FONT_MODE=ascii` for ASCII glyphs.
+/// RC18-D1: reads the cached startup font mode (see [`FONT_MODE`]) so the
+/// glyph vocabulary is stable for the process lifetime — never flaky
+/// between calls.
+pub fn is_ascii() -> bool {
+    cached_font_mode() == FontMode::Ascii
+}
+
+/// The horizontal line character for the current font mode: `─` (Unicode) or
+/// `-` (ASCII). Used by separator rules and horizontal dividers.
+pub fn h_line() -> &'static str {
+    if is_ascii() {
+        "-"
+    } else {
+        "─"
+    }
+}
+
+/// The vertical separator character for the current font mode: `│` (Unicode)
+/// or `|` (ASCII). Used by the tab bar between view labels.
+pub fn v_sep() -> &'static str {
+    if is_ascii() {
+        "|"
+    } else {
+        "│"
+    }
+}
+
+// --- Player bar glyph helpers (DEF-006 ASCII mode) ---
+
+/// Play glyph: `▶` (Unicode) or `>` (ASCII).
+pub fn play_glyph() -> &'static str {
+    if is_ascii() {
+        ">"
+    } else {
+        "▶"
+    }
+}
+/// Pause glyph: `⏸` (Unicode) or `||` (ASCII).
+pub fn pause_glyph() -> &'static str {
+    if is_ascii() {
+        "||"
+    } else {
+        "⏸"
+    }
+}
+/// Stop glyph: `■` (Unicode) or `#` (ASCII).
+pub fn stop_glyph() -> &'static str {
+    if is_ascii() {
+        "#"
+    } else {
+        "■"
+    }
+}
+/// Filled block for progress/volume bars: `▰` or `#`.
+pub fn filled_block() -> char {
+    if is_ascii() {
+        '#'
+    } else {
+        '▰'
+    }
+}
+/// Empty block for progress/volume bars: `▱` or `-`.
+pub fn empty_block() -> char {
+    if is_ascii() {
+        '-'
+    } else {
+        '▱'
+    }
+}
+/// Previous-track glyph: `◀◀` or `<<`.
+pub fn prev_glyph() -> &'static str {
+    if is_ascii() {
+        "<<"
+    } else {
+        "◀◀"
+    }
+}
+/// Next-track glyph: `▶▶` or `>>`.
+pub fn next_glyph() -> &'static str {
+    if is_ascii() {
+        ">>"
+    } else {
+        "▶▶"
+    }
+}
+/// Up-next marker glyph: `▸` or `>`.
+pub fn marker_glyph() -> &'static str {
+    if is_ascii() {
+        ">"
+    } else {
+        "▸"
+    }
+}
+/// Selection marker glyph for the currently-selected row: `▸` (Unicode) or
+/// `>` (ASCII). Exposed as a dedicated helper (RB-6) so the view layer can
+/// apply a visible non-color cue to the selected row without depending on
+/// `REVERSED` or color. This is the same as [`marker_glyph`] but named to
+/// convey its role in accessibility (selection visibility under `NO_COLOR`).
+pub fn selection_marker() -> &'static str {
+    marker_glyph()
+}
+/// Separator dot: `·` (Unicode) or `*` (ASCII). Used between status fields.
+pub fn sep_dot() -> &'static str {
+    if is_ascii() {
+        "*"
+    } else {
+        "·"
+    }
+}
+/// Em-dash: `—` (Unicode) or `--` (ASCII). Used in "title — artist" etc.
+pub fn em_dash() -> &'static str {
+    if is_ascii() {
+        "--"
+    } else {
+        "—"
+    }
+}
+/// Ellipsis: `…` (Unicode) or `...` (ASCII). Used in truncation/loading.
+pub fn ellipsis() -> &'static str {
+    if is_ascii() {
+        "..."
+    } else {
+        "…"
+    }
+}
+/// Right arrow: `→` (Unicode) or `->` (ASCII). Used in breadcrumbs and hints.
+pub fn right_arrow() -> &'static str {
+    if is_ascii() {
+        "->"
+    } else {
+        "→"
+    }
+}
+/// Left arrow: `←` (Unicode) or `<-` (ASCII). Used in breadcrumbs.
+pub fn left_arrow() -> &'static str {
+    if is_ascii() {
+        "<-"
+    } else {
+        "←"
+    }
+}
+/// Up arrow: `↑` (Unicode) or `^` (ASCII). Used in navigation hints.
+pub fn up_arrow() -> &'static str {
+    if is_ascii() {
+        "^"
+    } else {
+        "↑"
+    }
+}
+/// Down arrow: `↓` (Unicode) or `v` (ASCII). Used in navigation hints.
+pub fn down_arrow() -> &'static str {
+    if is_ascii() {
+        "v"
+    } else {
+        "↓"
+    }
+}
+/// Bullet: `•` (Unicode) or `*` (ASCII). Used for list items in overlays.
+pub fn bullet() -> &'static str {
+    if is_ascii() {
+        "*"
+    } else {
+        "•"
+    }
+}
+/// Replace all known Unicode decorative characters in `s` with their ASCII
+/// equivalents when ASCII font mode is active. Used for strings that originate
+/// outside the view layer (e.g. `YtState::human_label()`) where per-call
+/// helpers like `em_dash()` can't be inserted at the source. When not in ASCII
+/// mode, returns `s` unchanged.
+pub fn ascii_sanitize(s: &str) -> String {
+    if !is_ascii() {
+        return s.to_string();
+    }
+    s.replace('—', "--")
+        .replace('·', "*")
+        .replace('…', "...")
+        .replace('→', "->")
+        .replace('←', "<-")
+        .replace('↑', "^")
+        .replace('↓', "v")
+        .replace(['▸', '▶'], ">")
+        .replace('♫', "#")
+        .replace('✦', "*")
+        .replace('≡', "#")
+        .replace('⏸', "||")
+        .replace('■', "#")
+        .replace('•', "*")
 }

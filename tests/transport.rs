@@ -111,7 +111,12 @@ fn repeat_all_wraps_at_end() {
 }
 
 #[test]
-fn repeat_one_replays_same_track() {
+fn repeat_one_advances_on_explicit_next() {
+    // RPT=One replay is handled at the App level (on_track_ended), not in
+    // Transport::next(). A user `>` press must advance even with RPT=One
+    // (the user's "CONT radio still replaying song" report was RPT=One
+    // short-circuiting `>`). So Transport::next() with RPT=One now advances
+    // to the next track like RPT=Off, not replays the current.
     let (_d, cat) = cat_with_artists();
     let ctx = Context::Search {
         query: "x".into(),
@@ -120,7 +125,7 @@ fn repeat_one_replays_same_track() {
     let mut t = Transport::new(ctx);
     t.set_repeat(RepeatMode::One);
     t.play_at(&R, &cat, "t1");
-    assert_eq!(t.next(&R, &cat), Some("t1".into()));
+    assert_eq!(t.next(&R, &cat), Some("t2".into()));
 }
 
 #[test]

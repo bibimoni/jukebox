@@ -6,12 +6,17 @@ name: ci
 # libasound2 on Linux) are all exercised. Action versions and the cargo
 # cache layout are kept in sync with release.yml.
 #
+# The `summary` job (last in the graph) writes a one-page markdown digest
+# to the run's `$GITHUB_STEP_SUMMARY` — a per-job pass/fail table, the
+# version from Cargo.toml, and a "release-ready" verdict — so a human can
+# see the whole pipeline state at a glance without clicking each job.
+#
 # NOTE: the trigger key is quoted ("on") so YAML 1.1 parsers do not coerce
 # the bareword `on` into boolean `true` (which would corrupt the trigger
 # structure). GitHub Actions accepts both forms; the quoted form is robust.
 "on":
   push:
-    branches: [main, 'revamp/*']
+    branches: [main, 'revamp/*', 'feat/*']
   pull_request:
     branches: [main, 'revamp/*']
 
@@ -29,6 +34,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-fmt-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: cargo-fmt-
 
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -65,7 +80,9 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-clippy-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
-          restore-keys: cargo-clippy-${{ matrix.os }}-
+          restore-keys: |
+            cargo-clippy-${{ matrix.os }}-
+            cargo-build-${{ matrix.os }}-
 
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -100,7 +117,10 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-test-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
-          restore-keys: cargo-test-${{ matrix.os }}-
+          restore-keys: |
+            cargo-test-${{ matrix.os }}-
+            cargo-clippy-${{ matrix.os }}-
+            cargo-build-${{ matrix.os }}-
 
       - name: cargo test
         run: cargo test --all-features
@@ -168,10 +188,93 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-build-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
-          restore-keys: cargo-build-${{ matrix.os }}-
+          restore-keys: |
+            cargo-build-${{ matrix.os }}-
+            cargo-test-${{ matrix.os }}-
+            cargo-clippy-${{ matrix.os }}-
 
       - name: cargo build --release
         run: cargo build --release --locked
 
       - name: Verify binary exists
         run: test -f target/release/jukebox
+
+  # ── summary ──────────────────────────────────────────────────────────
+  # One-page digest of the whole pipeline. Runs `if: always()` so the
+  # summary is posted even when upstream jobs fail — that's the whole
+  # point: see the failure state in one place without clicking each job.
+  # Writes to `$GITHUB_STEP_SUMMARY` (the "Summary" tab on the run page).
+  summary:
+    name: summary
+    needs: [fmt, clippy, test, bats, build]
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build CI summary
+        # Pass each upstream job's result in as an env var. GHA expands
+        # `${{ needs.<job>.result }}` to one of: success | failure |
+        # cancelled | skipped. The bash loop below maps each to an icon +
+        # row in a markdown table and writes the digest to
+        # `$GITHUB_STEP_SUMMARY` (renders on the run's Summary tab).
+        env:
+          FMT_RESULT: ${{ needs.fmt.result }}
+          CLIPPY_RESULT: ${{ needs.clippy.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          BATS_RESULT: ${{ needs.bats.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          # Read version from Cargo.toml (handles "0.4.0" and quoted forms).
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          SHORT_SHA="${GITHUB_SHA::7}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          {
+            echo "## jukebox v${VERSION} — CI summary"
+            echo
+            echo "**Branch:** \`${GITHUB_REF_NAME}\`  "
+            echo "**Commit:** \`${SHORT_SHA}\`  "
+            echo "**Run:** [#${GITHUB_RUN_NUMBER}](${RUN_URL})"
+            echo
+            echo "### Job results"
+            echo
+            echo "| Job | Status |"
+            echo "|---|---|"
+            for pair in "fmt:${FMT_RESULT}" \
+                        "clippy:${CLIPPY_RESULT}" \
+                        "test:${TEST_RESULT}" \
+                        "bats:${BATS_RESULT}" \
+                        "build:${BUILD_RESULT}"; do
+              job="${pair%%:*}"
+              result="${pair##*:}"
+              case "$result" in
+                success)  icon=":white_check_mark:" ;;
+                failure)  icon=":x:" ;;
+                cancelled) icon=":no_entry_sign:" ;;
+                skipped)  icon=":fast_forward:" ;;
+                *)        icon=":question:" ;;
+              esac
+              echo "| ${job} | ${icon} ${result} |"
+            done
+            echo
+            # `bats` is `continue-on-error: true` — it never blocks the gate,
+            # so exclude it from the release-ready verdict.
+            if [ "${FMT_RESULT}" = "success" ] \
+               && [ "${CLIPPY_RESULT}" = "success" ] \
+               && [ "${TEST_RESULT}" = "success" ] \
+               && [ "${BUILD_RESULT}" = "success" ]; then
+              echo "### :rocket: Release-ready"
+              echo
+              echo "All gates passed (bats is informational only — \`continue-on-error: true\`)."
+              echo "Tag \`v${VERSION}\` to publish a release:"
+              echo
+              echo "\`\`\`bash"
+              echo "git tag v${VERSION}"
+              echo "git push origin v${VERSION}   # triggers release.yml"
+              echo "\`\`\`"
+            else
+              echo "### :warning: Not release-ready"
+              echo
+              echo "One or more gates failed. Fix before tagging \`v${VERSION}\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

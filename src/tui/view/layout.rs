@@ -21,6 +21,7 @@
 //!   saving 2 rows for content (T3).
 
 use ratatui::{
+    buffer::CellDiffOption,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -28,19 +29,21 @@ use ratatui::{
     Frame,
 };
 
-use super::{columns, footer, overlay, player_bar};
+use super::{columns, footer, now_playing_panel, overlay, player_bar, player_bar_big, sidebar};
 use crate::tui::app::{App, View};
-use crate::tui::view::theme::{self, Theme};
+use crate::tui::view::theme::{self, h_line, v_sep, Theme};
 
 /// Minimum terminal width for the full 3-column Miller layout. At
 /// `width < MIN_WIDTH` we collapse to the 2-column narrow path (rail +
 /// focused pane) so the three columns don't compress past readability.
 ///
-/// **T3 breakpoints:** `< 70` = single column, `70–100` = 2 columns (rail +
-/// focused), `> 100` = 3 columns. The old threshold was 120 (Issue 2 fix);
-/// lowered to 101 so the 3-column layout kicks in at >100 cols where
-/// rail(4)+col1(24)+col2(28)+col3(45)=101 fits comfortably.
-pub const MIN_WIDTH: u16 = 101;
+/// **T3 breakpoints:** `< 70` = single column, `70–99` = 2 columns (rail +
+/// focused), `>= 100` = 3 columns. The old threshold was 120 (Issue 2 fix),
+/// then 101; lowered to 100 so the 3-column layout kicks in at 100 cols
+/// (the standard test terminal size), making SHUF/RPT/volume indicators
+/// visible at 100×30 (DEF-004). rail(4)+col1(24)+col2(28)+col3(44)=100
+/// fits exactly at 100 cols.
+pub const MIN_WIDTH: u16 = 100;
 pub const MIN_HEIGHT: u16 = 24;
 /// Below this the app refuses to render and shows a "terminal too small" message.
 pub const NARROW_MIN_WIDTH: u16 = 60;
@@ -106,6 +109,47 @@ pub fn overlay_content_area(area: Rect) -> Rect {
     Rect::new(area.x, area.y, area.width, height)
 }
 
+/// Split `area` into sidebar + content when the sidebar is visible. Renders
+/// the sidebar into the left split and returns the right split for content.
+/// When the sidebar is off, returns `area` unchanged.
+fn split_sidebar(f: &mut Frame, area: Rect, app: &App) -> Rect {
+    if sidebar::is_visible(app, area.width) {
+        let sw = sidebar::sidebar_width(area.width);
+        if sw > 0 && area.width > sw {
+            let split =
+                Layout::horizontal([Constraint::Length(sw), Constraint::Min(1)]).split(area);
+            sidebar::render_sidebar(f, split[0], app);
+            split[1]
+        } else {
+            area
+        }
+    } else {
+        area
+    }
+}
+
+/// Split `content_area` into main content + the now-playing preview panel
+/// (right side). Renders the panel into the right split and returns the left
+/// split for the main columns/YouTube view. When the panel is hidden (narrow
+/// terminal), returns `content_area` unchanged.
+fn split_now_playing_panel(f: &mut Frame, content_area: Rect, app: &App) -> Rect {
+    if !now_playing_panel::is_visible(content_area.width) {
+        return content_area;
+    }
+    let pw = now_playing_panel::PANEL_WIDTH;
+    if content_area.width > pw + 40 {
+        let split = Layout::horizontal([
+            Constraint::Min(40),    // main content
+            Constraint::Length(pw), // now-playing panel
+        ])
+        .split(content_area);
+        now_playing_panel::render(f, split[1], app);
+        split[0]
+    } else {
+        content_area
+    }
+}
+
 /// The single entry point the event loop calls. Renders the full TUI frame:
 /// too-small guard, columns + player bar + footer, and any active overlay on top.
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -134,6 +178,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if app.overlay.is_some() {
             overlay::render(f, area, app);
         }
+        post_render_force(f, app);
         return;
     }
 
@@ -147,6 +192,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // row for the browse area on narrow terminals — the player bar's
     // distinct styling provides enough visual separation.
     let compact = area.height <= MIN_HEIGHT;
+    let big_mode = app.player_bar_state.effective_mode(area.width, area.height)
+        == player_bar_big::PlayerBarMode::Big;
+    app.player_bar_state.mode = if big_mode {
+        player_bar_big::PlayerBarMode::Big
+    } else {
+        player_bar_big::PlayerBarMode::Mini
+    };
     let footer_h = if compact {
         FOOTER_HEIGHT_NARROW
     } else {
@@ -156,6 +208,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         BAR_SEPARATOR_HEIGHT
     } else {
         0
+    };
+    let bar_h = if compact {
+        1u16
+    } else if big_mode {
+        player_bar_big::BIG_BAR_HEIGHT
+    } else {
+        PLAYER_BAR_HEIGHT
     };
 
     if compact {
@@ -170,7 +229,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 Constraint::Length(footer_h),
             ])
             .split(area);
-        columns::render(f, outer[0], app);
+        let content = split_sidebar(f, outer[0], app);
+        let content = split_now_playing_panel(f, content, app);
+        columns::render(f, content, app);
         if sep_h > 0 {
             render_separator_rule(f, outer[1], app);
         }
@@ -184,21 +245,187 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 Constraint::Length(1),
                 Constraint::Min(3),
                 Constraint::Length(sep_h),
-                Constraint::Length(PLAYER_BAR_HEIGHT),
+                Constraint::Length(bar_h),
                 Constraint::Length(footer_h),
             ])
             .split(area);
         render_tab_bar(f, outer[0], app);
-        columns::render(f, outer[1], app);
+        let content = split_sidebar(f, outer[1], app);
+        let content = split_now_playing_panel(f, content, app);
+        columns::render(f, content, app);
         if sep_h > 0 {
             render_separator_rule(f, outer[2], app);
         }
-        player_bar::render(f, outer[3], app);
+        if big_mode {
+            player_bar_big::render_big(f, outer[3], app);
+        } else {
+            player_bar::render(f, outer[3], app);
+        }
         footer::render(f, &outer[4], app);
     }
 
     if app.overlay.is_some() {
         overlay::render(f, area, app);
+    }
+    post_render_force(f, app);
+}
+
+/// Post-render diff forcing. Called at the end of every `draw` after all
+/// widgets (and any overlay) have rendered. Combines two diff-forcing passes:
+///
+/// 1. **Every-frame full redraw** (MOD-7 / DEF-002 persistent fix): marks
+///    every non-empty cell as `AlwaysUpdate` so the diff emits it
+///    unconditionally on EVERY frame. The persistent character-dropping bug
+///    ("delete" → "del te", "Test Artist" → "Test Art st", "YouTube" →
+///    "utube", "lossless" → "lossle s") happened on initial render, same-view
+///    updates (j/k navigation, scrolling), and view switches — anywhere
+///    ratatui's `Cell::eq` found a coincidental content+style match at the
+///    same position and skipped the cell, leaving stale terminal content.
+///    The previous view-change-only fix was insufficient because the same
+///    diff-skip happens whenever content shifts within a view (scroll,
+///    cursor move) or on the very first frame (where the cleared buffer can
+///    coincidentally match a styled cell). Forcing every non-empty cell on
+///    every frame guarantees the terminal always reflects the buffer.
+///
+/// 2. **`force_space_redraw`** (DEF-002 / MAJ-2): marks default-styled
+///    inter-word spaces so the diff writes them, clearing stale content
+///    at space positions.
+fn post_render_force(f: &mut Frame, app: &mut App) {
+    force_full_redraw(f);
+    force_space_redraw(f);
+    app.last_rendered_view = app.view;
+}
+
+/// Mark every non-empty cell in the buffer as `AlwaysUpdate` so the diff
+/// emits it regardless of whether it matches the previous frame. Called on
+/// EVERY frame by [`post_render_force`] to prevent the MOD-7
+/// character-dropping bug where a cell whose content+style coincidentally
+/// matches the previous frame at the same position is skipped by ratatui's
+/// `Cell::eq`, leaving stale terminal content. This happens on initial
+/// render, same-view updates (scroll/cursor move), and view switches.
+///
+/// "Non-empty" means the cell has a non-space symbol OR a non-default style
+/// (fg/bg/modifier). Default-styled spaces are left to `force_space_redraw`,
+/// which marks the inter-word ones.
+fn force_full_redraw(f: &mut Frame) {
+    let area = f.area();
+    let buf = f.buffer_mut();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if cell.diff_option != CellDiffOption::None {
+                    continue;
+                }
+                let is_default_space = cell.symbol() == " "
+                    && cell.fg == Color::Reset
+                    && cell.bg == Color::Reset
+                    && cell.modifier == Modifier::empty();
+                if !is_default_space {
+                    cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+                }
+            }
+        }
+    }
+}
+
+/// Maximum number of cells `force_space_redraw` will mark as `AlwaysUpdate`
+/// per frame. At small terminal sizes (80×24, 100×30) the cap is never
+/// reached, so all eligible spaces are marked (DEF-002 stays fixed). At
+/// large sizes (120×40, 160×50) the cap prevents the ~2100-cell flood of
+/// erase/update commands that corrupts the display (MAJ-2).
+const MAX_MARKED_CELLS: usize = 500;
+
+/// Work around ratatui's `Cell::eq` treating `symbol: None` (empty) as equal to
+/// `symbol: Some(" ")` (space). When text uses `Color::Reset` (the default
+/// `theme.text`), styled spaces are indistinguishable from empty buffer cells.
+/// The diff skips them, so old terminal content at space positions is never
+/// refreshed — the pervasive character-dropping bug (DEF-002). On a fresh
+/// terminal this is invisible (blank ≈ space), but after a view switch the
+/// previous frame's content shows through at every space position, making
+/// words run together ("WorkoutEnergy" instead of "Workout Energy").
+///
+/// Fix: after all rendering, mark default-styled space cells that are
+/// **adjacent to a non-space cell** as `CellDiffOption::AlwaysUpdate` so the
+/// diff always emits them. This limits the extra writes to spaces that are
+/// actually between words (or between a word and the border), not the vast
+/// empty background. A space in the middle of nowhere doesn't need a forced
+/// write — nothing visually abuts it, so stale content there is harmless.
+///
+/// MAJ-2: At large terminal sizes (120×40, 160×50) the old code marked every
+/// space adjacent to text (~2100 cells), flooding the terminal with erase
+/// commands that corrupt the status bar and hint line. Now we prioritize
+/// inter-word spaces (both neighbours non-space — the DEF-002 critical case
+/// where words run together) and cap the total at [`MAX_MARKED_CELLS`].
+/// Trailing/leading spaces (one neighbour) are filled in only if the cap
+/// hasn't been reached. At small sizes (80×24, 100×30) the cap is never hit,
+/// so DEF-002 stays fully fixed; at large sizes the flood is bounded.
+fn force_space_redraw(f: &mut Frame) {
+    let area = f.area();
+    let buf = f.buffer_mut();
+    // Collect candidates in two priority tiers:
+    // 1. Inter-word spaces: both left AND right neighbours are non-space.
+    //    These are the DEF-002 critical case — without them, words run
+    //    together ("WorkoutEnergy" instead of "Workout Energy").
+    // 2. One-neighbour spaces: only one side has a non-space neighbour
+    //    (trailing/leading spaces at text boundaries). Less visually
+    //    critical but still needed to clear stale content at text edges.
+    let mut inter_word: Vec<(u16, u16)> = Vec::new();
+    let mut one_neighbour: Vec<(u16, u16)> = Vec::new();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let is_default_space = match buf.cell((x, y)) {
+                Some(cell) => {
+                    cell.diff_option == CellDiffOption::None
+                        && cell.symbol() == " "
+                        && cell.fg == Color::Reset
+                        && cell.bg == Color::Reset
+                        && cell.modifier == Modifier::empty()
+                }
+                None => false,
+            };
+            if !is_default_space {
+                continue;
+            }
+            // Check horizontal neighbours — `symbol()` returns " " for both
+            // empty and space cells, so this only fires next to actual
+            // text/border content.
+            let left = buf
+                .cell((x.wrapping_sub(1), y))
+                .map(|c| c.symbol() != " " && !c.symbol().is_empty())
+                .unwrap_or(false);
+            let right = buf
+                .cell((x.wrapping_add(1), y))
+                .map(|c| c.symbol() != " " && !c.symbol().is_empty())
+                .unwrap_or(false);
+            if left && right {
+                inter_word.push((x, y));
+            } else if left || right {
+                one_neighbour.push((x, y));
+            }
+        }
+    }
+    // Mark inter-word spaces first (highest priority), then one-neighbour
+    // spaces, up to the cap. This ensures the most visible DEF-002 cases
+    // are always covered while bounding the total terminal output per
+    // frame (MAJ-2).
+    let mut marked = 0;
+    for &(x, y) in &inter_word {
+        if marked >= MAX_MARKED_CELLS {
+            break;
+        }
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+        }
+        marked += 1;
+    }
+    for &(x, y) in &one_neighbour {
+        if marked >= MAX_MARKED_CELLS {
+            break;
+        }
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+        }
+        marked += 1;
     }
 }
 
@@ -260,7 +487,7 @@ fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
         } else {
             theme.dim
         });
-        let rule = "─".repeat(outer[1].width as usize);
+        let rule = h_line().repeat(outer[1].width as usize);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(rule, dim)))
                 .block(Block::default().borders(Borders::NONE)),
@@ -348,7 +575,10 @@ fn render_narrow_breadcrumb(f: &mut Frame, area: Rect, cols: &[(&str, bool)]) {
     let mut spans: Vec<Span> = Vec::new();
     for (i, (label, is_active)) in cols.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" › ", dim));
+            spans.push(Span::styled(
+                format!(" {} ", if theme::is_ascii() { ">" } else { "›" }),
+                dim,
+            ));
         }
         if *is_active {
             spans.push(Span::styled(*label, active));
@@ -373,8 +603,9 @@ fn render_narrow_hint(f: &mut Frame, area: Rect, hint: &str) {
     } else {
         theme.dim
     });
+    let hint = theme::ascii_sanitize(hint);
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint.to_string(), dim)))
+        Paragraph::new(Line::from(Span::styled(hint, dim)))
             .alignment(Alignment::Center)
             .block(Block::default().borders(Borders::NONE)),
         area,
@@ -385,7 +616,10 @@ fn render_narrow_hint(f: &mut Frame, area: Rect, hint: &str) {
 /// is told to resize the window or press `q` to quit — no browse chrome is
 /// drawn in this state so a cramped terminal doesn't show garbage.
 fn render_too_small(f: &mut Frame, area: Rect) {
-    let msg = "terminal too small — resize or press q to quit";
+    let msg = format!(
+        "terminal too small {} resize or press q to quit",
+        theme::em_dash()
+    );
     let paragraph = Paragraph::new(Line::from(msg))
         .alignment(Alignment::Center)
         .style(Style::default().fg(Color::Yellow))
@@ -415,7 +649,7 @@ fn render_separator_rule(f: &mut Frame, area: Rect, _app: &App) {
     } else {
         theme.dim
     });
-    let rule = "─".repeat(area.width as usize);
+    let rule = h_line().repeat(area.width as usize);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(rule, dim)))
             .block(Block::default().borders(Borders::NONE)),
@@ -434,7 +668,7 @@ fn render_separator_rule(f: &mut Frame, area: Rect, _app: &App) {
 ///
 /// The `›` separator is a non-color structural cue (survives `NO_COLOR`).
 fn breadcrumb(app: &App) -> String {
-    let sep = " › ";
+    let sep = format!(" {} ", if theme::is_ascii() { ">" } else { "›" });
     match app.view {
         View::Artists => {
             let mut parts: Vec<String> = vec!["Artists".to_string()];
@@ -452,7 +686,7 @@ fn breadcrumb(app: &App) -> String {
                     }
                 }
             }
-            parts.join(sep)
+            parts.join(&sep)
         }
         View::Playlists => {
             let mut parts: Vec<String> = vec!["Playlists".to_string()];
@@ -461,7 +695,7 @@ fn breadcrumb(app: &App) -> String {
                     parts.push(pl.name.clone());
                 }
             }
-            parts.join(sep)
+            parts.join(&sep)
         }
         View::Queue => "Queue".to_string(),
         View::Youtube => {
@@ -471,7 +705,7 @@ fn breadcrumb(app: &App) -> String {
                     parts.push(list.name.clone());
                 }
             }
-            parts.join(sep)
+            parts.join(&sep)
         }
     }
 }
@@ -518,7 +752,7 @@ fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
         ("4:YouTube", View::Youtube),
     ];
 
-    let sep = " │ ";
+    let sep: &'static str = if v_sep() == "|" { " | " } else { " │ " };
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut tabs_w: usize = 0;
     for (i, (label, view)) in tabs.iter().enumerate() {
@@ -549,4 +783,379 @@ fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
             .block(Block::default().borders(Borders::NONE)),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::CellDiffOption;
+    use ratatui::widgets::Paragraph;
+    use ratatui::Terminal;
+
+    /// DEF-002 regression: a space between two words (default style) must be
+    /// marked `AlwaysUpdate` by `force_space_redraw` so the diff writes it
+    /// to the terminal, overwriting stale content from the previous frame.
+    #[test]
+    fn force_space_redraw_marks_spaces_between_words() {
+        let backend = TestBackend::new(20, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("hello world"), f.area());
+                force_space_redraw(f);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Position 5 is the space between "hello" and "world".
+        assert_eq!(
+            buf[(5, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "space between words must be AlwaysUpdate"
+        );
+        // Position 0 is 'h' (non-space) — should NOT be AlwaysUpdate.
+        assert_ne!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "non-space characters should not be force-marked"
+        );
+    }
+
+    /// DEF-002 regression: a space in the empty background (not adjacent to
+    /// any text) should NOT be marked — it doesn't need a forced write.
+    #[test]
+    fn force_space_redraw_skips_isolated_spaces() {
+        let backend = TestBackend::new(20, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                // Render only 5 chars in a 20-wide area — cols 5-19 are empty.
+                f.render_widget(Paragraph::new("hello"), f.area());
+                force_space_redraw(f);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Position 10 is empty background (no text neighbour).
+        assert_ne!(
+            buf[(10, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "isolated background space should not be force-marked"
+        );
+    }
+
+    /// DEF-004 regression: MIN_WIDTH must be 100 so 100×30 uses the full
+    /// 3-column layout with the 2-row player bar (SHUF/RPT/volume visible).
+    #[test]
+    fn min_width_is_100() {
+        assert_eq!(MIN_WIDTH, 100);
+    }
+
+    /// MAJ-2: At large terminal sizes (160×50), `force_space_redraw` must not
+    /// mark more than `MAX_MARKED_CELLS` cells as `AlwaysUpdate`. Without the
+    /// cap, ~2100 cells are marked at 120×40, flooding the terminal with erase
+    /// commands that corrupt the status bar and hint line.
+    #[test]
+    fn force_space_redraw_caps_marked_cells_at_large_sizes() {
+        let backend = TestBackend::new(160, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                // Render many short words with spaces on every line to create
+                // a large number of eligible default-styled space cells.
+                for y in 0..50u16 {
+                    let text = "word ".repeat(32); // 160 chars, lots of spaces
+                    f.render_widget(Paragraph::new(text), Rect::new(0, y, 160, 1));
+                }
+                force_space_redraw(f);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let count = (0..50u16)
+            .flat_map(|y| (0..160u16).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].diff_option == CellDiffOption::AlwaysUpdate)
+            .count();
+        assert!(
+            count <= MAX_MARKED_CELLS,
+            "MAJ-2: too many cells marked at 160×50: {count} > {MAX_MARKED_CELLS}"
+        );
+    }
+
+    /// MOD-7: `force_full_redraw` must mark every non-empty (non-default-space)
+    /// cell as `AlwaysUpdate` so the diff emits it unconditionally on a view
+    /// switch. Without this, a cell whose content+style coincidentally matches
+    /// the previous frame at the same position is skipped (e.g. "i" in "Test
+    /// Artist" → "i" in "Late Night Jazz"), leaving stale content.
+    #[test]
+    fn force_full_redraw_marks_non_empty_cells() {
+        let backend = TestBackend::new(20, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("hello"), f.area());
+                force_full_redraw(f);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // 'h' at (0,0) is a non-space character → must be AlwaysUpdate.
+        assert_eq!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: non-space cell must be marked AlwaysUpdate by force_full_redraw"
+        );
+        // 'o' at (4,0) is the last char of "hello" → must be AlwaysUpdate.
+        assert_eq!(
+            buf[(4, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: non-space cell must be marked AlwaysUpdate by force_full_redraw"
+        );
+        // Cell at (10,0) is an empty/default space → must NOT be marked
+        // (left to force_space_redraw to handle inter-word spaces).
+        assert_ne!(
+            buf[(10, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: default-styled empty cell should not be marked by force_full_redraw"
+        );
+    }
+
+    /// MOD-7: `force_full_redraw` must mark styled (non-default fg/bg/modifier)
+    /// cells even if their symbol is a space. A styled space (e.g. a colored
+    /// background) is "non-empty" in the visual sense and must be re-emitted
+    /// on a view switch so the old frame's styling doesn't linger.
+    #[test]
+    fn force_full_redraw_marks_styled_spaces() {
+        let backend = TestBackend::new(20, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    Paragraph::new(" ").style(Style::default().bg(Color::Blue)),
+                    f.area(),
+                );
+                force_full_redraw(f);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // The styled space at (0,0) has bg=Blue → must be AlwaysUpdate.
+        assert_eq!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: styled space (non-default bg) must be marked AlwaysUpdate"
+        );
+    }
+
+    /// MOD-7: `post_render_force` must trigger `force_full_redraw` on EVERY
+    /// frame — not just on view change. This is the persistent
+    /// character-dropping fix: ratatui's diff skips cells whose content+style
+    /// coincidentally match the previous frame at the same position, which
+    /// happens on initial render, same-view updates (j/k navigation,
+    /// scrolling), AND view switches. Marking all non-empty cells as
+    /// `AlwaysUpdate` on every frame guarantees the terminal always reflects
+    /// the buffer.
+    #[test]
+    fn post_render_force_always_triggers_full_redraw() {
+        use crate::catalog::Catalog;
+        use crate::player::StubPlayer;
+        use crate::tui::app::{App, View};
+
+        // Minimal catalog for App::new.
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({
+            "version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+            "tracks":[
+              {"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"Freedom",
+               "album":"Adele","bit_depth":24,"sample_rate_hz":96000,
+               "source_path":"lossless/A/01.flac","symlinked_into_artists":["Ado"]}
+            ]
+        })
+        .to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        let cat = Catalog::load(&p).unwrap();
+
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.view = View::Artists;
+        app.last_rendered_view = View::Artists;
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Frame 1: same view → full redraw NOW runs on every frame. 'h'
+        // must be AlwaysUpdate (MOD-7 persistent fix).
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("hello"), f.area());
+                post_render_force(f, &mut app);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: cell must be marked AlwaysUpdate on every frame, even when view is unchanged"
+        );
+
+        // Switch view → full redraw still runs.
+        app.view = View::Youtube;
+
+        // Frame 2: view changed → full redraw. 'w' must be AlwaysUpdate.
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("world"), f.area());
+                post_render_force(f, &mut app);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: cell must be marked AlwaysUpdate after view change"
+        );
+        // last_rendered_view must be updated so other code can track it.
+        assert_eq!(
+            app.last_rendered_view,
+            View::Youtube,
+            "MOD-7: last_rendered_view must be updated after view change"
+        );
+
+        // Frame 3: same view again → full redraw STILL runs (the persistent
+        // fix). 'a' must be AlwaysUpdate.
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("again"), f.area());
+                post_render_force(f, &mut app);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: cell must be marked AlwaysUpdate on every frame, even after a view switch"
+        );
+    }
+
+    /// MOD-7 persistent fix: the first frame (initial render) must mark all
+    /// non-empty cells as `AlwaysUpdate`. The cleared initial buffer can
+    /// coincidentally match a styled cell, causing the diff to skip it and
+    /// drop a character on the very first render.
+    #[test]
+    fn post_render_force_marks_cells_on_initial_frame() {
+        use crate::catalog::Catalog;
+        use crate::player::StubPlayer;
+        use crate::tui::app::{App, View};
+
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({
+            "version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+            "tracks":[
+              {"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"Freedom",
+               "album":"Adele","bit_depth":24,"sample_rate_hz":96000,
+               "source_path":"lossless/A/01.flac","symlinked_into_artists":["Ado"]}
+            ]
+        })
+        .to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        let cat = Catalog::load(&p).unwrap();
+
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.view = View::Artists;
+        app.last_rendered_view = View::Artists;
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // The very first draw on a fresh terminal — every non-empty cell
+        // must be marked so the diff emits it, even though the previous
+        // buffer is the cleared all-spaces buffer.
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("delete"), f.area());
+                post_render_force(f, &mut app);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // All 6 characters of "delete" must be AlwaysUpdate.
+        for (i, _ch) in "delete".chars().enumerate() {
+            assert_eq!(
+                buf[(i as u16, 0)].diff_option,
+                CellDiffOption::AlwaysUpdate,
+                "MOD-7: initial frame must mark every char of 'delete' as AlwaysUpdate (char at {i})"
+            );
+        }
+    }
+
+    /// MOD-7 persistent fix: a same-view update (e.g. j/k navigation changes
+    /// the rendered text) must mark all non-empty cells as `AlwaysUpdate`.
+    /// Without this, a cell whose new character coincidentally matches the
+    /// old character at the same position with the same style is skipped
+    /// (e.g. "i" in "Test Artist" → "i" in "Best Artist" at the same col).
+    #[test]
+    fn post_render_force_marks_cells_on_same_view_update() {
+        use crate::catalog::Catalog;
+        use crate::player::StubPlayer;
+        use crate::tui::app::{App, View};
+
+        let d = tempfile::tempdir().unwrap();
+        let lossless = d.path().join("lossless");
+        std::fs::create_dir_all(lossless.join("A")).unwrap();
+        std::fs::write(lossless.join("A").join("01.flac"), b"x").unwrap();
+        let json = serde_json::json!({
+            "version":1,"built_at":"x","source_root":lossless.to_str().unwrap(),
+            "tracks":[
+              {"id":"t1","artists":["Ado"],"primary_artist":"Ado","title":"Freedom",
+               "album":"Adele","bit_depth":24,"sample_rate_hz":96000,
+               "source_path":"lossless/A/01.flac","symlinked_into_artists":["Ado"]}
+            ]
+        })
+        .to_string();
+        let p = d.path().join("catalog.json");
+        std::fs::write(&p, json).unwrap();
+        let cat = Catalog::load(&p).unwrap();
+
+        let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+        app.view = View::Artists;
+        app.last_rendered_view = View::Artists;
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Frame 1: "Test Artist".
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("Test Artist"), f.area());
+                post_render_force(f, &mut app);
+            })
+            .unwrap();
+
+        // Frame 2: same view, different text where "i" is at the same
+        // position. Without every-frame force_full_redraw, the "i" would
+        // be skipped by the diff (same char + same style).
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("Best Artist"), f.area());
+                post_render_force(f, &mut app);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // "Best Artist" — 'B' at (0,0) must be AlwaysUpdate (the old 'T'
+        // was different, but force ensures it regardless). And the 'i' at
+        // (5,0) must also be AlwaysUpdate even though the previous frame
+        // also had 'i' at (5,0) with the same style.
+        assert_eq!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: same-view update must mark 'B' as AlwaysUpdate"
+        );
+        assert_eq!(
+            buf[(5, 0)].diff_option,
+            CellDiffOption::AlwaysUpdate,
+            "MOD-7: same-view update must mark 'i' as AlwaysUpdate even though previous frame also had 'i' at the same position"
+        );
+    }
 }

@@ -17,7 +17,7 @@ use ratatui::{
 };
 
 use crate::diagnostics::Diagnostics;
-use crate::tui::view::theme::Theme;
+use crate::tui::view::theme::{em_dash, is_ascii, Theme, ASCII_BORDER_SET};
 
 /// Render the diagnostics overlay into `area`: a bordered box titled
 /// "diagnostics — Esc to close" listing the buffered messages (newest last),
@@ -38,17 +38,37 @@ pub fn render(f: &mut Frame, area: Rect, diag: &Diagnostics) {
     f.render_widget(Clear, area);
 
     let title_style = Style::default().add_modifier(Modifier::BOLD);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled("diagnostics — Esc to close", title_style));
+    let block = if is_ascii() {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(ASCII_BORDER_SET)
+            .title(Span::styled(
+                format!("diagnostics {} Esc to close", em_dash()),
+                title_style,
+            ))
+    } else {
+        Block::default().borders(Borders::ALL).title(Span::styled(
+            format!("diagnostics {} Esc to close", em_dash()),
+            title_style,
+        ))
+    };
 
     let msgs = diag.messages();
     let body: Vec<Line> = if msgs.is_empty() {
         vec![Line::from(Span::styled("no diagnostics yet", dim))]
     } else {
-        msgs.iter()
+        // M-2: render newest-first so the latest error (the recovery
+        // guidance the user needs) is at the top and always visible —
+        // oldest-first clips the latest off-screen when the buffer has more
+        // messages than rows (especially at 80x24). A header note makes the
+        // order explicit.
+        let mut lines: Vec<Line> = msgs
+            .iter()
+            .rev()
             .map(|m| Line::from(Span::styled(m.clone(), dim)))
-            .collect()
+            .collect();
+        lines.insert(0, Line::from(Span::styled("(newest first)", dim)));
+        lines
     };
 
     f.render_widget(

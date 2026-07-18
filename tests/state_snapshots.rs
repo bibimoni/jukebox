@@ -84,7 +84,36 @@ fn snapshot_at(name: &str, w: u16, h: u16, app: &mut App) {
     let backend = TestBackend::new(w, h);
     let mut term = Terminal::new(backend).unwrap();
     term.draw(|f| draw(f, app)).unwrap();
-    let s = buffer_string(&term, w, h);
+    let mut s = buffer_string(&term, w, h);
+    // Redact the non-deterministic temp-dir path so snapshots are stable
+    // across runs, machines, and OSes. The footer can surface a "file not
+    // found: <tmp path>" for tracks whose TempDir was dropped; the tempdir
+    // name varies per run and the OS temp root differs (/var/folders on
+    // macOS vs /home/runner on Linux), causing different truncation points.
+    // Replace the OS temp root with <TMPROOT>, collapse <TMPROOT>/.tmpXXXX
+    // into <TMP>, and redact any trailing partial path after <TMP> so the
+    // truncation ellipsis lands at a deterministic point.
+    if let Some(prefix) = std::env::temp_dir().to_str() {
+        s = s.replace(prefix.trim_end_matches('/'), "<TMPROOT>");
+    }
+    if let Some(start) = s.find("<TMPROOT>/") {
+        let after = start + "<TMPROOT>/".len();
+        let end = s[after..].find('/').map(|e| after + e).unwrap_or(s.len());
+        s.replace_range(start..end, "<TMP>");
+    }
+    // Redact any partial path after <TMP> that was truncated by the footer
+    // (e.g. "<TMP>/lossles…" or "<TMP>/var/folders…") — replace with a
+    // deterministic "<TMP>/…" so the snapshot doesn't depend on the temp
+    // dir path length (which differs by OS).
+    if let Some(start) = s.find("<TMP>/") {
+        let after = start + "<TMP>/".len();
+        // Find the end of the truncated path: next space or newline.
+        let end = s[after..]
+            .find([' ', '\n'])
+            .map(|e| after + e)
+            .unwrap_or(s.len());
+        s.replace_range(start..end, "<TMP>/…");
+    }
     assert_snapshot!(name, s);
 }
 

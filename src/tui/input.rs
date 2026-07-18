@@ -14,7 +14,8 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
-use crate::tui::app::{App, Overlay, View};
+use crate::reco::feedback::FeedbackAction;
+use crate::tui::app::{App, Overlay, View, YtTab};
 
 // ---------------------------------------------------------------------------
 // Key dispatch
@@ -58,6 +59,250 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         app.pending_g = false;
     }
 
+    if app.view == View::Youtube && app.overlay.is_none() {
+        // Esc reliably exits the YouTube view to a local view when no overlay
+        // is open. This is the primary escape from the YT keyboard trap (RB-3):
+        // the global 1-4 view switches and Tab/Shift+Tab view cycling also work
+        // (handled in the main match below, no longer intercepted here).
+        if matches!(key.code, KeyCode::Esc) {
+            switch_view(app, View::Artists);
+            return;
+        }
+        // [ / ] cycle the YT sub-tabs. These are non-conflicting with the
+        // global 1-4 view switches and Tab/Shift+Tab view cycling (which now
+        // always work, even inside the YouTube view). The old 1-5 / Tab
+        // tab bindings shadowed the global keys and trapped the user.
+        if matches!(key.code, KeyCode::Char('[')) {
+            app.yt_view.tab = app.yt_view.tab.prev();
+            app.yt_tab_fetch_on_visit();
+            return;
+        }
+        if matches!(key.code, KeyCode::Char(']')) {
+            app.yt_view.tab = app.yt_view.tab.next();
+            app.yt_tab_fetch_on_visit();
+            return;
+        }
+        if matches!(key.code, KeyCode::Char('/')) {
+            app.yt_view.tab = YtTab::Search;
+        }
+        if matches!(key.code, KeyCode::Char('H')) {
+            app.open_home();
+            return;
+        }
+        if matches!(key.code, KeyCode::Char('S'))
+            && matches!(
+                app.source_mode,
+                crate::mode::SourceMode::Youtube | crate::mode::SourceMode::Mixed
+            )
+        {
+            app.open_discover();
+            return;
+        }
+        // R refreshes the cached content on the Home/Explore/Charts tabs (clears
+        // the matching cache field + re-fires the send_* method). On other YT
+        // tabs (Library/Search/Discover/Radio) R falls through to the global
+        // handler (retry_yt_probe / resume_last). Spec's `r` is mapped to `R`
+        // (uppercase) to match the existing refresh convention — `r` (lowercase)
+        // is already bound to `cycle_repeat` in the global keymap.
+        if matches!(key.code, KeyCode::Char('R'))
+            && matches!(
+                app.yt_view.tab,
+                YtTab::Home | YtTab::Explore | YtTab::Charts
+            )
+        {
+            if app.resume_hint.is_some() {
+                app.resume_last();
+            } else {
+                app.refresh_yt_home_explore_charts();
+            }
+            return;
+        }
+        // Inline filter (`f`) on the Home/Explore/Charts tabs. When active,
+        // typing narrows the displayed items; Esc clears; `f` on an empty
+        // filter closes it (toggle). j/k/Enter operate on the FILTERED list
+        // (see `filtered_explore`/`filtered_charts` + the play_*_selection
+        // methods). Mirrors the local-view `f` filter (`handle_filter_key`)
+        // but scoped to the YT content tabs.
+        if matches!(
+            app.yt_view.tab,
+            YtTab::Home | YtTab::Explore | YtTab::Charts
+        ) {
+            if app.yt_filter_active() && handle_yt_filter_key(app, key) {
+                return;
+            }
+            if matches!(key.code, KeyCode::Char('f')) {
+                app.toggle_yt_filter();
+                return;
+            }
+        }
+        // Home tab navigation: j/k move the cursor within the focused section,
+        // h/l switch sections (h at the leftmost section exits the YouTube
+        // view), Enter plays the selected item. When the filter is active,
+        // navigation operates on the FILTERED sections (sections with no
+        // matching items are dropped). Tab/Shift+Tab are deliberately NOT bound
+        // here — they fall through to global view cycling.
+        if app.yt_view.tab == YtTab::Home && !app.yt_view.home.sections.is_empty() {
+            let sections = if app.yt_filter_active() {
+                app.filtered_home_sections()
+            } else {
+                app.yt_view.home.sections.clone()
+            };
+            if sections.is_empty() {
+                // All sections filtered out — only Esc/Backspace/f make sense.
+                if matches!(key.code, KeyCode::Esc) {
+                    app.yt_view.yt_filter = None;
+                    return;
+                }
+                // Let handle_yt_filter_key handle typing (already done above).
+            }
+            let section_len = sections
+                .get(app.yt_view.home.focused_section)
+                .map(|(_, items)| items.len())
+                .unwrap_or(0);
+            let n_sections = sections.len().max(1);
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.yt_view.home.cursor_down(section_len.max(1));
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.yt_view.home.cursor_up();
+                    return;
+                }
+                KeyCode::Left | KeyCode::Char('h') if key.modifiers == KeyModifiers::NONE => {
+                    if app.yt_view.home.focused_section == 0 {
+                        switch_view(app, View::Artists);
+                    } else {
+                        app.yt_view.home.section_prev();
+                    }
+                    return;
+                }
+                KeyCode::Right | KeyCode::Char('l') if key.modifiers == KeyModifiers::NONE => {
+                    app.yt_view.home.section_next(n_sections);
+                    return;
+                }
+                KeyCode::Enter => {
+                    if app.yt_filter_active() {
+                        // When filtering, play from the FILTERED sections so
+                        // the cursor maps to the right item.
+                        let filtered = app.filtered_home_sections();
+                        let mut home = app.yt_view.home.clone();
+                        home.sections = filtered;
+                        app.play_home_selection_from(&home);
+                    } else {
+                        let home = app.yt_view.home.clone();
+                        app.play_home_selection_from(&home);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // Browse mode: when the user Enter'd a playlist from Explore/Charts,
+        // the tab shows the playlist's tracks. j/k navigates, Enter plays from
+        // the focused track, `a` plays the whole playlist, Esc goes back to
+        // the playlist list. This takes priority over the playlist-list nav.
+        if matches!(app.yt_view.tab, YtTab::Explore | YtTab::Charts)
+            && app.yt_view.browse_playlist_id.is_some()
+        {
+            let n = app.yt_view.browse_playlist_tracks.len();
+            match key.code {
+                KeyCode::Esc => {
+                    app.yt_view.browse_playlist_id = None;
+                    app.yt_view.browse_playlist_tracks.clear();
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') if n > 0 => {
+                    if app.yt_view.browse_cursor + 1 < n {
+                        app.yt_view.browse_cursor += 1;
+                    }
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') if n > 0 => {
+                    app.yt_view.browse_cursor = app.yt_view.browse_cursor.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Enter if n > 0 => {
+                    app.play_browsed_track();
+                    return;
+                }
+                KeyCode::Char('a') if n > 0 => {
+                    app.play_browsed_playlist_all();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // Explore tab navigation: j/k move the cursor through the (filtered,
+        // if active) playlists, Enter opens the focused playlist (existing
+        // `get_playlist` → `pending_discover_play` flow via
+        // `play_explore_selection`). Only active when content is loaded.
+        if app.yt_view.tab == YtTab::Explore
+            && app
+                .yt_view
+                .explore_cached
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+        {
+            let n = if app.yt_filter_active() {
+                app.filtered_explore().len()
+            } else {
+                app.yt_view.explore_cached.as_ref().unwrap().len()
+            };
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if app.yt_view.explore_cursor + 1 < n {
+                        app.yt_view.explore_cursor += 1;
+                    }
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.yt_view.explore_cursor = app.yt_view.explore_cursor.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Enter => {
+                    app.play_explore_selection();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // Charts tab navigation: same pattern. The cursor is a flat index
+        // into `charts_cached` (or the filtered list when a filter is active).
+        if app.yt_view.tab == YtTab::Charts
+            && app
+                .yt_view
+                .charts_cached
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+        {
+            let n = if app.yt_filter_active() {
+                app.filtered_charts().len()
+            } else {
+                app.yt_view.charts_cached.as_ref().unwrap().len()
+            };
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if app.yt_view.charts_cursor + 1 < n {
+                        app.yt_view.charts_cursor += 1;
+                    }
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.yt_view.charts_cursor = app.yt_view.charts_cursor.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Enter => {
+                    app.play_charts_selection();
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
     match (key.code, key.modifiers) {
         // --- Navigation -----------------------------------------------------
         (KeyCode::Char('h'), m) if m == KeyModifiers::NONE => move_left(app),
@@ -69,17 +314,27 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyCode::Down, m) if m == KeyModifiers::NONE => move_down(app),
         (KeyCode::Up, m) if m == KeyModifiers::NONE => move_up(app),
 
-        // `gg` top of column; first `g` arms, second `g` jumps.
         (KeyCode::Char('g'), _) => {
-            if was_pending_g {
+            if app.playlist_col_focused() {
+                app.toggle_playlist_group();
+            } else if was_pending_g {
                 top_of_column(app);
                 app.pending_g = false;
             } else {
                 app.pending_g = true;
             }
         }
-        // `G` bottom of column.
-        (KeyCode::Char('G'), _) => bottom_of_column(app),
+        // `G` opens the playlist generator in the YouTube view (where the
+        // recommendation features live); in other views it remains the
+        // vim-style "bottom of column" jump so the existing keymap is
+        // preserved. Also reachable via `:gen`.
+        (KeyCode::Char('G'), _) => {
+            if app.view == View::Youtube {
+                app.open_generator();
+            } else {
+                bottom_of_column(app);
+            }
+        }
 
         // View switching: 1/2/3/4 = Artists/Playlists/Queue/YouTube.
         (KeyCode::Char('1'), m) if m == KeyModifiers::NONE => switch_view(app, View::Artists),
@@ -94,10 +349,24 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // --- Playback -------------------------------------------------------
         (KeyCode::Enter, _) => app.play_selected(),
         (KeyCode::Char(' '), _) => {
-            let _ = app.player.play_pause();
+            // RC14-DEF-4: route through `toggle_pause` so wall-clock pause
+            // tracking stays in sync (used by the hi-res progress fallback).
+            app.toggle_pause();
         }
-        (KeyCode::Char('>'), _) => app.next(),
-        (KeyCode::Char('<'), _) => app.prev(),
+        (KeyCode::Char('>'), _) => {
+            if app.playlist_col_focused() {
+                app.adjust_playlist_col_width(1);
+            } else {
+                app.next();
+            }
+        }
+        (KeyCode::Char('<'), _) => {
+            if app.playlist_col_focused() {
+                app.adjust_playlist_col_width(-1);
+            } else {
+                app.prev();
+            }
+        }
         (KeyCode::Char(','), _) => {
             let _ = app.player.seek(-5.0);
         }
@@ -113,19 +382,49 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('Z'), _) => app.reshuffle(),
         (KeyCode::Char('r'), _) => app.cycle_repeat(),
         // `c` cycles continue mode (mode-dependent: see App::cycle_continue).
-        (KeyCode::Char('c'), _) => app.cycle_continue(),
+        (KeyCode::Char('c'), _) => {
+            if app.playlist_col_focused() {
+                app.toggle_playlist_counts();
+            } else {
+                app.cycle_continue();
+            }
+        }
         // `M` cycles the source mode Local → YouTube → Mixed → Local (never
         // stops playback).
         (KeyCode::Char('M'), _) => app.cycle_mode(),
+        // I.2: `P` toggles the big player bar preference.
+        (KeyCode::Char('P'), _) => {
+            app.player_bar_state.big_pref = !app.player_bar_state.big_pref;
+        }
+        // I.5: `T` toggles the track-list layout (table <-> cards).
+        (KeyCode::Char('T'), _) => {
+            use crate::tui::view::player_bar_big::TrackLayoutMode;
+            app.player_bar_state.track_layout = match app.player_bar_state.track_layout {
+                TrackLayoutMode::Table => TrackLayoutMode::Cards,
+                TrackLayoutMode::Cards => TrackLayoutMode::Table,
+            };
+        }
         // `s` instant random track in context; `S` discover overlay (spec §5.5).
         (KeyCode::Char('s'), _) => app.instant_random(),
         (KeyCode::Char('S'), _) => app.open_discover(),
-        // `R` retry the YouTube provider probe after an error/stale state
-        // (ProviderError / AuthExpired / RateLimited / ReadyStale). No-op when
-        // the state is healthy (Ready) or needs auth (Unconfigured/SignedOut) —
-        // `retry_yt_probe` guards with `can_retry()`. This is the fix for the
-        // "repeated login" root cause: press R instead of re-authenticating.
-        (KeyCode::Char('R'), _) => app.retry_yt_probe(),
+        // `R` has two jobs depending on state:
+        //   - RC11-DEF-014: when stopped with a saved last-played track (the
+        //     `resume_hint` is showing), R resumes that track at its saved
+        //     position. The hint clears on the first play so this branch only
+        //     fires from the stopped-with-resume state.
+        //   - Otherwise: retry the YouTube provider probe after an
+        //     error/stale state (ProviderError / AuthExpired / RateLimited /
+        //     ReadyStale). No-op when the state is healthy (Ready) or needs
+        //     auth (Unconfigured/SignedOut) — `retry_yt_probe` guards with
+        //     `can_retry()`. This is the fix for the "repeated login" root
+        //     cause: press R instead of re-authenticating.
+        (KeyCode::Char('R'), _) => {
+            if app.resume_hint.is_some() {
+                app.resume_last();
+            } else {
+                app.retry_yt_probe();
+            }
+        }
 
         // --- Queue & playlist ----------------------------------------------
         // `e` enqueues the focused track to the manual "play next" queue.
@@ -133,7 +432,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // `x` removes the focused track from the manual queue (Queue view).
         (KeyCode::Char('x'), _) => app.remove_selected_from_queue(),
         // `d` deletes the focused playlist (Playlists view, col 0 only).
-        (KeyCode::Char('d'), _) => app.delete_focused_playlist(),
+        // DEF-001: show a confirmation dialog before deletion — a single
+        // accidental keypress must not destroy a playlist. When the guard
+        // fails (not in Playlists view / col 0 / empty list), the arm falls
+        // through to `_ => {}` (no-op), matching the old gating in
+        // `delete_focused_playlist`.
+        (KeyCode::Char('d'), _)
+            if app.view == View::Playlists
+                && app.focus_col == 0
+                && app.playlists.get(app.cursors.playlist).is_some() =>
+        {
+            let name = app.playlists[app.cursors.playlist].name.clone();
+            app.overlay = Some(Overlay::Confirm {
+                message: format!("Delete playlist \"{name}\"?  y/n"),
+                action: crate::tui::app::ConfirmAction::DeletePlaylist,
+            });
+        }
 
         // --- Overlays -------------------------------------------------------
         (KeyCode::Char('/'), _) => {
@@ -183,6 +497,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('D'), _) => {
             app.overlay = Some(Overlay::Diagnostics);
         }
+        // `H` opens the YouTube Home view (recommendation discovery). Also
+        // reachable via `:home`.
+        (KeyCode::Char('H'), _) => app.open_home(),
+        (KeyCode::Char('B'), _) => app.toggle_sidebar(),
 
         // --- Quit -----------------------------------------------------------
         (KeyCode::Char('q'), _) => app.quit(),
@@ -197,7 +515,15 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 fn handle_overlay_key(app: &mut App, key: KeyEvent) {
     // Esc closes any overlay, first, before anything else.
     if matches!(key.code, KeyCode::Esc) {
+        // RB-4: closing the YtAuth overlay cancels any in-progress auth
+        // state so no busy/Authenticating/AuthenticatedNotSynced lingers.
+        if matches!(app.overlay, Some(Overlay::YtAuth { .. })) {
+            app.cancel_yt_auth();
+        }
         app.overlay = None;
+        // Drop any stashed play-saved index so a later confirm doesn't
+        // play a stale playlist (RC11-DEF-065 cleanup).
+        app.pending_play_saved_idx = None;
         return;
     }
 
@@ -250,6 +576,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     } else if scope == crate::tui::app::SearchScope::Local {
                         if let Some(id) = results.get(cursor).cloned() {
                             let ids = std::mem::take(&mut results);
+                            app.overlay = None;
                             app.play_in_context_ids(ids, &id);
                             return;
                         }
@@ -261,16 +588,25 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                             // Results match the current query → pick.
                             if let Some(id) = results.get(cursor).cloned() {
                                 let ids = std::mem::take(&mut results);
+                                app.overlay = None;
                                 app.play_in_context_ids(ids, &id);
                                 return;
                             }
                         } else if !input.trim().is_empty() {
                             // Dirty / never submitted → fire-and-forget search.
-                            app.submit_yt_search(input.clone());
-                            submitted = Some(input.clone());
-                            searching = true;
-                            results.clear();
-                            cursor = 0;
+                            let dispatched = app.submit_yt_search(input.clone());
+                            if dispatched {
+                                submitted = Some(input.clone());
+                                searching = true;
+                                results.clear();
+                                cursor = 0;
+                            } else {
+                                // RB-2: search couldn't be dispatched (no
+                                // session / send failed). yt_error is already
+                                // set by submit_yt_search; don't set
+                                // searching=true (would hang on "searching…").
+                                searching = false;
+                            }
                         }
                     }
                 }
@@ -433,7 +769,13 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 }
                 KeyCode::Tab => {
                     // Tab completion: complete known command prefix.
-                    let known = ["queue", "yt", "lyrics", "diag", "help", "quit", "q"];
+                    // NOTE: the stored `input` does NOT include the `:` prefix —
+                    // `render_command` (overlay.rs) prepends `:` for display.
+                    // Storing `:` here would double it (`::yt`) on screen (DEF-010).
+                    let known = [
+                        "queue", "yt", "lyrics", "diag", "help", "quit", "q", "home", "gen",
+                        "radio", "publish",
+                    ];
                     let prefix = input.trim_start_matches(':');
                     let matches: Vec<&str> = known
                         .iter()
@@ -441,7 +783,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                         .filter(|c| c.starts_with(prefix))
                         .collect();
                     if matches.len() == 1 {
-                        input = format!(":{}", matches[0]);
+                        input = matches[0].to_string();
                         cursor = input.len();
                     } else if matches.len() > 1 {
                         // Complete the common prefix.
@@ -457,7 +799,20 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                                 }
                             })
                             .unwrap_or_default();
-                        input = format!(":{}", String::from_utf8_lossy(&common));
+                        let completed = String::from_utf8_lossy(&common).to_string();
+                        // RC11-DEF-047: when the common prefix doesn't narrow
+                        // (e.g. empty `:` + Tab, or a prefix matching several
+                        // commands with no shared prefix beyond the typed
+                        // chars), surface the full match list as a status toast
+                        // so the user sees the available commands instead of a
+                        // silent no-op. Only show the toast when completion
+                        // didn't advance the input (otherwise a useful prefix
+                        // completion is its own feedback).
+                        if completed.len() <= prefix.len() {
+                            let list = matches.join("  ");
+                            app.set_status_toast(format!("commands:  {list}"));
+                        }
+                        input = completed;
                         cursor = input.len();
                     }
                 }
@@ -541,39 +896,73 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         // (handled above) closes; j/k/↑/↓ scroll a line, PgUp/PgDn half a page,
         // g/G jump to top/bottom. Any other key is a no-op.
         Some(Overlay::Help) => {
-            // Upper bound is the content length; over-scrolling just shows
-            // blank space, so a generous constant is safe and avoids needing
-            // the rendered height here.
-            const HELP_LINES: u16 = 31;
+            // Upper bound is the content length. RC15-DEF-1: cap at
+            // `help_lines_count - 1` (not `help_lines_count`) so `G` lands on
+            // the last PAGE of content, not a full page past it. The
+            // render_help clamp (overlay.rs) is the source of truth — it
+            // additionally clamps to `lines.len() - inner_height` so the popup
+            // never shows blank lines. This input-side cap prevents the scroll
+            // value from drifting far above what render_help can display.
+            let help_lines_count = crate::tui::view::overlay::help_lines(0, false).len() as u16;
+            let max_scroll = help_lines_count.saturating_sub(1);
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
-                    app.help_scroll = app.help_scroll.saturating_add(1).min(HELP_LINES);
+                    app.help_scroll = app.help_scroll.saturating_add(1).min(max_scroll);
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     app.help_scroll = app.help_scroll.saturating_sub(1);
                 }
                 KeyCode::PageDown => {
-                    app.help_scroll = app.help_scroll.saturating_add(10).min(HELP_LINES);
+                    app.help_scroll = app.help_scroll.saturating_add(10).min(max_scroll);
                 }
                 KeyCode::PageUp => {
                     app.help_scroll = app.help_scroll.saturating_sub(10);
                 }
+                // RC15-DEF-1: `G` jumps to the last PAGE of content (clamped
+                // by render_help to `lines.len() - inner_height`), not a full
+                // page past it. The old `help_lines_count` value scrolled past
+                // all content, leaving the popup blank.
                 KeyCode::Char('g') => app.help_scroll = 0,
-                KeyCode::Char('G') => app.help_scroll = HELP_LINES,
+                KeyCode::Char('G') => app.help_scroll = max_scroll,
+                // Home/End jump to top/bottom (mirrors g/G) — DEF-018: End was
+                // missing.
+                KeyCode::Home => app.help_scroll = 0,
+                KeyCode::End => app.help_scroll = max_scroll,
                 _ => {}
             }
             app.overlay = Some(Overlay::Help);
         }
         // Help overlay: any non-Esc key is a no-op (overlay stays open until Esc).
-        Some(Overlay::Discover { items, mut cursor }) => {
+        Some(Overlay::Discover {
+            mut items,
+            mut cursor,
+        }) => {
+            // j/k mirror ↑↓ so the help-text keymap ("h j k l · ↑↓←→ move")
+            // holds in the discover overlay too (DEF-026). Without this the
+            // `_` arm swallowed j/k, leaving the cursor unchanged while the
+            // renderer dropped the highlight — the overlay looked unselected.
             match key.code {
-                KeyCode::Down if !items.is_empty() => {
+                KeyCode::Down | KeyCode::Char('j') if !items.is_empty() => {
                     cursor = (cursor + 1) % items.len();
                 }
-                KeyCode::Up if !items.is_empty() => {
+                KeyCode::Up | KeyCode::Char('k') if !items.is_empty() => {
                     cursor = cursor
                         .checked_sub(1)
                         .unwrap_or(items.len().saturating_sub(1));
+                }
+                // RC11-DEF-029: dismiss/hide the focused suggestion. Removes
+                // the item from the list so the user can curate their
+                // discovery surface. (A future wiring to `reco::feedback`
+                // would feed the dismissal back to the reco engine; for now
+                // the item is just removed from the overlay.)
+                KeyCode::Char('x') | KeyCode::Char('d') if !items.is_empty() => {
+                    items.remove(cursor);
+                    if cursor >= items.len() && !items.is_empty() {
+                        cursor = items.len() - 1;
+                    }
+                    if items.is_empty() {
+                        cursor = 0;
+                    }
                 }
                 KeyCode::Enter => {
                     app.overlay = Some(Overlay::Discover { items, cursor });
@@ -601,18 +990,28 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                 }
                 KeyCode::Enter => {
                     if cursor < app.playlists.len() {
-                        app.add_track_to_playlist(&track_id, cursor);
+                        let added = app.add_track_to_playlist(&track_id, cursor);
                         app.save_playlists_db();
-                        app.yt_status =
-                            Some(format!("added to \"{}\"", app.playlists[cursor].name));
+                        app.yt_status = Some(if added {
+                            format!("added to \"{}\"", app.playlists[cursor].name)
+                        } else {
+                            format!("already in \"{}\" — no change", app.playlists[cursor].name)
+                        });
+                        app.overlay = None;
+                        return;
                     } else {
-                        // "+ new playlist..." — create a new one with the track.
-                        let idx = app.create_playlist_with_track(&track_id);
-                        app.save_playlists_db();
-                        app.yt_status = Some(format!("created \"{}\"", app.playlists[idx].name));
+                        // "+ new playlist..." — DEF-014: prompt for a name
+                        // before creating instead of auto-naming immediately.
+                        app.overlay = Some(Overlay::TextInput {
+                            prompt: "New playlist name:".to_string(),
+                            buffer: String::new(),
+                            cursor: 0,
+                            action: crate::tui::app::TextInputAction::NewPlaylist {
+                                track_id: track_id.clone(),
+                            },
+                        });
+                        return;
                     }
-                    app.overlay = None;
-                    return;
                 }
                 _ => {}
             }
@@ -648,18 +1047,87 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     scroll = scroll.saturating_add(1);
+                    app.lyrics_manual_scroll = true;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     scroll = scroll.saturating_sub(1);
+                    app.lyrics_manual_scroll = true;
                 }
                 KeyCode::PageDown => {
                     scroll = scroll.saturating_add(10);
+                    app.lyrics_manual_scroll = true;
                 }
                 KeyCode::PageUp => {
                     scroll = scroll.saturating_sub(10);
+                    app.lyrics_manual_scroll = true;
                 }
-                KeyCode::Char('g') => scroll = 0,
-                KeyCode::Char('G') => scroll = u16::MAX,
+                KeyCode::Char('g') => {
+                    scroll = 0;
+                    app.lyrics_manual_scroll = true;
+                }
+                KeyCode::Char('G') => {
+                    scroll = u16::MAX;
+                    app.lyrics_manual_scroll = true;
+                }
+                // M-2: 'f' resumes follow — clears manual-scroll and jumps the
+                // scroll back to the active (currently-playing) line so the user
+                // is not left with no resume path after manual scrolling.
+                KeyCode::Char('f') => {
+                    app.lyrics_manual_scroll = false;
+                    // Jump to the active line: compute active_idx the same way
+                    // the render does (last line whose time <= position).
+                    if let Some(crate::lyrics::Lyrics { lines, .. }) = content.as_ref() {
+                        let pos = app.player.position().unwrap_or(0.0);
+                        let active = lines
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .find(|(_, l)| l.time.is_some_and(|t| t <= pos))
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        scroll = active.saturating_sub(2) as u16;
+                    }
+                }
+                // RC11-DEF-009: pass `>` / `<` through to global playback while
+                // the lyrics overlay is open, then re-fetch lyrics for the new
+                // track. Keep the overlay open. `handle_overlay_key` takes the
+                // overlay (line 247), so we must re-set it before calling
+                // `request_lyrics` — otherwise `request_lyrics` sees
+                // `self.overlay == None` and never updates it. Return early so
+                // the trailing overlay re-set below doesn't clobber the new
+                // state.
+                KeyCode::Char('>') => {
+                    app.next();
+                    if let Some(np) = app.now_playing.clone() {
+                        app.overlay = Some(Overlay::Lyrics {
+                            content,
+                            state,
+                            scroll,
+                            track_id,
+                            gen,
+                        });
+                        app.request_lyrics(np.id());
+                    } else {
+                        app.overlay = None;
+                    }
+                    return;
+                }
+                KeyCode::Char('<') => {
+                    app.prev();
+                    if let Some(np) = app.now_playing.clone() {
+                        app.overlay = Some(Overlay::Lyrics {
+                            content,
+                            state,
+                            scroll,
+                            track_id,
+                            gen,
+                        });
+                        app.request_lyrics(np.id());
+                    } else {
+                        app.overlay = None;
+                    }
+                    return;
+                }
                 KeyCode::Char('L') => {
                     app.overlay = None;
                     return;
@@ -683,7 +1151,559 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             }
             app.overlay = Some(Overlay::Diagnostics);
         }
+        // Confirmation dialog (DEF-001, DEF-015): y/Enter confirms the
+        // action, n/Esc cancels. Any other key is a no-op (overlay stays).
+        Some(Overlay::Confirm { message, action }) => {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    match action {
+                        crate::tui::app::ConfirmAction::DeletePlaylist => {
+                            app.delete_focused_playlist();
+                        }
+                        crate::tui::app::ConfirmAction::YtLogout => {
+                            app.yt_logout();
+                        }
+                        crate::tui::app::ConfirmAction::ClearQueue => {
+                            app.transport.clear_queue();
+                            app.yt_status = Some("queue cleared".into());
+                        }
+                        crate::tui::app::ConfirmAction::PlaySavedPlaylist => {
+                            // RC11-DEF-065: play the most recently saved
+                            // generator playlist. Falls back to a no-op +
+                            // status hint if the index is stale (the user
+                            // deleted the playlist between save and
+                            // confirm — rare but possible).
+                            if let Some(idx) = app.pending_play_saved_idx.take() {
+                                if let Some(pl) = app.playlists.get(idx).cloned() {
+                                    if let Some(start) = pl.track_ids.first().cloned() {
+                                        let ids = pl.track_ids;
+                                        app.view = View::Playlists;
+                                        app.cursors.playlist = idx;
+                                        app.play_in_context_ids(ids, &start);
+                                    } else {
+                                        app.yt_status = Some(
+                                            "saved playlist is empty — nothing to play".into(),
+                                        );
+                                    }
+                                } else {
+                                    app.yt_status = Some(
+                                        "saved playlist no longer exists — open Playlists to find it"
+                                            .into(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    app.overlay = None;
+                    return;
+                }
+                KeyCode::Char('n') => {
+                    // Cancel: drop any stashed play-saved index so a later
+                    // confirm doesn't play a stale playlist.
+                    app.pending_play_saved_idx = None;
+                    app.overlay = None;
+                    return;
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::Confirm { message, action });
+        }
+        // Text input overlay (DEF-014: playlist name). Typing accumulates
+        // in `buffer`; Enter creates the playlist; Esc cancels (handled at
+        // the top of this fn). Backspace/Left/Right/Home/End edit.
+        Some(Overlay::TextInput {
+            prompt,
+            mut buffer,
+            mut cursor,
+            action,
+        }) => {
+            match key.code {
+                KeyCode::Enter => {
+                    match action {
+                        crate::tui::app::TextInputAction::NewPlaylist { track_id } => {
+                            let trimmed = buffer.trim();
+                            if trimmed.is_empty() {
+                                // Empty input → fall back to auto-name.
+                                let idx = app.create_playlist_with_track(&track_id);
+                                app.save_playlists_db();
+                                app.yt_status =
+                                    Some(format!("created \"{}\"", app.playlists[idx].name));
+                            } else {
+                                use crate::tui::app::Playlist;
+                                app.playlists.push(Playlist {
+                                    name: trimmed.to_string(),
+                                    track_ids: vec![track_id.clone()],
+                                });
+                                app.save_playlists_db();
+                                app.yt_status = Some(format!("created \"{trimmed}\""));
+                            }
+                        }
+                    }
+                    app.overlay = None;
+                    return;
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    cursor = cursor.min(buffer.len());
+                    buffer.insert(cursor, c);
+                    cursor += c.len_utf8();
+                }
+                KeyCode::Backspace => {
+                    cursor = cursor.min(buffer.len());
+                    if cursor > 0 {
+                        let mut prev = cursor - 1;
+                        while prev > 0 && !buffer.is_char_boundary(prev) {
+                            prev -= 1;
+                        }
+                        buffer.drain(prev..cursor);
+                        cursor = prev;
+                    }
+                }
+                KeyCode::Left => {
+                    cursor = cursor.min(buffer.len());
+                    if cursor > 0 {
+                        let mut prev = cursor - 1;
+                        while prev > 0 && !buffer.is_char_boundary(prev) {
+                            prev -= 1;
+                        }
+                        cursor = prev;
+                    }
+                }
+                KeyCode::Right => {
+                    cursor = cursor.min(buffer.len());
+                    if cursor < buffer.len() {
+                        let mut next = cursor + 1;
+                        while next < buffer.len() && !buffer.is_char_boundary(next) {
+                            next += 1;
+                        }
+                        cursor = next;
+                    }
+                }
+                KeyCode::Home => {
+                    cursor = 0;
+                }
+                KeyCode::End => {
+                    cursor = buffer.len();
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::TextInput {
+                prompt,
+                buffer,
+                cursor,
+                action,
+            });
+        }
+        // --- Recommendation overlays -----------------------------------------
+        // Home overlay (`H` / `:home`): j/k navigate items, Tab switches
+        // sections, Enter selects the highlighted item, ? opens help, Esc
+        // closes (generic).
+        // RC11-DEF-001: previously `?` was swallowed by `_ => {}` and
+        // `cursor_down(usize::MAX)` let the cursor grow unbounded. Now `?`
+        // opens the help overlay (stacked) and `j`/`k` are bounded by the
+        // focused section's item count, so the visible selection (rendered
+        // by `render_compact`) matches the item Enter will play.
+        Some(Overlay::Home { mut state }) => {
+            let section_len = state
+                .sections
+                .get(state.focused_section)
+                .map(|(_, items)| items.len())
+                .unwrap_or(0);
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    state.cursor_down(section_len.max(1));
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.cursor_up();
+                }
+                KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    state.section_prev();
+                }
+                KeyCode::Tab => {
+                    state.section_next(crate::tui::view::home::HomeSection::all().len());
+                }
+                KeyCode::Char('?') => {
+                    // Stack help on top of Home so the user returns to Home
+                    // after closing help (Esc closes help, restores Home).
+                    app.overlay = Some(Overlay::Home { state });
+                    app.overlay = Some(Overlay::Help);
+                    return;
+                }
+                KeyCode::Enter => {
+                    // Select the highlighted item. Dispatch to
+                    // `play_home_selection` which resolves the focused Home
+                    // item (Track / Playlist / Mix / RadioSeed / ...) and
+                    // starts the right playback / radio flow. The overlay is
+                    // closed by `play_home_selection` on the synchronous paths.
+                    app.overlay = Some(Overlay::Home { state });
+                    app.play_home_selection();
+                    return;
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::Home { state });
+        }
+        // Radio overlay (`:radio`): +/- feedback, s skip, n/> next, c change
+        // seed, q stop, Esc closes. The session is destructured from the
+        // overlay and used directly — `App::reco_radio_next` checks
+        // `self.overlay` which is `None` during key handling (the overlay is
+        // `take()`n at the top of this fn), so we must get the next track from
+        // the session ourselves and call `App::play_radio_track` to switch
+        // context + start playback.
+        Some(Overlay::Radio { mut session }) => {
+            // The current track is what's playing now (the radio's last pick).
+            let track_id = app.now_playing.as_ref().map(|ts| ts.id().to_string());
+            match key.code {
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    if let Some(id) = &track_id {
+                        app.apply_reco_feedback(FeedbackAction::Like, id);
+                    } else {
+                        // DEF-023: `+` with nothing playing is a visible no-op —
+                        // cue the user to start the radio first.
+                        app.yt_status = Some("nothing playing — press n to start".into());
+                    }
+                    // Positive feedback doesn't advance; the user stays on
+                    // the track they like.
+                }
+                KeyCode::Char('-') => {
+                    if let Some(id) = &track_id {
+                        app.apply_reco_feedback(FeedbackAction::HideTrack, id);
+                    }
+                    advance_radio(app, &mut session);
+                }
+                KeyCode::Char('s') => {
+                    if let Some(id) = &track_id {
+                        app.apply_reco_feedback(FeedbackAction::RemoveFromMix, id);
+                    }
+                    advance_radio(app, &mut session);
+                }
+                // DEF-026: `>` advances the radio (alias for `n`) so the
+                // global next-track reflex works inside the overlay.
+                KeyCode::Char('>') | KeyCode::Char('n') => {
+                    advance_radio(app, &mut session);
+                }
+                // DEF-006: `c` changes the seed to the currently-playing track
+                // (or the first upcoming pool track), resetting the pool +
+                // played-list. Delegates to App which owns the session +
+                // catalog borrows.
+                KeyCode::Char('c') => {
+                    app.overlay = Some(Overlay::Radio { session });
+                    app.change_radio_seed();
+                    return;
+                }
+                // DEF-007: `q` stops the radio session (clears the pool so no
+                // further auto-advance) and closes the overlay. Does NOT fall
+                // through to the global quit (the overlay swallows keys).
+                KeyCode::Char('q') => {
+                    app.overlay = Some(Overlay::Radio { session });
+                    app.stop_radio();
+                    return;
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::Radio { session });
+        }
+        // Generator overlay (`G` / `:gen`): NL input -> plan -> preview. In
+        // the Input phase, typing accumulates in `state.input`; Enter
+        // generates. In the Preview phase, p/x pin/remove, g regenerates, e
+        // edits, j/k navigate, Enter saves.
+        Some(Overlay::Generator { mut state }) => {
+            use crate::tui::view::generator::GeneratorPhase;
+            match key.code {
+                // Input phase: typing accumulates into the NL query.
+                KeyCode::Char(c)
+                    if state.phase == GeneratorPhase::Input
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    state.input.push(c);
+                }
+                KeyCode::Backspace if state.phase == GeneratorPhase::Input => {
+                    state.input.pop();
+                }
+                // Enter: Input/ReviewPlan -> generate; Preview -> save.
+                KeyCode::Enter
+                    if state.phase == GeneratorPhase::Input
+                        || state.phase == GeneratorPhase::ReviewPlan =>
+                {
+                    app.overlay = Some(Overlay::Generator { state });
+                    app.generate_playlist();
+                    return;
+                }
+                KeyCode::Enter if state.phase == GeneratorPhase::Preview => {
+                    // Save the generated playlist locally. RC11-DEF-032:
+                    // show a "Saved \"<name>\"" toast and refuse to save a
+                    // duplicate name (the user must rename). RC11-DEF-065:
+                    // after a successful save, offer to play the playlist
+                    // immediately via a Confirm overlay.
+                    if let Some(p) = &state.playlist {
+                        let track_ids: Vec<String> =
+                            p.tracks.iter().map(|t| t.track_id.clone()).collect();
+                        let name = if !state.input.trim().is_empty() {
+                            state.input.trim().to_string()
+                        } else {
+                            "Generated Playlist".to_string()
+                        };
+                        if app.playlists.iter().any(|pl| pl.name == name) {
+                            // Duplicate — refuse + tell the user. Keep the
+                            // overlay open so they can rename (edit the
+                            // input) or pick a different action.
+                            app.yt_error = Some(format!(
+                                "playlist \"{}\" already exists — rename or Esc to cancel",
+                                name
+                            ));
+                            app.overlay = Some(Overlay::Generator { state });
+                            return;
+                        }
+                        app.playlists.push(crate::tui::app::Playlist {
+                            name: name.clone(),
+                            track_ids,
+                        });
+                        app.save_playlists_db();
+                        app.yt_status = Some(format!("Saved \"{}\"", name));
+                        // RC11-DEF-065: offer to play the saved playlist.
+                        // Stash the saved playlist's index so the confirm
+                        // handler can play it on y/Enter.
+                        let saved_idx = app.playlists.len() - 1;
+                        app.pending_play_saved_idx = Some(saved_idx);
+                        app.overlay = Some(Overlay::Confirm {
+                            message: format!("Play \"{}\" now? (y/n)", name),
+                            action: crate::tui::app::ConfirmAction::PlaySavedPlaylist,
+                        });
+                        return;
+                    }
+                    app.overlay = None;
+                    return;
+                }
+                // `s` is a save alias in the Preview phase (RC11-DEF-060:
+                // the help text advertises `s` but the binding was missing).
+                // Put the overlay back before re-dispatching as Enter so the
+                // recursive handle_key sees the overlay is open and routes
+                // through the overlay handler (the overlay was `take()`n at
+                // the top of this function; without restoring it the Enter
+                // recursion would skip overlay routing entirely).
+                KeyCode::Char('s') if state.phase == GeneratorPhase::Preview => {
+                    app.overlay = Some(Overlay::Generator { state });
+                    handle_key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    return;
+                }
+                // Preview phase: p pin, x remove, g regenerate, e edit.
+                KeyCode::Char('p') if state.phase == GeneratorPhase::Preview => {
+                    let tid = state
+                        .playlist
+                        .as_ref()
+                        .and_then(|p| p.tracks.get(state.cursor))
+                        .map(|t| t.track_id.clone());
+                    if let Some(id) = tid {
+                        state.pin_track(id);
+                    }
+                }
+                KeyCode::Char('x') if state.phase == GeneratorPhase::Preview => {
+                    let tid = state
+                        .playlist
+                        .as_ref()
+                        .and_then(|p| p.tracks.get(state.cursor))
+                        .map(|t| t.track_id.clone());
+                    if let Some(id) = tid {
+                        state.remove_track(&id);
+                    }
+                }
+                KeyCode::Char('g') if state.phase == GeneratorPhase::Preview => {
+                    app.overlay = Some(Overlay::Generator { state });
+                    app.generate_playlist();
+                    return;
+                }
+                KeyCode::Char('e') if state.phase == GeneratorPhase::ReviewPlan => {
+                    state.phase = GeneratorPhase::Input;
+                }
+                // Preview phase: j/k navigate the track list.
+                KeyCode::Down | KeyCode::Char('j') if state.phase == GeneratorPhase::Preview => {
+                    if let Some(p) = &state.playlist {
+                        if state.cursor + 1 < p.tracks.len() {
+                            state.cursor += 1;
+                        }
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') if state.phase == GeneratorPhase::Preview => {
+                    state.cursor = state.cursor.saturating_sub(1);
+                }
+                _ => {}
+            }
+            app.overlay = Some(Overlay::Generator { state });
+        }
+        // Explanation overlay: Esc closes (generic). Any other key is a no-op
+        // — the overlay stays until the user reads and closes it.
+        Some(Overlay::Explanation { explanation }) => {
+            app.overlay = Some(Overlay::Explanation { explanation });
+        }
+        // Publication overlay (`:publish`): Tab cycles privacy, Enter
+        // proceeds, y confirms, n cancels, Esc closes (generic).
+        // RC11-DEF-002: the old handler only bumped `step` on Enter when
+        // `is_ready()` was false (always — `open_publication` never
+        // populated `publishable_ids`/`account`). Now the Name field is
+        // editable (typing/Backspace), j/k cycles field focus, Enter
+        // validates and either dispatches the sidecar publish API or
+        // surfaces a yt_error explaining why it can't.
+        Some(Overlay::Publication { mut state }) => {
+            // Clear the validation error on any new edit so the stale
+            // message doesn't linger after the user fixes the issue.
+            let mut clear_err = false;
+            match key.code {
+                // `n` and `y` are explicit confirm/cancel verbs (matches
+                // the rest of the app's Confirm pattern). They take
+                // precedence over typing into the Name field — the user
+                // can still type 'n' or 'y' as part of a name by switching
+                // to a different field (j/k) if needed; the cancel/confirm
+                // contract is more important than name-character parity.
+                KeyCode::Char('n') => {
+                    app.overlay = None;
+                    return;
+                }
+                KeyCode::Char('y') if state.is_ready() => {
+                    if let Some(session) = app.yt_session.as_mut() {
+                        let _ = session.send_create_playlist(
+                            state.name.clone(),
+                            String::new(),
+                            state.privacy.clone(),
+                            state.publishable_ids.clone(),
+                        );
+                        app.pending_publish_name = Some(state.name.clone());
+                        app.yt_status = Some(format!("publishing \"{}\" to YouTube", state.name));
+                        app.overlay = None;
+                        return;
+                    }
+                }
+                KeyCode::Tab => {
+                    state.privacy = match state.privacy.as_str() {
+                        "PRIVATE" => "UNLISTED".into(),
+                        "UNLISTED" => "PUBLIC".into(),
+                        _ => "PRIVATE".into(),
+                    };
+                    state.field = crate::tui::view::publication::PubField::Privacy;
+                    clear_err = true;
+                }
+                KeyCode::Backspace
+                    if state.field == crate::tui::view::publication::PubField::Name =>
+                {
+                    state.name.pop();
+                    clear_err = true;
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && state.field == crate::tui::view::publication::PubField::Name
+                        && c != 'n'
+                        && c != 'y'
+                        && c != 'j'
+                        && c != 'k'
+                        && c != '\t'
+                        && c != '\n'
+                        && c != '\r' =>
+                {
+                    // Editable name field. Reject newlines/tabs (Tab is
+                    // privacy-cycle above), the reserved verbs `n`/`y`
+                    // (cancel/confirm), and `j`/`k` (field navigation) so
+                    // those keys keep working when Name is focused.
+                    state.name.push(c);
+                    clear_err = true;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    state.field = match state.field {
+                        crate::tui::view::publication::PubField::Name => {
+                            crate::tui::view::publication::PubField::Privacy
+                        }
+                        crate::tui::view::publication::PubField::Privacy => {
+                            crate::tui::view::publication::PubField::Account
+                        }
+                        crate::tui::view::publication::PubField::Account => {
+                            crate::tui::view::publication::PubField::Name
+                        }
+                    };
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.field = match state.field {
+                        crate::tui::view::publication::PubField::Name => {
+                            crate::tui::view::publication::PubField::Account
+                        }
+                        crate::tui::view::publication::PubField::Privacy => {
+                            crate::tui::view::publication::PubField::Name
+                        }
+                        crate::tui::view::publication::PubField::Account => {
+                            crate::tui::view::publication::PubField::Privacy
+                        }
+                    };
+                }
+                KeyCode::Enter => {
+                    if let Some(err) = state.validation_error() {
+                        // Not ready — show the validation error and keep
+                        // the overlay open so the user can fix it (was a
+                        // silent bump-step before).
+                        state.error = Some(err);
+                    } else if app.yt_lists.iter().any(|l| l.name == state.name) {
+                        // Duplicate-name guard: a YouTube playlist with
+                        // this title already exists. Don't publish (would
+                        // create a confusing second list); tell the user
+                        // to rename.
+                        state.error = Some(format!(
+                            "a YouTube playlist named \"{}\" already exists — rename",
+                            state.name
+                        ));
+                    } else {
+                        // Dispatch the sidecar publish API. Fire-and-
+                        // forget — `on_tick` drains the result and shows
+                        // the success/error toast.
+                        if let Some(session) = app.yt_session.as_mut() {
+                            let _ = session.send_create_playlist(
+                                state.name.clone(),
+                                String::new(),
+                                state.privacy.clone(),
+                                state.publishable_ids.clone(),
+                            );
+                            app.pending_publish_name = Some(state.name.clone());
+                            app.yt_status =
+                                Some(format!("publishing \"{}\" to YouTube", state.name));
+                            app.overlay = None;
+                            return;
+                        } else {
+                            state.error =
+                                Some("no YouTube session — run :yt auth browser <name>".into());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            // M-1: PgUp/PgDn scrolls the publication content so the account
+            // + publish/cancel controls are reachable when the content
+            // overflows the popup (e.g. at 80x24 or with many tracks).
+            match key.code {
+                KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(3),
+                KeyCode::PageDown => state.scroll = state.scroll.saturating_add(3),
+                _ => {}
+            }
+            if clear_err {
+                state.error = None;
+            }
+            app.overlay = Some(Overlay::Publication { state });
+        }
         None => {}
+    }
+}
+
+/// Get the next track from the radio session and play it. The session is
+/// passed directly (not read from `app.overlay`) because the overlay is
+/// taken out during key handling — `App::reco_radio_next` would see `None`
+/// and return nothing. Here we advance the session ourselves and call
+/// `App::play_radio_track` to switch the transport context + start playback.
+fn advance_radio(app: &mut App, session: &mut Option<crate::reco::radio::RadioSession>) {
+    if let Some(s) = session.as_mut() {
+        if s.needs_refill() {
+            s.refill_if_needed(&app.reco_profile, &app.catalog.tracks);
+        }
+        if let Some(c) = s.next_track() {
+            app.play_radio_track(&c.track_id);
+        }
     }
 }
 
@@ -731,6 +1751,65 @@ fn handle_filter_key(app: &mut App, key: KeyEvent) -> bool {
     }
 }
 
+fn handle_yt_filter_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc => {
+            app.yt_view.yt_filter = None;
+            true
+        }
+        KeyCode::Enter => {
+            // Enter on a YT filter: keep the filter active (so the user can
+            // keep narrowing) but jump the cursor to 0 (first match). The
+            // actual play happens via the tab-specific Enter handler below
+            // (which falls through since this returns false for Enter —
+            // NO: return true to consume Enter as "apply filter" not "play").
+            // Actually: Enter while filtering should PLAY the focused match
+            // (same as Enter without a filter). So return false here to let
+            // the tab-specific Enter handler fire.
+            false
+        }
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            // `f` on an empty filter closes it (toggle semantics); otherwise
+            // the char goes into the query. Backspace-to-empty + `f` also
+            // closes.
+            if c == 'f'
+                && app
+                    .yt_view
+                    .yt_filter
+                    .as_ref()
+                    .map(|f| f.is_empty())
+                    .unwrap_or(false)
+            {
+                app.yt_view.yt_filter = None;
+            } else if let Some(f) = &mut app.yt_view.yt_filter {
+                f.push(c);
+                // Reset the cursor to 0 so it stays valid in the filtered list.
+                match app.yt_view.tab {
+                    YtTab::Explore => app.yt_view.explore_cursor = 0,
+                    YtTab::Charts => app.yt_view.charts_cursor = 0,
+                    _ => {}
+                }
+            }
+            true
+        }
+        KeyCode::Backspace => {
+            if let Some(f) = &mut app.yt_view.yt_filter {
+                f.pop();
+                match app.yt_view.tab {
+                    YtTab::Explore => app.yt_view.explore_cursor = 0,
+                    YtTab::Charts => app.yt_view.charts_cursor = 0,
+                    _ => {}
+                }
+            }
+            true
+        }
+        _ => false, // navigation keys (j/k/Enter) fall through to the tab handlers
+    }
+}
+
 /// Execute a `:` command. Supports `:yt auth`, `:yt auth browser <name>`,
 /// `:yt logout`, `:yt setup`.
 fn execute_command(app: &mut App, cmd: &str) {
@@ -741,14 +1820,29 @@ fn execute_command(app: &mut App, cmd: &str) {
             });
         }
         "yt logout" => {
-            app.yt_logout();
+            // DEF-015: show a confirmation dialog before clearing credentials.
+            app.overlay = Some(Overlay::Confirm {
+                message: "Clear YouTube credentials and log out?  y/n".to_string(),
+                action: crate::tui::app::ConfirmAction::YtLogout,
+            });
         }
         "yt setup" => {
             app.yt_setup();
         }
         "queue clear" => {
-            app.transport.clear_queue();
-            app.yt_status = Some("queue cleared".into());
+            // MOD-4: confirm before clearing a non-empty queue (mirrors the
+            // `d` delete-playlist and `:yt logout` confirmation pattern from
+            // DEF-001 / DEF-015). When the queue is already empty, `:queue
+            // clear` is a no-op without confirmation — there's nothing to
+            // destroy.
+            if app.transport.manual_queue.is_empty() {
+                app.yt_status = Some("queue is empty".into());
+            } else {
+                app.overlay = Some(Overlay::Confirm {
+                    message: "Clear the play-next queue?  y/n".to_string(),
+                    action: crate::tui::app::ConfirmAction::ClearQueue,
+                });
+            }
         }
         // `:diag` — open the diagnostics overlay (recent provider errors,
         // respawn notices, sidecar failures). Esc closes (generic handler).
@@ -758,6 +1852,53 @@ fn execute_command(app: &mut App, cmd: &str) {
         // `:q` / `:quit` — quit the app (same as the `q` keybinding).
         "q" | "quit" => {
             app.quit();
+        }
+        // `:home` — open the YouTube Home view (same as the `H` keybinding).
+        "home" => {
+            app.open_home();
+        }
+        // `:gen` — open the playlist generator (same as `G` in the Y view).
+        "gen" => {
+            app.open_generator();
+        }
+        // RC18-D8: `:gen <description>` — open the generator with the NL
+        // prompt pre-filled (mirrors `:publish <name>`). The user can edit
+        // or press Enter to parse. Falls through to plain `:gen` when the
+        // argument is empty/whitespace.
+        other if other.starts_with("gen ") => {
+            let prompt = other.trim_start_matches("gen ").trim().to_string();
+            app.open_generator_with_prompt(prompt);
+        }
+        // `:profile` — show recommendation profile health (DEF-064: wires
+        // reco::evaluation into the running app so the user can see their
+        // listening-history coverage).
+        "profile" => {
+            // Generate mixes if none yet so the summary has material.
+            if app.reco_mixes.is_empty() {
+                app.reco_mixes =
+                    crate::reco::mixes::generate_all_mixes(&app.reco_profile, &app.catalog.tracks);
+            }
+            app.yt_status = Some(app.profile_health_summary());
+        }
+        // `:radio` — start a radio session from the currently selected track.
+        "radio" => {
+            if let Some(track_id) = app.selected_track_id() {
+                app.start_radio_from_track(&track_id);
+            } else {
+                app.yt_status = Some("no track selected".into());
+            }
+        }
+        // `:publish` — start the publication flow for the focused playlist.
+        "publish" => {
+            if let Some(name) = app
+                .playlists
+                .get(app.cursors.playlist)
+                .map(|p| p.name.clone())
+            {
+                app.open_publication(&name);
+            } else {
+                app.yt_status = Some("no playlist selected".into());
+            }
         }
         other if other.starts_with("yt auth browser") => {
             let browser = other
@@ -770,7 +1911,34 @@ fn execute_command(app: &mut App, cmd: &str) {
                         .into(),
                 );
             } else {
+                // RC11-DEF-019: immediate feedback before the (possibly slow)
+                // sidecar spawn + Keychain read. `apply_yt_browser` overwrites
+                // `yt_status` only on the auto-setup path; in the common case
+                // (venv already exists) this message stays visible until the
+                // first sidecar response lands (or the 5s TTL clears it).
+                app.yt_error = None;
+                app.yt_status = Some(format!("Opening {browser} — waiting for token…"));
+                app.yt_state = crate::yt::state::YtState::Authenticating;
                 app.apply_yt_browser(browser);
+            }
+        }
+        // `:radio artist <name>` — start a radio session from an artist.
+        other if other.starts_with("radio artist ") => {
+            let artist = other.trim_start_matches("radio artist ").trim().to_string();
+            if artist.is_empty() {
+                app.yt_status = Some("usage: :radio artist <name>".into());
+            } else {
+                app.start_radio_from_artist(&artist);
+            }
+        }
+        // `:publish <playlist>` — start the publication flow for a named
+        // playlist.
+        other if other.starts_with("publish ") => {
+            let name = other.trim_start_matches("publish ").trim().to_string();
+            if name.is_empty() {
+                app.yt_status = Some("usage: :publish <playlist>".into());
+            } else {
+                app.open_publication(&name);
             }
         }
         _ => {
@@ -778,7 +1946,15 @@ fn execute_command(app: &mut App, cmd: &str) {
             // wondering if their command ran. Known commands are matched
             // above; anything else (non-empty) is unknown.
             if !cmd.is_empty() {
-                app.yt_error = Some(format!("unknown command: :{cmd}"));
+                let msg = format!("unknown command: :{cmd}");
+                app.yt_error = Some(msg.clone());
+                // RC11-DEF-005: surface the error in the footer status line
+                // immediately (within one frame) regardless of `yt_state`.
+                // The old footer only rendered `yt_error` when
+                // `yt_state == Ready`, so local-only users (default
+                // `Unconfigured`) never saw the feedback. `yt_error` is still
+                // set for the diagnostics overlay (`D`).
+                app.set_status_toast(msg);
             }
         }
     }
@@ -807,11 +1983,21 @@ fn focused_column_len(app: &App) -> usize {
             0 => app.yt_lists.len(),
             _ => focused_track_count(app),
         },
-        View::Queue => app.transport.manual_queue.len(),
+        // Queue view: when the manual queue is empty, the view shows the
+        // current playback CONTEXT tracks (so the user can navigate the
+        // playlist that's playing). The cursor length must match what's
+        // actually rendered.
+        View::Queue => {
+            let manual_len = app.transport.manual_queue.len();
+            if manual_len > 0 {
+                manual_len
+            } else {
+                app.transport_context_ids().len()
+            }
+        }
     }
 }
 
-/// Track-list length of the album/playlist currently in view.
 fn focused_track_count(app: &App) -> usize {
     match app.view {
         View::Artists => {
@@ -836,7 +2022,14 @@ fn focused_track_count(app: &App) -> usize {
             .get(app.cursors.playlist)
             .map(|l| l.track_ids.len())
             .unwrap_or(0),
-        View::Queue => app.transport.manual_queue.len(),
+        View::Queue => {
+            let manual_len = app.transport.manual_queue.len();
+            if manual_len > 0 {
+                manual_len
+            } else {
+                app.transport_context_ids().len()
+            }
+        }
     }
 }
 
@@ -853,6 +2046,10 @@ fn max_focus_col(app: &App) -> usize {
 fn move_left(app: &mut App) {
     if app.focus_col > 0 {
         app.focus_col -= 1;
+    } else if app.view == View::Youtube {
+        // RB-3: at the left edge of the YouTube view, `h` / Left exits to a
+        // local view instead of being a no-op (a reliable second escape).
+        switch_view(app, View::Artists);
     }
 }
 
@@ -956,6 +2153,7 @@ fn set_focused_cursor(app: &mut App, v: usize) {
 }
 
 fn switch_view(app: &mut App, view: View) {
+    let prev = app.view;
     app.view = view;
     app.focus_col = 0;
     // Clamp cursors for the target view so a stale cursor from the previous
@@ -970,6 +2168,13 @@ fn switch_view(app: &mut App, view: View) {
     // synchronous roundtrip at the view-enter boundary; spec §5.3).
     if view == View::Youtube {
         app.refresh_yt_lists();
+        // RB-3: surface a short recovery/exit affordance when entering the
+        // YouTube view so the user can always see how to leave it (and is not
+        // trapped if the pane renders empty at 80x24). Kept under 80 columns
+        // so it fits the footer at 80x24 without clipping.
+        if prev != View::Youtube {
+            app.set_status_toast("YT: 1-4 view · Tab cycle · [ ] tabs · Esc exit".into());
+        }
     }
 }
 
@@ -1061,7 +2266,8 @@ fn handle_player_bar_click(app: &mut App, col: u16, row: u16, area: ratatui::lay
     if rect_contains(geo.previous, col, row) {
         app.prev();
     } else if rect_contains(geo.play_pause, col, row) {
-        let _ = app.player.play_pause();
+        // RC14-DEF-4: route through `toggle_pause` for pause-time tracking.
+        app.toggle_pause();
     } else if rect_contains(geo.next, col, row) {
         app.next();
     }
@@ -1132,7 +2338,14 @@ fn focused_column_len_with_focus(app: &App, focus: usize) -> usize {
             0 => app.yt_lists.len(),
             _ => focused_track_count(app),
         },
-        View::Queue => app.transport.manual_queue.len(),
+        View::Queue => {
+            let manual_len = app.transport.manual_queue.len();
+            if manual_len > 0 {
+                manual_len
+            } else {
+                app.transport_context_ids().len()
+            }
+        }
     }
 }
 

@@ -320,35 +320,96 @@ fn read_embedded_falls_through_to_sidecar() {
 
 // --- Stale-discard: generation guard (AC-M3.4.2) ---------------------------
 
+/// Build a fake sidecar Session whose script reads stdin and echoes nothing,
+/// so `send_get_lyrics` succeeds (writes to stdin) but no response lands until
+/// we inject `pending_lyrics` manually. Lets the generation-guard test
+/// exercise the real `on_tick` sidecar path without a ytmusicapi roundtrip.
+fn fake_lyrics_session() -> jukebox::yt::session::Session {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let script =
+        std::env::temp_dir().join(format!("jk-lyrics-fake-{}-{}.py", std::process::id(), n));
+    std::fs::write(&script, "import sys\nfor line in sys.stdin: pass\n").unwrap();
+    jukebox::yt::session::Session::spawn(std::path::Path::new("python3"), &script, None).unwrap()
+}
+
 #[test]
 fn stale_lyrics_dropped_on_track_change() {
-    // The generation guard lives in App::lyrics_gen + the Overlay::Lyrics.gen
-    // field. We test the protocol-level pieces: the sidecar returns lyrics
-    // for a DIFFERENT video_id than the overlay's track_id → on_tick discards.
-    // Here we verify the proto-level pairing: a Response::Lyrics carries the
-    // video_id from the Pending::Lyrics variant, and the App-side guard
-    // (track_id == vid && gen == lyrics_gen) rejects mismatches.
-    //
-    // This test simulates the check: a response for "old_vid" while the
-    // overlay's track_id is "new_vid" → the condition `track_id == vid` is
-    // false → the response is dropped.
-    let overlay_track_id = "new_vid";
-    let response_vid = "old_vid";
-    assert_ne!(
-        overlay_track_id, response_vid,
-        "stale response must be dropped"
+    // REAL generation-guard exercise: request lyrics for track A (bumping
+    // lyrics_gen), then for track B (bumping again), then deliver A's stale
+    // sidecar response via `pending_lyrics`. on_tick's guard
+    // (`track_id == vid && gen == self.lyrics_gen`) must reject A's response
+    // so the overlay stays on B's Loading state — A's lyrics must NOT
+    // overwrite B's overlay.
+    let mut app = empty_app();
+    app.yt_session = Some(fake_lyrics_session());
+    app.overlay = Some(Overlay::Lyrics {
+        content: None,
+        state: LyricsState::Idle,
+        scroll: 0,
+        track_id: String::new(),
+        gen: app.lyrics_gen,
+    });
+    app.request_lyrics("vidA");
+    let gen_a = app.lyrics_gen;
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Lyrics {
+                state: LyricsState::Loading,
+                ref track_id,
+                ..
+            }) if track_id == "vidA"
+        ),
+        "overlay should be Loading for A after request"
+    );
+    app.request_lyrics("vidB");
+    assert_ne!(app.lyrics_gen, gen_a, "gen must advance between requests");
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Lyrics {
+                state: LyricsState::Loading,
+                ref track_id,
+                ..
+            }) if track_id == "vidB"
+        ),
+        "overlay should be Loading for B after request"
+    );
+    app.yt_session.as_mut().unwrap().pending_lyrics = Some((
+        "vidA".into(),
+        vec![LyricLineProto {
+            time: Some(1.0),
+            text: "stale line for A".into(),
+        }],
+        true,
+    ));
+    app.on_tick();
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Lyrics {
+                state: LyricsState::Loading,
+                content: None,
+                ref track_id,
+                ..
+            }) if track_id == "vidB"
+        ),
+        "stale lyrics for A must be dropped; overlay should stay Loading for B"
     );
 }
 
 #[test]
 fn lyrics_gen_increments_on_request() {
-    // The generation counter bumps on every request_lyrics call so stale
-    // responses are discarded. We verify the counter type wraps correctly.
-    let mut gen: u64 = 0;
-    gen = gen.wrapping_add(1);
-    assert_eq!(gen, 1);
-    gen = gen.wrapping_add(1);
-    assert_eq!(gen, 2);
+    let mut app = empty_app();
+    assert_eq!(app.lyrics_gen, 0);
+    app.request_lyrics("vidA");
+    assert_eq!(app.lyrics_gen, 1);
+    app.request_lyrics("vidB");
+    assert_eq!(app.lyrics_gen, 2);
+    app.request_lyrics("vidA");
+    assert_eq!(app.lyrics_gen, 3);
 }
 
 // --- Unicode / CJK safety --------------------------------------------------

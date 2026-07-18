@@ -76,6 +76,7 @@ pub fn save_yt_lists_at(path: &std::path::Path, lists: &[YtList]) -> Result<()> 
             kind: match l.kind {
                 crate::tui::app::YtListKind::Account => "account",
                 crate::tui::app::YtListKind::Suggested => "suggested",
+                crate::tui::app::YtListKind::Generated => "generated",
             }
             .to_string(),
             track_ids: l.track_ids.clone(),
@@ -116,6 +117,7 @@ pub fn load_yt_lists_at(path: &std::path::Path) -> Result<Vec<YtList>> {
                     name: c.name,
                     kind: match c.kind.as_str() {
                         "suggested" => crate::tui::app::YtListKind::Suggested,
+                        "generated" => crate::tui::app::YtListKind::Generated,
                         _ => crate::tui::app::YtListKind::Account,
                     },
                     track_ids: c.track_ids,
@@ -152,6 +154,68 @@ pub fn load_yt_lists() -> Vec<YtList> {
 /// Clear the cached yt_lists in the default state DB (best-effort).
 pub fn clear_yt_lists() {
     let _ = clear_yt_lists_at(&state::db_path());
+}
+
+// ---------------------------------------------------------------------------
+// Track metadata cache (persisted so resume shows real titles)
+// ---------------------------------------------------------------------------
+
+const TRACK_CACHE_KEY: &str = "track_cache";
+
+/// Save the session's track_cache to `path` as JSON, so the next launch can
+/// restore track titles/artists for the Queue view + now-playing bar (the
+/// in-memory `track_cache` doesn't survive a restart).
+pub fn save_track_cache_at(
+    path: &std::path::Path,
+    tracks: &[crate::source::RemoteTrack],
+) -> Result<()> {
+    let conn = open_at(path)?;
+    let v = serde_json::to_string(tracks)?;
+    conn.execute(
+        "INSERT INTO state (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![TRACK_CACHE_KEY, &v],
+    )?;
+    Ok(())
+}
+
+/// Load cached track metadata from `path`. Empty on first launch or after
+/// clear. The caller populates the session's `track_cache` with these
+/// entries so `track_for(video_id)` resolves immediately after restart.
+pub fn load_track_cache_at(path: &std::path::Path) -> Result<Vec<crate::source::RemoteTrack>> {
+    let conn = open_at(path)?;
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT value FROM state WHERE key = ?1",
+            rusqlite::params![TRACK_CACHE_KEY],
+            |r| r.get::<_, String>(0),
+        )
+        .ok();
+    match v {
+        Some(s) if !s.is_empty() => Ok(serde_json::from_str(&s)?),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Save to the default state DB (best-effort).
+pub fn save_track_cache(tracks: &[crate::source::RemoteTrack]) {
+    let _ = save_track_cache_at(&state::db_path(), tracks);
+}
+
+/// Load from the default state DB. Empty on first launch.
+pub fn load_track_cache() -> Vec<crate::source::RemoteTrack> {
+    load_track_cache_at(&state::db_path()).unwrap_or_default()
+}
+
+/// Clear the cached track metadata (best-effort).
+pub fn clear_track_cache() {
+    let conn = open_at(&state::db_path());
+    if let Ok(conn) = conn {
+        let _ = conn.execute(
+            "DELETE FROM state WHERE key = ?1",
+            rusqlite::params![TRACK_CACHE_KEY],
+        );
+    }
 }
 
 #[cfg(test)]

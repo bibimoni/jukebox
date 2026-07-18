@@ -16,9 +16,11 @@ pub const ARTISTS: &str = "artists";
 pub const SEARCH: &str = "search";
 pub const QUEUE: &str = "queue";
 
-/// Resolve the state DB path: `<config_dir>/jukebox/state.db`. Honors
-/// `$XDG_CONFIG_HOME`, else falls back to `dirs::config_dir()`, matching
-/// `config::config_path()` so the two files live together.
+/// Resolve the state DB path: `~/.config/jukebox/state.db`. Honors
+/// `$XDG_CONFIG_HOME`, else falls back to `~/.config` (via `dirs::home_dir`,
+/// NOT `dirs::config_dir` which returns `~/Library/Application Support` on
+/// macOS — the user's config.yml is at `~/.config/jukebox/` and all state
+/// should live alongside it).
 ///
 /// The `/tmp/.config` fallback is acceptable here: `state.db` stores only UI
 /// prefs (focus, column widths, volume, playlists) — no secrets. Cookie
@@ -26,7 +28,7 @@ pub const QUEUE: &str = "queue";
 pub fn db_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(dirs::config_dir)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .unwrap_or_else(|| PathBuf::from("/tmp/.config"));
     base.join("jukebox").join("state.db")
 }
@@ -35,7 +37,12 @@ pub fn db_path() -> PathBuf {
 /// Increment when the schema or stored JSON format changes incompatibly.
 /// `open_at` auto-migrates older DBs by wiping + recreating (state is
 /// ephemeral UI prefs, not user data — losing it is acceptable).
-const SCHEMA_VERSION: u32 = 2;
+///
+/// Version history:
+/// - 1: initial (focus pane)
+/// - 2: layout + playlists + command history
+/// - 3: events table for the recommendation engine (listening history)
+const SCHEMA_VERSION: u32 = 3;
 
 /// Open (creating if missing) the state DB at `path` and ensure the schema
 /// exists. Checks the stored schema version; if it's older than current,
@@ -74,6 +81,21 @@ fn open_and_init(path: &Path) -> Result<Connection> {
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );",
+    )?;
+    // Events table for the recommendation engine (schema v3). Created here
+    // (outside the need_wipe block) so it survives a v2→v3 migration: the
+    // state table gets wiped (UI prefs are ephemeral), but listening history
+    // is user data we want to preserve across migrations. If the table already
+    // exists (re-open), `CREATE TABLE IF NOT EXISTS` is a no-op.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS events (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_json TEXT NOT NULL,
+            timestamp  INTEGER NOT NULL,
+            event_type TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);",
     )?;
     // Check schema version; wipe if older (migration = fresh start for UI prefs).
     let stored: Option<String> = conn
@@ -160,6 +182,17 @@ pub fn clear() -> Result<()> {
 /// Persisted browse layout + transport modes. `shuffle`/`repeat` are stored as
 /// strings (`"off"`/`"smart"`/`"random"`, `"off"`/`"all"`/`"one"`) rather than
 /// the enum types so we don't need serde derives on `ShuffleMode`/`RepeatMode`
+/// Serializable track metadata for the last-played context. Persisted so the
+/// Queue view + now-playing bar show real titles immediately after restart.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct CachedTrackMeta {
+    pub video_id: String,
+    pub title: String,
+    pub artist: String,
+    #[serde(default)]
+    pub album: Option<String>,
+}
+
 /// (defined in `tui::queue`).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct LayoutState {
@@ -182,6 +215,89 @@ pub struct LayoutState {
     /// the sidecar then falls back to persisted pasted cookies, else guest.
     #[serde(default)]
     pub yt_browser: String,
+    /// RC11-DEF-014: the last-played track id, restored on launch so the
+    /// cursor can return to it and a "resume" hint can show. `None` on a
+    /// fresh install (no track has been played yet).
+    #[serde(default)]
+    pub last_played_track_id: Option<String>,
+    /// RC11-DEF-014: the last-played track's position in seconds, restored
+    /// on launch so `resume_last()` can seek to it. afplay can't seek so
+    /// resume only re-seeks on mpv; afplay restarts from 0.
+    #[serde(default)]
+    pub last_played_position: f64,
+    /// The track ids + metadata (title/artist/album) of the last-played context
+    /// (the playlist/album/search that was playing), persisted so resume
+    /// restores the FULL context with real titles — not just video_id strings.
+    /// Empty when the context was a single track or no track has been played.
+    #[serde(default)]
+    pub last_played_context_ids: Vec<String>,
+    /// Full track metadata for the last-played context. Persisted alongside
+    /// `last_played_context_ids` so the Queue view + now-playing bar show real
+    /// titles immediately after restart — no need to wait for get_playlist or
+    /// search to fire. Each entry has video_id + title + artist + album.
+    #[serde(default)]
+    pub last_played_context_tracks: Vec<CachedTrackMeta>,
+    /// The YouTube playlist ID the last-played context came from (when the
+    /// context was a YouTube playlist/mood list). On startup, we re-fire
+    /// `get_playlist(key)` to fetch ALL track metadata so the Queue view
+    /// shows real titles instead of "Loading…" for tracks whose metadata
+    /// wasn't cached before the previous session ended. `None` when the
+    /// context was local (album/artist/playlist) or a single track.
+    #[serde(default)]
+    pub last_played_context_key: Option<String>,
+    /// RC11-DEF-014: the last-focused browse cursors (artist/album/track/
+    /// playlist), restored on launch so the user returns to the last-played
+    /// track instead of track 1. `queue` is not persisted (it's transient).
+    #[serde(default)]
+    pub last_cursor_artist: usize,
+    #[serde(default)]
+    pub last_cursor_album: usize,
+    #[serde(default)]
+    pub last_cursor_track: usize,
+    #[serde(default)]
+    pub last_cursor_playlist: usize,
+    #[serde(default)]
+    pub player_bar_mode: String,
+    #[serde(default)]
+    pub track_layout_mode: String,
+    #[serde(default = "default_sidebar_visible")]
+    pub sidebar_visible: bool,
+    #[serde(default)]
+    pub playlist_col: PlaylistColState,
+}
+
+fn default_sidebar_visible() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PlaylistColState {
+    #[serde(default = "default_playlist_col_width")]
+    pub width: u16,
+    #[serde(default = "default_playlist_col_group")]
+    pub group_by_type: bool,
+    #[serde(default = "default_playlist_col_counts")]
+    pub show_counts: bool,
+}
+
+fn default_playlist_col_width() -> u16 {
+    32
+}
+fn default_playlist_col_group() -> bool {
+    true
+}
+fn default_playlist_col_counts() -> bool {
+    true
+}
+
+impl Default for PlaylistColState {
+    fn default() -> Self {
+        PlaylistColState {
+            width: 32,
+            group_by_type: true,
+            show_counts: true,
+        }
+    }
 }
 
 fn default_focus() -> String {
@@ -211,6 +327,19 @@ impl Default for LayoutState {
             continue_mode: "off".to_string(),
             source_mode: "local".to_string(),
             yt_browser: String::new(),
+            last_played_track_id: None,
+            last_played_position: 0.0,
+            last_played_context_ids: Vec::new(),
+            last_played_context_tracks: Vec::new(),
+            last_played_context_key: None,
+            last_cursor_artist: 0,
+            last_cursor_album: 0,
+            last_cursor_track: 0,
+            last_cursor_playlist: 0,
+            player_bar_mode: "mini".to_string(),
+            track_layout_mode: "table".to_string(),
+            sidebar_visible: true,
+            playlist_col: PlaylistColState::default(),
         }
     }
 }
@@ -268,6 +397,28 @@ pub struct LayoutSave<'a> {
     pub continue_mode: crate::tui::queue::ContinueMode,
     pub source_mode: crate::mode::SourceMode,
     pub yt_browser: &'a str,
+    /// RC11-DEF-014: the last-played track id + position (None when nothing
+    /// has been played this session).
+    pub last_played_track_id: Option<&'a str>,
+    pub last_played_position: f64,
+    /// The track ids of the last-played context (playlist/album/search).
+    /// Persisted so resume restores the full context, not just 1 track.
+    pub last_played_context_ids: &'a [String],
+    /// Full track metadata for the last-played context so the Queue view
+    /// shows real titles immediately after restart.
+    pub last_played_context_tracks: &'a [CachedTrackMeta],
+    /// YouTube playlist ID for the last-played context (to re-fetch metadata).
+    pub last_played_context_key: Option<&'a str>,
+    /// RC11-DEF-014: the last-focused browse cursors so the next launch
+    /// returns to the last-played track.
+    pub last_cursor_artist: usize,
+    pub last_cursor_album: usize,
+    pub last_cursor_track: usize,
+    pub last_cursor_playlist: usize,
+    pub player_bar_mode: &'a str,
+    pub track_layout_mode: &'a str,
+    pub sidebar_visible: bool,
+    pub playlist_col: &'a crate::tui::app::PlaylistColumnState,
 }
 
 /// Save the layout (focus + widths + volume + shuffle/repeat) to `path`.
@@ -304,6 +455,23 @@ pub fn save_layout_at(path: &Path, input: &LayoutSave) -> Result<()> {
         .to_string(),
         source_mode: input.source_mode.as_str().to_string(),
         yt_browser: input.yt_browser.to_string(),
+        last_played_track_id: input.last_played_track_id.map(|s| s.to_string()),
+        last_played_position: input.last_played_position,
+        last_played_context_ids: input.last_played_context_ids.to_vec(),
+        last_played_context_tracks: input.last_played_context_tracks.to_vec(),
+        last_played_context_key: input.last_played_context_key.map(|s| s.to_string()),
+        last_cursor_artist: input.last_cursor_artist,
+        last_cursor_album: input.last_cursor_album,
+        last_cursor_track: input.last_cursor_track,
+        last_cursor_playlist: input.last_cursor_playlist,
+        player_bar_mode: input.player_bar_mode.to_string(),
+        track_layout_mode: input.track_layout_mode.to_string(),
+        sidebar_visible: input.sidebar_visible,
+        playlist_col: PlaylistColState {
+            width: input.playlist_col.width,
+            group_by_type: input.playlist_col.group_by_type,
+            show_counts: input.playlist_col.show_counts,
+        },
     })?;
     conn.execute(
         "INSERT INTO state (key, value) VALUES ('layout', ?1)
@@ -417,6 +585,122 @@ pub fn save_command_history(history: &[String]) -> Result<()> {
 /// Load command history from the default DB path.
 pub fn load_command_history() -> Result<Vec<String>> {
     load_command_history_at(&db_path())
+}
+
+// --- Events (recommendation engine listening history) ---
+
+/// Save a single listening event to `path`. Delegates to
+/// `reco::events::EventStore::save_at` after opening the connection.
+pub fn save_event_at(path: &Path, event: &crate::reco::events::ListenEvent) -> Result<()> {
+    let conn = open_at(path)?;
+    crate::reco::events::EventStore::save_at(event, &conn)
+}
+
+/// Load the `limit` most recent events from `path` (chronological order).
+pub fn load_events_at(path: &Path, limit: usize) -> Result<Vec<crate::reco::events::ListenEvent>> {
+    let conn = open_at(path)?;
+    crate::reco::events::EventStore::load_at(&conn, limit)
+}
+
+/// Load all events since `since` from `path` (chronological order).
+pub fn load_events_since_at(
+    path: &Path,
+    since: u64,
+) -> Result<Vec<crate::reco::events::ListenEvent>> {
+    let conn = open_at(path)?;
+    crate::reco::events::EventStore::load_since_at(&conn, since)
+}
+
+/// Clear all listening events from `path`.
+pub fn clear_events_at(path: &Path) -> Result<()> {
+    let conn = open_at(path)?;
+    crate::reco::events::EventStore::clear_at(&conn)
+}
+
+/// Count the total number of listening events at `path`.
+pub fn count_events_at(path: &Path) -> Result<u64> {
+    let conn = open_at(path)?;
+    crate::reco::events::EventStore::count_at(&conn)
+}
+
+/// Prune events older than `before` at `path` (retention enforcement).
+/// Returns the number of deleted rows.
+pub fn prune_events_before_at(path: &Path, before: u64) -> Result<u64> {
+    let conn = open_at(path)?;
+    crate::reco::events::EventStore::prune_before_at(&conn, before)
+}
+
+/// Save a single listening event to the default DB path.
+pub fn save_event(event: &crate::reco::events::ListenEvent) -> Result<()> {
+    save_event_at(&db_path(), event)
+}
+
+/// Load the `limit` most recent events from the default DB path.
+pub fn load_events(limit: usize) -> Result<Vec<crate::reco::events::ListenEvent>> {
+    load_events_at(&db_path(), limit)
+}
+
+/// Clear all listening events from the default DB path.
+pub fn clear_events() -> Result<()> {
+    clear_events_at(&db_path())
+}
+
+/// Count the total number of listening events at the default DB path.
+pub fn count_events() -> Result<u64> {
+    count_events_at(&db_path())
+}
+
+// --- Profile (recommendation engine user profile) ---
+
+/// Save the user profile to `path` as JSON under the `'profile'` key. UPSERT
+/// so the row is created on first save and updated thereafter.
+pub fn save_profile_at(path: &Path, profile: &crate::reco::profile::UserProfile) -> Result<()> {
+    let conn = open_at(path)?;
+    let v = serde_json::to_string(profile)?;
+    conn.execute(
+        "INSERT INTO state (key, value) VALUES ('profile', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [v],
+    )?;
+    Ok(())
+}
+
+/// Load the saved user profile from `path`. Returns `UserProfile::default()`
+/// (empty) when no `'profile'` row exists yet (first launch, or after reset).
+pub fn load_profile_at(path: &Path) -> Result<crate::reco::profile::UserProfile> {
+    let conn = open_at(path)?;
+    match conn.query_row("SELECT value FROM state WHERE key = 'profile'", [], |r| {
+        r.get::<_, String>(0)
+    }) {
+        Ok(s) => Ok(serde_json::from_str(&s)?),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            Ok(crate::reco::profile::UserProfile::default())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Clear the saved user profile at `path` (privacy: user requests profile
+/// reset). The next `load_profile` will return an empty profile.
+pub fn clear_profile_at(path: &Path) -> Result<()> {
+    let conn = open_at(path)?;
+    conn.execute("DELETE FROM state WHERE key = 'profile'", [])?;
+    Ok(())
+}
+
+/// Save the user profile to the default DB path.
+pub fn save_profile(profile: &crate::reco::profile::UserProfile) -> Result<()> {
+    save_profile_at(&db_path(), profile)
+}
+
+/// Load the user profile from the default DB path. Empty on first launch.
+pub fn load_profile() -> Result<crate::reco::profile::UserProfile> {
+    load_profile_at(&db_path())
+}
+
+/// Clear the user profile at the default DB path (privacy reset).
+pub fn clear_profile() -> Result<()> {
+    clear_profile_at(&db_path())
 }
 
 #[cfg(test)]

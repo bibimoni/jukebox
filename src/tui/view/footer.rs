@@ -4,14 +4,14 @@
 
 use ratatui::{
     layout::{Alignment, Constraint, Layout},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
 use crate::tui::app::{App, Overlay, SearchScope};
-use crate::tui::view::theme::Theme;
+use crate::tui::view::theme::{ascii_sanitize, ellipsis, sep_dot, Theme};
 
 /// Render the footer. When the area is ≥ 2 rows: line 1 = YT provider status
 /// (or blank when Ready), line 2 = persistent key-hint line. When only 1 row
@@ -26,7 +26,7 @@ pub fn render(f: &mut Frame, area: &ratatui::layout::Rect, app: &App) {
         let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(*area);
 
         // Line 1: YT status (or transient message, or blank when Ready).
-        let status = status_line(app, &theme);
+        let status = status_line(app, &theme, area.width);
         f.render_widget(
             Paragraph::new(status.alignment(Alignment::Left))
                 .block(Block::default().borders(Borders::NONE)),
@@ -76,10 +76,17 @@ pub fn render(f: &mut Frame, area: &ratatui::layout::Rect, app: &App) {
 fn mode_badge(app: &App, theme: &Theme) -> Span<'static> {
     use crate::tui::app::View;
     let view_src = match app.view {
-        View::Artists | View::Playlists | View::Queue => "local",
+        View::Artists | View::Playlists => "local",
+        // DEF-050: Queue is a distinct view — show "queue".
+        View::Queue => "queue",
         View::Youtube => "youtube",
     };
-    let mode = app.source_mode.as_str();
+    // DEF-021: SOURCE reflects the playing track's source, not mode pref.
+    let source = app
+        .now_playing
+        .as_ref()
+        .map(|np| if np.is_remote() { "youtube" } else { "local" })
+        .unwrap_or_else(|| app.source_mode.as_str());
     // High-contrast indicator: when `JUKEBOX_HIGH_CONTRAST` is set the theme
     // collapses to pure white/black. Surface the mode in the status line so
     // the user can verify the toggle is active (judge: accessibility mode
@@ -88,9 +95,9 @@ fn mode_badge(app: &App, theme: &Theme) -> Span<'static> {
     // env is unset (the test fixtures run in a clean env → no snapshot
     // change).
     let hc = if crate::tui::view::theme::high_contrast() {
-        " · HC"
+        format!(" {} HC", sep_dot())
     } else {
-        ""
+        String::new()
     };
     let color = if no_color() {
         Color::Reset
@@ -98,40 +105,99 @@ fn mode_badge(app: &App, theme: &Theme) -> Span<'static> {
         theme.accent
     };
     Span::styled(
-        format!("VIEW: {view_src} · SOURCE: {mode}{hc}"),
+        format!("VIEW: {view_src} {} SOURCE: {source}{hc}", sep_dot()),
         Style::default().fg(color),
     )
 }
 
-/// The status line (footer row 1): mode badge + YT provider status from
-/// `yt_state`, or just the mode badge when Ready. YT status is suppressed in
-/// pure Local mode (non-YouTube view) so unrelated provider errors don't
-/// alarm the user — only the mode badge is shown.
-fn status_line(app: &App, theme: &Theme) -> Line<'static> {
+/// The status line (footer row 1): mode badge + compact YT indicator (always
+/// visible — RC11-DEF-020) + YT provider status from `yt_state`. YT status is
+/// suppressed in pure Local mode (non-YouTube view) so unrelated provider
+/// errors don't alarm the user — only the compact `[Y …]` badge is shown.
+fn status_line(app: &App, theme: &Theme, width: u16) -> Line<'static> {
+    use crate::tui::view::theme::disp_width;
     use crate::yt::state::YtState;
     let badge = mode_badge(app, theme);
+    let yt_badge = compact_yt_badge(app, theme);
+    // M-2: compute the message budget from the ACTUAL badge + yt_badge widths
+    // (not a hardcoded 57) so recovery guidance is not clipped to invisibility
+    // at 80x24. The overhead = badge + " " + yt_badge + " · " (separator).
+    let overhead =
+        disp_width(badge.content.as_ref()) + 1 + disp_width(yt_badge.content.as_ref()) + 3;
+    let budget = (width as usize).saturating_sub(overhead).max(10);
 
-    // Suppress YT status when in Local mode and not viewing the YT library.
+    // RC11-DEF-005: a status-bar toast (unknown command, ambiguous Tab) takes
+    // precedence over everything else so command feedback is visible within
+    // one frame regardless of `yt_state`. The old footer only rendered
+    // `yt_error` when `yt_state == Ready`, so local-only users (default
+    // `Unconfigured`) never saw "unknown command: :foobar". The toast clears
+    // after ~3s via `on_tick` and the normal status line returns.
+    if let Some(msg) = &app.status_toast {
+        let style = if no_color() {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            theme.error_style()
+        };
+        let m = truncate_footer_msg(msg, budget);
+        return Line::from(vec![
+            badge,
+            Span::raw(" "),
+            yt_badge,
+            Span::raw(format!(" {} ", sep_dot())),
+            Span::styled(m, style),
+        ]);
+    }
+
+    // RC15-DEF-4: a prominent transient message (yt_status) is shown
+    // regardless of `yt_relevant` (view/mode) so feedback like "Setting up
+    // YouTube deps…" (from `:yt setup` while in Local mode) or "Opening
+    // chrome — waiting for token…" (from `:yt auth browser` while in Local
+    // mode) reaches the user even when the current view is Artists/Playlists
+    // and source_mode is Local. The old code gated `yt_status` behind
+    // `yt_relevant`, so `:yt setup` from Local mode showed nothing for 30s.
+    // Truncated to fit the footer so long paths get a clean `…` instead of a
+    // mid-word cut (RC11-DEF-017).
+    if let Some(msg) = &app.yt_status {
+        let color = if no_color() {
+            Color::Reset
+        } else {
+            theme.accent
+        };
+        let m = truncate_footer_msg(msg, budget);
+        return Line::from(vec![
+            badge,
+            Span::raw(" "),
+            yt_badge,
+            Span::raw(format!(" {} ", sep_dot())),
+            Span::styled(m, Style::default().fg(color)),
+        ]);
+    }
+
+    // Suppress YT state/error details when in Local mode and not viewing the
+    // YT library — only the compact `[Y …]` badge is shown. (Transient
+    // `yt_status` messages are already handled above, regardless of mode.)
     let yt_relevant = {
         use crate::mode::SourceMode;
         use crate::tui::app::View;
         app.source_mode != SourceMode::Local || app.view == View::Youtube
     };
     if !yt_relevant {
-        return Line::from(badge);
+        // RC11-DEF-020: still show the compact YT indicator so the user can
+        // see at a glance whether YT is connected without switching views.
+        return Line::from(vec![badge, Span::raw(" "), yt_badge]);
     }
 
     if app.yt_state == YtState::Ready {
-        if let Some(msg) = &app.yt_status {
-            let color = if no_color() {
-                Color::Reset
-            } else {
-                theme.accent
-            };
+        // DEF-003: show yt_error when Ready (e.g., "Unknown command: foobar").
+        if let Some(err) = &app.yt_error {
+            let err_style = theme.error_style();
+            let m = truncate_footer_msg(err, budget);
             return Line::from(vec![
                 badge,
-                Span::raw(" · "),
-                Span::styled(msg.clone(), Style::default().fg(color)),
+                Span::raw(" "),
+                yt_badge,
+                Span::raw(format!(" {} ", sep_dot())),
+                Span::styled(format!("[ERR] {m}"), err_style),
             ]);
         }
         // Ready + no transient: "✓ YT connected" alongside the mode badge.
@@ -142,12 +208,16 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
         };
         return Line::from(vec![
             badge,
-            Span::raw(" · "),
+            Span::raw(" "),
+            yt_badge,
+            Span::raw(format!(" {} ", sep_dot())),
             Span::styled("[ok] YT connected", Style::default().fg(color)),
         ]);
     }
     // Non-Ready: mode badge + YT status.
-    let label = app.yt_state.human_label();
+    // DEF-006: in ASCII mode, replace any Unicode ellipsis in the label with
+    // "..." so the footer is fully ASCII when JUKEBOX_FONT_MODE=ascii.
+    let label = ascii_sanitize(app.yt_state.human_label());
     let icon = app.yt_state.icon();
     let color = if no_color() {
         Color::Reset
@@ -174,7 +244,72 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
     // it overflows the 1-line footer and dumps raw exceptions (T5: footer
     // showed "Unable to find 'contents' using path ['conte"..."). The full
     // error is captured in the diagnostics overlay (press `D`).
-    Line::from(vec![badge, Span::raw(" · "), Span::styled(yt_label, style)])
+    Line::from(vec![
+        badge,
+        Span::raw(" "),
+        yt_badge,
+        Span::raw(format!(" {} ", sep_dot())),
+        Span::styled(yt_label, style),
+    ])
+}
+
+/// Compact, persistent YT state indicator (RC11-DEF-020): always visible in
+/// the footer next to the mode badge, in ALL views at ALL terminal sizes.
+/// 4-glyph vocabulary so it's glanceable on a single line:
+/// - `[Y ok]`  — Ready
+/// - `[Y ~]`   — transient (Authenticating / AuthenticatedNotSynced /
+///   Synchronizing)
+/// - `[Y err]` — error (ProviderError / AuthExpired / RateLimited / Failed /
+///   ReadyStale)
+/// - `[Y —]`   — not connected (Unconfigured / SignedOut)
+///
+/// Color follows severity (Green / Dim / Red / Dim). Under NO_COLOR all
+/// colors collapse to Reset — the text labels distinguish states without
+/// color.
+fn compact_yt_badge(app: &App, theme: &Theme) -> Span<'static> {
+    use crate::yt::state::YtState;
+    let txt = match app.yt_state {
+        YtState::Ready => "[Y ok]",
+        YtState::Authenticating | YtState::AuthenticatedNotSynced | YtState::Synchronizing => {
+            "[Y ~]"
+        }
+        YtState::ReadyStale
+        | YtState::ProviderError
+        | YtState::AuthExpired
+        | YtState::RateLimited
+        | YtState::Failed => "[Y err]",
+        YtState::Unconfigured | YtState::SignedOut => "[Y —]",
+    };
+    let color = if no_color() {
+        Color::Reset
+    } else {
+        match app.yt_state {
+            YtState::Ready => Color::Green,
+            YtState::ReadyStale
+            | YtState::ProviderError
+            | YtState::AuthExpired
+            | YtState::RateLimited
+            | YtState::Failed => Color::Red,
+            _ => theme.dim,
+        }
+    };
+    Span::styled(txt.to_string(), Style::default().fg(color))
+}
+
+/// Budget (in display columns) for a footer status/error message, after
+/// reserving space for the mode badge, the compact YT badge, the separators,
+/// and a small margin. Used so long `yt_status` / `yt_error` strings get a
+/// clean `…` truncation instead of a mid-word cut at the terminal width
+/// (RC11-DEF-017). M-2: the budget is now derived from the footer width so
+/// recovery guidance is NOT clipped to invisibility at 80x24 — the old
+/// hardcoded 57 was sized for a 100-col terminal and overflowed by ~20 cols
+/// at 80, clipping the end of the message (often the actionable part — "press
+/// R to retry"). The fixed overhead (badge + yt_badge + separators + margin)
+/// is ~40 cols; the rest is the message budget, clamped to a sane minimum.
+pub fn footer_msg_budget(width: u16, _msg: &str) -> usize {
+    const OVERHEAD: usize = 40;
+    let budget = (width as usize).saturating_sub(OVERHEAD);
+    budget.max(10)
 }
 
 /// Build the footer line: a YT provider status (from `yt_state`) when the
@@ -194,24 +329,85 @@ fn status_line(app: &App, theme: &Theme) -> Line<'static> {
 /// communicate, and the player bar already shows the MODE label).
 pub fn footer_line(app: &App, theme: &Theme, dim: &Style, width: u16) -> Line<'static> {
     use crate::yt::state::YtState;
-    // Ready + no transient: hints are the priority (no error to communicate,
-    // and the player bar already shows the MODE label).
-    if app.yt_state == YtState::Ready && app.yt_status.is_none() {
-        return hint_line(app, dim, width);
+    // RC11-DEF-005: a status-bar toast takes precedence over everything
+    // (including the hint bar) so command feedback is visible on the 1-row
+    // narrow footer too, regardless of `yt_state`.
+    if app.status_toast.is_some() {
+        return status_line(app, theme, width);
     }
-    // Non-Ready or Ready+msg: mirror status_line so the 1-row footer shows
-    // the same VIEW/PLAYBACK separation as the 2-row footer (Issue 2).
-    status_line(app, theme)
+    // A transient yt_status (e.g. "Opening chrome — waiting for token…",
+    // "YT setup OK · venv: …") is now shown by `status_line` regardless of
+    // state (RC11-DEF-019 / RC11-DEF-017), so delegate to it whenever one is
+    // set instead of falling through to the hint bar.
+    if app.yt_status.is_some() {
+        return status_line(app, theme, width);
+    }
+    // Ready + no transient: check yt_error first (DEF-003: unknown commands
+    // set yt_error while yt_state stays Ready — the old footer only showed
+    // yt_status/yt_state, never yt_error, so the user got no feedback).
+    if app.yt_state == YtState::Ready {
+        if app.yt_error.is_some() {
+            return status_line(app, theme, width);
+        }
+        // Ready + no transient + no error: hint line, prefixed with the
+        // compact YT indicator so it stays visible in the 1-row footer too
+        // (RC11-DEF-020 — the badge must be visible in ALL views at ALL
+        // terminal sizes, including the narrow 1-row footer).
+        let badge = mode_badge(app, theme);
+        let yt_badge = compact_yt_badge(app, theme);
+        let hint = hint_line(app, dim, width);
+        let mut spans = vec![badge, Span::raw(" "), yt_badge, Span::raw("  ")];
+        spans.extend(hint.spans);
+        return Line::from(spans);
+    }
+    // Non-Ready + no yt_status: state label (with the compact YT badge).
+    status_line(app, theme, width)
+}
+
+/// DEF-036: a description of the current async operation, if one is in
+/// flight. Checked by `hint_line` so the footer shows a persistent loading
+/// indicator (with the item name + op type) until completion/failure.
+fn async_loading_text(app: &App) -> Option<String> {
+    use crate::tui::view::theme::ellipsis;
+    if let Some(name) = &app.discover_play_loading {
+        return Some(format!("Loading {name}{}", ellipsis()));
+    }
+    if app.discover_loading {
+        return Some(format!("Loading suggestions{}", ellipsis()));
+    }
+    if app.pending_discover_play.is_some() {
+        return Some(format!("Loading playlist{}", ellipsis()));
+    }
+    if app.pending_play.is_some() {
+        let title = app
+            .yt_session
+            .as_ref()
+            .and_then(|s| s.track_for(app.pending_play.as_ref().unwrap()))
+            .map(|t| t.title.clone())
+            .unwrap_or_else(|| "stream".to_string());
+        return Some(format!("Resolving {title}{}", ellipsis()));
+    }
+    if app.pending_radio_seed.is_some() {
+        return Some(format!("Refilling radio{}", ellipsis()));
+    }
+    if app.yt_lists_loading {
+        return Some(format!("Loading YT lists{}", ellipsis()));
+    }
+    if app.is_resolving() {
+        return Some(format!("Resolving{}", ellipsis()));
+    }
+    None
 }
 
 /// The key-hint bar, ordered by priority so the most discoverable keys survive
-/// narrow terminals. Priority: `Enter play` > `q quit` > `? help` >
-/// `1-4 view` > `> < next prev` > `M mode` > `/ search`. Below 60 cols only the
-/// top 3 are shown so `Enter play · q quit · ? help` always fits. The
-/// `1-4 view` hint tells the user they can press `1`–`4` to switch between
-/// Artists / Playlists / Queue / YouTube views — so an empty queue or an
-/// empty playlist pane doesn't become a dead end (GLM:
-/// empty-queue-no-quick-navigation).
+/// narrow terminals. Below 60 cols only the top 3 are shown.
+///
+/// DEF-036: when an async op is in flight, shows a persistent loading indicator
+/// (with item name + op type) instead of key hints.
+///
+/// DEF-066: context-aware — "Space pause" while playing, "Space resume" while
+/// paused, view-specific hints (x remove in Queue, S discover in YouTube),
+/// "Esc close" when an overlay is active.
 fn hint_line(app: &App, dim: &Style, width: u16) -> Line<'static> {
     let theme = Theme::default();
     let accent = Style::default().fg(if no_color() {
@@ -220,10 +416,19 @@ fn hint_line(app: &App, dim: &Style, width: u16) -> Line<'static> {
         theme.accent
     });
 
-    // When a search overlay is active, show prominent segmented scope tabs
-    // "[Local] [YouTube]" so the search scope is visible at a glance (T5:
-    // search scope was muted — add segmented tabs). The active scope is
-    // accent-colored; the inactive is dim.
+    // DEF-036: persistent loading indicator.
+    if let Some(loading) = async_loading_text(app) {
+        let style = Style::default()
+            .fg(if no_color() {
+                Color::Reset
+            } else {
+                theme.accent
+            })
+            .add_modifier(Modifier::BOLD);
+        return Line::from(Span::styled(loading, style));
+    }
+
+    // Search overlay: segmented scope tabs.
     if let Some(Overlay::Search { scope, .. }) = &app.overlay {
         let local_st = if *scope == SearchScope::Local {
             accent
@@ -240,28 +445,57 @@ fn hint_line(app: &App, dim: &Style, width: u16) -> Line<'static> {
             Span::raw(" "),
             Span::styled("[YouTube]", yt_st),
             Span::raw("   "),
-            Span::styled("Tab scope · Enter search · Esc close", *dim),
+            Span::styled(
+                format!(
+                    "Tab scope {} Enter search {} Esc close",
+                    sep_dot(),
+                    sep_dot()
+                ),
+                *dim,
+            ),
         ];
         return Line::from(spans);
     }
 
-    let sep = " · ";
-    let search_hint = "/ search";
+    let sep = format!(" {} ", sep_dot());
+
+    // DEF-066: context-aware first hint.
+    let playing = app.player.is_playing() && app.now_playing.is_some();
+    let has_track = app.now_playing.is_some();
+    let first_hint = if playing {
+        "Space pause"
+    } else if has_track {
+        "Space resume"
+    } else {
+        "Enter play"
+    };
+
     let mut parts: Vec<String> = vec![
-        "Enter play".to_string(),
+        first_hint.to_string(),
         "q quit".to_string(),
         "? help".to_string(),
     ];
+
+    // DEF-066: "Esc close" when an overlay is active.
+    if app.overlay.is_some() {
+        parts.insert(1, "Esc close".to_string());
+    }
+
     if width >= 60 {
         parts.push("1-4 view".to_string());
         parts.push("> < next prev".to_string());
-        parts.push("M mode".to_string());
-        parts.push(search_hint.to_string());
+        parts.push("M pref".to_string());
+        // DEF-066: view-specific hints.
+        match app.view {
+            crate::tui::app::View::Queue => parts.push("x remove".to_string()),
+            crate::tui::app::View::Youtube => parts.push("S discover".to_string()),
+            _ => parts.push("/ search".to_string()),
+        }
     }
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, s) in parts.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::raw(sep));
+            spans.push(Span::raw(sep.clone()));
         }
         spans.push(Span::styled(s.clone(), *dim));
     }
@@ -270,4 +504,30 @@ fn hint_line(app: &App, dim: &Style, width: u16) -> Line<'static> {
 
 fn no_color() -> bool {
     crate::tui::view::theme::no_color()
+}
+
+/// Truncate a footer message to fit within `max` display columns, appending
+/// `…` when cut. Prevents long error messages from overflowing the 1-row
+/// footer (T5: raw exceptions overflowed the footer line).
+fn truncate_footer_msg(s: &str, max: usize) -> String {
+    use crate::tui::view::theme::disp_width;
+    if max == 0 {
+        return String::new();
+    }
+    if disp_width(s) <= max {
+        return s.to_string();
+    }
+    let target = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = disp_width(&c.to_string());
+        if w + cw > target {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push_str(ellipsis());
+    out
 }

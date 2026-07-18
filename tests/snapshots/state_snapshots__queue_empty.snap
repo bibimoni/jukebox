@@ -1,28 +1,29 @@
 ---
 source: tests/state_snapshots.rs
+assertion_line: 88
 expression: s
 ---
-1   ┏Queue━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-2   ┃                                                 ≡ Queue is empty                                                 ┃
-3   ┃                                           Press e on a track to enqueue                                          ┃
-4   ┃                                           1 Artists · / search · ? help                                          ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┃                                                                                                                  ┃
-    ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+VIEWS                      │┏Queue━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+›   1 Artists              │┃                                     ≡ Queue is empty                                     ┃
+›   2 Playlists            │┃                               Press e on a track to enqueue                              ┃
+›   3 Queue                │┃                               1 Artists · / search · ? help                              ┃
+›   4 YouTube              │┃                                                                                          ┃
+────────────────────────   │┃                                                                                          ┃
+DISCOVER                   │┃                                                                                          ┃
+♫   H Home                 │┃                                                                                          ┃
+✦   S Discover             │┃                                                                                          ┃
+◎ :radio Radio             │┃                                                                                          ┃
+◆ :gen Generator           │┃                                                                                          ┃
+────────────────────────   │┃                                                                                          ┃
+TOOLS                      │┃                                                                                          ┃
+/   / Search               │┃                                                                                          ┃
+!   D Diagnostics          │┃                                                                                          ┃
+?   ? Help                 │┃                                                                                          ┃
+                           │┃                                                                                          ┃
+                           │┃                                                                                          ┃
+                           │┃                                                                                          ┃
+                           │┃                                                                                          ┃
+                           │┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-[STOPPED] ■ — nothing playing —  --:-- / --:--  ▸ Enter to play  --  MODE local · CONT off
-VIEW: local · SOURCE: local
+[STOPPED] ■ — nothing playing —  --:-- / --:--  ▸ Enter to play  --  PREF local · CONT off · SHUF off · RPT off
+VIEW: queue · SOURCE: local [Y —]

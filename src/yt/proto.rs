@@ -44,6 +44,63 @@ pub enum Request {
     GetLyrics {
         video_id: String,
     },
+    /// Create a new YouTube playlist (ytmusicapi `create_playlist`). `privacy`
+    /// defaults to `"PRIVATE"` (the safest option). `video_ids` is optional —
+    /// pass a non-empty vec to seed the playlist at creation, or empty for a
+    /// blank playlist. Fire-and-forget; the response carries the new playlist id.
+    CreatePlaylist {
+        title: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        privacy: String,
+        #[serde(default)]
+        video_ids: Vec<String>,
+    },
+    /// Add tracks to an existing playlist (ytmusicapi `add_playlist_items`).
+    /// `duplicates` defaults to `true` so retry-on-failure is idempotent.
+    /// Fire-and-forget; the response carries a status + count.
+    AddPlaylistItems {
+        playlist_id: String,
+        video_ids: Vec<String>,
+        #[serde(default)]
+        duplicates: bool,
+    },
+    /// Fetch the user's liked-songs playlist (ytmusicapi `get_liked_songs`).
+    /// `limit` caps the fetch (default 100) so a huge library doesn't block the
+    /// single-threaded sidecar. Fire-and-forget; the response is a track list.
+    GetLikedSongs {
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Fetch artist info (ytmusicapi `get_artist`): name, channel id,
+    /// shuffleId/radioId for radio seeding, top songs, and related artists.
+    /// Fire-and-forget; the response is an [`ArtistSummary`].
+    GetArtist {
+        channel_id: String,
+    },
+    /// Fetch related content for a song (ytmusicapi `get_song_related`):
+    /// flattens ytmusicapi's sectioned response into tracks + playlists.
+    /// Fire-and-forget; the response carries both lists.
+    GetSongRelated {
+        browse_id: String,
+    },
+    /// Fetch album info (ytmusicapi `get_album`): title, artists, year, and
+    /// tracks. Fire-and-forget; the response is an [`AlbumSummary`].
+    GetAlbum {
+        browse_id: String,
+    },
+    /// Fetch the YouTube Music home feed (ytmusicapi `get_home`). Fire-and-
+    /// forget; the response is a list of [`HomeSectionProto`] shelves.
+    Home,
+    /// Fetch the YouTube Music explore shelves (ytmusicapi `get_explore`).
+    /// Fire-and-forget; the response is a list of [`PlaylistProto`] mood/genre
+    /// playlists.
+    Explore,
+    /// Fetch the YouTube Music charts (ytmusicapi `get_charts`). Fire-and-
+    /// forget; the response is a flat list of [`ChartEntryProto`] entries
+    /// across the available chart categories.
+    Charts,
     Ping,
     AuthStatus,
 }
@@ -71,7 +128,9 @@ pub struct RemoteTrackSummary {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct PlaylistSummary {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub count: u32,
@@ -88,6 +147,16 @@ pub struct ResolvedUrl {
     pub container: String,
     #[serde(default)]
     pub premium: bool,
+    /// Track title from yt-dlp's extraction — cached so the player bar /
+    /// Queue view show the real title instead of the raw 11-char video_id.
+    /// Empty when yt-dlp didn't provide one (rare; the view falls back to
+    /// "Loading…" and a get_watch_playlist will fill it later).
+    #[serde(default)]
+    pub title: String,
+    /// Track artist from yt-dlp's extraction (the `uploader` or `artist`
+    /// field). May be empty — the view falls back gracefully.
+    #[serde(default)]
+    pub artist: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -130,6 +199,118 @@ pub struct LyricLineProto {
     pub text: String,
 }
 
+/// A related artist entry: a name + a browse id (the channel/artist page id
+/// ytmusicapi returns). Used in [`ArtistSummary::related`] and
+/// [`AlbumSummary::artists`] — both are "name + browse id" pairs, so one
+/// struct covers both.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RelatedArtist {
+    pub name: String,
+    #[serde(default)]
+    pub browse_id: String,
+}
+
+/// Artist info from ytmusicapi `get_artist`, flattened into the fields the
+/// Rust side needs. `shuffle_id` / `radio_id` seed the autoplay radio;
+/// `songs_browse_id` can be used to fetch the full top-songs list;
+/// `songs` is the first page; `related` is related artists.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ArtistSummary {
+    pub name: String,
+    #[serde(default)]
+    pub channel_id: String,
+    #[serde(default)]
+    pub shuffle_id: String,
+    #[serde(default)]
+    pub radio_id: String,
+    #[serde(default)]
+    pub subscribers: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub songs_browse_id: String,
+    #[serde(default)]
+    pub songs: Vec<RemoteTrackSummary>,
+    #[serde(default)]
+    pub related: Vec<RelatedArtist>,
+}
+
+/// Album info from ytmusicapi `get_album`: title, artists, year, and tracks.
+/// `artists` reuses [`RelatedArtist`] (name + browse id).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AlbumSummary {
+    pub title: String,
+    #[serde(default)]
+    pub artists: Vec<RelatedArtist>,
+    #[serde(default)]
+    pub year: String,
+    #[serde(default)]
+    pub tracks: Vec<RemoteTrackSummary>,
+}
+
+/// One shelf of the YouTube Music home feed (ytmusicapi `get_home`). Each
+/// shelf has a title and a list of [`HomeItemProto`] entries. The sidecar
+/// flattens ytmusicapi's sectioned response into these small typed payloads.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct HomeSectionProto {
+    pub title: String,
+    #[serde(default)]
+    pub items: Vec<HomeItemProto>,
+}
+
+/// One entry in a home shelf. Exactly one of `playlist_id` / `video_id` is
+/// set (the sidecar picks the most useful destination for a tap); `artist`
+/// and `browse_id` are populated for artist-radio shelves. Every optional
+/// field carries `#[serde(default)]` so the sidecar may omit fields it
+/// couldn't populate without failing the parse.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct HomeItemProto {
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub playlist_id: Option<String>,
+    #[serde(default)]
+    pub video_id: Option<String>,
+    #[serde(default)]
+    pub artist: Option<String>,
+    /// For artist-radio shelves: the channel/artist browse id used to seed
+    /// radio via a follow-up `GetArtist` request.
+    #[serde(default)]
+    pub browse_id: Option<String>,
+}
+
+/// One explore shelf playlist (mood/genre). Returned by `get_explore`.
+/// `count` is the playlist's track count when ytmusicapi provides it; `None`
+/// when the sidecar couldn't determine it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PlaylistProto {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub count: Option<usize>,
+}
+
+/// One entry in a YouTube Music chart. `chart` is the category label
+/// ("Top songs", "Top videos", "Trending", "Top artists"). Exactly one of
+/// `video_id` / `playlist_id` / `artist` is set depending on the category;
+/// the rest are `None`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ChartEntryProto {
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub video_id: Option<String>,
+    #[serde(default)]
+    pub playlist_id: Option<String>,
+    #[serde(default)]
+    pub artist: Option<String>,
+    pub chart: String,
+}
+
 // --- Responses -------------------------------------------------------------
 
 /// A sidecar response. `from_line` parses the `{"ok":..., "data":...}` wrapper.
@@ -158,6 +339,37 @@ pub enum Response {
     /// not-found payload rather than an error, so the UI shows a truthful
     /// "lyrics unavailable" state).
     Lyrics(Vec<LyricLineProto>, bool),
+    /// A newly-created playlist's id + the title/privacy we asked for (echoed
+    /// back so the caller can confirm what was created).
+    CreatedPlaylist {
+        id: String,
+        title: String,
+        privacy: String,
+    },
+    /// The result of adding tracks to a playlist: a ytmusicapi status string
+    /// (e.g. `"STATUS_SUCCEEDED"`) + the count of video_ids we asked to add.
+    AddedItems {
+        status: String,
+        count: u32,
+    },
+    /// The user's liked-songs playlist as a track list.
+    LikedSongs(Vec<RemoteTrackSummary>),
+    /// Artist info (flattened from ytmusicapi `get_artist`).
+    ArtistInfo(ArtistSummary),
+    /// Related content for a song, split into tracks and playlists.
+    RelatedContent {
+        tracks: Vec<RemoteTrackSummary>,
+        playlists: Vec<PlaylistSummary>,
+    },
+    /// Album info (flattened from ytmusicapi `get_album`).
+    AlbumInfo(AlbumSummary),
+    /// Home feed shelves (flattened from ytmusicapi `get_home`).
+    HomeSections(Vec<HomeSectionProto>),
+    /// Explore shelves (flattened from ytmusicapi `get_explore`).
+    ExplorePlaylists(Vec<PlaylistProto>),
+    /// Chart entries across categories (flattened from ytmusicapi
+    /// `get_charts`).
+    Charts(Vec<ChartEntryProto>),
     Pong,
     Error(String),
 }
@@ -223,6 +435,76 @@ impl Response {
                     .unwrap_or_default();
                 let synced: bool = obj.get("synced").and_then(|s| s.as_bool()).unwrap_or(false);
                 return Ok(Response::Lyrics(lines, synced));
+            }
+            if let Some(val) = o.get("created_playlist") {
+                let empty = serde_json::Map::new();
+                let obj = val.as_object().unwrap_or(&empty);
+                return Ok(Response::CreatedPlaylist {
+                    id: obj
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    title: obj
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    privacy: obj
+                        .get("privacy")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                });
+            }
+            if let Some(val) = o.get("added_items") {
+                let empty = serde_json::Map::new();
+                let obj = val.as_object().unwrap_or(&empty);
+                return Ok(Response::AddedItems {
+                    status: obj
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    count: obj.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                });
+            }
+            if let Some(val) = o.get("liked_songs") {
+                return Ok(Response::LikedSongs(serde_json::from_value(val.clone())?));
+            }
+            if let Some(val) = o.get("artist_info") {
+                return Ok(Response::ArtistInfo(serde_json::from_value(val.clone())?));
+            }
+            if let Some(val) = o.get("related_content") {
+                let empty = serde_json::Map::new();
+                let obj = val.as_object().unwrap_or(&empty);
+                let tracks: Vec<RemoteTrackSummary> = obj
+                    .get("tracks")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default();
+                let playlists: Vec<PlaylistSummary> = obj
+                    .get("playlists")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default();
+                return Ok(Response::RelatedContent { tracks, playlists });
+            }
+            if let Some(val) = o.get("album_info") {
+                return Ok(Response::AlbumInfo(serde_json::from_value(val.clone())?));
+            }
+            if let Some(val) = o.get("home_sections") {
+                return Ok(Response::HomeSections(serde_json::from_value(val.clone())?));
+            }
+            if let Some(val) = o.get("explore_playlists") {
+                return Ok(Response::ExplorePlaylists(serde_json::from_value(
+                    val.clone(),
+                )?));
+            }
+            if let Some(val) = o.get("charts") {
+                return Ok(Response::Charts(serde_json::from_value(val.clone())?));
             }
         }
         // Truncate the raw line to avoid leaking cookie material if the sidecar

@@ -105,12 +105,13 @@ impl Transport {
     }
 
     pub fn next(&mut self, r: &dyn ContextResolver, cat: &Catalog) -> Option<String> {
-        if self.repeat == RepeatMode::One {
-            return self.current(r, cat);
-        }
-        // push current to history before advancing
-        if let Some(cur) = self.current(r, cat) {
-            self.history.push((cur, self.context.clone()));
+        // Capture the current id before advancing so the repeat-all wrap
+        // branch can detect "wrapped to the same track we just left" (a
+        // single-track context, or every other track dead-skipped back to
+        // the start). Push it to history for `prev()`.
+        let cur = self.current(r, cat);
+        if let Some(c) = cur.clone() {
+            self.history.push((c, self.context.clone()));
         }
         let next_cursor = self.cursor + 1;
         if next_cursor < self.order.len() {
@@ -127,7 +128,26 @@ impl Transport {
             Some(id)
         } else if self.repeat == RepeatMode::All && !self.order.is_empty() {
             self.cursor = 0;
-            self.current(r, cat)
+            let wrap = self.current(r, cat);
+            // Repeat-all wrapped to the same track we just left (single-track
+            // context, or all other tracks dead-skipped back to the start).
+            // With a radio-style continue mode (YouTube/Radio), signal
+            // exhaustion (None) so `App::next()` advances to fresh music via
+            // the continue-mode path instead of replaying the one track —
+            // otherwise `>` / auto-advance on the single-track radio context
+            // loops the same song forever. With continue-off/next-album,
+            // keep the wrap so repeat-all still loops a lone track (the
+            // spec's "repeat-all wraps to the start").
+            if wrap == cur
+                && matches!(
+                    self.continue_mode,
+                    ContinueMode::YouTube | ContinueMode::Radio
+                )
+            {
+                self.history.pop();
+                return None;
+            }
+            wrap
         } else {
             // Nothing to advance to: undo the history push (we never moved).
             self.history.pop();

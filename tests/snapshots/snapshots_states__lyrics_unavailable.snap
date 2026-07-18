@@ -1,11 +1,12 @@
 ---
 source: tests/snapshots_states.rs
+assertion_line: 98
 expression: s
 ---
 
 
             ┌ Lyrics — not found ──────────────────────────────────────────────────────────────────────────┐
-            │ No lyrics found for this track.                                                              │
+            │ Lyrics are searched on YouTube; local tracks without a YouTube match have no lyrics.         │
             │                                                                                              │
             │ R retry lyrics for this track  ·  L or Esc close                                             │
             │                                                                                              │
@@ -24,5 +25,5 @@ expression: s
 
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-[PLAYING] ▶ Song1 — 40mP  0:00 / 3:00  ▸ Next: (end)  24bit/96  MODE local · CONT off
-VIEW: local · SOURCE: local
+[PLAYING] ▶ Song1 — 40mP  0:00 / 3:00  ▸ Next: (end)  24bit/96  PREF local · CONT off · SHUF off · RPT off
+VIEW: local · SOURCE: local [Y —]
