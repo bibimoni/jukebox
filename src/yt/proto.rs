@@ -90,6 +90,17 @@ pub enum Request {
     GetAlbum {
         browse_id: String,
     },
+    /// Fetch the YouTube Music home feed (ytmusicapi `get_home`). Fire-and-
+    /// forget; the response is a list of [`HomeSectionProto`] shelves.
+    Home,
+    /// Fetch the YouTube Music explore shelves (ytmusicapi `get_explore`).
+    /// Fire-and-forget; the response is a list of [`PlaylistProto`] mood/genre
+    /// playlists.
+    Explore,
+    /// Fetch the YouTube Music charts (ytmusicapi `get_charts`). Fire-and-
+    /// forget; the response is a flat list of [`ChartEntryProto`] entries
+    /// across the available chart categories.
+    Charts,
     Ping,
     AuthStatus,
 }
@@ -227,6 +238,69 @@ pub struct AlbumSummary {
     pub tracks: Vec<RemoteTrackSummary>,
 }
 
+/// One shelf of the YouTube Music home feed (ytmusicapi `get_home`). Each
+/// shelf has a title and a list of [`HomeItemProto`] entries. The sidecar
+/// flattens ytmusicapi's sectioned response into these small typed payloads.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct HomeSectionProto {
+    pub title: String,
+    #[serde(default)]
+    pub items: Vec<HomeItemProto>,
+}
+
+/// One entry in a home shelf. Exactly one of `playlist_id` / `video_id` is
+/// set (the sidecar picks the most useful destination for a tap); `artist`
+/// and `browse_id` are populated for artist-radio shelves. Every optional
+/// field carries `#[serde(default)]` so the sidecar may omit fields it
+/// couldn't populate without failing the parse.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct HomeItemProto {
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub playlist_id: Option<String>,
+    #[serde(default)]
+    pub video_id: Option<String>,
+    #[serde(default)]
+    pub artist: Option<String>,
+    /// For artist-radio shelves: the channel/artist browse id used to seed
+    /// radio via a follow-up `GetArtist` request.
+    #[serde(default)]
+    pub browse_id: Option<String>,
+}
+
+/// One explore shelf playlist (mood/genre). Returned by `get_explore`.
+/// `count` is the playlist's track count when ytmusicapi provides it; `None`
+/// when the sidecar couldn't determine it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PlaylistProto {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub count: Option<usize>,
+}
+
+/// One entry in a YouTube Music chart. `chart` is the category label
+/// ("Top songs", "Top videos", "Trending", "Top artists"). Exactly one of
+/// `video_id` / `playlist_id` / `artist` is set depending on the category;
+/// the rest are `None`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ChartEntryProto {
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub video_id: Option<String>,
+    #[serde(default)]
+    pub playlist_id: Option<String>,
+    #[serde(default)]
+    pub artist: Option<String>,
+    pub chart: String,
+}
+
 // --- Responses -------------------------------------------------------------
 
 /// A sidecar response. `from_line` parses the `{"ok":..., "data":...}` wrapper.
@@ -279,6 +353,13 @@ pub enum Response {
     },
     /// Album info (flattened from ytmusicapi `get_album`).
     AlbumInfo(AlbumSummary),
+    /// Home feed shelves (flattened from ytmusicapi `get_home`).
+    HomeSections(Vec<HomeSectionProto>),
+    /// Explore shelves (flattened from ytmusicapi `get_explore`).
+    ExplorePlaylists(Vec<PlaylistProto>),
+    /// Chart entries across categories (flattened from ytmusicapi
+    /// `get_charts`).
+    Charts(Vec<ChartEntryProto>),
     Pong,
     Error(String),
 }
@@ -403,6 +484,17 @@ impl Response {
             }
             if let Some(val) = o.get("album_info") {
                 return Ok(Response::AlbumInfo(serde_json::from_value(val.clone())?));
+            }
+            if let Some(val) = o.get("home_sections") {
+                return Ok(Response::HomeSections(serde_json::from_value(val.clone())?));
+            }
+            if let Some(val) = o.get("explore_playlists") {
+                return Ok(Response::ExplorePlaylists(serde_json::from_value(
+                    val.clone(),
+                )?));
+            }
+            if let Some(val) = o.get("charts") {
+                return Ok(Response::Charts(serde_json::from_value(val.clone())?));
             }
         }
         // Truncate the raw line to avoid leaking cookie material if the sidecar

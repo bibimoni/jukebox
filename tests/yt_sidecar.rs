@@ -192,3 +192,100 @@ fn session_spawn_and_auth_status_no_cookies() {
     assert!(s.is_ok(), "session spawn failed");
     let _ = std::fs::remove_file(&script);
 }
+
+// ---------------------------------------------------------------------------
+// Home / Explore / Charts wire-protocol (Request + Response variants)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn home_request_serializes() {
+    let line = Request::Home.to_line();
+    assert!(line.contains("\"cmd\":\"home\""), "line was: {line}");
+    assert!(!line.contains('\n'));
+}
+
+#[test]
+fn explore_request_serializes() {
+    let line = Request::Explore.to_line();
+    assert!(line.contains("\"cmd\":\"explore\""), "line was: {line}");
+    assert!(!line.contains('\n'));
+}
+
+#[test]
+fn charts_request_serializes() {
+    let line = Request::Charts.to_line();
+    assert!(line.contains("\"cmd\":\"charts\""), "line was: {line}");
+    assert!(!line.contains('\n'));
+}
+
+#[test]
+fn home_sections_response_parses() {
+    let wire = r#"{"ok":true,"data":{"home_sections":[{"title":"Listen again","items":[{"title":"Mix 1","subtitle":"Playlist","playlist_id":"PL1","video_id":null,"artist":null,"browse_id":null}]}]}}"#;
+    let r = Response::from_line(wire).unwrap();
+    match r {
+        Response::HomeSections(v) => {
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].title, "Listen again");
+            assert_eq!(v[0].items.len(), 1);
+            assert_eq!(v[0].items[0].title, "Mix 1");
+            assert_eq!(v[0].items[0].playlist_id.as_deref(), Some("PL1"));
+        }
+        other => panic!("expected HomeSections, got {other:?}"),
+    }
+}
+
+#[test]
+fn explore_playlists_response_parses() {
+    let wire = r#"{"ok":true,"data":{"explore_playlists":[{"id":"PL1","title":"Chill","subtitle":"mood","count":42}]}}"#;
+    let r = Response::from_line(wire).unwrap();
+    match r {
+        Response::ExplorePlaylists(v) => {
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].id, "PL1");
+            assert_eq!(v[0].title, "Chill");
+            assert_eq!(v[0].subtitle.as_deref(), Some("mood"));
+            assert_eq!(v[0].count, Some(42));
+        }
+        other => panic!("expected ExplorePlaylists, got {other:?}"),
+    }
+}
+
+#[test]
+fn charts_response_parses() {
+    let wire = r#"{"ok":true,"data":{"charts":[{"title":"Song A","subtitle":"Artist A","video_id":"v1","playlist_id":null,"artist":"Artist A","chart":"Top songs"}]}}"#;
+    let r = Response::from_line(wire).unwrap();
+    match r {
+        Response::Charts(v) => {
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].title, "Song A");
+            assert_eq!(v[0].chart, "Top songs");
+            assert_eq!(v[0].video_id.as_deref(), Some("v1"));
+            assert_eq!(v[0].playlist_id, None);
+            assert_eq!(v[0].artist.as_deref(), Some("Artist A"));
+        }
+        other => panic!("expected Charts, got {other:?}"),
+    }
+}
+
+#[test]
+fn home_sections_response_missing_fields_default() {
+    // Optional fields omitted — serde defaults must kick in (all Option<T>
+    // fields deserialize to None, not an error).
+    let wire = r#"{"ok":true,"data":{"home_sections":[{"title":"sec","items":[{"title":"it"}]}]}}"#;
+    let r = Response::from_line(wire).unwrap();
+    match r {
+        Response::HomeSections(v) => {
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].title, "sec");
+            assert_eq!(v[0].items.len(), 1);
+            let item = &v[0].items[0];
+            assert_eq!(item.title, "it");
+            assert!(item.subtitle.is_none());
+            assert!(item.playlist_id.is_none());
+            assert!(item.video_id.is_none());
+            assert!(item.artist.is_none());
+            assert!(item.browse_id.is_none());
+        }
+        other => panic!("expected HomeSections, got {other:?}"),
+    }
+}

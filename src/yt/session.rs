@@ -1091,6 +1091,14 @@ impl Session {
             Request::GetArtist { channel_id } => Pending::Artist(channel_id.clone()),
             Request::GetSongRelated { browse_id } => Pending::Related(browse_id.clone()),
             Request::GetAlbum { browse_id } => Pending::Album(browse_id.clone()),
+            // Home/Explore/Charts wire-protocol variants are added in
+            // `src/yt/proto.rs` but the session-side wiring (Pending kinds +
+            // apply_pair arms) is a later task — these arms only exist to keep
+            // the match exhaustive. No code path currently sends these
+            // requests, so the `todo!` is never hit in practice.
+            Request::Home | Request::Explore | Request::Charts => {
+                todo!("session wiring for home/explore/charts is a later task")
+            }
             Request::Ping => Pending::Pong,
         }
     }
