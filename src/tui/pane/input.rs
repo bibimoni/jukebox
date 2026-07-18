@@ -138,7 +138,14 @@ fn module_to_view(module: ModuleId) -> Option<crate::tui::app::View> {
         ModuleId::Artists => Some(crate::tui::app::View::Artists),
         ModuleId::Playlists => Some(crate::tui::app::View::Playlists),
         ModuleId::Queue => Some(crate::tui::app::View::Queue),
-        ModuleId::Youtube => Some(crate::tui::app::View::Youtube),
+        ModuleId::Youtube
+        | ModuleId::YtHome
+        | ModuleId::YtLibrary
+        | ModuleId::YtSearch
+        | ModuleId::YtDiscover
+        | ModuleId::YtRadio
+        | ModuleId::YtExplore
+        | ModuleId::YtCharts => Some(crate::tui::app::View::Youtube),
         ModuleId::NowPlaying | ModuleId::Placeholder => None,
     }
 }

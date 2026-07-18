@@ -88,6 +88,13 @@ impl ModuleRegistry {
         reg.register(Box::new(QueueModule));
         reg.register(Box::new(YoutubeModule));
         reg.register(Box::new(NowPlayingModule));
+        reg.register(Box::new(YtHomeModule));
+        reg.register(Box::new(YtLibraryModule));
+        reg.register(Box::new(YtSearchModule));
+        reg.register(Box::new(YtDiscoverModule));
+        reg.register(Box::new(YtRadioModule));
+        reg.register(Box::new(YtExploreModule));
+        reg.register(Box::new(YtChartsModule));
         reg.register(Box::new(PlaceholderModule));
         reg
     }
@@ -274,6 +281,97 @@ impl PaneModule for NowPlayingModule {
     }
 }
 
+// ---------------------------------------------------------------------------
+// YouTube sub-tab modules (Phase 2.5)
+// ---------------------------------------------------------------------------
+
+/// Each YouTube sub-tab as its own pane module. Renders just the sub-tab
+/// content (no sub-tab bar) via the matching `view::yt_view::render_yt_*`
+/// function. Sets `app.view = View::Youtube` AND `app.yt_view.tab` to the
+/// sub-tab during render so the existing yt input handlers route keys
+/// correctly for the focused pane.
+///
+/// The `macro_rules!` boilerplate-eliminator defines a module struct + its
+/// `PaneModule` impl from three pieces: the struct name, the `ModuleId`
+/// variant, and the renderer function. Each renderer takes `&mut App` (or
+/// `&App`, which we reborrow as `&*app`) — the macro handles both.
+macro_rules! yt_subtab_module {
+    ($struct_name:ident, $module_id:expr, $title:expr, $tab:expr, $render_fn:path) => {
+        pub struct $struct_name;
+
+        impl PaneModule for $struct_name {
+            fn id(&self) -> ModuleId {
+                $module_id
+            }
+            fn title(&self) -> &'static str {
+                $title
+            }
+            fn render(&self, frame: &mut Frame, area: Rect, app: &mut App) {
+                let saved_view = app.view;
+                let saved_tab = app.yt_view.tab;
+                app.view = crate::tui::app::View::Youtube;
+                app.yt_view.tab = $tab;
+                $render_fn(frame, area, app);
+                app.view = saved_view;
+                app.yt_view.tab = saved_tab;
+            }
+            fn handle_key(&self, _key: KeyEvent, _app: &mut App) -> bool {
+                false
+            }
+        }
+    };
+}
+
+yt_subtab_module!(
+    YtHomeModule,
+    ModuleId::YtHome,
+    "YT Home",
+    crate::tui::app::YtTab::Home,
+    crate::tui::view::yt_view::render_yt_home
+);
+yt_subtab_module!(
+    YtLibraryModule,
+    ModuleId::YtLibrary,
+    "YT Library",
+    crate::tui::app::YtTab::Library,
+    crate::tui::view::yt_view::render_yt_library
+);
+yt_subtab_module!(
+    YtSearchModule,
+    ModuleId::YtSearch,
+    "YT Search",
+    crate::tui::app::YtTab::Search,
+    crate::tui::view::yt_view::render_yt_search
+);
+yt_subtab_module!(
+    YtDiscoverModule,
+    ModuleId::YtDiscover,
+    "YT Discover",
+    crate::tui::app::YtTab::Discover,
+    crate::tui::view::yt_view::render_yt_discover
+);
+yt_subtab_module!(
+    YtRadioModule,
+    ModuleId::YtRadio,
+    "YT Radio",
+    crate::tui::app::YtTab::Radio,
+    crate::tui::view::yt_view::render_yt_radio
+);
+yt_subtab_module!(
+    YtExploreModule,
+    ModuleId::YtExplore,
+    "YT Explore",
+    crate::tui::app::YtTab::Explore,
+    crate::tui::view::yt_view::render_yt_explore
+);
+yt_subtab_module!(
+    YtChartsModule,
+    ModuleId::YtCharts,
+    "YT Charts",
+    crate::tui::app::YtTab::Charts,
+    crate::tui::view::yt_view::render_yt_charts
+);
+
 /// Demo / placeholder module. Rendered as a centered "Press `m` to choose
 /// a module" hint. Used as the default for a fresh split (the user
 /// hasn't picked a real module yet). Proves third-party modules can be
@@ -381,6 +479,13 @@ mod tests {
                 ModuleId::Queue,
                 ModuleId::Youtube,
                 ModuleId::NowPlaying,
+                ModuleId::YtHome,
+                ModuleId::YtLibrary,
+                ModuleId::YtSearch,
+                ModuleId::YtDiscover,
+                ModuleId::YtRadio,
+                ModuleId::YtExplore,
+                ModuleId::YtCharts,
                 ModuleId::Placeholder,
             ]
         );

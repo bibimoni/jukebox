@@ -39,6 +39,22 @@ pub enum ModuleId {
     /// pane. Useful for dedicating a pane to playback status. Wraps
     /// `view::player_bar_big::render_big` + `view::now_playing_panel`.
     NowPlaying,
+    /// YouTube Home sub-tab as a pane module. Renders just the Home
+    /// content (Quick Picks, mixes, radio shelves) without the sub-tab
+    /// bar. Wraps `view::yt_view::render_yt_home`.
+    YtHome,
+    /// YouTube Library sub-tab (account + suggested + generated playlists).
+    YtLibrary,
+    /// YouTube Search sub-tab (search input + results).
+    YtSearch,
+    /// YouTube Discover sub-tab (suggested albums / YT mood playlists).
+    YtDiscover,
+    /// YouTube Radio sub-tab (radio session UI).
+    YtRadio,
+    /// YouTube Explore sub-tab (explore-feed playlists).
+    YtExplore,
+    /// YouTube Charts sub-tab (chart entries grouped by chart type).
+    YtCharts,
     /// Demo / placeholder module proving third-party modules can register.
     /// Rendered as a "Press `m` to choose a module" hint.
     Placeholder,
@@ -48,13 +64,20 @@ impl ModuleId {
     /// All registered built-in modules, in the order they appear in the
     /// module picker. `Placeholder` is last (it's the "no choice" default
     /// for a fresh split) so the user sees real modules first.
-    pub fn all() -> [ModuleId; 6] {
+    pub fn all() -> [ModuleId; 13] {
         [
             ModuleId::Artists,
             ModuleId::Playlists,
             ModuleId::Queue,
             ModuleId::Youtube,
             ModuleId::NowPlaying,
+            ModuleId::YtHome,
+            ModuleId::YtLibrary,
+            ModuleId::YtSearch,
+            ModuleId::YtDiscover,
+            ModuleId::YtRadio,
+            ModuleId::YtExplore,
+            ModuleId::YtCharts,
             ModuleId::Placeholder,
         ]
     }
@@ -67,6 +90,13 @@ impl ModuleId {
             ModuleId::Queue => "Queue",
             ModuleId::Youtube => "YouTube",
             ModuleId::NowPlaying => "Now Playing",
+            ModuleId::YtHome => "YT Home",
+            ModuleId::YtLibrary => "YT Library",
+            ModuleId::YtSearch => "YT Search",
+            ModuleId::YtDiscover => "YT Discover",
+            ModuleId::YtRadio => "YT Radio",
+            ModuleId::YtExplore => "YT Explore",
+            ModuleId::YtCharts => "YT Charts",
             ModuleId::Placeholder => "Placeholder",
         }
     }
@@ -1179,8 +1209,10 @@ mod tests {
         let all = ModuleId::all();
         assert_eq!(all[0], ModuleId::Artists);
         assert_eq!(all[4], ModuleId::NowPlaying);
-        assert_eq!(all[5], ModuleId::Placeholder);
-        assert_eq!(all.len(), 6);
+        assert_eq!(all[5], ModuleId::YtHome);
+        assert_eq!(all[11], ModuleId::YtCharts);
+        assert_eq!(all[12], ModuleId::Placeholder);
+        assert_eq!(all.len(), 13);
     }
 
     /// `Default::default()` for PaneWorkspace equals `new()`.
