@@ -232,6 +232,22 @@ enum Pending {
     /// differs, and FIFO pairing (responses in send order) keeps each
     /// `HomeSuggestions` response paired with the kind that asked for it.
     Discover,
+    /// A YouTube Music home-feed fetch outstanding (`Request::Home`). The
+    /// response lands in `pending_home_sections` via `apply_pair`'s
+    /// `(Response::HomeSections, Pending::Home)` arm. Unit (no payload) like
+    /// the other home-page-style kinds — the FIFO queue pairs the response
+    /// with this tag, and `home_inflight` guards against duplicate sends.
+    Home,
+    /// An explore-feed fetch outstanding (`Request::Explore`). The response
+    /// lands in `pending_explore_playlists` via `apply_pair`'s
+    /// `(Response::ExplorePlaylists, Pending::Explore)` arm.
+    /// `explore_inflight` guards against duplicate sends.
+    Explore,
+    /// A charts fetch outstanding (`Request::Charts`). The response lands in
+    /// `pending_charts` via `apply_pair`'s `(Response::Charts,
+    /// Pending::Charts)` arm. `charts_inflight` guards against duplicate
+    /// sends.
+    Charts,
     /// A create-playlist request outstanding. Carries the title so the
     /// response can be correlated with the request.
     #[allow(dead_code)]
@@ -369,6 +385,27 @@ pub struct Session {
     /// True while a discover fetch is in flight (guards against re-sending
     /// every tick while the fetch is in flight).
     discover_inflight: bool,
+    /// Home-feed shelves from a fire-and-forget `send_home`, picked up by
+    /// `App::on_tick` to populate the Home tab. Distinct from
+    /// `pending_discover` (the `S` overlay's flat suggestion list) — this
+    /// carries the sectioned ytmusicapi `get_home` shelves.
+    pub pending_home_sections: Option<Vec<crate::yt::proto::HomeSectionProto>>,
+    /// True while a home-feed fetch is in flight (guards against re-sending
+    /// every tick while the fetch is in flight).
+    home_inflight: bool,
+    /// Explore shelves (mood/genre playlists) from a fire-and-forget
+    /// `send_explore`, picked up by `App::on_tick` to populate the Explore
+    /// tab.
+    pub pending_explore_playlists: Option<Vec<crate::yt::proto::PlaylistProto>>,
+    /// True while an explore-feed fetch is in flight (guards against
+    /// re-sending every tick while the fetch is in flight).
+    explore_inflight: bool,
+    /// Chart entries from a fire-and-forget `send_charts`, picked up by
+    /// `App::on_tick` to populate the Charts tab.
+    pub pending_charts: Option<Vec<crate::yt::proto::ChartEntryProto>>,
+    /// True while a charts fetch is in flight (guards against re-sending
+    /// every tick while the fetch is in flight).
+    charts_inflight: bool,
     /// `video_ids` from a fire-and-forget `send_watch_playlist` (CONT=YouTube
     /// auto-advance), picked up by `App::on_tick` to refill the `RadioCursor`
     /// and start playback of the next track. Non-blocking so a natural
@@ -459,6 +496,12 @@ impl Session {
             lyrics_inflight: None,
             pending_discover: None,
             discover_inflight: false,
+            pending_home_sections: None,
+            home_inflight: false,
+            pending_explore_playlists: None,
+            explore_inflight: false,
+            pending_charts: None,
+            charts_inflight: false,
             pending_watch: None,
             watch_inflight: false,
             pending_publication: None,
@@ -509,6 +552,12 @@ impl Session {
             lyrics_inflight: None,
             pending_discover: None,
             discover_inflight: false,
+            pending_home_sections: None,
+            home_inflight: false,
+            pending_explore_playlists: None,
+            explore_inflight: false,
+            pending_charts: None,
+            charts_inflight: false,
             pending_watch: None,
             watch_inflight: false,
             pending_publication: None,
@@ -663,6 +712,9 @@ impl Session {
         self.pending_premium_url = None;
         self.pending_lyrics = None;
         self.pending_discover = None;
+        self.pending_home_sections = None;
+        self.pending_explore_playlists = None;
+        self.pending_charts = None;
         self.pending_watch = None;
         self.pending_publication = None;
         self.pending_errors.clear();
@@ -674,6 +726,9 @@ impl Session {
         self.premium_resolve_inflight = None;
         self.lyrics_inflight = None;
         self.discover_inflight = false;
+        self.home_inflight = false;
+        self.explore_inflight = false;
+        self.charts_inflight = false;
         self.watch_inflight = false;
         self.refresh_inflight = false;
         self.refresh_remaining = 0;
@@ -781,6 +836,26 @@ impl Session {
             (Response::Suggestions(v), Pending::Discover) => {
                 self.pending_discover = Some(v.clone());
                 self.discover_inflight = false;
+            }
+            // Home feed: route the sectioned shelves to `pending_home_sections`
+            // for `App::on_tick` to render the Home tab. Clear the inflight
+            // guard so a later refresh can fire.
+            (Response::HomeSections(v), Pending::Home) => {
+                self.pending_home_sections = Some(v.clone());
+                self.home_inflight = false;
+            }
+            // Explore feed: route the mood/genre playlists to
+            // `pending_explore_playlists` for `App::on_tick` to render the
+            // Explore tab.
+            (Response::ExplorePlaylists(v), Pending::Explore) => {
+                self.pending_explore_playlists = Some(v.clone());
+                self.explore_inflight = false;
+            }
+            // Charts: route the chart entries to `pending_charts` for
+            // `App::on_tick` to render the Charts tab.
+            (Response::Charts(v), Pending::Charts) => {
+                self.pending_charts = Some(v.clone());
+                self.charts_inflight = false;
             }
             (Response::Resolve(u), Pending::Resolve(vid)) => {
                 // FAST tier: fill the fast slot WITHOUT evicting a premium slot
@@ -962,6 +1037,21 @@ impl Session {
                 self.discover_inflight = false;
                 self.set_error(ErrorScope::Other, e.clone());
             }
+            (Response::Error(e), Pending::Home) => {
+                // Free the home inflight guard so a later refresh can fire, and
+                // surface the error so `App::on_tick` can clear the Home tab's
+                // "loading…" state.
+                self.home_inflight = false;
+                self.set_error(ErrorScope::Other, e.clone());
+            }
+            (Response::Error(e), Pending::Explore) => {
+                self.explore_inflight = false;
+                self.set_error(ErrorScope::Other, e.clone());
+            }
+            (Response::Error(e), Pending::Charts) => {
+                self.charts_inflight = false;
+                self.set_error(ErrorScope::Other, e.clone());
+            }
             (Response::Error(e), Pending::Watch) => {
                 // Free the watch inflight guard so a later auto-advance can
                 // fire a fresh radio refill. Surface the error so `App::on_tick`
@@ -1091,14 +1181,9 @@ impl Session {
             Request::GetArtist { channel_id } => Pending::Artist(channel_id.clone()),
             Request::GetSongRelated { browse_id } => Pending::Related(browse_id.clone()),
             Request::GetAlbum { browse_id } => Pending::Album(browse_id.clone()),
-            // Home/Explore/Charts wire-protocol variants are added in
-            // `src/yt/proto.rs` but the session-side wiring (Pending kinds +
-            // apply_pair arms) is a later task — these arms only exist to keep
-            // the match exhaustive. No code path currently sends these
-            // requests, so the `todo!` is never hit in practice.
-            Request::Home | Request::Explore | Request::Charts => {
-                todo!("session wiring for home/explore/charts is a later task")
-            }
+            Request::Home => Pending::Home,
+            Request::Explore => Pending::Explore,
+            Request::Charts => Pending::Charts,
             Request::Ping => Pending::Pong,
         }
     }
@@ -1410,6 +1495,71 @@ impl Session {
     /// discover fetches.
     pub fn reset_discover_inflight(&mut self) {
         self.discover_inflight = false;
+    }
+
+    /// Fire-and-forget: fetch the YouTube Music home feed (ytmusicapi
+    /// `get_home`). Results land in `pending_home_sections` (picked up by
+    /// `App::on_tick` to populate the Home tab). Non-blocking — switching to
+    /// the Home tab never blocks on the ~3s ytmusicapi roundtrip (the tab
+    /// opens instantly with a "loading…" state, shelves appear when the
+    /// response lands). Only one home fetch at a time (`home_inflight`);
+    /// re-sending while in flight is a no-op so repeated tab switches don't
+    /// flood the sidecar.
+    pub fn send_home(&mut self) -> Result<()> {
+        if self.home_inflight {
+            return Ok(());
+        }
+        self.home_inflight = true;
+        self.pending.push_back(Pending::Home);
+        self.sidecar.send(&Request::Home)?;
+        Ok(())
+    }
+
+    /// True if a home-feed fetch is currently in flight.
+    pub fn home_loading(&self) -> bool {
+        self.home_inflight
+    }
+
+    /// Fire-and-forget: fetch the YouTube Music explore feed (ytmusicapi
+    /// `get_explore`). Results land in `pending_explore_playlists` (picked
+    /// up by `App::on_tick` to populate the Explore tab). Non-blocking —
+    /// switching to the Explore tab never blocks on the ytmusicapi
+    /// roundtrip. Only one explore fetch at a time (`explore_inflight`);
+    /// re-sending while in flight is a no-op.
+    pub fn send_explore(&mut self) -> Result<()> {
+        if self.explore_inflight {
+            return Ok(());
+        }
+        self.explore_inflight = true;
+        self.pending.push_back(Pending::Explore);
+        self.sidecar.send(&Request::Explore)?;
+        Ok(())
+    }
+
+    /// True if an explore-feed fetch is currently in flight.
+    pub fn explore_loading(&self) -> bool {
+        self.explore_inflight
+    }
+
+    /// Fire-and-forget: fetch the YouTube Music charts (ytmusicapi
+    /// `get_charts`). Results land in `pending_charts` (picked up by
+    /// `App::on_tick` to populate the Charts tab). Non-blocking — switching
+    /// to the Charts tab never blocks on the ytmusicapi roundtrip. Only one
+    /// charts fetch at a time (`charts_inflight`); re-sending while in
+    /// flight is a no-op.
+    pub fn send_charts(&mut self) -> Result<()> {
+        if self.charts_inflight {
+            return Ok(());
+        }
+        self.charts_inflight = true;
+        self.pending.push_back(Pending::Charts);
+        self.sidecar.send(&Request::Charts)?;
+        Ok(())
+    }
+
+    /// True if a charts fetch is currently in flight.
+    pub fn charts_loading(&self) -> bool {
+        self.charts_inflight
     }
 
     /// Fire-and-forget: fetch a watch_playlist (radio queue) seeded by
@@ -1746,5 +1896,44 @@ mod tests {
         let mut rc = RadioCursor::new();
         let mut yt = FakeYt;
         assert_eq!(rc.advance(&mut yt, None), None);
+    }
+
+    // --- Home/Explore/Charts session wiring -----------------------------------
+    //
+    // These tests cover the Task-3 additions: the three new `Pending`
+    // variants (`Home`, `Explore`, `Charts`), the `kind_for` mapping that
+    // replaces the `todo!()` placeholders, and the `Pending::matches`
+    // discriminant behaviour. They run as in-crate unit tests because
+    // `Pending` and `kind_for` are private (integration tests can't see
+    // them). Field-initialization and `apply_pair` routing require a live
+    // `Session` (which needs a real Python sidecar) and are covered by
+    // Task 7 (integration tests).
+
+    #[test]
+    fn kind_for_maps_home_explore_charts_requests() {
+        assert!(matches!(Session::kind_for(&Request::Home), Pending::Home));
+        assert!(matches!(
+            Session::kind_for(&Request::Explore),
+            Pending::Explore
+        ));
+        assert!(matches!(Session::kind_for(&Request::Charts), Pending::Charts));
+    }
+
+    #[test]
+    fn pending_matches_home_explore_charts_by_discriminant() {
+        // Same variant matches itself.
+        assert!(Pending::Home.matches(&Pending::Home));
+        assert!(Pending::Explore.matches(&Pending::Explore));
+        assert!(Pending::Charts.matches(&Pending::Charts));
+        // Different new variants don't match each other.
+        assert!(!Pending::Home.matches(&Pending::Explore));
+        assert!(!Pending::Home.matches(&Pending::Charts));
+        assert!(!Pending::Explore.matches(&Pending::Charts));
+        // New variants don't collide with existing unit variants.
+        assert!(!Pending::Home.matches(&Pending::Watch));
+        assert!(!Pending::Home.matches(&Pending::Discover));
+        assert!(!Pending::Home.matches(&Pending::Auth));
+        assert!(!Pending::Explore.matches(&Pending::Pong));
+        assert!(!Pending::Charts.matches(&Pending::LikedSongs));
     }
 }
