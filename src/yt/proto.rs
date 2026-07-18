@@ -147,6 +147,16 @@ pub struct ResolvedUrl {
     pub container: String,
     #[serde(default)]
     pub premium: bool,
+    /// Track title from yt-dlp's extraction — cached so the player bar /
+    /// Queue view show the real title instead of the raw 11-char video_id.
+    /// Empty when yt-dlp didn't provide one (rare; the view falls back to
+    /// "Loading…" and a get_watch_playlist will fill it later).
+    #[serde(default)]
+    pub title: String,
+    /// Track artist from yt-dlp's extraction (the `uploader` or `artist`
+    /// field). May be empty — the view falls back gracefully.
+    #[serde(default)]
+    pub artist: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

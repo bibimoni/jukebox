@@ -41,17 +41,22 @@ fn default_mpv_socket() -> PathBuf {
 }
 
 /// Resolve the config file path.
-/// Honors `$XDG_CONFIG_HOME`, else falls back to `~/.config` (via `dirs`).
+/// Always uses `~/.config/jukebox/` (not the macOS `~/Library/Application
+/// Support` — the user's config.yml is already at `~/.config/jukebox/` and
+/// all state should live alongside it).
 ///
 /// The `/tmp/.config` fallback is acceptable here: `config.yml` contains only
 /// the source dir path + player prefs (no secrets). Cookie secrets use
 /// `yt::session::cookies_file_opt()` which refuses the fallback.
-pub fn config_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+pub fn config_base() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(dirs::config_dir)
-        .unwrap_or_else(|| PathBuf::from("/tmp/.config"));
-    base.join("jukebox").join("config.yml")
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .unwrap_or_else(|| PathBuf::from("/tmp/.config"))
+}
+
+pub fn config_path() -> PathBuf {
+    config_base().join("jukebox").join("config.yml")
 }
 
 impl Config {

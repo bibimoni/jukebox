@@ -913,7 +913,11 @@ mod tests {
         // Icon::Youtube glyph).
         let sections = vec![(
             HomeSection::YtFeed("Listen again".into()),
-            vec![HomeItem::playlist("PL1".into(), "Chill Vibes".into(), false)],
+            vec![HomeItem::playlist(
+                "PL1".into(),
+                "Chill Vibes".into(),
+                false,
+            )],
         )];
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();

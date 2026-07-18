@@ -1326,6 +1326,9 @@ fn rb3_persisted_youtube_view_is_not_a_trap() {
             yt_browser: &app.yt_browser,
             last_played_track_id: app.last_played_track_id.as_deref(),
             last_played_position: app.last_played_position,
+            last_played_context_ids: &app.last_played_context_ids,
+            last_played_context_tracks: &app.last_played_context_tracks,
+            last_played_context_key: app.last_played_context_key.as_deref(),
             last_cursor_artist: app.cursors.artist,
             last_cursor_album: app.cursors.album,
             last_cursor_track: app.cursors.track,
@@ -1578,8 +1581,8 @@ fn fake_session() -> jukebox::yt::session::Session {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let script = std::env::temp_dir()
-        .join(format!("jk-input-fake-{}-{}.py", std::process::id(), n));
+    let script =
+        std::env::temp_dir().join(format!("jk-input-fake-{}-{}.py", std::process::id(), n));
     std::fs::write(&script, "import sys\nfor line in sys.stdin: pass\n").unwrap();
     jukebox::yt::session::Session::spawn(std::path::Path::new("python3"), &script, None).unwrap()
 }
@@ -1654,7 +1657,11 @@ fn bracket_keys_cycle_yt_tabs_with_fetch_on_visit() {
     app.yt_session = Some(fake_session());
     app.yt_view.explore_cached = None;
     handle_key(&mut app, key(']'));
-    assert_eq!(app.yt_view.tab, YtTab::Explore, "] must cycle Radio -> Explore");
+    assert_eq!(
+        app.yt_view.tab,
+        YtTab::Explore,
+        "] must cycle Radio -> Explore"
+    );
     assert!(
         app.yt_session.as_ref().unwrap().explore_loading(),
         "tab-switch to Explore must fire send_explore via yt_tab_fetch_on_visit"

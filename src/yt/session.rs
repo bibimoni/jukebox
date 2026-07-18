@@ -32,6 +32,12 @@ use std::time::{Duration, Instant};
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ErrorScope {
     Search(String),
+    /// A per-track resolve_url failure (DRM-protected, region-blocked,
+    /// no audio formats). This is a SINGLE-TRACK failure — the provider
+    /// itself is healthy and other tracks still play. Excluded from the
+    /// `on_tick` provider-state degradation so one DRM video doesn't mark
+    /// the whole YouTube tab "offline — showing cached".
+    Resolve,
     Other,
 }
 
@@ -63,7 +69,7 @@ pub trait YtClient {
 fn config_base_opt() -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(dirs::config_dir)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
 }
 
 /// Path to the persisted cookies file: `<config_dir>/jukebox/yt-cookies.txt`.
@@ -109,7 +115,7 @@ pub fn load_cookies() -> Option<String> {
 pub fn venv_dir() -> std::path::PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(dirs::config_dir)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp/.config"));
     base.join("jukebox").join("yt-venv")
 }
@@ -883,6 +889,38 @@ impl Session {
                             premium: u.premium,
                         });
                     }
+                    // Fill in the title/artist if the cache entry had empty
+                    // ones (e.g. a cold-miss Charts track with no prior
+                    // get_playlist). yt-dlp's extraction always has the title.
+                    if t.title.is_empty() && !u.title.is_empty() {
+                        t.title = u.title.clone();
+                    }
+                    if t.artist.is_empty() && !u.artist.is_empty() {
+                        t.artist = u.artist.clone();
+                    }
+                } else if !u.title.is_empty() {
+                    // No cache entry at all (e.g. a track played directly from
+                    // Charts with no prior get_playlist/get_watch_playlist).
+                    // Create one from the resolve response so the player bar
+                    // shows the real title instead of the raw video_id.
+                    self.cache_track(&crate::yt::proto::RemoteTrackSummary {
+                        video_id: vid.clone(),
+                        title: u.title.clone(),
+                        artist: u.artist.clone(),
+                        album: None,
+                        dur: None,
+                        isrc: None,
+                    });
+                    // cache_track created a fresh entry with fmt=None; set it.
+                    if let Some(t) = self.track_cache.get_mut(vid) {
+                        t.fmt = Some(StreamFormat {
+                            codec: u.codec.clone(),
+                            abr: u.abr,
+                            sample_rate: u.sample_rate,
+                            container: u.container.clone(),
+                            premium: u.premium,
+                        });
+                    }
                 }
                 self.resolve_inflight = None;
             }
@@ -908,6 +946,32 @@ impl Session {
                         container: u.container.clone(),
                         premium: u.premium,
                     });
+                    // Fill in title/artist if empty (cold-miss Charts track).
+                    if t.title.is_empty() && !u.title.is_empty() {
+                        t.title = u.title.clone();
+                    }
+                    if t.artist.is_empty() && !u.artist.is_empty() {
+                        t.artist = u.artist.clone();
+                    }
+                } else if !u.title.is_empty() {
+                    // Create a cache entry from the premium resolve response.
+                    self.cache_track(&crate::yt::proto::RemoteTrackSummary {
+                        video_id: vid.clone(),
+                        title: u.title.clone(),
+                        artist: u.artist.clone(),
+                        album: None,
+                        dur: None,
+                        isrc: None,
+                    });
+                    if let Some(t) = self.track_cache.get_mut(vid) {
+                        t.fmt = Some(StreamFormat {
+                            codec: u.codec.clone(),
+                            abr: u.abr,
+                            sample_rate: u.sample_rate,
+                            container: u.container.clone(),
+                            premium: u.premium,
+                        });
+                    }
                 }
                 self.premium_resolve_inflight = None;
                 // Hand the premium URL to App so on_tick can swap the live stream
@@ -1014,11 +1078,15 @@ impl Session {
             }
             (Response::Error(e), Pending::Resolve(_)) => {
                 self.resolve_inflight = None;
-                self.set_error(ErrorScope::Other, e.clone());
+                // Per-track failure (DRM, region-block, no audio) — does NOT
+                // degrade the provider state. The user can still browse/play
+                // other tracks. `on_tick` surfaces the message as a toast and
+                // skips the dead track.
+                self.set_error(ErrorScope::Resolve, e.clone());
             }
             (Response::Error(e), Pending::ResolvePremium(_)) => {
                 self.premium_resolve_inflight = None;
-                self.set_error(ErrorScope::Other, e.clone());
+                self.set_error(ErrorScope::Resolve, e.clone());
             }
             (Response::Error(e), Pending::Lyrics(vid)) => {
                 // Free the inflight guard so a re-request after an error isn't
@@ -1497,6 +1565,31 @@ impl Session {
         self.discover_inflight = false;
     }
 
+    /// Reset the home inflight flag so a new `send_home` can be issued.
+    /// Called by `App::on_tick`'s 600-tick timeout — if the previous
+    /// `get_home()` response never arrived (sidecar hang, network drop),
+    /// the flag would stay `true` forever and block all future home fetches
+    /// (R refresh would be a no-op).
+    pub fn reset_home_inflight(&mut self) {
+        self.home_inflight = false;
+    }
+
+    /// Reset the explore inflight flag so a new `send_explore` can be issued.
+    /// Mirrors `reset_home_inflight` — called by `App::on_tick`'s 600-tick
+    /// timeout so an unresponsive `get_explore()` doesn't wedge the Explore
+    /// tab's R refresh forever.
+    pub fn reset_explore_inflight(&mut self) {
+        self.explore_inflight = false;
+    }
+
+    /// Reset the charts inflight flag so a new `send_charts` can be issued.
+    /// Mirrors `reset_home_inflight` — called by `App::on_tick`'s 600-tick
+    /// timeout so an unresponsive `get_charts()` doesn't wedge the Charts
+    /// tab's R refresh forever.
+    pub fn reset_charts_inflight(&mut self) {
+        self.charts_inflight = false;
+    }
+
     /// Fire-and-forget: fetch the YouTube Music home feed (ytmusicapi
     /// `get_home`). Results land in `pending_home_sections` (picked up by
     /// `App::on_tick` to populate the Home tab). Non-blocking — switching to
@@ -1768,6 +1861,28 @@ impl Session {
     pub fn track_for(&self, video_id: &str) -> Option<&RemoteTrack> {
         self.track_cache.get(video_id)
     }
+
+    /// All cached tracks (for persisting to disk on exit so the next launch
+    /// can restore track titles/artists for resume).
+    pub fn all_cached_tracks(&self) -> Vec<RemoteTrack> {
+        self.track_cache.values().cloned().collect()
+    }
+
+    /// Restore previously-cached tracks (from disk on startup). Populates
+    /// the `track_cache` so `track_for(video_id)` resolves immediately after
+    /// restart, before any search/get_playlist fires.
+    pub fn restore_track_cache(&mut self, tracks: Vec<RemoteTrack>) {
+        for t in tracks {
+            self.cache_track(&crate::yt::proto::RemoteTrackSummary {
+                video_id: t.video_id.clone(),
+                title: t.title.clone(),
+                artist: t.artist.clone(),
+                album: t.album.clone(),
+                dur: t.dur,
+                isrc: t.isrc.clone(),
+            });
+        }
+    }
 }
 
 impl YtClient for Session {
@@ -1916,7 +2031,10 @@ mod tests {
             Session::kind_for(&Request::Explore),
             Pending::Explore
         ));
-        assert!(matches!(Session::kind_for(&Request::Charts), Pending::Charts));
+        assert!(matches!(
+            Session::kind_for(&Request::Charts),
+            Pending::Charts
+        ));
     }
 
     #[test]

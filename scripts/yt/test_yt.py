@@ -40,48 +40,82 @@ _DEFAULT_HOME = [
     },
 ]
 
-_DEFAULT_EXPLORE = [
-    {
-        "items": [
-            {"playlistId": "PL1", "title": "Chill", "subtitle": "mood", "itemCount": 42},
-            {"playlistId": "PL2", "title": "Focus", "subtitle": "mood", "itemCount": 25},
-        ]
-    },
-    {
-        "items": [
-            {"playlistId": "PL3", "title": "Workout", "subtitle": "energy", "itemCount": 30},
-            {"playlistId": "PL4", "title": "Party", "subtitle": "energy", "itemCount": 18},
-        ]
-    },
-]
-
-_DEFAULT_CHARTS = {
-    "Top songs": [
-        {"title": "Song A", "subtitle": "Artist A", "videoId": "v1", "artists": [{"name": "Artist A"}]},
-        {"title": "Song B", "subtitle": "Artist B", "videoId": "v2", "artists": [{"name": "Artist B"}]},
+# ytmusicapi.get_mood_categories() returns a dict of section -> list of
+# {params, title} categories.
+_DEFAULT_MOOD_CATEGORIES = {
+    "For you": [
+        {"params": "p1", "title": "1980s"},
+        {"params": "p2", "title": "Feel Good"},
     ],
-    "Trending": [
-        {"title": "Trend 1", "subtitle": "Artist C", "videoId": "v3", "artists": [{"name": "Artist C"}]},
-        {"title": "Trend 2", "subtitle": "Artist D", "videoId": "v4", "artists": [{"name": "Artist D"}]},
+    "Genres": [
+        {"params": "p3", "title": "Dance & Electronic"},
+    ],
+    "Moods & moments": [
+        {"params": "p4", "title": "Chill"},
+    ],
+}
+
+# ytmusicapi.get_mood_playlists(params) returns a list of playlists (same
+# shape as get_library_playlists). One canned list per params value.
+_DEFAULT_MOOD_PLAYLISTS = {
+    "p1": [
+        {"playlistId": "PL1", "title": "80s Pop Hits", "playlistCount": 42},
+        {"playlistId": "PL2", "title": "80s Rock", "playlistCount": 30},
+    ],
+    "p2": [
+        {"playlistId": "PL3", "title": "Feel Good Mix", "playlistCount": 25},
+    ],
+    "p3": [
+        {"playlistId": "PL4", "title": "Dance Anthems", "playlistCount": 50},
+    ],
+    "p4": [
+        {"playlistId": "PL5", "title": "Chill Vibes", "playlistCount": 18},
+        {"playlistId": "PL6", "title": "Late Night", "playlistCount": 22},
+    ],
+}
+
+# ytmusicapi.get_charts() returns a dict like:
+#   {"countries": {...}, "videos": [...], "artists": [...], "genres": [...]}
+# Items have different shapes per chart (artists have subscribers/rank, not
+# subtitle; videos/genres have playlistId).
+_DEFAULT_CHARTS = {
+    "countries": {"selected": {"text": "United States"}, "options": ["ZZ"]},
+    "videos": [
+        {"title": "Daily Top Music Videos", "playlistId": "PLV1", "thumbnails": []},
+        {"title": "Weekly Top Music Videos", "playlistId": "PLV2", "thumbnails": []},
+    ],
+    "artists": [
+        {"title": "Artist X", "browseId": "UCX", "subscribers": "9.62M", "rank": "1", "trend": "neutral"},
+        {"title": "Artist Y", "browseId": "UCY", "subscribers": "5.00M", "rank": "2", "trend": "up"},
+    ],
+    "genres": [
+        {"title": "Top Pop Videos", "playlistId": "PLG1", "thumbnails": []},
     ],
 }
 
 
 class MockYTM:
     """Minimal ytmusicapi stub returning canned fixtures for get_home,
-    get_explore, get_charts. Shape mirrors ytmusicapi's responses. Pass
-    overrides to customize per-test."""
+    get_mood_categories, get_mood_playlists, get_charts. Shape mirrors
+    ytmusicapi's real responses. Pass overrides to customize per-test."""
 
-    def __init__(self, home=None, explore=None, charts=None):
+    def __init__(self, home=None, mood_categories=None, mood_playlists=None,
+                 charts=None):
         self._home = home if home is not None else _DEFAULT_HOME
-        self._explore = explore if explore is not None else _DEFAULT_EXPLORE
+        self._mood_cats = (mood_categories if mood_categories is not None
+                           else _DEFAULT_MOOD_CATEGORIES)
+        self._mood_pls = (mood_playlists if mood_playlists is not None
+                          else _DEFAULT_MOOD_PLAYLISTS)
         self._charts = charts if charts is not None else _DEFAULT_CHARTS
 
     def get_home(self):
         return self._home
 
-    def get_explore(self):
-        return self._explore
+    def get_mood_categories(self):
+        return self._mood_cats
+
+    def get_mood_playlists(self, params):
+        return self._mood_pls.get(params, [])
 
     def get_charts(self):
         return self._charts
@@ -131,13 +165,35 @@ class ExploreTests(unittest.TestCase):
         result = handle("explore", {}, MockYTM())
         self.assertIn("explore_playlists", result)
         playlists = result["explore_playlists"]
-        self.assertEqual(len(playlists), 4)
+        # 2 + 1 + 1 + 2 = 6 playlists across all categories.
+        self.assertEqual(len(playlists), 6)
         self.assertEqual(playlists[0]["id"], "PL1")
-        self.assertEqual(playlists[0]["title"], "Chill")
-        self.assertEqual(playlists[0]["subtitle"], "mood")
+        self.assertEqual(playlists[0]["title"], "80s Pop Hits")
+        # subtitle carries the category title ("1980s").
+        self.assertEqual(playlists[0]["subtitle"], "1980s")
         self.assertEqual(playlists[0]["count"], 42)
-        self.assertEqual(playlists[3]["id"], "PL4")
-        self.assertEqual(playlists[3]["title"], "Party")
+        self.assertEqual(playlists[5]["id"], "PL6")
+        self.assertEqual(playlists[5]["title"], "Late Night")
+
+    def test_explore_skips_categories_without_params(self):
+        cats = {
+            "For you": [
+                {"params": "p1", "title": "good"},
+                {"title": "no params here"},  # skipped
+            ],
+            "Bad section": "not a list",  # skipped
+        }
+        pls = {"p1": [{"playlistId": "PL1", "title": "ok"}]}
+        result = handle("explore", {}, MockYTM(mood_categories=cats,
+                                               mood_playlists=pls))
+        playlists = result["explore_playlists"]
+        self.assertEqual(len(playlists), 1)
+        self.assertEqual(playlists[0]["id"], "PL1")
+
+    def test_explore_handles_empty_categories(self):
+        cats = {"Empty": []}
+        result = handle("explore", {}, MockYTM(mood_categories=cats))
+        self.assertEqual(result, {"explore_playlists": []})
 
 
 class ChartsTests(unittest.TestCase):
@@ -145,29 +201,50 @@ class ChartsTests(unittest.TestCase):
         result = handle("charts", {}, MockYTM())
         self.assertIn("charts", result)
         entries = result["charts"]
-        self.assertEqual(len(entries), 4)
+        # 2 videos + 2 artists + 1 genre = 5 entries.
+        self.assertEqual(len(entries), 5)
         chart_names = {e["chart"] for e in entries}
-        self.assertEqual(chart_names, {"Top songs", "Trending"})
-        first = entries[0]
-        self.assertEqual(first["title"], "Song A")
-        self.assertEqual(first["subtitle"], "Artist A")
-        self.assertEqual(first["video_id"], "v1")
+        self.assertEqual(chart_names, {"videos", "artists", "genres"})
+
+    def test_charts_video_item_shape(self):
+        result = handle("charts", {}, MockYTM())
+        videos = [e for e in result["charts"] if e["chart"] == "videos"]
+        self.assertEqual(len(videos), 2)
+        first = videos[0]
+        self.assertEqual(first["title"], "Daily Top Music Videos")
+        self.assertEqual(first["playlist_id"], "PLV1")
+        self.assertIsNone(first["video_id"])
+        self.assertEqual(first["subtitle"], "")
+
+    def test_charts_artist_item_uses_subscribers_as_subtitle(self):
+        result = handle("charts", {}, MockYTM())
+        artists = [e for e in result["charts"] if e["chart"] == "artists"]
+        self.assertEqual(len(artists), 2)
+        first = artists[0]
+        self.assertEqual(first["title"], "Artist X")
+        self.assertEqual(first["subtitle"], "9.62M")  # subscribers field
+        self.assertIsNone(first["video_id"])
         self.assertIsNone(first["playlist_id"])
-        self.assertEqual(first["artist"], "Artist A")
-        self.assertEqual(first["chart"], "Top songs")
 
     def test_charts_skips_non_list_values(self):
         charts = {
-            "Top songs": [{"title": "S1", "videoId": "v1"}],
-            "Bad entry": "not a list",
-            "Another bad": {"also": "not a list"},
-            "Empty": [],
+            "videos": [{"title": "V1", "playlistId": "PL1"}],
+            "countries": {"selected": "not a list"},  # skipped
+            "Bad": "also not a list",  # skipped
+            "Empty": [],  # skipped (no entries)
         }
         result = handle("charts", {}, MockYTM(charts=charts))
         entries = result["charts"]
         self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["title"], "S1")
-        self.assertEqual(entries[0]["chart"], "Top songs")
+        self.assertEqual(entries[0]["title"], "V1")
+        self.assertEqual(entries[0]["chart"], "videos")
+
+    def test_charts_skips_non_dict_items(self):
+        charts = {"videos": ["not a dict", {"title": "ok", "playlistId": "PL1"}]}
+        result = handle("charts", {}, MockYTM(charts=charts))
+        entries = result["charts"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["title"], "ok")
 
 
 if __name__ == "__main__":

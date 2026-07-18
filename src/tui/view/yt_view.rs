@@ -85,6 +85,107 @@ fn border<'a>(title: &'a str, focused: bool, theme: &Theme) -> Block<'a> {
     }
 }
 
+/// Render the playlist browse mode (shared by Explore + Charts tabs). When
+/// `browse_playlist_id` is set, the tab shows the playlist's tracks instead
+/// of the playlist/chart list. Shows a loading state while tracks are being
+/// fetched, then a scrollable track list with j/k + Enter + `a` + Esc hints.
+fn render_playlist_browse(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    tab_name: &str,
+    theme: &Theme,
+    dim: &Style,
+    dash: &str,
+    dot: &str,
+) {
+    let block = border("Playlist tracks", true, theme);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let tracks = &app.yt_view.browse_playlist_tracks;
+    let loading = tracks.is_empty();
+
+    let lines: Vec<Line> = if loading {
+        let frames: &[&str] = if is_ascii() {
+            &["|", "/", "-", "\\"]
+        } else {
+            &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        };
+        let tick = if app.yt_view.tab == YtTab::Explore {
+            app.explore_loading_ticks
+        } else {
+            app.charts_loading_ticks
+        };
+        let frame = frames[(tick as usize) % frames.len()];
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("{frame} Loading tracks{}", ellipsis()),
+                Style::default().fg(theme.hi_fg),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(format!("Esc back to {tab_name}"), *dim)),
+        ]
+    } else {
+        let glyph = if is_ascii() { "*" } else { "♫" };
+        let text_style = Style::default().fg(if no_color() { Color::Reset } else { theme.text });
+        let marker = marker_glyph();
+        let cursor = app
+            .yt_view
+            .browse_cursor
+            .min(tracks.len().saturating_sub(1));
+        let mut out: Vec<Line> = Vec::new();
+        for (i, vid) in tracks.iter().enumerate() {
+            // Resolve the track title from the session cache (populated by
+            // get_playlist). Fall back to "Loading…" — `on_tick` fires a
+            // get_watch_playlist to fetch the seed video's metadata so the
+            // real title replaces this placeholder. Never show the raw video_id.
+            let (title, artist) = app
+                .yt_session
+                .as_ref()
+                .and_then(|s| s.track_for(vid))
+                .map(|t| (t.title.clone(), t.artist.clone()))
+                .unwrap_or((format!("Loading{}", ellipsis()), String::new()));
+            let body = if artist.is_empty() {
+                format!("{glyph} {title}")
+            } else {
+                format!("{glyph} {title} {dash} {artist}")
+            };
+            let is_focused = i == cursor;
+            let line = if is_focused {
+                format!("{marker} {body}")
+            } else {
+                format!("  {body}")
+            };
+            let style = if is_focused {
+                theme.selected_style()
+            } else {
+                text_style
+            };
+            out.push(Line::from(Span::styled(line, style)));
+        }
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            format!(
+                "j/k navigate {dot} Enter play from here {dot} a play all {dot} Esc back to {tab_name}"
+            ),
+            *dim,
+        )));
+        // Scroll the focused row into view.
+        let visible_h = inner.height as usize;
+        let scroll = if cursor >= visible_h {
+            (cursor - visible_h + 1) as u16
+        } else {
+            0
+        };
+        f.render_widget(Paragraph::new(out).scroll((scroll, 0)), inner);
+        return;
+    };
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 /// Explore tab (Task 5): renders the cached YouTube Music explore-feed
 /// playlists (mood/genre shelves) from `app.yt_view.explore_cached` (populated
 /// by Task 3's `on_tick` consumer for `Pending::Explore`). The layout mirrors
@@ -113,23 +214,53 @@ pub fn render_yt_explore(f: &mut Frame, area: Rect, app: &App) {
     let dash = em_dash();
     let dot = sep_dot();
 
+    // Browse mode: show the playlist's tracks instead of the playlist list.
+    if app.yt_view.browse_playlist_id.is_some() {
+        render_playlist_browse(f, area, app, "Explore", &theme, &dim, &dash, &dot);
+        return;
+    }
+
     let loading = app
         .yt_session
         .as_ref()
         .map(|s| s.explore_loading())
         .unwrap_or(false);
-    let cached = app.yt_view.explore_cached.as_ref();
-    let is_empty = cached.map(|v| v.is_empty()).unwrap_or(true);
+    // When the inline filter (`f`) is active, render only matching playlists.
+    let cached: Vec<crate::yt::proto::PlaylistProto> = if app.yt_filter_active() {
+        app.filtered_explore()
+    } else {
+        app.yt_view.explore_cached.clone().unwrap_or_default()
+    };
+    let is_empty = cached.is_empty();
+    let filter_active = app.yt_filter_active();
+    let filter_text = app.yt_view.yt_filter.clone().unwrap_or_default();
 
     let block = border("Explore", true, &theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let lines: Vec<Line> = if loading && cached.is_none() {
-        // Loading state — mirror render_yt_discover's spinner. Use a static
-        // frame (no loading_ticks field for Explore; animation is a cosmetic
-        // concern for a follow-up).
-        let frame = if is_ascii() { "|" } else { "⠋" };
+    // Filter input line at the top (when active).
+    let content_area = if filter_active {
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
+        let filter_line = Line::from(vec![
+            Span::styled("filter: ", Style::default().fg(theme.accent)),
+            Span::styled(filter_text.clone(), Style::default().fg(theme.text)),
+            Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        ]);
+        f.render_widget(filter_line, rows[0]);
+        rows[1]
+    } else {
+        inner
+    };
+
+    let lines: Vec<Line> = if loading && app.yt_view.explore_cached.is_none() {
+        // Loading state — animated spinner (see render_yt_explore).
+        let frames: &[&str] = if is_ascii() {
+            &["|", "/", "-", "\\"]
+        } else {
+            &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        };
+        let frame = frames[(app.explore_loading_ticks as usize) % frames.len()];
         vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -143,45 +274,89 @@ pub fn render_yt_explore(f: &mut Frame, area: Rect, app: &App) {
             )),
         ]
     } else if is_empty {
-        // Empty state — mirror render_yt_radio's "No active radio session."
-        vec![
-            Line::from(""),
-            Line::from(Span::styled("No content available".to_string(), dim)),
-            Line::from(""),
-            Line::from(Span::styled(
-                format!("press R to refresh {dot} Esc close"),
-                dim,
-            )),
-        ]
+        if filter_active {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("No matches for \"{filter_text}\""),
+                    dim,
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("Backspace to edit {dot} Esc to clear filter"),
+                    dim,
+                )),
+            ]
+        } else {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled("No content available".to_string(), dim)),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("press R to refresh {dot} Esc close"),
+                    dim,
+                )),
+            ]
+        }
     } else {
-        // Content state — render each playlist as a line.
-        let playlists = cached.unwrap();
+        // Content state — render each playlist as a line. The focused row
+        // (at `app.yt_view.explore_cursor`) carries the selection style
+        // (REVERSED + BOLD under NO_COLOR, or accent bg in color mode) plus a
+        // `▸` marker glyph — matching the Home/Library tab selection cues so
+        // the user sees which row Enter will activate.
         let glyph = if is_ascii() { "*" } else { "✦" };
         let text_style = Style::default().fg(if nc { Color::Reset } else { theme.text });
+        let marker = marker_glyph();
+        let cursor = app
+            .yt_view
+            .explore_cursor
+            .min(cached.len().saturating_sub(1));
         let mut out: Vec<Line> = Vec::new();
-        for p in playlists {
+        for (i, p) in cached.iter().enumerate() {
             let subtitle = p.subtitle.as_deref().unwrap_or("");
             let count_label = match p.count {
                 Some(n) => format!(" {dash} {n} tracks"),
                 None => String::new(),
             };
-            let line = if subtitle.is_empty() {
+            let body = if subtitle.is_empty() {
                 format!("{glyph} {}{count_label}", p.title)
             } else {
                 format!("{glyph} {} {dash} {subtitle}{count_label}", p.title)
             };
-            out.push(Line::from(Span::styled(line, text_style)));
+            let is_focused = i == cursor;
+            let line = if is_focused {
+                format!("{marker} {body}")
+            } else {
+                format!("  {body}")
+            };
+            let style = if is_focused {
+                theme.selected_style()
+            } else {
+                text_style
+            };
+            out.push(Line::from(Span::styled(line, style)));
         }
         // Hint line at the bottom.
         out.push(Line::from(""));
-        out.push(Line::from(Span::styled(
-            format!("R refresh {dot} Esc close"),
-            dim,
-        )));
-        out
+        let hint = if filter_active {
+            format!("j/k navigate {dot} Enter open {dot} Esc clear filter {dot} R refresh")
+        } else {
+            format!("j/k navigate {dot} Enter open {dot} f filter {dot} R refresh {dot} Esc close")
+        };
+        out.push(Line::from(Span::styled(hint, dim)));
+        // Scroll the focused row into view (Paragraph doesn't auto-scroll).
+        let visible_h = content_area.height as usize;
+        let scroll = if cursor >= visible_h {
+            (cursor - visible_h + 1) as u16
+        } else {
+            0
+        };
+        f.render_widget(Paragraph::new(out).scroll((scroll, 0)), content_area);
+        return;
     };
 
-    f.render_widget(Paragraph::new(lines), inner);
+    // Loading or empty state — no scroll needed.
+    f.render_widget(Paragraph::new(lines), content_area);
 }
 
 /// Charts tab (Task 5): renders the cached YouTube Music chart entries from
@@ -209,6 +384,12 @@ pub fn render_yt_charts(f: &mut Frame, area: Rect, app: &App) {
         .fg(if nc { Color::Reset } else { theme.accent })
         .add_modifier(Modifier::BOLD);
 
+    // Browse mode: show the playlist's tracks instead of the chart list.
+    if app.yt_view.browse_playlist_id.is_some() {
+        render_playlist_browse(f, area, app, "Charts", &theme, &dim, &dash, &dot);
+        return;
+    }
+
     let loading = app
         .yt_session
         .as_ref()
@@ -222,7 +403,13 @@ pub fn render_yt_charts(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(block, area);
 
     let lines: Vec<Line> = if loading && cached.is_none() {
-        let frame = if is_ascii() { "|" } else { "⠋" };
+        // Loading state — animated spinner (see render_yt_explore).
+        let frames: &[&str] = if is_ascii() {
+            &["|", "/", "-", "\\"]
+        } else {
+            &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        };
+        let frame = frames[(app.charts_loading_ticks as usize) % frames.len()];
         vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -247,47 +434,90 @@ pub fn render_yt_charts(f: &mut Frame, area: Rect, app: &App) {
         ]
     } else {
         // Content state — group entries by `chart` field, emit a section
-        // header + dim h_line divider whenever the chart name changes.
+        // header + dim h_line divider whenever the chart name changes. The
+        // focused row (at `app.yt_view.charts_cursor`, a FLAT index into
+        // `charts_cached`) carries the selection style + `▸` marker. Section
+        // headers and dividers are NOT selectable (they're render-only; the
+        // cursor skips over them implicitly because it indexes the entries
+        // list directly, not the rendered line list).
         let entries = cached.unwrap();
         let glyph = if is_ascii() { "*" } else { "•" };
         let text_style = Style::default().fg(if nc { Color::Reset } else { theme.text });
         let col_w = inner.width.saturating_sub(2) as usize;
         let rule_w = col_w.min(60);
         let rule = h_line().repeat(rule_w);
+        let marker = marker_glyph();
+        let cursor = app
+            .yt_view
+            .charts_cursor
+            .min(entries.len().saturating_sub(1));
         let mut out: Vec<Line> = Vec::new();
         let mut prev_chart: Option<&str> = None;
         // Pre-compute per-chart counts so the header can show `Top songs — 5
         // entries` (mirrors render_yt_library's per-kind count).
-        let mut counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for e in entries {
             *counts.entry(e.chart.as_str()).or_default() += 1;
         }
-        for e in entries {
+        // Track the rendered line index of the focused entry so we can scroll
+        // it into view (section headers + dividers inflate the line count
+        // above the flat entry index).
+        let mut focused_line: usize = 0;
+        let mut lines_before_focus: usize = 0;
+        for (i, e) in entries.iter().enumerate() {
             if prev_chart != Some(e.chart.as_str()) {
                 let n = counts.get(e.chart.as_str()).copied().unwrap_or(0);
                 let header = format!("{} {dash} {n} entries", e.chart);
                 out.push(Line::from(Span::styled(header, header_style)));
                 out.push(Line::from(Span::styled(rule.clone(), dim)));
                 prev_chart = Some(e.chart.as_str());
+                if i <= cursor {
+                    lines_before_focus += 2;
+                }
             }
             let subtitle = e.subtitle.as_deref().unwrap_or("");
-            let line = if subtitle.is_empty() {
+            let body = if subtitle.is_empty() {
                 format!("{glyph} {}", e.title)
             } else {
                 format!("{glyph} {} {dash} {subtitle}", e.title)
             };
-            out.push(Line::from(Span::styled(line, text_style)));
+            let is_focused = i == cursor;
+            let line = if is_focused {
+                format!("{marker} {body}")
+            } else {
+                format!("  {body}")
+            };
+            let style = if is_focused {
+                theme.selected_style()
+            } else {
+                text_style
+            };
+            if is_focused {
+                focused_line = lines_before_focus;
+            }
+            out.push(Line::from(Span::styled(line, style)));
+            if i < cursor {
+                lines_before_focus += 1;
+            }
         }
         // Hint line at the bottom.
         out.push(Line::from(""));
         out.push(Line::from(Span::styled(
-            format!("R refresh {dot} Esc close"),
+            format!("j/k navigate {dot} Enter play {dot} R refresh {dot} Esc close"),
             dim,
         )));
-        out
+        // Scroll the focused row into view.
+        let visible_h = inner.height as usize;
+        let scroll = if focused_line >= visible_h {
+            (focused_line - visible_h + 1) as u16
+        } else {
+            0
+        };
+        f.render_widget(Paragraph::new(out).scroll((scroll, 0)), inner);
+        return;
     };
 
+    // Loading or empty state — no scroll needed.
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -613,10 +843,48 @@ pub fn render_yt_home(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         // render_compact renders a Clear + body + hint bar. In-pane the Clear
         // only erases the pane area (not the full screen), which is what we
-        // want. Clone sections to satisfy the borrow (render_compact takes
-        // &[...], state by &).
-        let sections = state.sections.clone();
-        home::render_compact(f, area, &sections, state, &icons);
+        // want. When the YT-tab filter (`f`) is active, filter the sections
+        // so only matching items show (empty shelves are dropped).
+        let sections = if app.yt_filter_active() {
+            app.filtered_home_sections()
+        } else {
+            state.sections.clone()
+        };
+        if app.yt_filter_active() && !sections.is_empty() {
+            // Show the filter input at the top + the filtered content below.
+            let theme = Theme::default();
+            let split = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+            let filter_text = app.yt_view.yt_filter.clone().unwrap_or_default();
+            let filter_line = Line::from(vec![
+                Span::styled("filter: ", Style::default().fg(theme.accent)),
+                Span::styled(filter_text, Style::default().fg(theme.text)),
+                Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            ]);
+            f.render_widget(filter_line, split[0]);
+            home::render_compact(f, split[1], &sections, state, &icons);
+        } else if app.yt_filter_active() && sections.is_empty() {
+            // No matches — show a "no matches" message.
+            let theme = Theme::default();
+            let dim = Style::default().fg(if no_color() { Color::Reset } else { theme.dim });
+            let filter_text = app.yt_view.yt_filter.clone().unwrap_or_default();
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("filter: {filter_text}_"),
+                    Style::default().fg(theme.accent),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("No matches for \"{filter_text}\""),
+                    dim,
+                )),
+                Line::from(""),
+                Line::from(Span::styled("Backspace to edit · Esc to clear filter", dim)),
+            ];
+            f.render_widget(Paragraph::new(lines), area);
+        } else {
+            home::render_compact(f, area, &sections, state, &icons);
+        }
     }
 }
 
@@ -809,7 +1077,10 @@ fn yt_search_label(app: &App, id: &str) -> String {
         let dash = em_dash();
         return format!("{} {dash} {}", rt.title, rt.artist);
     }
-    id.to_string()
+    // No cached metadata — `on_tick` fires a get_watch_playlist to fetch the
+    // seed video's metadata so the real title replaces this placeholder.
+    // Never show the raw 11-char video_id to the user.
+    format!("Loading{}", ellipsis())
 }
 
 /// Discover tab (I.1): reuses `Overlay::Discover` items in-pane. The overlay
@@ -1043,13 +1314,7 @@ mod tests {
         app.yt_view.tab = YtTab::Home;
         let text = yt_view_text(&mut app, 100, 30);
         for label in [
-            "Home",
-            "Library",
-            "Search",
-            "Discover",
-            "Radio",
-            "Explore",
-            "Charts",
+            "Home", "Library", "Search", "Discover", "Radio", "Explore", "Charts",
         ] {
             assert!(
                 text.contains(label),

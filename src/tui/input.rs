@@ -105,27 +105,61 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // (uppercase) to match the existing refresh convention — `r` (lowercase)
         // is already bound to `cycle_repeat` in the global keymap.
         if matches!(key.code, KeyCode::Char('R'))
-            && matches!(app.yt_view.tab, YtTab::Home | YtTab::Explore | YtTab::Charts)
+            && matches!(
+                app.yt_view.tab,
+                YtTab::Home | YtTab::Explore | YtTab::Charts
+            )
         {
-            app.refresh_yt_home_explore_charts();
+            if app.resume_hint.is_some() {
+                app.resume_last();
+            } else {
+                app.refresh_yt_home_explore_charts();
+            }
             return;
+        }
+        // Inline filter (`f`) on the Home/Explore/Charts tabs. When active,
+        // typing narrows the displayed items; Esc clears; `f` on an empty
+        // filter closes it (toggle). j/k/Enter operate on the FILTERED list
+        // (see `filtered_explore`/`filtered_charts` + the play_*_selection
+        // methods). Mirrors the local-view `f` filter (`handle_filter_key`)
+        // but scoped to the YT content tabs.
+        if matches!(
+            app.yt_view.tab,
+            YtTab::Home | YtTab::Explore | YtTab::Charts
+        ) {
+            if app.yt_filter_active() && handle_yt_filter_key(app, key) {
+                return;
+            }
+            if matches!(key.code, KeyCode::Char('f')) {
+                app.toggle_yt_filter();
+                return;
+            }
         }
         // Home tab navigation: j/k move the cursor within the focused section,
         // h/l switch sections (h at the leftmost section exits the YouTube
-        // view), Enter plays the selected item. Tab/Shift+Tab are deliberately
-        // NOT bound here — they fall through to global view cycling so the user
-        // can always escape the YouTube view. ? opens help (stacked). These
-        // only apply when the Home tab is active and the sections are populated
-        // (not the welcome/cold-start screen).
+        // view), Enter plays the selected item. When the filter is active,
+        // navigation operates on the FILTERED sections (sections with no
+        // matching items are dropped). Tab/Shift+Tab are deliberately NOT bound
+        // here — they fall through to global view cycling.
         if app.yt_view.tab == YtTab::Home && !app.yt_view.home.sections.is_empty() {
-            let section_len = app
-                .yt_view
-                .home
-                .sections
+            let sections = if app.yt_filter_active() {
+                app.filtered_home_sections()
+            } else {
+                app.yt_view.home.sections.clone()
+            };
+            if sections.is_empty() {
+                // All sections filtered out — only Esc/Backspace/f make sense.
+                if matches!(key.code, KeyCode::Esc) {
+                    app.yt_view.yt_filter = None;
+                    return;
+                }
+                // Let handle_yt_filter_key handle typing (already done above).
+            }
+            let section_len = sections
                 .get(app.yt_view.home.focused_section)
                 .map(|(_, items)| items.len())
                 .unwrap_or(0);
-            let n_sections = crate::tui::view::home::HomeSection::all().len();
+            let n_sections = sections.len().max(1);
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     app.yt_view.home.cursor_down(section_len.max(1));
@@ -148,8 +182,120 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                     return;
                 }
                 KeyCode::Enter => {
-                    let home = app.yt_view.home.clone();
-                    app.play_home_selection_from(&home);
+                    if app.yt_filter_active() {
+                        // When filtering, play from the FILTERED sections so
+                        // the cursor maps to the right item.
+                        let filtered = app.filtered_home_sections();
+                        let mut home = app.yt_view.home.clone();
+                        home.sections = filtered;
+                        app.play_home_selection_from(&home);
+                    } else {
+                        let home = app.yt_view.home.clone();
+                        app.play_home_selection_from(&home);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // Browse mode: when the user Enter'd a playlist from Explore/Charts,
+        // the tab shows the playlist's tracks. j/k navigates, Enter plays from
+        // the focused track, `a` plays the whole playlist, Esc goes back to
+        // the playlist list. This takes priority over the playlist-list nav.
+        if matches!(app.yt_view.tab, YtTab::Explore | YtTab::Charts)
+            && app.yt_view.browse_playlist_id.is_some()
+        {
+            let n = app.yt_view.browse_playlist_tracks.len();
+            match key.code {
+                KeyCode::Esc => {
+                    app.yt_view.browse_playlist_id = None;
+                    app.yt_view.browse_playlist_tracks.clear();
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') if n > 0 => {
+                    if app.yt_view.browse_cursor + 1 < n {
+                        app.yt_view.browse_cursor += 1;
+                    }
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') if n > 0 => {
+                    app.yt_view.browse_cursor = app.yt_view.browse_cursor.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Enter if n > 0 => {
+                    app.play_browsed_track();
+                    return;
+                }
+                KeyCode::Char('a') if n > 0 => {
+                    app.play_browsed_playlist_all();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // Explore tab navigation: j/k move the cursor through the (filtered,
+        // if active) playlists, Enter opens the focused playlist (existing
+        // `get_playlist` → `pending_discover_play` flow via
+        // `play_explore_selection`). Only active when content is loaded.
+        if app.yt_view.tab == YtTab::Explore
+            && app
+                .yt_view
+                .explore_cached
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+        {
+            let n = if app.yt_filter_active() {
+                app.filtered_explore().len()
+            } else {
+                app.yt_view.explore_cached.as_ref().unwrap().len()
+            };
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if app.yt_view.explore_cursor + 1 < n {
+                        app.yt_view.explore_cursor += 1;
+                    }
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.yt_view.explore_cursor = app.yt_view.explore_cursor.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Enter => {
+                    app.play_explore_selection();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // Charts tab navigation: same pattern. The cursor is a flat index
+        // into `charts_cached` (or the filtered list when a filter is active).
+        if app.yt_view.tab == YtTab::Charts
+            && app
+                .yt_view
+                .charts_cached
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+        {
+            let n = if app.yt_filter_active() {
+                app.filtered_charts().len()
+            } else {
+                app.yt_view.charts_cached.as_ref().unwrap().len()
+            };
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if app.yt_view.charts_cursor + 1 < n {
+                        app.yt_view.charts_cursor += 1;
+                    }
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.yt_view.charts_cursor = app.yt_view.charts_cursor.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Enter => {
+                    app.play_charts_selection();
                     return;
                 }
                 _ => {}
@@ -430,6 +576,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     } else if scope == crate::tui::app::SearchScope::Local {
                         if let Some(id) = results.get(cursor).cloned() {
                             let ids = std::mem::take(&mut results);
+                            app.overlay = None;
                             app.play_in_context_ids(ids, &id);
                             return;
                         }
@@ -441,6 +588,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                             // Results match the current query → pick.
                             if let Some(id) = results.get(cursor).cloned() {
                                 let ids = std::mem::take(&mut results);
+                                app.overlay = None;
                                 app.play_in_context_ids(ids, &id);
                                 return;
                             }
@@ -1603,6 +1751,65 @@ fn handle_filter_key(app: &mut App, key: KeyEvent) -> bool {
     }
 }
 
+fn handle_yt_filter_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc => {
+            app.yt_view.yt_filter = None;
+            true
+        }
+        KeyCode::Enter => {
+            // Enter on a YT filter: keep the filter active (so the user can
+            // keep narrowing) but jump the cursor to 0 (first match). The
+            // actual play happens via the tab-specific Enter handler below
+            // (which falls through since this returns false for Enter —
+            // NO: return true to consume Enter as "apply filter" not "play").
+            // Actually: Enter while filtering should PLAY the focused match
+            // (same as Enter without a filter). So return false here to let
+            // the tab-specific Enter handler fire.
+            false
+        }
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            // `f` on an empty filter closes it (toggle semantics); otherwise
+            // the char goes into the query. Backspace-to-empty + `f` also
+            // closes.
+            if c == 'f'
+                && app
+                    .yt_view
+                    .yt_filter
+                    .as_ref()
+                    .map(|f| f.is_empty())
+                    .unwrap_or(false)
+            {
+                app.yt_view.yt_filter = None;
+            } else if let Some(f) = &mut app.yt_view.yt_filter {
+                f.push(c);
+                // Reset the cursor to 0 so it stays valid in the filtered list.
+                match app.yt_view.tab {
+                    YtTab::Explore => app.yt_view.explore_cursor = 0,
+                    YtTab::Charts => app.yt_view.charts_cursor = 0,
+                    _ => {}
+                }
+            }
+            true
+        }
+        KeyCode::Backspace => {
+            if let Some(f) = &mut app.yt_view.yt_filter {
+                f.pop();
+                match app.yt_view.tab {
+                    YtTab::Explore => app.yt_view.explore_cursor = 0,
+                    YtTab::Charts => app.yt_view.charts_cursor = 0,
+                    _ => {}
+                }
+            }
+            true
+        }
+        _ => false, // navigation keys (j/k/Enter) fall through to the tab handlers
+    }
+}
+
 /// Execute a `:` command. Supports `:yt auth`, `:yt auth browser <name>`,
 /// `:yt logout`, `:yt setup`.
 fn execute_command(app: &mut App, cmd: &str) {
@@ -1776,11 +1983,21 @@ fn focused_column_len(app: &App) -> usize {
             0 => app.yt_lists.len(),
             _ => focused_track_count(app),
         },
-        View::Queue => app.transport.manual_queue.len(),
+        // Queue view: when the manual queue is empty, the view shows the
+        // current playback CONTEXT tracks (so the user can navigate the
+        // playlist that's playing). The cursor length must match what's
+        // actually rendered.
+        View::Queue => {
+            let manual_len = app.transport.manual_queue.len();
+            if manual_len > 0 {
+                manual_len
+            } else {
+                app.transport_context_ids().len()
+            }
+        }
     }
 }
 
-/// Track-list length of the album/playlist currently in view.
 fn focused_track_count(app: &App) -> usize {
     match app.view {
         View::Artists => {
@@ -1805,7 +2022,14 @@ fn focused_track_count(app: &App) -> usize {
             .get(app.cursors.playlist)
             .map(|l| l.track_ids.len())
             .unwrap_or(0),
-        View::Queue => app.transport.manual_queue.len(),
+        View::Queue => {
+            let manual_len = app.transport.manual_queue.len();
+            if manual_len > 0 {
+                manual_len
+            } else {
+                app.transport_context_ids().len()
+            }
+        }
     }
 }
 
@@ -2114,7 +2338,14 @@ fn focused_column_len_with_focus(app: &App, focus: usize) -> usize {
             0 => app.yt_lists.len(),
             _ => focused_track_count(app),
         },
-        View::Queue => app.transport.manual_queue.len(),
+        View::Queue => {
+            let manual_len = app.transport.manual_queue.len();
+            if manual_len > 0 {
+                manual_len
+            } else {
+                app.transport_context_ids().len()
+            }
+        }
     }
 }
 

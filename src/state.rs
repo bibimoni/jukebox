@@ -16,9 +16,11 @@ pub const ARTISTS: &str = "artists";
 pub const SEARCH: &str = "search";
 pub const QUEUE: &str = "queue";
 
-/// Resolve the state DB path: `<config_dir>/jukebox/state.db`. Honors
-/// `$XDG_CONFIG_HOME`, else falls back to `dirs::config_dir()`, matching
-/// `config::config_path()` so the two files live together.
+/// Resolve the state DB path: `~/.config/jukebox/state.db`. Honors
+/// `$XDG_CONFIG_HOME`, else falls back to `~/.config` (via `dirs::home_dir`,
+/// NOT `dirs::config_dir` which returns `~/Library/Application Support` on
+/// macOS — the user's config.yml is at `~/.config/jukebox/` and all state
+/// should live alongside it).
 ///
 /// The `/tmp/.config` fallback is acceptable here: `state.db` stores only UI
 /// prefs (focus, column widths, volume, playlists) — no secrets. Cookie
@@ -26,7 +28,7 @@ pub const QUEUE: &str = "queue";
 pub fn db_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(dirs::config_dir)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .unwrap_or_else(|| PathBuf::from("/tmp/.config"));
     base.join("jukebox").join("state.db")
 }
@@ -180,6 +182,17 @@ pub fn clear() -> Result<()> {
 /// Persisted browse layout + transport modes. `shuffle`/`repeat` are stored as
 /// strings (`"off"`/`"smart"`/`"random"`, `"off"`/`"all"`/`"one"`) rather than
 /// the enum types so we don't need serde derives on `ShuffleMode`/`RepeatMode`
+/// Serializable track metadata for the last-played context. Persisted so the
+/// Queue view + now-playing bar show real titles immediately after restart.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct CachedTrackMeta {
+    pub video_id: String,
+    pub title: String,
+    pub artist: String,
+    #[serde(default)]
+    pub album: Option<String>,
+}
+
 /// (defined in `tui::queue`).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct LayoutState {
@@ -212,6 +225,26 @@ pub struct LayoutState {
     /// resume only re-seeks on mpv; afplay restarts from 0.
     #[serde(default)]
     pub last_played_position: f64,
+    /// The track ids + metadata (title/artist/album) of the last-played context
+    /// (the playlist/album/search that was playing), persisted so resume
+    /// restores the FULL context with real titles — not just video_id strings.
+    /// Empty when the context was a single track or no track has been played.
+    #[serde(default)]
+    pub last_played_context_ids: Vec<String>,
+    /// Full track metadata for the last-played context. Persisted alongside
+    /// `last_played_context_ids` so the Queue view + now-playing bar show real
+    /// titles immediately after restart — no need to wait for get_playlist or
+    /// search to fire. Each entry has video_id + title + artist + album.
+    #[serde(default)]
+    pub last_played_context_tracks: Vec<CachedTrackMeta>,
+    /// The YouTube playlist ID the last-played context came from (when the
+    /// context was a YouTube playlist/mood list). On startup, we re-fire
+    /// `get_playlist(key)` to fetch ALL track metadata so the Queue view
+    /// shows real titles instead of "Loading…" for tracks whose metadata
+    /// wasn't cached before the previous session ended. `None` when the
+    /// context was local (album/artist/playlist) or a single track.
+    #[serde(default)]
+    pub last_played_context_key: Option<String>,
     /// RC11-DEF-014: the last-focused browse cursors (artist/album/track/
     /// playlist), restored on launch so the user returns to the last-played
     /// track instead of track 1. `queue` is not persisted (it's transient).
@@ -296,6 +329,9 @@ impl Default for LayoutState {
             yt_browser: String::new(),
             last_played_track_id: None,
             last_played_position: 0.0,
+            last_played_context_ids: Vec::new(),
+            last_played_context_tracks: Vec::new(),
+            last_played_context_key: None,
             last_cursor_artist: 0,
             last_cursor_album: 0,
             last_cursor_track: 0,
@@ -365,6 +401,14 @@ pub struct LayoutSave<'a> {
     /// has been played this session).
     pub last_played_track_id: Option<&'a str>,
     pub last_played_position: f64,
+    /// The track ids of the last-played context (playlist/album/search).
+    /// Persisted so resume restores the full context, not just 1 track.
+    pub last_played_context_ids: &'a [String],
+    /// Full track metadata for the last-played context so the Queue view
+    /// shows real titles immediately after restart.
+    pub last_played_context_tracks: &'a [CachedTrackMeta],
+    /// YouTube playlist ID for the last-played context (to re-fetch metadata).
+    pub last_played_context_key: Option<&'a str>,
     /// RC11-DEF-014: the last-focused browse cursors so the next launch
     /// returns to the last-played track.
     pub last_cursor_artist: usize,
@@ -413,6 +457,9 @@ pub fn save_layout_at(path: &Path, input: &LayoutSave) -> Result<()> {
         yt_browser: input.yt_browser.to_string(),
         last_played_track_id: input.last_played_track_id.map(|s| s.to_string()),
         last_played_position: input.last_played_position,
+        last_played_context_ids: input.last_played_context_ids.to_vec(),
+        last_played_context_tracks: input.last_played_context_tracks.to_vec(),
+        last_played_context_key: input.last_played_context_key.map(|s| s.to_string()),
         last_cursor_artist: input.last_cursor_artist,
         last_cursor_album: input.last_cursor_album,
         last_cursor_track: input.last_cursor_track,

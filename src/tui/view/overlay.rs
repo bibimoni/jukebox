@@ -401,7 +401,10 @@ fn track_label(app: &App, id: &str) -> String {
         }
         return format!("{} {} {}", rt.title, em_dash(), rt.artist);
     }
-    id.to_string()
+    // No cached metadata — `on_tick` fires a get_watch_playlist to fetch the
+    // seed video's metadata so the real title replaces this placeholder.
+    // Never show the raw 11-char video_id to the user.
+    format!("Loading{}", ellipsis())
 }
 
 /// RC16-DEF-3: truncate `s` to `max` display columns, appending an ellipsis

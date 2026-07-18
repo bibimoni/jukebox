@@ -77,9 +77,17 @@ pub fn render(
         )));
         // RC14-DEF-2: show resolved "Title — Artist" titles instead of raw
         // track ids. `played` is parallel to `history` (same length, same
-        // order); fall back to the raw id if a title wasn't resolved.
+        // order); fall back to "Loading…" if a title wasn't resolved (the
+        // label-resolvers `track_label`/`yt_search_label` already return
+        // "Loading…" for uncached tracks, so this is defense in depth —
+        // never leak a raw 11-char video_id to the user).
         for (i, (track_id, title)) in history.iter().zip(played.iter()).take(10).enumerate() {
-            let label = if title.is_empty() { track_id } else { title };
+            let _ = track_id; // unused — kept for parallel-iterator clarity.
+            let label = if title.is_empty() {
+                format!("Loading{}", ellipsis())
+            } else {
+                title.to_string()
+            };
             lines.push(Line::from(format!("  {}. {label}", i + 1)));
         }
         if history.len() > 10 {

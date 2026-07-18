@@ -1304,7 +1304,19 @@ fn render_playlists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
 // --- Queue view -------------------------------------------------------------
 
 fn render_queue(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
-    let ids = app.transport.manual_queue.clone();
+    // The Queue view shows the manual "play next" queue when it has items.
+    // When the manual queue is empty, fall back to showing the CURRENT
+    // PLAYBACK CONTEXT (the album/playlist/search tracks that are playing
+    // right now) so the user sees what's playing + what's coming up — this
+    // is the "now playing tab" the user expects when they Enter a playlist
+    // from Home/Explore/Charts.
+    let manual_ids = app.transport.manual_queue.clone();
+    let context_ids = app.transport_context_ids();
+    let ids = if !manual_ids.is_empty() {
+        manual_ids
+    } else {
+        context_ids
+    };
     let title = format!("Queue{}", mixed_tag(app));
     let block = border(&title, app.focus_col == 0, theme);
     if ids.is_empty() {
@@ -1448,7 +1460,10 @@ fn track_rows(app: &App, ids: &[String], width: usize, theme: &Theme) -> Vec<Lin
                     true,
                 ),
                 None => (
-                    format!("Loading{}", ellipsis()),
+                    // No cached metadata — `on_tick` fires a get_watch_playlist
+                    // to fetch the seed video's metadata so the real title
+                    // replaces this placeholder. Never show the raw video_id.
+                    format!("Loading{}", crate::tui::view::theme::ellipsis()),
                     String::new(),
                     String::new(),
                     "YT".to_string(),

@@ -29,7 +29,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{columns, footer, overlay, player_bar, player_bar_big, sidebar};
+use super::{columns, footer, now_playing_panel, overlay, player_bar, player_bar_big, sidebar};
 use crate::tui::app::{App, View};
 use crate::tui::view::theme::{self, h_line, v_sep, Theme};
 
@@ -128,6 +128,28 @@ fn split_sidebar(f: &mut Frame, area: Rect, app: &App) -> Rect {
     }
 }
 
+/// Split `content_area` into main content + the now-playing preview panel
+/// (right side). Renders the panel into the right split and returns the left
+/// split for the main columns/YouTube view. When the panel is hidden (narrow
+/// terminal), returns `content_area` unchanged.
+fn split_now_playing_panel(f: &mut Frame, content_area: Rect, app: &App) -> Rect {
+    if !now_playing_panel::is_visible(content_area.width) {
+        return content_area;
+    }
+    let pw = now_playing_panel::PANEL_WIDTH;
+    if content_area.width > pw + 40 {
+        let split = Layout::horizontal([
+            Constraint::Min(40),    // main content
+            Constraint::Length(pw), // now-playing panel
+        ])
+        .split(content_area);
+        now_playing_panel::render(f, split[1], app);
+        split[0]
+    } else {
+        content_area
+    }
+}
+
 /// The single entry point the event loop calls. Renders the full TUI frame:
 /// too-small guard, columns + player bar + footer, and any active overlay on top.
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -208,6 +230,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             ])
             .split(area);
         let content = split_sidebar(f, outer[0], app);
+        let content = split_now_playing_panel(f, content, app);
         columns::render(f, content, app);
         if sep_h > 0 {
             render_separator_rule(f, outer[1], app);
@@ -228,6 +251,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             .split(area);
         render_tab_bar(f, outer[0], app);
         let content = split_sidebar(f, outer[1], app);
+        let content = split_now_playing_panel(f, content, app);
         columns::render(f, content, app);
         if sep_h > 0 {
             render_separator_rule(f, outer[2], app);

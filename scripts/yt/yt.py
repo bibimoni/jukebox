@@ -394,29 +394,14 @@ def handle(cmd, arg, ytm):
         # main() returns {"ok": false, "error": "..."} — distinguishing a
         # genuinely empty library (Ok([])) from a failed fetch (Err).
         #
-        # The fallback (get_library) stays because ytmusicapi's
-        # get_library_playlists can raise on an intermittent alternate browse
-        # layout (singleColumnBrowseResultsRenderer) that its parser doesn't
-        # expect — an account/region-dependent response. get_library uses a
-        # more tolerant path.
-        try:
-            ps = ytm.get_library_playlists(limit=50)
-        except Exception:  # noqa: BLE001
-            # Fallback: get_library returns mixed sections; keep only entries
-            # that look like playlists (have a playlistId). If THIS also
-            # fails (or doesn't exist in the installed ytmusicapi version),
-            # let the exception propagate so the caller sees a real error
-            # instead of a silent empty list.
-            if hasattr(ytm, "get_library"):
-                lib = ytm.get_library()
-            else:
-                raise
-            if isinstance(lib, dict):
-                lib = lib.get("items", lib)
-            ps = [
-                it for it in (lib or [])
-                if isinstance(it, dict) and it.get("playlistId")
-            ]
+        # NOTE: the old get_library fallback was removed — ytm.get_library()
+        # doesn't exist in the installed ytmusicapi version, so the fallback
+        # was dead code. With browser auth (the startup fix), the primary
+        # get_library_playlists call works correctly. If it raises (rare
+        # singleColumnBrowseResultsRenderer layout), let the exception
+        # propagate — the Rust side surfaces it as yt_error and the user can
+        # press R to retry.
+        ps = ytm.get_library_playlists(limit=50)
         return {"playlists": [
             {"id": p.get("playlistId", ""), "name": p.get("title", ""), "count": p.get("playlistCount", 0)}
             for p in ps
@@ -459,13 +444,18 @@ def handle(cmd, arg, ytm):
             _sig.signal(_sig.SIGALRM, _old_handler)
     if cmd == "home":
         # 5s SIGALRM guard — get_home() can hang in guest mode (mirrors the
-        # home_suggestions handler above). On timeout, return an empty feed
-        # (NOT an error): an empty feed is a valid state for guest users.
+        # home_suggestions handler). On timeout, return an empty feed (NOT
+        # an error): an empty feed is a valid state for guest users. This
+        # runs in the main thread now (not a worker thread), so signal.alarm
+        # works. 15s — the 5s timeout was too tight for a cold start (first
+        # get_home() after login takes >5s due to browser cookie read +
+        # ytmusicapi warmup). Guest-mode hangs are truly indefinite, so 15s
+        # still catches them while giving authenticated cold starts room.
         import signal as _sig
         def _timeout_handler(signum, frame):
-            raise TimeoutError("get_home() timed out after 5s")
+            raise TimeoutError("get_home() timed out after 15s")
         _old_handler = _sig.signal(_sig.SIGALRM, _timeout_handler)
-        _sig.alarm(5)
+        _sig.alarm(15)
         try:
             out = []
             for sec in ytm.get_home():
@@ -487,25 +477,66 @@ def handle(cmd, arg, ytm):
             _sig.alarm(0)
             _sig.signal(_sig.SIGALRM, _old_handler)
     if cmd == "explore":
+        # ytmusicapi has no `get_explore()` — the Explore page is built from
+        # `get_mood_categories()` (returns sections → categories with `params`)
+        # + `get_mood_playlists(params)` per category (returns playlists).
+        # This is a two-step N+1 flow: 1 call for categories + N calls for
+        # playlists (N ≈ 15-20). We parallelize the per-category calls with a
+        # thread pool (each sub-thread creates its own YTMusic instance via
+        # _yt() since requests.Session isn't thread-safe; the cached browser
+        # cookie jar makes per-thread creation ~10ms).
+        import concurrent.futures
+        try:
+            cats = ytm.get_mood_categories()
+        except Exception:
+            return {"explore_playlists": []}
+        # Flatten all categories across all sections into (section, cat) pairs.
+        pairs = []
+        for section_name, category_list in cats.items():
+            if not isinstance(category_list, list):
+                continue
+            for cat in category_list:
+                if isinstance(cat, dict) and cat.get("params"):
+                    pairs.append((section_name, cat))
+        def _fetch_playlists(cat):
+            try:
+                return ytm.get_mood_playlists(cat.get("params", ""))
+            except Exception:  # noqa: BLE001
+                return []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(_fetch_playlists, [cat for _, cat in pairs]))
         out = []
-        for cat in ytm.get_explore():
-            for pl in cat.get("items", []):  # flatten across categories
+        for (section_name, cat), playlists in zip(pairs, results):
+            if not isinstance(playlists, list):
+                continue
+            for pl in playlists:
+                if not isinstance(pl, dict):
+                    continue
                 out.append({
                     "id": pl.get("playlistId", ""),
                     "title": pl.get("title", ""),
-                    "subtitle": pl.get("subtitle", ""),
-                    "count": pl.get("itemCount"),
+                    "subtitle": cat.get("title", "") or section_name,
+                    "count": pl.get("playlistCount"),
                 })
         return {"explore_playlists": out}
     if cmd == "charts":
+        # ytmusicapi `get_charts()` returns a dict like:
+        #   {"countries": {...}, "videos": [...], "artists": [...], "genres": [...]}
+        # The "countries" key has a dict value (not a list) — skip it. The
+        # items have different shapes: videos/genres have {title, playlistId};
+        # artists have {title, browseId, subscribers, rank, trend}. Use
+        # `subscribers` as the subtitle for artists; default to "" for others.
         out = []
         for chart_name, items in ytm.get_charts().items():
             if not isinstance(items, list):
                 continue
             for it in items:
+                if not isinstance(it, dict):
+                    continue
+                subtitle = it.get("subtitle") or it.get("subscribers") or ""
                 out.append({
                     "title": it.get("title", ""),
-                    "subtitle": it.get("subtitle", ""),
+                    "subtitle": subtitle,
                     "video_id": it.get("videoId"),
                     "playlist_id": it.get("playlistId"),
                     "artist": it.get("artists", [{}])[0].get("name") if it.get("artists") else None,
@@ -534,9 +565,15 @@ def handle(cmd, arg, ytm):
         # with a permissive format that accepts ANY audio (mp4a OR opus); a
         # set that yields no audio formats falls through to the next.
         if quality == "premium":
+            # YouTube's SABR-only streaming experiment blocks higher-quality
+            # formats for some clients/accounts. The tv/web clients return 0
+            # audio formats; android_music gets 260k but doesn't support
+            # cookies (can't authenticate as Premium). Try multiple client
+            # sets — the one that works varies by account/region/day.
             client_sets = [
                 {"player_client": ["tv", "web"], "remote_components": ["ejs:github"]},
                 {"player_client": ["tv_embedded", "mweb"], "remote_components": ["ejs:github"]},
+                {"player_client": ["web_safari"]},
             ]
         else:
             # Fast tier: only try ONE client set. The old code tried 3 sets
@@ -653,10 +690,18 @@ def handle(cmd, arg, ytm):
                 codec = acodec.split(".")[0].upper()
             else:
                 codec = "AAC"
-            # `premium` is quality-aware: only the premium tier can reach itag 141
-            # (AAC 256k). The fast tier always reports False (it caps at 129k even
-            # for a Premium account, since itag 141 isn't offered to tv_embedded).
-            is_premium = (quality == "premium") and authed and abr >= 256
+            # `premium` is quality-aware: only the premium tier can reach
+            # higher bitrates. The android_music client returns opus at ~260k
+            # (itag 774) for Premium accounts; the old tv/web client used
+            # to return AAC 256k (itag 141). Either way, abr >= 200 means
+            # the premium tier found a higher-quality stream.
+            is_premium = (quality == "premium") and authed and abr >= 200
+            # Include the title + artist from yt-dlp's extraction so the
+            # player bar / Queue view show the real title instead of the raw
+            # 11-char video_id. `title` is the video title; `uploader` is the
+            # channel name (fallback when `artist` tag is missing).
+            track_title = info.get("title") or ""
+            track_artist = info.get("artist") or info.get("uploader") or ""
             return {"resolve": {
                 "url": best.get("url") or info.get("url", ""),
                 "expires_at": None,
@@ -665,6 +710,8 @@ def handle(cmd, arg, ytm):
                 "sample_rate": int(best.get("asr") or 48000),
                 "container": best.get("ext", "m4a"),
                 "premium": is_premium,
+                "title": track_title,
+                "artist": track_artist,
             }}
         finally:
             # Unlink the short-lived temp cookie file as soon as yt-dlp has
@@ -759,9 +806,16 @@ def handle(cmd, arg, ytm):
         # caps the fetch (default 100) so a huge liked-songs library doesn't
         # block the single-threaded sidecar. Returns tracks via the shared
         # `_track` mapper.
+        # NOTE: get_liked_songs can raise "twoColumnBrowseResultsRenderer" when
+        # the auth doesn't have the full browser session cookies (pasted-cookie
+        # auth). Return empty (not an error) so the UI shows "no liked songs"
+        # instead of crashing the sidecar / triggering ReadyStale.
         limit = arg.get("limit", 100)
-        result = ytm.get_liked_songs(limit)
-        return {"liked_songs": [_track(t) for t in result.get("tracks", [])]}
+        try:
+            result = ytm.get_liked_songs(limit)
+            return {"liked_songs": [_track(t) for t in result.get("tracks", [])]}
+        except Exception:  # noqa: BLE001
+            return {"liked_songs": []}
     if cmd == "get_artist":
         # Artist info: name, channel id, shuffleId/radioId (for radio seeding),
         # subscriber counts, description, top songs, and related artists.
@@ -919,11 +973,13 @@ def main():
                   flush=True)
             continue
         # Only resolve_url is slow (yt-dlp retries across multiple client sets
-        # for DRM-protected videos, 10-30s). All other commands (home_suggestions,
-        # library_playlists, search, get_lyrics) are quick ytmusicapi calls (<2s).
-        # We only wrap resolve_url in a thread with timeout; other commands run
-        # directly in the main thread (ytmusicapi uses signal.alarm which only
-        # works in the main thread).
+        # for DRM-protected videos, 10-30s). The first cold-start resolve also
+        # downloads the EJS nsig solver (~10-15s) — a 5s timeout was too tight
+        # and caused false "timed out" errors on the first play from
+        # Explore/Charts. 30s gives the cold-start case room while still
+        # bounding a genuinely stuck resolve. The fast tier (tv_embedded, no
+        # nsig solver) usually finishes in 1-2s, so the user rarely waits
+        # the full 30s.
         if cmd == "resolve_url":
             try:
                 import threading
@@ -936,9 +992,9 @@ def main():
                         error_box[0] = e
                 t = threading.Thread(target=_run, daemon=True)
                 t.start()
-                t.join(timeout=5)
+                t.join(timeout=30)
                 if t.is_alive():
-                    print(json.dumps({"ok": False, "error": "request timed out (5s) — the video may be DRM-protected or YouTube is rate-limiting; try another track"}), flush=True)
+                    print(json.dumps({"ok": False, "error": "request timed out (30s) — the video may be DRM-protected or YouTube is rate-limiting; try another track"}), flush=True)
                     continue
                 if error_box[0] is not None:
                     raise error_box[0]
@@ -946,6 +1002,19 @@ def main():
             except Exception as e:  # noqa: BLE001
                 print(json.dumps({"ok": False, "error": str(e)}), flush=True)
             print(f"[sidecar] {cmd} done in {time.time()-_t0:.2f}s at {time.time():.3f}", file=sys.stderr, flush=True)
+        # home/explore/charts run in the main thread (NOT threaded). The
+        # threaded approach blocked the main loop with t.join(timeout), which
+        # wedged get_playlist commands behind a slow get_home — the user
+        # Enter'd a playlist but the fetch couldn't be processed until the
+        # home thread finished, causing "Loading playlist" to hang for 5s+
+        # and then error out. The Rust side's inflight guards already prevent
+        # duplicate sends, and on_tick's fetch-on-first-visit staggers the
+        # three fetches, so serial execution is safe. A slow get_home (cold
+        # start) may delay subsequent commands by 1-3s, but it won't time out
+        # or wedge the main loop. get_home's guest-mode hang is handled by
+        # the SIGALRM guard inside handle() (signal.alarm works in the main
+        # thread — that's why the threaded version had to remove it and use
+        # t.join instead, which caused this bug).
         else:
             try:
                 data = handle(cmd, req, ytm)

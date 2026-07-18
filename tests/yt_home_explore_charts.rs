@@ -57,17 +57,9 @@ fn fake_sidecar(map_json: &str) -> (PathBuf, PathBuf) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let map = std::env::temp_dir().join(format!(
-        "yt-home-map-{}-{}.json",
-        std::process::id(),
-        n
-    ));
+    let map = std::env::temp_dir().join(format!("yt-home-map-{}-{}.json", std::process::id(), n));
     std::fs::write(&map, map_json).unwrap();
-    let p = std::env::temp_dir().join(format!(
-        "yt-home-fake-{}-{}.py",
-        std::process::id(),
-        n
-    ));
+    let p = std::env::temp_dir().join(format!("yt-home-fake-{}-{}.py", std::process::id(), n));
     let mut f = std::fs::File::create(&p).unwrap();
     write!(
         f,
@@ -204,11 +196,7 @@ fn counting_sidecar(log_path: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let p = std::env::temp_dir().join(format!(
-        "yt-home-count-{}-{}.py",
-        std::process::id(),
-        n
-    ));
+    let p = std::env::temp_dir().join(format!("yt-home-count-{}-{}.py", std::process::id(), n));
     let mut f = std::fs::File::create(&p).unwrap();
     write!(
         f,
@@ -247,11 +235,7 @@ fn draining_sidecar() -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let p = std::env::temp_dir().join(format!(
-        "yt-home-drain-{}-{}.py",
-        std::process::id(),
-        n
-    ));
+    let p = std::env::temp_dir().join(format!("yt-home-drain-{}-{}.py", std::process::id(), n));
     std::fs::write(&p, "import sys\nfor line in sys.stdin: pass\n").unwrap();
     p
 }
@@ -285,10 +269,16 @@ fn send_home_populates_pending_home_sections() {
     let mut s = spawn_session(&script, &map_file);
 
     s.send_home().unwrap();
-    assert!(s.home_loading(), "home_inflight should be true right after send_home");
+    assert!(
+        s.home_loading(),
+        "home_inflight should be true right after send_home"
+    );
 
     let landed = poll_session(&mut s, |s| s.pending_home_sections.is_some());
-    assert!(landed, "pending_home_sections should be populated within 5s");
+    assert!(
+        landed,
+        "pending_home_sections should be populated within 5s"
+    );
 
     let sections = s.pending_home_sections.as_ref().unwrap();
     assert_eq!(sections.len(), 1, "one section in the response");
@@ -328,10 +318,16 @@ fn send_explore_populates_pending_explore_playlists() {
     let mut s = spawn_session(&script, &map_file);
 
     s.send_explore().unwrap();
-    assert!(s.explore_loading(), "explore_inflight true after send_explore");
+    assert!(
+        s.explore_loading(),
+        "explore_inflight true after send_explore"
+    );
 
     let landed = poll_session(&mut s, |s| s.pending_explore_playlists.is_some());
-    assert!(landed, "pending_explore_playlists should be populated within 5s");
+    assert!(
+        landed,
+        "pending_explore_playlists should be populated within 5s"
+    );
 
     let playlists = s.pending_explore_playlists.as_ref().unwrap();
     assert_eq!(playlists.len(), 1, "one playlist in the response");
@@ -443,24 +439,25 @@ fn on_tick_consumes_pending_home_sections_and_sets_cache() {
     assert_eq!(cached[0].title, "Listen again");
     assert_eq!(cached[1].title, "Today's hits");
 
-    // home.sections has the local sections PLUS the 2 YouTube shelves
-    // appended after them (the local sections are still there).
+    // home.sections has the 2 YouTube shelves PREPENDED before the local
+    // sections (YouTube content first, like the real YouTube Music app).
     let total = app.yt_view.home.sections.len();
     assert_eq!(
         total,
         local_section_count + 2,
-        "home.sections should have the local sections + 2 YouTube shelves appended"
+        "home.sections should have 2 YouTube shelves + local sections"
     );
 
     // Section title mapping: "Listen again" → ContinueListening,
     // "Today's hits" (unknown) → YtFeed("Today's hits").
-    let yt0 = &app.yt_view.home.sections[local_section_count];
+    // YouTube shelves are prepended (first 2 entries).
+    let yt0 = &app.yt_view.home.sections[0];
     assert_eq!(
         yt0.0,
         HomeSection::ContinueListening,
         "'Listen again' must map to HomeSection::ContinueListening"
     );
-    let yt1 = &app.yt_view.home.sections[local_section_count + 1];
+    let yt1 = &app.yt_view.home.sections[1];
     assert!(
         matches!(yt1.0, HomeSection::YtFeed(ref t) if t == "Today's hits"),
         "unknown title must map to HomeSection::YtFeed carrying the raw title, got {:?}",
@@ -572,7 +569,10 @@ fn inflight_guard_prevents_duplicate_send_home() {
     // Second send immediately after — must be a no-op (home_inflight is
     // already true → early return, no sidecar command sent).
     s.send_home().unwrap();
-    assert!(s.home_loading(), "home_inflight still true after second send_home");
+    assert!(
+        s.home_loading(),
+        "home_inflight still true after second send_home"
+    );
 
     // Wait for the single response to land + be drained.
     let landed = poll_session(&mut s, |s| s.pending_home_sections.is_some());
@@ -684,12 +684,9 @@ fn logout_clears_all_three_caches() {
     app.yt_script = script.clone();
 
     // Pre-populate all three caches with non-empty content.
-    app.yt_view.home_sections_cached =
-        Some(vec![jukebox::yt::proto::HomeSectionProto::default()]);
-    app.yt_view.explore_cached =
-        Some(vec![jukebox::yt::proto::PlaylistProto::default()]);
-    app.yt_view.charts_cached =
-        Some(vec![jukebox::yt::proto::ChartEntryProto::default()]);
+    app.yt_view.home_sections_cached = Some(vec![jukebox::yt::proto::HomeSectionProto::default()]);
+    app.yt_view.explore_cached = Some(vec![jukebox::yt::proto::PlaylistProto::default()]);
+    app.yt_view.charts_cached = Some(vec![jukebox::yt::proto::ChartEntryProto::default()]);
     assert!(app.yt_view.home_sections_cached.is_some());
     assert!(app.yt_view.explore_cached.is_some());
     assert!(app.yt_view.charts_cached.is_some());
@@ -765,9 +762,7 @@ fn r_refresh_on_home_does_not_duplicate_sections() {
     // Simulate the post-first-fetch state: local + YouTube shelves already
     // in `home.sections`, and the raw proto list stashed in the cache.
     app.yt_view.home.sections = local_plus_yt_sections();
-    app.yt_view.home_sections_cached = Some(vec![
-        jukebox::yt::proto::HomeSectionProto::default(),
-    ]);
+    app.yt_view.home_sections_cached = Some(vec![jukebox::yt::proto::HomeSectionProto::default()]);
     let pre_count = app.yt_view.home.sections.len();
     assert_eq!(
         pre_count, 2,
@@ -800,14 +795,21 @@ fn r_refresh_on_home_does_not_duplicate_sections() {
     );
 
     // The refresh re-fired `send_home` — verify the sidecar received a
-    // `home` command (give the reader thread a moment to flush the log).
-    std::thread::sleep(Duration::from_millis(100));
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-    let home_count = log.lines().filter(|l| l.trim() == "home").count();
+    // `home` command (poll the log for up to 2s — the sidecar's reader
+    // thread may need a moment to flush, especially under parallel test
+    // load).
+    let mut home_count = 0;
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        home_count = log.lines().filter(|l| l.trim() == "home").count();
+        if home_count >= 1 {
+            break;
+        }
+    }
     assert_eq!(
         home_count, 1,
-        "the sidecar must receive a 'home' command from the R refresh: \
-         log={log:?}"
+        "the sidecar must receive a 'home' command from the R refresh"
     );
 
     let _ = std::fs::remove_file(&script);
@@ -841,12 +843,9 @@ fn yt_logout_clears_home_sections() {
     // after the first fetch landed) and all three caches with non-empty
     // content.
     app.yt_view.home.sections = local_plus_yt_sections();
-    app.yt_view.home_sections_cached =
-        Some(vec![jukebox::yt::proto::HomeSectionProto::default()]);
-    app.yt_view.explore_cached =
-        Some(vec![jukebox::yt::proto::PlaylistProto::default()]);
-    app.yt_view.charts_cached =
-        Some(vec![jukebox::yt::proto::ChartEntryProto::default()]);
+    app.yt_view.home_sections_cached = Some(vec![jukebox::yt::proto::HomeSectionProto::default()]);
+    app.yt_view.explore_cached = Some(vec![jukebox::yt::proto::PlaylistProto::default()]);
+    app.yt_view.charts_cached = Some(vec![jukebox::yt::proto::ChartEntryProto::default()]);
     assert_eq!(
         app.yt_view.home.sections.len(),
         2,
@@ -947,11 +946,7 @@ fn delayed_explore_sidecar(delay_ms: u64) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let p = std::env::temp_dir().join(format!(
-        "yt-home-delayed-{}-{}.py",
-        std::process::id(),
-        n
-    ));
+    let p = std::env::temp_dir().join(format!("yt-home-delayed-{}-{}.py", std::process::id(), n));
     let mut f = std::fs::File::create(&p).unwrap();
     write!(
         f,

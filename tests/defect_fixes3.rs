@@ -140,12 +140,15 @@ fn def023_youtube_track_in_queue_visible_as_loading_without_session() {
     app.view = View::Queue;
     // A YouTube video id enqueued — no yt_session, so metadata can't resolve.
     // DEF-023: previously this row was DROPPED (track_by_id_fast returns None
-    // and filter_map skipped it). Now it must render as "Loading...".
+    // and filter_map skipped it). Now it must render as "Loading…" (the
+    // track_cache is empty — on_tick would fire a get_watch_playlist to fetch
+    // the metadata if a session existed; without one, the placeholder stays).
+    // Never show the raw 11-char video_id to the user.
     app.transport.manual_queue.push("v001".into());
     let buf = rendered_cols(&mut app, 120, 30);
     assert!(
         buf.contains("Loading"),
-        "DEF-023: YouTube track in queue must be visible (Loading...), not dropped: {buf}"
+        "DEF-023: YouTube track in queue must be visible (Loading placeholder), not dropped: {buf}"
     );
     assert!(
         !buf.contains("Queue is empty"),

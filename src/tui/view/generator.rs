@@ -153,7 +153,7 @@ pub fn render(_area: Rect, state: &GeneratorState, icons: &IconRenderer) -> Para
                         .title_map
                         .get(&track.track_id)
                         .cloned()
-                        .unwrap_or_else(|| track.track_id.clone());
+                        .unwrap_or_else(|| format!("Loading{}", ellipsis()));
                     // Truncate long titles with an ellipsis so a 3-line wrap
                     // doesn't break the numbered-list rhythm (RC11-DEF-039).
                     // 60 chars is the preview's usable width inside a 70-wide
