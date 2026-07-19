@@ -62,6 +62,18 @@ pub trait PaneModule: Send + Sync {
     /// drawn the border + title; the module owns the inner rect.
     fn render(&self, frame: &mut Frame, area: Rect, app: &mut App);
 
+    /// Render with the pane's focus state. Most modules rely on the pane
+    /// workspace for focus chrome, so the default delegates to `render`.
+    fn render_with_focus(&self, frame: &mut Frame, area: Rect, app: &mut App, _focused: bool) {
+        self.render(frame, area, app);
+    }
+
+    /// Whether this module draws its own outer border and title. The pane
+    /// workspace skips its generic block when this is true.
+    fn owns_chrome(&self) -> bool {
+        false
+    }
+
     /// Handle a key in Normal mode (when this module's pane is focused).
     /// Layout-edit commands (the `Ctrl+w` prefix) are handled by the pane
     /// layer before this is called, so the module never sees them.
@@ -243,15 +255,10 @@ impl PaneModule for YoutubeModule {
     }
 }
 
-/// "Now Playing" pane module: the big player bar as a pane. Renders the
-/// full-size now-playing view (title, artist, album, quality, big
-/// progress bar, transport, source badge, next-up preview) into a pane.
-///
-/// Uses [`crate::tui::view::player_bar_big::render_big`] when the pane
-/// is tall enough (>= `BIG_BAR_HEIGHT` = 10 rows), otherwise falls back
-/// to the side [`crate::tui::view::now_playing_panel::render`] which
-/// fits a narrower/shorter pane. Unlike the browse modules, this one
-/// doesn't swap `app.view` — the now-playing view is view-independent.
+/// "Now Playing" pane module. The responsive deck owns all breakpoint,
+/// metadata, state, progress, controls, source, and queue rendering.
+/// Unlike browse modules, this one does not swap `app.view` because
+/// playback status is view-independent.
 pub struct NowPlayingModule;
 
 impl PaneModule for NowPlayingModule {
@@ -262,19 +269,13 @@ impl PaneModule for NowPlayingModule {
         "Now Playing"
     }
     fn render(&self, frame: &mut Frame, area: Rect, app: &mut App) {
-        use crate::tui::view::now_playing_panel as npp;
-        use crate::tui::view::player_bar_big as pbb;
-
-        // The big player bar is designed for a 10-row-tall area at the
-        // bottom of the screen. In a pane, the pane's inner rect (after
-        // the pane border) may be smaller. Use the big renderer when
-        // the pane is tall enough; otherwise use the side panel
-        // renderer (which is more compact and works at any size).
-        if area.height >= pbb::BIG_BAR_HEIGHT {
-            pbb::render_big(frame, area, app);
-        } else {
-            npp::render(frame, area, app);
-        }
+        crate::tui::view::now_playing_deck::render_pane(frame, area, app, false);
+    }
+    fn render_with_focus(&self, frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
+        crate::tui::view::now_playing_deck::render_pane(frame, area, app, focused);
+    }
+    fn owns_chrome(&self) -> bool {
+        true
     }
     fn handle_key(&self, _key: KeyEvent, _app: &mut App) -> bool {
         false
@@ -327,49 +328,49 @@ yt_subtab_module!(
     ModuleId::YtHome,
     "YT Home",
     crate::tui::app::YtTab::Home,
-    crate::tui::view::yt_view::render_yt_home
+    crate::tui::view::yt_view::render_yt_home_pane
 );
 yt_subtab_module!(
     YtLibraryModule,
     ModuleId::YtLibrary,
     "YT Library",
     crate::tui::app::YtTab::Library,
-    crate::tui::view::yt_view::render_yt_library
+    crate::tui::view::yt_view::render_yt_library_pane
 );
 yt_subtab_module!(
     YtSearchModule,
     ModuleId::YtSearch,
     "YT Search",
     crate::tui::app::YtTab::Search,
-    crate::tui::view::yt_view::render_yt_search
+    crate::tui::view::yt_view::render_yt_search_pane
 );
 yt_subtab_module!(
     YtDiscoverModule,
     ModuleId::YtDiscover,
     "YT Discover",
     crate::tui::app::YtTab::Discover,
-    crate::tui::view::yt_view::render_yt_discover
+    crate::tui::view::yt_view::render_yt_discover_pane
 );
 yt_subtab_module!(
     YtRadioModule,
     ModuleId::YtRadio,
     "YT Radio",
     crate::tui::app::YtTab::Radio,
-    crate::tui::view::yt_view::render_yt_radio
+    crate::tui::view::yt_view::render_yt_radio_pane
 );
 yt_subtab_module!(
     YtExploreModule,
     ModuleId::YtExplore,
     "YT Explore",
     crate::tui::app::YtTab::Explore,
-    crate::tui::view::yt_view::render_yt_explore
+    crate::tui::view::yt_view::render_yt_explore_pane
 );
 yt_subtab_module!(
     YtChartsModule,
     ModuleId::YtCharts,
     "YT Charts",
     crate::tui::app::YtTab::Charts,
-    crate::tui::view::yt_view::render_yt_charts
+    crate::tui::view::yt_view::render_yt_charts_pane
 );
 
 /// Demo / placeholder module. Rendered as a centered "Press `m` to choose
@@ -389,37 +390,36 @@ impl PaneModule for PlaceholderModule {
         use ratatui::layout::Alignment;
         use ratatui::style::{Color, Modifier, Style};
         use ratatui::text::{Line, Span};
-        use ratatui::widgets::{Block, Borders, Paragraph};
+        use ratatui::widgets::Paragraph;
 
-        let block = Block::default().borders(Borders::ALL);
-        let inner = block.inner(area);
-        if inner.width < 10 || inner.height < 3 {
+        if area.width == 0 || area.height == 0 {
             return;
         }
-        let msg = Line::from(vec![
-            Span::styled(
-                "Press ",
-                Style::default()
-                    .fg(Color::Reset)
-                    .add_modifier(Modifier::DIM),
-            ),
-            Span::styled(
-                "m",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " to choose a module for this pane",
-                Style::default()
-                    .fg(Color::Reset)
-                    .add_modifier(Modifier::DIM),
-            ),
-        ]);
-        let para =
-            Paragraph::new(vec![Line::from(""), msg, Line::from("")]).alignment(Alignment::Center);
-        frame.render_widget(block, area);
-        frame.render_widget(para, inner);
+        let key = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let dim = Style::default()
+            .fg(Color::Reset)
+            .add_modifier(Modifier::DIM);
+        let msg = if area.width < 5 {
+            Line::from(Span::styled("m", key))
+        } else if area.width < 12 {
+            Line::from(vec![Span::styled("m", key), Span::styled(":", dim)])
+        } else if area.width < 28 {
+            Line::from(vec![Span::styled("m", key), Span::styled(": choose", dim)])
+        } else {
+            Line::from(vec![
+                Span::styled("Press ", dim),
+                Span::styled("m", key),
+                Span::styled(" to choose a module", dim),
+            ])
+        };
+        let lines = if area.height >= 3 {
+            vec![Line::from(""), msg, Line::from("")]
+        } else {
+            vec![msg]
+        };
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
     }
     fn handle_key(&self, _key: KeyEvent, _app: &mut App) -> bool {
         false

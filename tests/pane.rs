@@ -508,6 +508,79 @@ fn placeholder_module_renders() {
     // No panic; the placeholder module rendered into the right pane.
 }
 
+fn render_workspace_text(app: &mut App, width: u16, height: u16) -> String {
+    use jukebox::tui::pane::render::render_pane_workspace;
+    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+
+    let backend = TestBackend::new(width, height);
+    let mut term = Terminal::new(backend).unwrap();
+    let area = Rect::new(0, 0, width, height);
+    term.draw(|f| render_pane_workspace(f, area, app)).unwrap();
+    let mut output = String::new();
+    for y in 0..height {
+        for x in 0..width {
+            output.push_str(term.backend().buffer()[(x, y)].symbol());
+        }
+        output.push('\n');
+    }
+    output
+}
+
+#[test]
+fn tiny_placeholder_pane_still_renders_visible_hint() {
+    let mut app = build_app();
+    app.pane_workspace.root = jukebox::tui::pane::PaneNode::Split {
+        axis: jukebox::tui::pane::SplitAxis::Vertical,
+        ratio: 0.92,
+        first: Box::new(jukebox::tui::pane::PaneNode::Leaf {
+            id: PaneId(0),
+            module: ModuleId::Artists,
+        }),
+        second: Box::new(jukebox::tui::pane::PaneNode::Leaf {
+            id: PaneId(1),
+            module: ModuleId::Placeholder,
+        }),
+    };
+    app.pane_workspace.focused_pane = PaneId(1);
+    app.pane_workspace.enter_edit_mode();
+    app.pane_workspace.status_line_visible = false;
+
+    let output = render_workspace_text(&mut app, 50, 12);
+
+    assert!(
+        output.contains(" m") || output.contains("m:") || output.contains("m choose"),
+        "tiny placeholder must still show a module-picker hint so it can be found and removed:\n{output}"
+    );
+}
+
+#[test]
+fn yt_subtab_pane_does_not_render_nested_title() {
+    for (module, inner_title) in [
+        (ModuleId::YtLibrary, "Library"),
+        (ModuleId::YtSearch, "Search"),
+        (ModuleId::YtDiscover, "Discover"),
+        (ModuleId::YtRadio, "Radio"),
+        (ModuleId::YtExplore, "Explore"),
+        (ModuleId::YtCharts, "Charts"),
+    ] {
+        let mut app = build_app();
+        app.pane_workspace.root = jukebox::tui::pane::PaneNode::Leaf {
+            id: PaneId(0),
+            module,
+        };
+        app.pane_workspace.focused_pane = PaneId(0);
+        app.pane_workspace.enter_edit_mode();
+
+        let output = render_workspace_text(&mut app, 100, 24);
+        let nested_title = format!("┏{inner_title}");
+
+        assert!(
+            !output.contains(&nested_title),
+            "YT pane should use the outer pane title only, not inner title {inner_title}:\n{output}"
+        );
+    }
+}
+
 /// `Ctrl+w` is not reserved and doesn't conflict with existing keys.
 /// After `Ctrl+w`, a non-pane key falls through to normal dispatch.
 #[test]

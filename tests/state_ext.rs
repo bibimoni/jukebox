@@ -45,6 +45,7 @@ fn layout_round_trips() {
             player_bar_mode: "mini",
             track_layout_mode: "table",
             sidebar_visible: true,
+            player_bar_hidden: false,
             playlist_col: &jukebox::tui::app::PlaylistColumnState::default(),
             pane_workspace: None,
         },

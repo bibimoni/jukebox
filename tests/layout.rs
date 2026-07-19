@@ -90,6 +90,26 @@ fn layout_120x24() {
 }
 
 #[test]
+fn layout_160x50_wide() {
+    snapshot_at(160, 50, "wide_160x50");
+}
+
+#[test]
+fn layout_130x35_wide() {
+    snapshot_at(130, 35, "wide_130x35");
+}
+
+#[test]
+fn layout_100x28_medium() {
+    snapshot_at(100, 28, "medium_100x28");
+}
+
+#[test]
+fn layout_70x20_compact() {
+    snapshot_at(70, 20, "compact_70x20");
+}
+
+#[test]
 fn layout_80x24() {
     snapshot_at(80, 24, "standard");
 }
@@ -101,18 +121,33 @@ fn layout_70x24_narrow() {
 
 #[test]
 fn layout_too_small() {
-    snapshot_at(50, 18, "too_small");
+    snapshot_at(30, 8, "too_small");
     // Hard invariant: the too-small terminal must show the "terminal too small"
     // message and nothing else. Below the narrow floor (60×20).
-    let backend = TestBackend::new(50, 18);
+    let backend = TestBackend::new(30, 8);
     let mut term = Terminal::new(backend).unwrap();
     let mut app = build_app();
     term.draw(|f| draw(f, &mut app)).unwrap();
-    let s = buffer_string(&term, 50, 18);
+    let s = buffer_string(&term, 30, 8);
     assert!(
-        s.contains("terminal too small"),
+        s.contains("too small"),
         "too-small render must contain the resize message: {s}"
     );
+    // Phase 8 (visual spec M44 / A14): the message now includes the
+    // current + required dimensions so the user knows how much to resize.
+    assert!(
+        s.contains("30x8"),
+        "too-small render should include current dimensions: {s}"
+    );
+    assert!(
+        s.contains("60x20"),
+        "too-small render should include required dimensions: {s}"
+    );
+}
+
+#[test]
+fn layout_45x15_minimal_playback_shell() {
+    snapshot_at(45, 15, "minimal_playback_shell");
 }
 
 #[test]
@@ -225,8 +260,15 @@ fn active_tab_and_separator_are_rendered_across_full_width() {
     term.draw(|frame| draw(frame, &mut app)).unwrap();
     let rendered = buffer_string(&term, width, 25);
     let active = term.backend().buffer()[(26, 0)].modifier;
+    // Phase 3 visual spec H18/V22: active tab is now BOLD + UNDERLINED
+    // (not REVERSED, which collides with row selection). Both BOLD and
+    // UNDERLINED survive NO_COLOR and don't conflict with the selected-
+    // row style (REVERSED + BOLD).
     assert!(active.contains(Modifier::BOLD), "{rendered}");
-    assert!(active.contains(Modifier::REVERSED), "{rendered}");
+    assert!(
+        active.contains(Modifier::UNDERLINED),
+        "active tab must have UNDERLINED (Phase 3 visual spec H18/V22): {rendered}"
+    );
     assert!(
         rendered
             .lines()

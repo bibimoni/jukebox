@@ -811,13 +811,13 @@ fn end_to_end_rectangle_to_split_tree() {
     let mut app = build_app();
     enter_edit_mode(&mut app);
     enter_rectangle_selection(&mut app);
-    // Build a selection. Move anchor to (0.7, 0.7) — 10 right + 10 down
-    // (each step is 0.02, so 10 steps = 0.2; anchor ends at 0.5 + 0.2 =
-    // 0.7).
-    move_corner(&mut app, 10, 10);
+    // Build a 60%-wide/tall selection. The responsive Now Playing deck
+    // leaves a shorter pane at 80x24, so this must exceed the existing
+    // three-cell minimum after normalized coordinates are resolved.
+    move_corner(&mut app, 15, 15);
     handle_key(&mut app, key_code(KeyCode::Enter)); // → ChoosingExtent
-                                                    // Move cursor to (0.3, 0.3) — 10 left + 10 up.
-    move_corner(&mut app, -10, -10);
+                                                    // Move cursor to (0.2, 0.2).
+    move_corner(&mut app, -15, -15);
     handle_key(&mut app, key_code(KeyCode::Enter)); // → Confirming + picker
     assert!(matches!(
         app.overlay,
@@ -979,10 +979,16 @@ fn right_click_cancels_selection() {
     let mut app = build_app();
     enter_edit_mode(&mut app);
     enter_rectangle_selection(&mut app);
-    let area = Rect::new(0, 0, 100, 30);
+    let area = app.pane_content_area();
+    let inner = jukebox::tui::pane::input::focused_pane_inner_rect(&app)
+        .expect("focused pane should have an inner rect");
     handle_mouse_in_area(
         &mut app,
-        mouse(MouseEventKind::Down(MouseButton::Right), 50, 15),
+        mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            inner.x + inner.width / 2,
+            inner.y + inner.height / 2,
+        ),
         area,
     );
     assert!(

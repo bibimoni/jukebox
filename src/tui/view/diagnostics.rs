@@ -1,7 +1,7 @@
 //! Diagnostics overlay renderer: a scrollable list of recent diagnostic
 //! messages (provider errors, respawn notices, sidecar failures) captured
 //! by [`crate::diagnostics::Diagnostics`]. The overlay is intended to be
-//! opened from the `:` command mode (`:diag`) and closed with `Esc`; this
+//! opened from the `:` command mode (`:diag`) and closed with `ESC`; this
 //! module only renders — the toggle wiring lives in the input/layout layers.
 //!
 //! The buffer is bounded by [`crate::diagnostics::Diagnostics`]; here we
@@ -10,7 +10,6 @@
 
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
@@ -25,32 +24,32 @@ use crate::tui::view::theme::{em_dash, is_ascii, Theme, ASCII_BORDER_SET};
 /// centered rect over the screen); this function clears the area underneath
 /// so the overlay doesn't blend with the pane behind it. An empty buffer
 /// renders a single "no diagnostics yet" placeholder line.
+///
+/// Phase 2 (visual spec H17 / V16): the diagnostics border + title now
+/// use the accent color (matching every other overlay). Previously the
+/// border had no `border_style` call, so it rendered in the terminal
+/// default color — making diagnostics the lone outlier.
 pub fn render(f: &mut Frame, area: Rect, diag: &Diagnostics) {
     let theme = Theme::default();
-    let dim = Style::default().fg(if crate::tui::view::theme::no_color() {
-        Color::Reset
-    } else {
-        theme.dim
-    });
+    let dim = theme.status_description();
+    let accent = theme.status_key();
 
     // Clear the area so the overlay reads as a popup, not a blend with the
     // pane behind it (mirrors the Command overlay in `overlay::render_command`).
     f.render_widget(Clear, area);
 
-    let title_style = Style::default().add_modifier(Modifier::BOLD);
+    let title = format!("diagnostics {} Esc to close", em_dash());
     let block = if is_ascii() {
         Block::default()
             .borders(Borders::ALL)
             .border_set(ASCII_BORDER_SET)
-            .title(Span::styled(
-                format!("diagnostics {} Esc to close", em_dash()),
-                title_style,
-            ))
+            .border_style(accent)
+            .title(Span::styled(title, accent))
     } else {
-        Block::default().borders(Borders::ALL).title(Span::styled(
-            format!("diagnostics {} Esc to close", em_dash()),
-            title_style,
-        ))
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(accent)
+            .title(Span::styled(title, accent))
     };
 
     let msgs = diag.messages();

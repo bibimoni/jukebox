@@ -30,14 +30,14 @@
 #![allow(clippy::doc_lazy_continuation)]
 
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::tui::app::App;
 use crate::tui::pane::layout::{is_usable, resolve_rects, MIN_PANE_HEIGHT};
-use crate::tui::pane::model::UiMode;
+use crate::tui::pane::model::{ModuleId, UiMode};
 use crate::tui::pane::registry::registry;
 use crate::tui::pane::selection::SelectionPhase;
 use crate::tui::view::theme::{is_ascii, ASCII_BORDER_SET};
@@ -85,15 +85,17 @@ pub fn render_pane_workspace(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     // Reserve space for the status line in PaneEdit mode (only when
-    // the user hasn't hidden it via `Ctrl+w, S`).
-    let content_area = if mode == UiMode::PaneEdit
-        && status_line_visible
-        && area.height > STATUS_LINE_H + MIN_PANE_HEIGHT
-    {
-        Rect::new(area.x, area.y, area.width, area.height - STATUS_LINE_H)
-    } else {
-        area
-    };
+    // the user hasn't hidden it via `Ctrl+w, S`). Treat `PaneModulePicker`
+    // as a sub-mode of edit (visual spec H7/I5) so the status line stays
+    // visible while the picker is open — otherwise the user loses two
+    // mode cues ([EDIT] badge + keymap) at once when the picker opens.
+    let edit_or_picker = matches!(mode, UiMode::PaneEdit | UiMode::PaneModulePicker);
+    let content_area =
+        if edit_or_picker && status_line_visible && area.height > STATUS_LINE_H + MIN_PANE_HEIGHT {
+            Rect::new(area.x, area.y, area.width, area.height - STATUS_LINE_H)
+        } else {
+            area
+        };
     let panes = resolve_rects(&root_clone, content_area);
 
     // Paint each pane. We look up the module via the global registry
@@ -101,37 +103,47 @@ pub fn render_pane_workspace(f: &mut Frame, area: Rect, app: &mut App) {
     // render fn with `&mut app`. The static registry borrow doesn't
     // conflict with `&mut app`.
     for p in &panes {
-        if !is_usable(p.rect) {
-            continue;
-        }
-        let is_focused = p.pane_id == focused_pane;
-        let block = pane_block(p.module_id, is_focused, mode);
-        let inner = block.inner(p.rect);
-        if !is_usable(inner) {
-            // Inner too small after border — just paint the block.
-            f.render_widget(block, p.rect);
-            continue;
-        }
         // Look up the module via the global registry. The reference is
         // `&'static` so the borrow doesn't conflict with `&mut app`.
         if let Some(module) = registry().get(p.module_id) {
-            module.render(f, inner, app);
+            let is_focused = p.pane_id == focused_pane;
+            if !is_usable(p.rect) {
+                if p.module_id == ModuleId::Placeholder && p.rect.width > 0 && p.rect.height > 0 {
+                    let block = pane_block(p.module_id, is_focused, mode);
+                    let inner = block.inner(p.rect);
+                    f.render_widget(block, p.rect);
+                    if inner.width > 0 && inner.height > 0 {
+                        module.render_with_focus(f, inner, app, is_focused);
+                    }
+                }
+                continue;
+            }
+            if module.owns_chrome() {
+                module.render_with_focus(f, p.rect, app, is_focused);
+                continue;
+            }
+            let block = pane_block(p.module_id, is_focused, mode);
+            let inner = block.inner(p.rect);
+            if !is_usable(inner) {
+                // Inner too small after border — just paint the block.
+                f.render_widget(block, p.rect);
+                continue;
+            }
+            module.render_with_focus(f, inner, app, is_focused);
+            f.render_widget(block, p.rect);
         }
-        f.render_widget(block, p.rect);
     }
 
-    // Status line. Only rendered when the user hasn't hidden it.
-    if mode == UiMode::PaneEdit
-        && status_line_visible
-        && area.height > STATUS_LINE_H + MIN_PANE_HEIGHT
-    {
+    // Status line. Only rendered when the user hasn't hidden it. Fires
+    // for both PaneEdit and PaneModulePicker (visual spec H7/I5).
+    if edit_or_picker && status_line_visible && area.height > STATUS_LINE_H + MIN_PANE_HEIGHT {
         let status_area = Rect::new(
             area.x,
             area.bottom().saturating_sub(STATUS_LINE_H),
             area.width,
             STATUS_LINE_H,
         );
-        render_edit_status_line(f, status_area);
+        render_edit_status_line(f, status_area, mode);
     }
 
     // Rectangle selection preview (Phase 2): drawn on top of the
@@ -158,7 +170,7 @@ fn render_single_pane(
     pane: &crate::tui::pane::ResolvedPane,
 ) {
     if let Some(module) = registry().get(pane.module_id) {
-        module.render(f, area, app);
+        module.render_with_focus(f, area, app, true);
     }
 }
 
@@ -175,18 +187,21 @@ fn render_tiny_workspace(
     if let Some(p) = focused {
         if is_usable(p.rect) {
             if let Some(module) = registry().get(p.module_id) {
-                module.render(f, p.rect, app);
+                module.render_with_focus(f, p.rect, app, true);
             }
         }
     }
     // Toast at the bottom.
     if area.height >= 2 {
         let toast = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
+        // Phase 4 (visual spec V10): use theme.warning (not hardcoded
+        // Color::Yellow) so this collapses to Reset under NO_COLOR.
+        let theme = crate::tui::view::theme::Theme::default();
         let msg = "terminal too small for panes — resize or press Esc";
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 msg,
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme.warning),
             )))
             .alignment(Alignment::Center),
             toast,
@@ -197,73 +212,86 @@ fn render_tiny_workspace(
 /// Build the border block for a pane. Focused panes get accent + thick
 /// (Unicode) / accent + ASCII set (ASCII mode). Unfocused get dim +
 /// plain. In PaneEdit mode the focused pane's title gets an "EDIT" badge.
+///
+/// Phase 1 (visual spec): delegates to [`Theme::pane_block`] so the
+/// border color, border type (Thick vs Plain), and ASCII/Unicode branch
+/// are centralized. The `editing` flag is `true` when `mode == PaneEdit`
+/// (or `PaneModulePicker`, treated as a sub-mode of edit for rendering
+/// — visual spec H7/I5 so the `[EDIT]` badge doesn't disappear when the
+/// picker opens).
 fn pane_block(module: crate::tui::pane::ModuleId, focused: bool, mode: UiMode) -> Block<'static> {
     let theme = crate::tui::view::theme::Theme::default();
-    let color = if focused { theme.accent } else { theme.dim };
-
-    let title = if focused && mode == UiMode::PaneEdit {
+    let editing = focused && matches!(mode, UiMode::PaneEdit | UiMode::PaneModulePicker);
+    let title = if editing {
         format!("{} [EDIT]", module.label())
     } else {
         module.label().to_string()
     };
-
-    let mut block = if is_ascii() {
-        Block::default()
-            .borders(Borders::ALL)
-            .border_set(ASCII_BORDER_SET)
-            .border_style(Style::default().fg(color))
-    } else {
-        let bt = if focused {
-            BorderType::Thick
-        } else {
-            BorderType::Plain
-        };
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(bt)
-            .border_style(Style::default().fg(color))
-    };
-    block = block.title(Span::styled(title, Style::default().fg(color)));
-    block
+    theme.pane_block(&title, focused, editing)
 }
 
 /// Edit-mode status line: a one-line keymap hint at the bottom of the
-/// workspace. Dim text so it doesn't compete with content. Kept short
-/// enough to fit at 80 columns (the narrow path's minimum width).
-fn render_edit_status_line(f: &mut Frame, area: Rect) {
+/// workspace. Kept short enough to fit at 80 columns (the narrow path's
+/// minimum width).
+///
+/// Phase 1 (visual spec M4 / V23): keys use `Theme::status_key` (accent
+/// + BOLD), descriptions use `Theme::status_description` (dim), groups
+/// separated by ` · ` so the line reads as `[PANE EDIT] · hjkl move ·
+/// HJKL resize · …`. The key/description contrast makes the available
+/// commands scannable at a glance.
+///
+/// Phase 6 (visual spec H7/I5): when `mode == PaneModulePicker`, show
+/// the picker keymap instead of the edit keymap so the user knows the
+/// picker is the active sub-mode.
+fn render_edit_status_line(f: &mut Frame, area: Rect, mode: UiMode) {
     let theme = crate::tui::view::theme::Theme::default();
-    let nc = crate::tui::view::theme::no_color();
-    let accent = Style::default()
-        .fg(if nc { Color::Reset } else { theme.accent })
-        .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(if nc { Color::Reset } else { theme.dim });
+    let key = theme.status_key();
+    let desc = theme.status_description();
 
     // Clear the line so the pane content above doesn't bleed through.
     f.render_widget(Clear, area);
 
-    // Keep the status line concise: at 80 cols the content area is ~76
-    // cells (after rail). The full keymap doesn't fit, so we show the
-    // most important keys and let `?` (Help) carry the rest.
-    let spans: Vec<Span> = vec![
-        Span::styled("PANE EDIT", accent),
-        Span::styled(" ", dim),
-        Span::styled("hjkl", dim),
-        Span::styled(" move ", dim),
-        Span::styled("HJKL", dim),
-        Span::styled(" resize ", dim),
-        Span::styled("v/x/s", dim),
-        Span::styled(" split ", dim),
-        Span::styled("d", dim),
-        Span::styled(" close ", dim),
-        Span::styled("m", dim),
-        Span::styled(" module ", dim),
-        Span::styled("Tab", dim),
-        Span::styled(" cycle ", dim),
-        Span::styled("1-4", dim),
-        Span::styled(" module ", dim),
-        Span::styled("Esc", dim),
-        Span::styled(" exit", dim),
-    ];
+    // Group separator: ` · ` (Unicode) or ` * ` (ASCII). The `sep_dot`
+    // helper handles the font-mode branch.
+    let sep_dot = crate::tui::view::theme::sep_dot();
+    let group_sep = format!(" {sep_dot} ");
+
+    // Build the status line as alternating key / description spans,
+    // separated by ` · ` between groups. The first group is the mode
+    // label (e.g. `PANE EDIT`), styled as a key to anchor the line.
+    let mut spans: Vec<Span> = Vec::new();
+
+    let (mode_label, groups): (&str, &[(&str, &str)]) = match mode {
+        UiMode::PaneModulePicker => (
+            "PICK MODULE",
+            &[("j/k", "move"), ("Enter", "confirm"), ("Esc", "cancel")][..],
+        ),
+        _ => (
+            "PANE EDIT",
+            &[
+                ("hjkl", "move"),
+                ("HJKL", "resize"),
+                ("v/x/s", "split"),
+                ("d", "close"),
+                ("m", "module"),
+                ("Tab", "cycle"),
+                ("1-4", "module"),
+                ("Esc", "exit"),
+            ][..],
+        ),
+    };
+
+    // Mode label.
+    spans.push(Span::styled(mode_label, key));
+    // Each group: ` · key description`.
+    for (i, (k, d)) in groups.iter().enumerate() {
+        spans.push(Span::raw(group_sep.clone()));
+        spans.push(Span::styled(*k, key));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(*d, desc));
+        let _ = i; // (no trailing separator needed)
+    }
+
     f.render_widget(
         Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
         area,
@@ -307,16 +335,25 @@ fn render_rectangle_selection(f: &mut Frame, pane_rect: Rect, app: &mut App) {
     let sel_rect = sel.to_cell_rect(inner);
 
     let theme = crate::tui::view::theme::Theme::default();
-    let nc = crate::tui::view::theme::no_color();
-    let accent = if nc { Color::Reset } else { theme.accent };
-    let dim = if nc { Color::Reset } else { theme.dim };
+    // Phase 1 (visual spec M13/M14/V38/V39/I6): the rectangle selection
+    // is an active operation on the focused pane, so its border should
+    // be at least as strong as the focused pane's border. The prior
+    // `accent + DIM` was washed out and weak under NO_COLOR (DIM is
+    // poorly supported on some terminals). Now: `accent + BOLD` with
+    // `BorderType::Thick` — visually dominant, BOLD survives NO_COLOR.
+    let accent = theme.border_focused;
+    let dim = theme.dim;
 
     let is_valid = sel.is_valid(inner);
     let label = sel.dimensions_label(inner);
     let label_style = if is_valid {
         Style::default().fg(accent).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        // Phase 4 (visual spec V11): use theme.error (not hardcoded
+        // Color::Red) so this collapses to Reset/Bold under NO_COLOR.
+        Style::default()
+            .fg(theme.error)
+            .add_modifier(Modifier::BOLD)
     };
     let label_text = if is_valid {
         label.clone()
@@ -329,7 +366,10 @@ fn render_rectangle_selection(f: &mut Frame, pane_rect: Rect, app: &mut App) {
     // the rect is 0×0 (degenerate), we render a crosshair marker at the
     // anchor point instead.
     if sel_rect.width > 0 && sel_rect.height > 0 {
-        let border_style = Style::default().fg(accent).add_modifier(Modifier::DIM);
+        // Phase 1: Thick + accent + BOLD (no DIM). The selection sits ON
+        // TOP of the focused pane border, so it should be visually
+        // dominant. BOLD survives NO_COLOR; Thick is shape-distinct.
+        let border_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
         let block = if is_ascii() {
             Block::default()
                 .borders(Borders::ALL)
@@ -338,7 +378,7 @@ fn render_rectangle_selection(f: &mut Frame, pane_rect: Rect, app: &mut App) {
         } else {
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Plain)
+                .border_type(BorderType::Thick)
                 .border_style(border_style)
         };
         f.render_widget(block, sel_rect);
@@ -880,7 +920,18 @@ mod tests {
         let backend = TestBackend::new(80, 1);
         let mut term = Terminal::new(backend).unwrap();
         let area = Rect::new(0, 0, 80, 1);
-        term.draw(|f| render_edit_status_line(f, area)).unwrap();
+        term.draw(|f| render_edit_status_line(f, area, UiMode::PaneEdit))
+            .unwrap();
+    }
+
+    /// `render_edit_status_line` doesn't panic for the picker sub-mode.
+    #[test]
+    fn render_edit_status_line_picker_mode_no_panic() {
+        let backend = TestBackend::new(80, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 80, 1);
+        term.draw(|f| render_edit_status_line(f, area, UiMode::PaneModulePicker))
+            .unwrap();
     }
 
     /// `render_tiny_workspace` doesn't panic when the focused pane

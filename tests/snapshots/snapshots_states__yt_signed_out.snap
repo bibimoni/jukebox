@@ -12,17 +12,17 @@ DISCOVER                   │                  Connect to see your library, mix
 ♫   H Home                 │                  • Run :yt auth browser <chrome|firefox|safari> to sign in
 ✦   S Discover             │                              • Or paste cookies with :yt auth
 ◎ :radio Radio             │
-◆ :gen Generator           │                      Local music is fully functional while signed out.
-────────────────────────   │
-TOOLS                      │
-/   / Search               │
-!   D Diagnostics          │
-?   ? Help                 │
-                           │
-                           │
-                           │
-                           │
-                           │
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-[PLAYING] ▶ Song1 — 40mP  0:00 / 3:00  ▸ Next: (end)  24bit/96  PREF local · YT… · CONT off · SHUF off · RPT off
+╭─ NOW PLAYING ────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│Song1                                                                                                                 │
+│40mP                                                                                                                  │
+│Cosmic                                                                                                                │
+│LOCAL · 24-bit · 96 kHz                                                                                               │
+│▶ PLAYING  [Space] Pause                                                                                              │
+│0:00  ────────────────────────────────────────────────────────────  3:00                                              │
+│[←] Previous   [Space] Pause   [→] Next   Vol 70% ▰▰▰▰▰▰▰▱▱▱                                                          │
+│LOCAL                                                                                                                 │
+│Shuffle: Off   Repeat: Off   Continue: Off                                                                            │
+│Up next: Nothing queued                                                                                               │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 VIEW: youtube · SOURCE: local [Y —] · [!] YT: signed out — run :yt auth to reconnect

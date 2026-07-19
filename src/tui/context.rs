@@ -63,13 +63,18 @@ pub enum Context {
 
 impl Context {
     /// Human-readable label for the context bar / pane header.
+    ///
+    /// Phase 8 (visual spec C5 / A4): the `♫` glyph routes through
+    /// `theme::bullet()` so it becomes `*` under `JUKEBOX_FONT_MODE=ascii`.
+    /// The prior hardcoded `♫` leaked Unicode into ASCII-only terminals.
     pub fn label(&self) -> String {
+        let bullet = crate::tui::view::theme::bullet();
         match self {
             Context::Album { album, artist, .. } => format!("{artist} — {album}"),
             Context::Artist { artist, .. } => artist.clone(),
-            Context::Playlist { name } => format!("♫ {name}"),
+            Context::Playlist { name } => format!("{bullet} {name}"),
             Context::Search { query, .. } => format!("search: {query}"),
-            Context::Youtube { name, .. } => format!("♫ {name}"),
+            Context::Youtube { name, .. } => format!("{bullet} {name}"),
             Context::Queue => "Queue".into(),
         }
     }

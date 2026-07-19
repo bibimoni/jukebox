@@ -10,8 +10,10 @@ use jukebox::player::StubPlayer;
 use jukebox::search::Searcher;
 use jukebox::tui::app::{App, DiscoverItem, Overlay, View, YtTab};
 use jukebox::tui::input::{handle_key, handle_mouse_in_area};
+use jukebox::tui::keymap::{parse_key_spec, Action};
+use jukebox::tui::pane::model::{ModuleId, PaneId, Side};
 use jukebox::tui::queue::{RepeatMode, ShuffleMode};
-use jukebox::tui::view::{layout::player_bar_area, player_bar::geometry};
+use jukebox::tui::view::layout::player_bar_area;
 use ratatui::layout::Rect;
 
 /// A 3-track catalog under one artist/album, with real on-disk source files
@@ -57,6 +59,10 @@ fn key(c: char) -> KeyEvent {
 
 fn key_code(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+fn alt(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
 }
 
 /// Focus the track column (col 2) and place the cursor on track 0 of the album.
@@ -115,6 +121,48 @@ fn r_cycles_repeat_mode() {
 }
 
 #[test]
+fn capital_r_refreshes_focused_youtube_surface_instead_of_resuming() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.pane_workspace
+        .split(PaneId(0), Side::Right, ModuleId::YtCharts)
+        .unwrap();
+    app.yt_session = Some(fake_session());
+    app.yt_view.charts_cached = Some(Vec::new());
+    app.last_played_track_id = Some("t1".to_string());
+    app.resume_hint = Some("resume Song1".to_string());
+
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+    );
+
+    assert!(
+        app.now_playing.is_none(),
+        "R must not resume in YT surface panes"
+    );
+    assert!(
+        app.yt_view.charts_cached.is_none() && app.yt_session.as_ref().unwrap().charts_loading(),
+        "R should refresh the focused YouTube Charts pane"
+    );
+}
+
+#[test]
+fn alt_h_moves_pane_focus_in_normal_mode() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    let right = app
+        .pane_workspace
+        .split(PaneId(0), Side::Right, ModuleId::Queue)
+        .unwrap();
+    assert_eq!(app.pane_workspace.focused_pane, right);
+
+    handle_key(&mut app, alt('h'));
+
+    assert_eq!(app.pane_workspace.focused_pane, PaneId(0));
+}
+
+#[test]
 fn q_sets_should_quit() {
     let (_d, cat) = cat_album();
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
@@ -132,6 +180,145 @@ fn slash_opens_search_overlay_and_esc_closes_it() {
     assert!(matches!(app.overlay, Some(Overlay::Search { .. })));
     handle_key(&mut app, key_code(KeyCode::Esc));
     assert!(app.overlay.is_none());
+}
+
+#[test]
+fn custom_help_key_opens_help_overlay() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.keymap
+        .set_primary_binding(Action::HelpOpen, parse_key_spec("F1").unwrap());
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+
+    assert!(matches!(app.overlay, Some(Overlay::Help)));
+}
+
+#[test]
+fn custom_search_key_replaces_slash() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.keymap
+        .set_primary_binding(Action::SearchOpen, parse_key_spec("F2").unwrap());
+
+    handle_key(&mut app, key('/'));
+    assert!(
+        app.overlay.is_none(),
+        "old slash binding should be disabled after rebinding"
+    );
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+    assert!(matches!(app.overlay, Some(Overlay::Search { .. })));
+}
+
+#[test]
+fn custom_search_key_replaces_slash_in_youtube_view() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.view = View::Youtube;
+    app.yt_view.tab = YtTab::Home;
+    app.keymap
+        .set_primary_binding(Action::SearchOpen, parse_key_spec("F2").unwrap());
+
+    handle_key(&mut app, key('/'));
+    assert_eq!(
+        app.yt_view.tab,
+        YtTab::Home,
+        "old slash binding should be disabled in YT view"
+    );
+    assert!(app.overlay.is_none());
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+    assert!(matches!(app.overlay, Some(Overlay::Search { .. })));
+}
+
+#[test]
+fn custom_command_key_replaces_colon() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.keymap
+        .set_primary_binding(Action::CommandOpen, parse_key_spec("F3").unwrap());
+
+    handle_key(&mut app, key(':'));
+    assert!(
+        app.overlay.is_none(),
+        "old colon binding should be disabled after rebinding"
+    );
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+    assert!(matches!(app.overlay, Some(Overlay::Command { .. })));
+}
+
+#[test]
+fn ctrl_k_control_character_opens_keybindings() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('\u{b}'), KeyModifiers::NONE),
+    );
+
+    assert!(matches!(app.overlay, Some(Overlay::Keybindings { .. })));
+}
+
+#[test]
+fn ctrl_uppercase_k_event_opens_keybindings() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('K'), KeyModifiers::CONTROL),
+    );
+
+    assert!(matches!(app.overlay, Some(Overlay::Keybindings { .. })));
+}
+
+#[test]
+fn keys_command_opens_keybindings() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+
+    handle_key(&mut app, key(':'));
+    handle_key(&mut app, key('k'));
+    handle_key(&mut app, key('e'));
+    handle_key(&mut app, key('y'));
+    handle_key(&mut app, key('s'));
+    handle_key(&mut app, key_code(KeyCode::Enter));
+
+    assert!(matches!(app.overlay, Some(Overlay::Keybindings { .. })));
+}
+
+#[test]
+fn custom_next_key_replaces_gt() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    focus_track_col(&mut app);
+    handle_key(&mut app, key_code(KeyCode::Enter));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
+    app.keymap
+        .set_primary_binding(Action::PlaybackNext, parse_key_spec("F4").unwrap());
+
+    handle_key(&mut app, key('>'));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t1"));
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+    assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t2"));
+}
+
+#[test]
+fn custom_repeat_key_replaces_r() {
+    let (_d, cat) = cat_album();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.keymap
+        .set_primary_binding(Action::RepeatCycle, parse_key_spec("F5").unwrap());
+
+    handle_key(&mut app, key('r'));
+    assert_eq!(app.transport.repeat, RepeatMode::Off);
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
+    assert_eq!(app.transport.repeat, RepeatMode::All);
 }
 
 /// Build a small catalog (2 artists) backed by a real Tantivy index so a query
@@ -194,6 +381,44 @@ fn four_key_switches_to_youtube_view() {
     let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
     handle_key(&mut app, key('4'));
     assert_eq!(app.view, jukebox::tui::app::View::Youtube);
+}
+
+#[test]
+fn custom_youtube_view_key_replaces_four() {
+    let (_d, cat) = cat_with_index();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.keymap.config.keybindings.insert(
+        "navigation.view_youtube".to_string(),
+        vec!["F6".to_string()],
+    );
+    app.keymap = jukebox::tui::keymap::Keymap::from_config(app.keymap.config.clone(), Vec::new());
+
+    handle_key(&mut app, key('4'));
+    assert_eq!(app.view, View::Artists, "old 4 binding should be disabled");
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+    assert_eq!(app.view, View::Youtube);
+}
+
+#[test]
+fn custom_cycle_view_next_key_replaces_tab() {
+    let (_d, cat) = cat_with_index();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.keymap.config.keybindings.insert(
+        "navigation.view_cycle_next".to_string(),
+        vec!["F7".to_string()],
+    );
+    app.keymap = jukebox::tui::keymap::Keymap::from_config(app.keymap.config.clone(), Vec::new());
+
+    handle_key(&mut app, key_code(KeyCode::Tab));
+    assert_eq!(
+        app.view,
+        View::Artists,
+        "old Tab binding should be disabled"
+    );
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE));
+    assert_eq!(app.view, View::Playlists);
 }
 
 /// Regression for the "Capital letters dropped in search overlay input" bug.
@@ -591,24 +816,20 @@ fn mouse_uses_rendered_player_bar_geometry() {
     handle_key(&mut app, key_code(KeyCode::Enter));
     let screen = Rect::new(0, 0, 120, 25);
     let bar = player_bar_area(screen).expect("wide layout has a player bar");
-    let geo = geometry(bar);
 
-    handle_mouse_in_area(&mut app, click(geo.next.x, geo.next.y), screen);
+    // 120x25 selects the 12-row Medium deck. Its controls are the seventh
+    // inner row; `[→] Next` begins after Previous + gap + Space action + gap.
+    let controls_y = bar.y + 7;
+    let next_x = bar.x + 32;
+    handle_mouse_in_area(&mut app, click(next_x, controls_y), screen);
     assert_eq!(app.now_playing.as_ref().map(|s| s.id()), Some("t2"));
 
     let before = app.player.position();
-    handle_mouse_in_area(
-        &mut app,
-        click(geo.progress.right() + 2, geo.progress.y),
-        screen,
-    );
+    handle_mouse_in_area(&mut app, click(bar.x + 70, bar.y + 6), screen);
     assert_eq!(app.player.position(), before, "outside gauge must not seek");
 
-    handle_mouse_in_area(
-        &mut app,
-        click(geo.progress.x + geo.progress.width / 2, geo.progress.y),
-        screen,
-    );
+    // Elapsed label (4) + two spaces, then the capped 60-cell gauge.
+    handle_mouse_in_area(&mut app, click(bar.x + 7 + 30, bar.y + 6), screen);
     assert_eq!(app.player.position(), Some(90.0));
 }
 
@@ -1336,6 +1557,7 @@ fn rb3_persisted_youtube_view_is_not_a_trap() {
             player_bar_mode: "mini",
             track_layout_mode: "table",
             sidebar_visible: app.sidebar_visible,
+            player_bar_hidden: app.player_bar_state.hidden,
             playlist_col: &PlaylistColumnState::default(),
             pane_workspace: None,
         },

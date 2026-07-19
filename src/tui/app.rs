@@ -510,6 +510,10 @@ pub enum Overlay {
         /// Cursor into `ModuleId::all()`.
         cursor: usize,
     },
+    Keybindings {
+        cursor: usize,
+        capturing: bool,
+    },
 }
 
 /// Actions that can be confirmed via [`Overlay::Confirm`].
@@ -955,6 +959,7 @@ pub struct App {
     /// or after the module picker confirms (the rectangle is converted
     /// to split-tree ops and the selection is consumed).
     pub rectangle_selection: Option<crate::tui::pane::RectangleSelection>,
+    pub keymap: crate::tui::keymap::Keymap,
 }
 
 /// Inline filter state for the `f` filter-on-focused-column (spec §5.4).
@@ -1065,17 +1070,22 @@ impl App {
     pub fn pane_content_area(&self) -> ratatui::layout::Rect {
         let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
         let area = ratatui::layout::Rect::new(0, 0, w, h);
-        // Subtract the rail (when visible) so pane focus uses the same
+        // Subtract the sidebar when render does, so pane focus uses the same
         // coordinate frame as the rendered panes.
-        let main = if self.sidebar_visible {
-            area
+        let main = if crate::tui::view::sidebar::is_visible(self, area.width) {
+            let sw = crate::tui::view::sidebar::sidebar_width(area.width);
+            if sw > 0 && area.width > sw {
+                let split = ratatui::layout::Layout::horizontal([
+                    ratatui::layout::Constraint::Length(sw),
+                    ratatui::layout::Constraint::Min(1),
+                ])
+                .split(area);
+                split[1]
+            } else {
+                area
+            }
         } else {
-            let split = ratatui::layout::Layout::horizontal([
-                ratatui::layout::Constraint::Length(self.column_widths.rail),
-                ratatui::layout::Constraint::Min(1),
-            ])
-            .split(area);
-            split[1]
+            area
         };
         crate::tui::view::layout::overlay_content_area(main)
     }
@@ -1228,6 +1238,7 @@ impl App {
             pane_workspace: crate::tui::pane::PaneWorkspace::new(),
             pending_pane_prefix: false,
             rectangle_selection: None,
+            keymap: crate::tui::keymap::Keymap::load_or_default(),
         }
     }
 
@@ -6184,6 +6195,15 @@ impl App {
     /// `note_play_started`).
     fn set_play_start_offset(&mut self, offset: f64) {
         self.play_start_offset = offset.max(0.0);
+    }
+
+    /// Execute the action advertised by the deck's `[Space]` control.
+    pub fn toggle_or_resume(&mut self) {
+        if self.now_playing.is_none() && self.resume_hint.is_some() && self.pending_play.is_none() {
+            self.resume_last();
+        } else {
+            self.toggle_pause();
+        }
     }
 
     /// RC14-DEF-4: toggle pause/resume on the player backend AND track the

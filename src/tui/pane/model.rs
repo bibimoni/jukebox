@@ -36,8 +36,8 @@ pub enum ModuleId {
     /// The big "Now Playing" player bar as a pane module. Renders the
     /// full-size now-playing view (title, artist, album, quality, big
     /// progress bar, transport, source badge, next-up preview) into a
-    /// pane. Useful for dedicating a pane to playback status. Wraps
-    /// `view::player_bar_big::render_big` + `view::now_playing_panel`.
+    /// pane. Useful for dedicating a pane to playback status. Uses the
+    /// responsive `view::now_playing_deck` renderer at every pane size.
     NowPlaying,
     /// YouTube Home sub-tab as a pane module. Renders just the Home
     /// content (Quick Picks, mixes, radio shelves) without the sub-tab
@@ -722,27 +722,25 @@ fn resize_recursive(
 
     // Check if THIS is a matching ancestor. The axis must match the
     // requested direction (Vertical for left/right, Horizontal for
-    // up/down), and the focused pane must be on the side that lets the
-    // boundary move in the requested direction.
+    // up/down). Either child position matches — the delta pushes the
+    // split boundary in the requested direction, growing one side and
+    // shrinking the other. E.g. `L` (Right) on the left child grows it
+    // (ratio increases); `L` on the right child shrinks it (ratio also
+    // increases, giving more space to the left sibling). This lets the
+    // user resize any pane from either side — the prior side_matches
+    // check prevented resizing the rightmost/bottommost pane with `L`/`J`.
     let axis_matches = match dir {
         Direction::Left | Direction::Right => *axis == SplitAxis::Vertical,
         Direction::Up | Direction::Down => *axis == SplitAxis::Horizontal,
     };
-    let side_matches = match dir {
-        // Growing left = shrinking the left sibling = focused pane is the
-        // SECOND (right) child of a Vertical split; decrease ratio.
-        Direction::Left => pos == ChildPos::Second,
-        // Growing right = shrinking the right sibling = focused pane is
-        // the FIRST (left) child; increase ratio.
-        Direction::Right => pos == ChildPos::First,
-        // Growing down = shrinking the bottom sibling = focused pane is
-        // the FIRST (top) child of a Horizontal split; increase ratio.
-        Direction::Down => pos == ChildPos::First,
-        // Growing up = shrinking the top sibling = focused pane is the
-        // SECOND (bottom) child; decrease ratio.
-        Direction::Up => pos == ChildPos::Second,
-    };
-    if axis_matches && side_matches {
+    if axis_matches {
+        // Right/Down = boundary moves in the positive direction (ratio
+        // increases, more space to the FIRST child). Left/Up = boundary
+        // moves in the negative direction (ratio decreases, more space
+        // to the SECOND child). Regardless of which child is focused,
+        // the boundary moves the same way — the focused pane either
+        // grows (if it's on the receiving side) or shrinks (if it's on
+        // the giving side).
         let delta = if matches!(dir, Direction::Left | Direction::Up) {
             -step
         } else {
@@ -1059,15 +1057,19 @@ mod tests {
             leaf(0, ModuleId::Artists),
             leaf(1, ModuleId::Queue),
         );
-        // Focused = A (left). Grow left — no left sibling to shrink.
+        // Focused = A (left). Press Left — with the new resize semantics
+        // (Phase 9 fix), Left on the leftmost pane SHRINKS it (the right
+        // boundary moves left, ratio decreases, giving more space to the
+        // right sibling). This is no longer a noop — the user can resize
+        // any pane from either side.
         let path = find_path(&root, PaneId(0)).unwrap();
         assert_eq!(
             resize_recursive(&mut root, &path, Direction::Left, 0.02),
-            ResizeResult::NoAncestor
+            ResizeResult::Resized
         );
-        // Ratio unchanged.
+        // Ratio decreased (left pane shrank).
         match root {
-            PaneNode::Split { ratio, .. } => assert!((ratio - 0.5).abs() < 1e-6),
+            PaneNode::Split { ratio, .. } => assert!((ratio - 0.48).abs() < 1e-6),
             _ => panic!("expected Split"),
         }
     }
@@ -1461,8 +1463,11 @@ mod tests {
     /// fall through to check the current split. Tree: Split(V,
     /// Split(H, A, B), C). Focus on A. Grow A left — the inner H split
     /// doesn't match (Left needs Vertical), so the deeper call returns
-    /// NoAncestor. The outer V split doesn't match either (A is First,
-    /// grow-left needs Second). So the whole thing returns NoAncestor.
+    /// NoAncestor for the inner H split. The outer V split DOES match
+    /// now (Phase 9 fix: Left on the First child shrinks it by
+    /// decreasing the ratio). So the result is Resized — the outer V
+    /// split's ratio decreases, shrinking A's subtree and growing the
+    /// right sibling (Youtube pane).
     #[test]
     fn resize_recursive_first_child_deeper_no_ancestor_falls_through() {
         let mut root = split(
@@ -1477,11 +1482,11 @@ mod tests {
             leaf(2, ModuleId::Youtube),
         );
         let path = find_path(&root, PaneId(0)).unwrap();
-        // Grow A left — no matching ancestor anywhere.
+        // Press Left on A — the inner H split doesn't match (Left needs
+        // Vertical). The outer V split matches (Phase 9 fix: Left on
+        // First child shrinks it). Result is Resized.
         let res = resize_recursive(&mut root, &path, Direction::Left, 0.05);
-        // The outer V split COULD match: A is First, grow-left needs
-        // Second. So no — outer doesn't match. Result is NoAncestor.
-        assert_eq!(res, ResizeResult::NoAncestor);
+        assert_eq!(res, ResizeResult::Resized);
     }
 
     /// `move_focus` on a workspace returns false when there's no

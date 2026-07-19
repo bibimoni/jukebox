@@ -21,6 +21,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use crate::tui::app::{App, Overlay};
 use crate::tui::pane::focus::move_focus_directional;
 use crate::tui::pane::layout::resolve_rects;
+use crate::tui::pane::model::PaneId;
 use crate::tui::pane::model::{Direction, ModuleId, Side, UiMode};
 use crate::tui::pane::selection::{
     NormalizedPoint, RectangleSelection, SelectionInput, SelectionPhase,
@@ -55,8 +56,12 @@ pub fn handle_prefix_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('e') => {
             if app.pane_workspace.mode == UiMode::PaneEdit {
                 app.pane_workspace.exit_edit_mode();
+                app.set_status_toast("exited pane edit mode".into());
             } else {
                 app.pane_workspace.enter_edit_mode();
+                app.set_status_toast(
+                    "EDIT MODE — hjkl move · v/x split · d close · m module · Esc exit".into(),
+                );
             }
             true
         }
@@ -72,11 +77,19 @@ pub fn handle_prefix_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Right => move_focus(app, Direction::Right),
         // `Ctrl+w, Tab` / `Ctrl+w, Shift+Tab` — cycle pane focus.
         KeyCode::Tab => cycle_focus(app, !key.modifiers.contains(KeyModifiers::SHIFT)),
-        // `Ctrl+w, S` (capital) toggles the PANE EDIT status line in
-        // any mode. Distinct from `s` (lowercase) which would fall
+        // `Ctrl+w, S` (capital) toggles the now-playing player bar
+        // visibility. When hidden, the bar's rows go to the browse area
+        // so panes get more vertical room. The footer (keymap hint)
+        // stays visible. Distinct from `s` (lowercase) which would fall
         // through to the global `S` discover overlay.
         KeyCode::Char('S') => {
-            app.pane_workspace.toggle_status_line();
+            app.player_bar_state.hidden = !app.player_bar_state.hidden;
+            let msg = if app.player_bar_state.hidden {
+                "player bar hidden"
+            } else {
+                "player bar shown"
+            };
+            app.set_status_toast(msg.into());
             true
         }
         // All other keys after `Ctrl+w` are not pane commands — let them
@@ -86,7 +99,7 @@ pub fn handle_prefix_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 /// Move the pane focus in a direction. Returns true if focus moved.
-fn move_focus(app: &mut App, dir: Direction) -> bool {
+pub fn move_focus(app: &mut App, dir: Direction) -> bool {
     let panes = resolve_rects(&app.pane_workspace.root, app.pane_content_area());
     if let Some(new) = move_focus_directional(&panes, app.pane_workspace.focused_pane, dir) {
         app.pane_workspace.set_focused(new);
@@ -101,7 +114,7 @@ fn move_focus(app: &mut App, dir: Direction) -> bool {
 }
 
 /// Cycle pane focus forward (true) or backward (false).
-fn cycle_focus(app: &mut App, forward: bool) -> bool {
+pub fn cycle_focus(app: &mut App, forward: bool) -> bool {
     let panes = resolve_rects(&app.pane_workspace.root, app.pane_content_area());
     if let Some(new) =
         crate::tui::pane::focus::cycle_focus(&panes, app.pane_workspace.focused_pane, forward)
@@ -122,15 +135,41 @@ fn sync_app_view_to_focused_pane(app: &mut App) {
     if let Some(view) = module_to_view(module) {
         app.view = view;
     }
+    if let Some(tab) = module_to_yt_tab(module) {
+        app.yt_view.tab = tab;
+    }
 }
 
-fn focused_module(ws: &PaneWorkspace) -> ModuleId {
+pub fn focused_module(ws: &PaneWorkspace) -> ModuleId {
     let panes = resolve_rects(&ws.root, ratatui::layout::Rect::new(0, 0, 1, 1));
     panes
         .iter()
         .find(|p| p.pane_id == ws.focused_pane)
         .map(|p| p.module_id)
         .unwrap_or(ModuleId::Artists)
+}
+
+/// Look up the module assigned to a specific pane id. Returns
+/// `ModuleId::Artists` as a fallback if the pane isn't found (defensive —
+/// the target pane is always in the tree).
+fn module_of_pane(ws: &PaneWorkspace, pane: PaneId) -> ModuleId {
+    let panes = resolve_rects(&ws.root, ratatui::layout::Rect::new(0, 0, 1, 1));
+    panes
+        .iter()
+        .find(|p| p.pane_id == pane)
+        .map(|p| p.module_id)
+        .unwrap_or(ModuleId::Artists)
+}
+
+/// Check if any pane OTHER than `exclude` has the given module. Used to
+/// warn the user when they're about to create a duplicate pane (same
+/// module in two panes — both render the same content via shared global
+/// cursor state, which is confusing per the user's report).
+fn any_other_pane_has_module(ws: &PaneWorkspace, module: ModuleId, exclude: PaneId) -> bool {
+    let panes = resolve_rects(&ws.root, ratatui::layout::Rect::new(0, 0, 1, 1));
+    panes
+        .iter()
+        .any(|p| p.pane_id != exclude && p.module_id == module)
 }
 
 fn module_to_view(module: ModuleId) -> Option<crate::tui::app::View> {
@@ -147,6 +186,19 @@ fn module_to_view(module: ModuleId) -> Option<crate::tui::app::View> {
         | ModuleId::YtExplore
         | ModuleId::YtCharts => Some(crate::tui::app::View::Youtube),
         ModuleId::NowPlaying | ModuleId::Placeholder => None,
+    }
+}
+
+fn module_to_yt_tab(module: ModuleId) -> Option<crate::tui::app::YtTab> {
+    match module {
+        ModuleId::YtHome => Some(crate::tui::app::YtTab::Home),
+        ModuleId::YtLibrary | ModuleId::Youtube => Some(crate::tui::app::YtTab::Library),
+        ModuleId::YtSearch => Some(crate::tui::app::YtTab::Search),
+        ModuleId::YtDiscover => Some(crate::tui::app::YtTab::Discover),
+        ModuleId::YtRadio => Some(crate::tui::app::YtTab::Radio),
+        ModuleId::YtExplore => Some(crate::tui::app::YtTab::Explore),
+        ModuleId::YtCharts => Some(crate::tui::app::YtTab::Charts),
+        _ => None,
     }
 }
 
@@ -220,10 +272,16 @@ pub fn handle_pane_edit_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('J') => return resize_focused(app, Direction::Down),
         KeyCode::Char('K') => return resize_focused(app, Direction::Up),
         KeyCode::Char('L') => return resize_focused(app, Direction::Right),
-        // `S` (capital) toggles the PANE EDIT status line. Distinct
-        // from `s` (lowercase) which opens the split picker.
+        // `S` (capital) toggles the now-playing player bar visibility.
+        // Distinct from `s` (lowercase) which opens the split picker.
         KeyCode::Char('S') => {
-            app.pane_workspace.toggle_status_line();
+            app.player_bar_state.hidden = !app.player_bar_state.hidden;
+            let msg = if app.player_bar_state.hidden {
+                "player bar hidden"
+            } else {
+                "player bar shown"
+            };
+            app.set_status_toast(msg.into());
             return true;
         }
         _ => {}
@@ -325,7 +383,7 @@ pub fn handle_pane_edit_key(app: &mut App, key: KeyEvent) -> bool {
     // (we don't intercept it here — the prefix handler is pane-mode-aware).
     match key.code {
         KeyCode::Char(' ') => {
-            app.toggle_pause();
+            app.toggle_or_resume();
             return true;
         }
         KeyCode::Char('>') => {
@@ -380,6 +438,15 @@ fn resize_focused(app: &mut App, dir: Direction) -> bool {
 /// Change the focused pane's module. Returns true (consumed).
 fn change_focused_module(app: &mut App, module: ModuleId) -> bool {
     let target = app.pane_workspace.focused_pane;
+    // Warn the user if another pane already shows this module. Two
+    // panes with the same module render identical content (shared
+    // global cursor state) — the user reported this as confusing.
+    if any_other_pane_has_module(&app.pane_workspace, module, target) {
+        app.set_status_toast(format!(
+            "another pane already shows {} — Tab to switch panes",
+            module.label()
+        ));
+    }
     app.pane_workspace.set_module(target, module);
     sync_app_view_to_focused_pane(app);
     true
@@ -410,10 +477,18 @@ pub fn handle_split_direction_key(app: &mut App, key: KeyEvent) -> bool {
         // Take the overlay to get the target pane id, then open the
         // module picker with the pending split.
         if let Some(Overlay::PaneSplitDirection { target_pane }) = app.overlay.take() {
+            // Start the cursor at a module that ISN'T the source pane's
+            // module, so the default Enter doesn't create a duplicate
+            // pane showing the same view. The user's complaint: "it
+            // didn't just a subpanel, i can interact inside it, this
+            // behavior is confusing" — two identical Artists panes.
+            let source_module = module_of_pane(&app.pane_workspace, target_pane);
+            let all = ModuleId::all();
+            let cursor = all.iter().position(|m| *m != source_module).unwrap_or(0);
             app.overlay = Some(Overlay::PaneModulePicker {
                 target_pane,
                 pending_split: Some(side),
-                cursor: 0,
+                cursor,
             });
             return true;
         }
@@ -450,6 +525,17 @@ pub fn handle_module_picker_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Enter => {
             let module = modules[cursor.min(n - 1)];
+            // Warn the user if another pane already shows this module.
+            // Two panes with the same module render identical content
+            // (shared global cursor state) which is confusing — the
+            // user reported: "i can interact inside it, this behavior
+            // is confusing and isn't what i wanted."
+            if any_other_pane_has_module(&app.pane_workspace, module, target_pane) {
+                app.set_status_toast(format!(
+                    "another pane already shows {} — Tab to switch panes",
+                    module.label()
+                ));
+            }
             if let Some(selection) = app.rectangle_selection.take() {
                 // Rectangle selection confirmed: convert the rectangle
                 // to split-tree ops + install the chosen module in the

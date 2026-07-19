@@ -11,6 +11,12 @@ fn disp_width_counts_cjk_as_two() {
 }
 
 #[test]
+fn disp_width_counts_terminal_emoji_width() {
+    assert_eq!(disp_width("🎵"), 2);
+    assert_eq!(disp_width("A🎵B"), 4);
+}
+
+#[test]
 fn display_width_zero_width() {
     // Zero-width space (U+200B) and zero-width non-joiner (U+200C) count as 0.
     assert_eq!(

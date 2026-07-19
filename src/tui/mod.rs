@@ -2,6 +2,7 @@ pub mod app;
 pub mod context;
 pub mod event;
 pub mod input;
+pub mod keymap;
 pub mod pane;
 pub mod queue;
 pub mod view;

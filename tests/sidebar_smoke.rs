@@ -38,11 +38,14 @@ fn sidebar_smoke_100x30() {
         "Home",
         "Generator",
         "Search",
-        "Help",
     ] {
         assert!(
             text.contains(c),
             "sidebar smoke: missing {c} at 100x30:\n{text}"
         );
     }
+    assert!(
+        text.contains("? help"),
+        "help must remain discoverable in the footer at 100x30:\n{text}"
+    );
 }

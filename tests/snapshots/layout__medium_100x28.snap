@@ -1,0 +1,32 @@
+---
+source: tests/layout.rs
+expression: s
+---
+1:Artists │ 2:Playlists │ 3:Queue │ 4:YouTube                                                Artists
+VIEWS                  │┏Artists━━━━━━━━━━━━━━━┓┌Albums────────────────────┐┌Tracks────────────────┐
+›   1 Artists          │┃▸ 40mP                ┃│Cosmic                    ││▶  1 Song1 — 40mP 24b…│
+›   2 Playlists        │┃  DECO*27             ┃│                          ││                      │
+›   3 Queue            │┃                      ┃│                          ││                      │
+›   4 YouTube          │┃                      ┃│                          ││                      │
+───────────────────────│┃                      ┃│                          ││                      │
+DISCOVER               │┃                      ┃│                          ││                      │
+♫   H Home             │┃                      ┃│                          ││                      │
+✦   S Discover         │┃                      ┃│                          ││                      │
+◎ :radio Radio         │┃                      ┃│                          ││                      │
+◆ :gen Generator       │┃                      ┃│                          ││                      │
+───────────────────────│┗━━━━━━━━━━━━━━━━━━━━━━┛└──────────────────────────┘└──────────────────────┘
+────────────────────────────────────────────────────────────────────────────────────────────────────
+╭─ NOW PLAYING ────────────────────────────────────────────────────────────────────────────────────╮
+│Song1                                                                                             │
+│40mP                                                                                              │
+│Cosmic                                                                                            │
+│LOCAL · 24-bit · 96 kHz                                                                           │
+│▶ PLAYING  [Space] Pause                                                                          │
+│0:00  ────────────────────────────────────────────────────────────  3:00                          │
+│[←] Previous   [Space] Pause   [→] Next   Vol 70% ▰▰▰▰▰▰▰▱▱▱                                      │
+│LOCAL                                                                                             │
+│Shuffle: Off   Repeat: Off   Continue: Off                                                        │
+│Up next: Nothing queued                                                                           │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+VIEW: local · SOURCE: local [Y —]
+Space pause · q quit · ? help · 1-4 view · > < next prev · M pref · / search

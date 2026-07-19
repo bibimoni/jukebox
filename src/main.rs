@@ -158,6 +158,7 @@ fn main() -> anyhow::Result<()> {
                         &layout.track_layout_mode,
                     );
                 app.sidebar_visible = layout.sidebar_visible;
+                app.player_bar_state.hidden = layout.player_bar_hidden;
                 app.playlist_col = jukebox::tui::app::PlaylistColumnState {
                     width: layout.playlist_col.width,
                     group_by_type: layout.playlist_col.group_by_type,
@@ -427,6 +428,7 @@ fn main() -> anyhow::Result<()> {
                 },
                 track_layout_mode: app.player_bar_state.track_layout.as_str(),
                 sidebar_visible: app.sidebar_visible,
+                player_bar_hidden: app.player_bar_state.hidden,
                 playlist_col: &app.playlist_col,
                 pane_workspace: Some(&crate::tui::pane::persistence::PaneWorkspaceDto::from(
                     &app.pane_workspace,

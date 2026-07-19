@@ -29,7 +29,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{columns, footer, now_playing_panel, overlay, player_bar, player_bar_big, sidebar};
+use super::{columns, footer, now_playing_deck, overlay, player_bar_big, sidebar};
 use crate::tui::app::{App, View};
 use crate::tui::view::theme::{self, h_line, v_sep, Theme};
 
@@ -53,8 +53,6 @@ pub const NARROW_MIN_HEIGHT: u16 = 20;
 /// tmux-split floor; below `NARROW_MIN_WIDTH` we refuse to render entirely.
 pub const NARROW_SINGLE_COL_WIDTH: u16 = 70;
 
-/// Height of the persistent player bar at the bottom of the screen.
-const PLAYER_BAR_HEIGHT: u16 = 2;
 /// Height of the thin dim separator rule drawn above the player bar so it's
 /// visually distinct from the browse content. One line of chrome — the bar
 /// itself still gets exactly `PLAYER_BAR_HEIGHT` content rows. Suppressed at
@@ -70,24 +68,16 @@ const FOOTER_HEIGHT_NARROW: u16 = 1;
 /// Mouse input and overlays use this layout-owned contract instead of
 /// reconstructing bottom chrome with fixed row guesses.
 pub fn player_bar_area(area: Rect) -> Option<Rect> {
-    if area.width < NARROW_MIN_WIDTH || area.height < NARROW_MIN_HEIGHT {
-        return None;
-    }
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-        return Some(Rect::new(
-            area.x,
-            area.bottom().saturating_sub(FOOTER_HEIGHT_NARROW + 1),
-            area.width,
-            1,
-        ));
-    }
     let compact = area.height <= MIN_HEIGHT;
     let footer_h = if compact {
         FOOTER_HEIGHT_NARROW
     } else {
         FOOTER_HEIGHT_WIDE
     };
-    let bar_h = if compact { 1 } else { PLAYER_BAR_HEIGHT };
+    let bar_h = now_playing_deck::height_for_terminal(area);
+    if bar_h == 0 {
+        return None;
+    }
     Some(Rect::new(
         area.x,
         area.bottom().saturating_sub(footer_h + bar_h),
@@ -132,30 +122,57 @@ fn split_sidebar(f: &mut Frame, area: Rect, app: &App) -> Rect {
 /// (right side). Renders the panel into the right split and returns the left
 /// split for the main columns/YouTube view. When the panel is hidden (narrow
 /// terminal), returns `content_area` unchanged.
-fn split_now_playing_panel(f: &mut Frame, content_area: Rect, app: &App) -> Rect {
-    if !now_playing_panel::is_visible(content_area.width) {
-        return content_area;
-    }
-    let pw = now_playing_panel::PANEL_WIDTH;
-    if content_area.width > pw + 40 {
-        let split = Layout::horizontal([
-            Constraint::Min(40),    // main content
-            Constraint::Length(pw), // now-playing panel
-        ])
-        .split(content_area);
-        now_playing_panel::render(f, split[1], app);
-        split[0]
-    } else {
-        content_area
-    }
+///
+/// Phase 9: the Now Playing panel was removed as a fixed layout element.
+/// The user found it confusing that `l`/`Ctrl+W, l` couldn't move focus
+/// to it (it wasn't part of the pane split-tree). Now Playing is now
+/// only available as a pane module (press `5` in pane edit mode to put
+/// Now Playing in a real, focusable pane). This function is kept as a
+/// no-op pass-through so the layout call sites don't need to change —
+/// the main content gets the full `content_area`.
+fn split_now_playing_panel(f: &mut Frame, content_area: Rect, _app: &App) -> Rect {
+    let _ = f;
+    content_area
 }
 
 /// The single entry point the event loop calls. Renders the full TUI frame:
 /// too-small guard, columns + player bar + footer, and any active overlay on top.
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    if area.width < NARROW_MIN_WIDTH || area.height < NARROW_MIN_HEIGHT {
+    if area.width < 40 || area.height < 10 {
         render_too_small(f, area);
+        return;
+    }
+
+    // Below the library browser's 60x20 floor, keep playback usable instead
+    // of replacing the entire UI with a resize message. The minimal deck has
+    // no border and preserves title/state, progress, volume, and resume.
+    if area.width < NARROW_MIN_WIDTH || area.height < NARROW_MIN_HEIGHT {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(now_playing_deck::MINIMAL_HEIGHT),
+                Constraint::Length(FOOTER_HEIGHT_NARROW),
+            ])
+            .split(area);
+        let theme = Theme::default();
+        f.render_widget(
+            Paragraph::new("Library hidden · resize for browser")
+                .style(Style::default().fg(theme.dim)),
+            rows[0],
+        );
+        now_playing_deck::render_for_breakpoint(
+            f,
+            rows[1],
+            app,
+            now_playing_deck::Breakpoint::Minimal,
+        );
+        footer::render(f, &rows[2], app);
+        if app.overlay.is_some() {
+            overlay::render(f, area, app);
+        }
+        post_render_force(f, app);
         return;
     }
 
@@ -192,9 +209,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // row for the browse area on narrow terminals — the player bar's
     // distinct styling provides enough visual separation.
     let compact = area.height <= MIN_HEIGHT;
-    let big_mode = app.player_bar_state.effective_mode(area.width, area.height)
-        == player_bar_big::PlayerBarMode::Big;
-    app.player_bar_state.mode = if big_mode {
+    let deck_breakpoint = now_playing_deck::pick_breakpoint(area);
+    app.player_bar_state.mode = if deck_breakpoint == now_playing_deck::Breakpoint::Wide {
         player_bar_big::PlayerBarMode::Big
     } else {
         player_bar_big::PlayerBarMode::Mini
@@ -209,23 +225,30 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         0
     };
-    let bar_h = if compact {
-        1u16
-    } else if big_mode {
-        player_bar_big::BIG_BAR_HEIGHT
+    // `S` (in pane edit mode or after `Ctrl+w`) toggles the now-playing
+    // player bar visibility. When hidden, the bar gets 0 rows and the
+    // separator above it is also dropped (it only exists to delimit the
+    // bar from the content). The freed rows go to the content area via
+    // the `Min` constraint.
+    let bar_hidden = app.player_bar_state.hidden;
+    let bar_h = if bar_hidden {
+        0u16
     } else {
-        PLAYER_BAR_HEIGHT
+        now_playing_deck::height_for_terminal(area)
     };
+    let sep_h = if bar_hidden { 0u16 } else { sep_h };
 
     if compact {
         // ≤24 rows: no tab bar, 1-row compact player bar. Chrome = sep(1) +
-        // bar(1) + footer(1) = 3 rows. Content gets height-3 rows.
+        // bar(1) + footer(1) = 3 rows. Content gets height-3 rows. When
+        // the player bar is hidden (`S` toggle), bar_h=0 and sep_h=0 so
+        // content gets height-1 (footer only).
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(3),
                 Constraint::Length(sep_h),
-                Constraint::Length(1),
+                Constraint::Length(bar_h),
                 Constraint::Length(footer_h),
             ])
             .split(area);
@@ -235,7 +258,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if sep_h > 0 {
             render_separator_rule(f, outer[1], app);
         }
-        player_bar::render_compact(f, outer[2], app);
+        if !bar_hidden {
+            now_playing_deck::render_for_breakpoint(f, outer[2], app, deck_breakpoint);
+        }
         footer::render(f, &outer[3], app);
     } else {
         // >24 rows: full chrome — tab bar(1) + sep(1) + bar(2) + footer(2).
@@ -256,10 +281,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if sep_h > 0 {
             render_separator_rule(f, outer[2], app);
         }
-        if big_mode {
-            player_bar_big::render_big(f, outer[3], app);
-        } else {
-            player_bar::render(f, outer[3], app);
+        if !bar_hidden {
+            now_playing_deck::render_for_breakpoint(f, outer[3], app, deck_breakpoint);
         }
         footer::render(f, &outer[4], app);
     }
@@ -433,8 +456,8 @@ fn force_space_redraw(f: &mut Frame) {
 /// breadcrumb + drill hint (so the user can see what other panes exist and
 /// how to reach them — Issue 3: at 80×24 the narrow path showed only one pane
 /// with no indication that Albums/Tracks columns existed), a single focused
-/// pane (Miller collapse — `h`/`l` drills in/out), a 1-row compressed player
-/// bar, and a short 1-row footer.
+/// pane (Miller collapse — `h`/`l` drills in/out), a responsive Now Playing
+/// deck, and a short 1-row footer.
 ///
 /// **Chrome budget (5 rows):** tab bar (1) · HR (1) · breadcrumb (1) · hint (1)
 /// · player bar (1) · footer (1). The column breadcrumb shows the Miller
@@ -445,6 +468,16 @@ fn force_space_redraw(f: &mut Frame) {
 fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
     let bc = narrow_column_breadcrumb(app);
 
+    // `S` toggle: when the deck is hidden, the narrow path gives its rows
+    // back to the browse area.
+    let bar_hidden = app.player_bar_state.hidden;
+    let narrow_bar_h = if bar_hidden {
+        0
+    } else {
+        now_playing_deck::height_for_terminal(area)
+    };
+    let deck_breakpoint = now_playing_deck::pick_breakpoint(area);
+
     let outer = if bc.is_some() {
         Layout::default()
             .direction(Direction::Vertical)
@@ -454,7 +487,7 @@ fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
                 Constraint::Length(1),                    // column breadcrumb
                 Constraint::Length(1),                    // drill-in/out hint
                 Constraint::Min(3),                       // browse area
-                Constraint::Length(1),                    // compressed player bar (1 row)
+                Constraint::Length(narrow_bar_h), // compressed player bar (1 row, or 0 when hidden)
                 Constraint::Length(FOOTER_HEIGHT_NARROW), // footer (exactly 1 row)
             ])
             .split(area)
@@ -465,7 +498,7 @@ fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
                 Constraint::Length(1),                    // tab bar (1 row)
                 Constraint::Length(1),                    // horizontal rule below tabs
                 Constraint::Min(3),                       // browse area
-                Constraint::Length(1),                    // compressed player bar (1 row)
+                Constraint::Length(narrow_bar_h), // compressed player bar (1 row, or 0 when hidden)
                 Constraint::Length(FOOTER_HEIGHT_NARROW), // footer (exactly 1 row)
             ])
             .split(area)
@@ -520,8 +553,10 @@ fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
     }
     idx += 1;
 
-    // Compressed 1-row player bar: now-playing + quality + flags on one line.
-    player_bar::render_compact(f, outer[idx], app);
+    // Responsive Now Playing deck. Skipped when hidden via `S`.
+    if !bar_hidden {
+        now_playing_deck::render_for_breakpoint(f, outer[idx], app, deck_breakpoint);
+    }
     idx += 1;
     footer::render(f, &outer[idx], app);
 }
@@ -622,14 +657,26 @@ fn render_narrow_hint(f: &mut Frame, area: Rect, hint: &str) {
 /// Render a centered "terminal too small" message and nothing else. The user
 /// is told to resize the window or press `q` to quit — no browse chrome is
 /// drawn in this state so a cramped terminal doesn't show garbage.
+///
+/// Phase 8 (visual spec M44 / A14): the message now includes the current
+/// dimensions and the required minimum (60×20) so the user knows how
+/// much to resize. Also uses `theme.warning` (not hardcoded `Color::Yellow`)
+/// so it collapses to `Reset` under `NO_COLOR`. The message is kept short
+/// enough to fit at the narrowest width where it's shown (the too-small
+/// guard fires below 60×20, so the message must fit at <60 cols).
 fn render_too_small(f: &mut Frame, area: Rect) {
+    let theme = Theme::default();
+    // Short form: `{w}x{h} too small — need 60x20 (q to quit)`.
+    // 40 chars at the smallest, fits comfortably at 50 cols.
     let msg = format!(
-        "terminal too small {} resize or press q to quit",
+        "{}x{} too small {} need 60x20 (q to quit)",
+        area.width,
+        area.height,
         theme::em_dash()
     );
     let paragraph = Paragraph::new(Line::from(msg))
         .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::Yellow))
+        .style(Style::default().fg(theme.warning))
         .block(Block::default().borders(Borders::NONE));
     f.render_widget(paragraph, area);
 }
@@ -718,35 +765,39 @@ fn breadcrumb(app: &App) -> String {
 }
 
 /// Top bar: shows the four top-level views as tabs separated by `│`, with
-/// the active view highlighted (accent + BOLD + REVERSED), AND the current
-/// navigation breadcrumb right-aligned on the same row (T3 + T4). This gives
-/// the user view-switch context + key hints (the `1`–`4` prefix matches the
-/// actual view-switch keys) AND their location in the hierarchy — both at
-/// the top of the screen, at all widths ≥ 80 (T3: previously the wide layout
-/// had no top tab bar; T4: previously the breadcrumb was buried in the
-/// separator above the player bar).
+/// the active view highlighted (accent + BOLD + UNDERLINE — Phase 3 visual
+/// spec H18/V22, changed from REVERSED so tabs don't collide with row
+/// selection), AND the current navigation breadcrumb right-aligned on the
+/// same row (T3 + T4). This gives the user view-switch context + key hints
+/// (the `1`–`4` prefix matches the actual view-switch keys) AND their
+/// location in the hierarchy — both at the top of the screen, at all
+/// widths ≥ 80 (T3: previously the wide layout had no top tab bar; T4:
+/// previously the breadcrumb was buried in the separator above the player
+/// bar).
 ///
 /// Tabs: `1:Artists │ 2:Playlists │ 3:Queue │ 4:YouTube`
 /// Breadcrumb (right-aligned): `Artists › 40mP › Cosmic` (built by
 /// [`breadcrumb`]). Dropped when the remaining width is too narrow for it
 /// to fit cleanly so the tabs never get crowded out.
 ///
-/// The active tab uses accent + BOLD + REVERSED (three non-color cues under
-/// `NO_COLOR` — bold weight + reverse video survive monochrome); inactive
-/// tabs are dim. The `│` separator is dim so the tabs read as a connected
-/// bar, not disconnected labels.
+/// The active tab uses accent + BOLD + UNDERLINE (three non-color cues
+/// under `NO_COLOR` — bold weight + underline survive monochrome, and
+/// neither collides with the row-selection REVERSED+BOLD); inactive tabs
+/// are dim. The `│` separator is dim so the tabs read as a connected bar,
+/// not disconnected labels.
 fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let theme = Theme::default();
-    let nc = theme::no_color();
-    let dim = Style::default().fg(if nc { Color::Reset } else { theme.dim });
-    let active = Style::default()
-        .fg(if nc { Color::Reset } else { theme.accent })
-        .add_modifier(Modifier::BOLD)
-        .add_modifier(Modifier::REVERSED);
-    let text = Style::default().fg(if nc { Color::Reset } else { theme.text });
+    // Phase 3 (visual spec H18 / V22 / M38 / M39): tabs use
+    // `Theme::tab(true)` = accent + BOLD + UNDERLINE (not REVERSED) so
+    // they don't collide with row selection (accent + BOLD + REVERSED).
+    // The visual hierarchy becomes: tabs (accent+bold+underline) <
+    // selected row (accent+bold+reverse) < focused pane (accent+thick).
+    let dim = theme.status_description();
+    let active = theme.tab(true);
+    let text = Style::default().fg(theme.text);
 
     // View-switch tabs — the `N:` prefix matches the actual view-switch keys
     // (1=Artists, 2=Playlists, 3=Queue, 4=YouTube). The full "YouTube" label is

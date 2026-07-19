@@ -352,12 +352,12 @@ fn def041_progress_resets_to_zero_when_stopped() {
     app.now_playing = None;
     let (buf, _t) = rendered_draw(&mut app, 100, 30);
     assert!(
-        buf.contains("--:-- / --:--"),
-        "DEF-041: stopped bar must show --:-- / --:-- (not stale position): {buf}"
+        buf.matches("--:--").count() >= 2,
+        "DEF-041: stopped deck must show unknown elapsed + total (not stale position): {buf}"
     );
     assert!(
-        buf.contains("0%"),
-        "DEF-041: stopped bar must show 0%: {buf}"
+        !buf.contains(" 0% "),
+        "DEF-041: redesigned progress must not show a separate 0% label: {buf}"
     );
 }
 
@@ -400,8 +400,8 @@ fn def043_enqueue_toast_visible_in_player_bar() {
     assert_eq!(app.toast.as_deref(), Some("Added to queue"));
     let (buf, _t) = rendered_draw(&mut app, 100, 30);
     assert!(
-        buf.contains("Added to queue"),
-        "DEF-043: enqueue toast must render in the player bar even without YT (yt_state != Ready): {buf}"
+        buf.to_ascii_lowercase().contains("added to queue"),
+        "DEF-043: enqueue toast must remain visibly surfaced even without YT: {buf}"
     );
 }
 
@@ -420,12 +420,12 @@ fn def015_buffering_label_when_pending_resolve() {
     // is_buffering() also fires on pending_play alone (cold-start case).
     let (buf, _t) = rendered_draw(&mut app, 100, 30);
     assert!(
-        buf.contains("[BUFFERING]"),
-        "DEF-015: cold-miss pick must show [BUFFERING] (not [STOPPED]): {buf}"
+        buf.contains("RESOLVING"),
+        "DEF-015: cold-miss pick must show RESOLVING (not STOPPED): {buf}"
     );
     assert!(
-        buf.contains("Buffering"),
-        "DEF-015: bar must show 'Buffering' text: {buf}"
+        buf.contains("Finding the stream"),
+        "DEF-015: deck must explain that it is finding the stream: {buf}"
     );
     assert!(
         !buf.contains("nothing playing"),
@@ -492,6 +492,47 @@ fn def014_r_key_resumes_when_hint_showing() {
     );
 }
 
+#[test]
+fn def014_space_key_resumes_when_deck_advertises_resume() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use jukebox::tui::input::handle_key;
+    let (_d, cat) = two_track_cat_d();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.last_played_track_id = Some("t2".into());
+    app.last_played_position = 3.0;
+    app.resume_hint = Some("resume: Night Tales at 0:03 · R to resume".into());
+
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    );
+
+    assert_eq!(app.now_playing.as_ref().map(|track| track.id()), Some("t2"));
+    assert_eq!(app.player.position(), Some(3.0));
+    assert!(app.resume_hint.is_none());
+}
+
+#[test]
+fn def014_space_key_resumes_from_pane_edit_mode() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use jukebox::tui::input::handle_key;
+    use jukebox::tui::pane::UiMode;
+    let (_d, cat) = two_track_cat_d();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.last_played_track_id = Some("t2".into());
+    app.last_played_position = 3.0;
+    app.resume_hint = Some("resume: Night Tales at 0:03 · R to resume".into());
+    app.pane_workspace.mode = UiMode::PaneEdit;
+
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    );
+
+    assert_eq!(app.now_playing.as_ref().map(|track| track.id()), Some("t2"));
+    assert_eq!(app.player.position(), Some(3.0));
+}
+
 /// RC11-DEF-014: when stopped with a saved last-played track, the player bar
 /// shows the "resume" hint so the user knows they can pick up where they left
 /// off. The hint is cleared on the first play.
@@ -503,12 +544,16 @@ fn def014_resume_hint_shown_when_stopped() {
     app.resume_hint = Some("resume: Night Tales at 0:05 · Enter to resume".into());
     let (buf, _t) = rendered_draw(&mut app, 100, 30);
     assert!(
-        buf.contains("resume:"),
-        "DEF-014: resume hint must render in the player bar when stopped: {buf}"
+        buf.contains("Night Tales"),
+        "DEF-014: title must render: {buf}"
     );
     assert!(
-        buf.contains("Enter") || buf.contains("R to resume") || buf.contains("R to"),
-        "DEF-014: hint must tell the user how to resume: {buf}"
+        buf.contains("[Space] Resume from 0:05"),
+        "DEF-014: state row must expose the resume action and position: {buf}"
+    );
+    assert!(
+        !buf.contains("resume: Night Tales"),
+        "DEF-014: resume action must not be prefixed into the title: {buf}"
     );
 }
 
@@ -548,6 +593,7 @@ fn def014_last_played_state_round_trip() {
             player_bar_mode: "mini",
             track_layout_mode: "table",
             sidebar_visible: true,
+            player_bar_hidden: false,
             playlist_col: &jukebox::tui::app::PlaylistColumnState::default(),
             pane_workspace: None,
         },

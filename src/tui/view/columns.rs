@@ -332,17 +332,21 @@ pub fn render_queue_pane(f: &mut Frame, area: Rect, app: &mut App) {
 /// In addition to color, the focused column gets a `Thick` (double-line) border
 /// and unfocused a `Plain` one, so focus is still visible under `NO_COLOR`
 /// (where both colors collapse to `Reset`).
-fn border<'a>(title: &'a str, focused: bool, theme: &Theme) -> Block<'a> {
+///
+/// Phase 9: when `in_pane` is true, the column title is dropped — the pane
+/// border already shows the module name (e.g. "Artists"), so a nested
+/// "Artists" column title is redundant. The border itself stays (it shows
+/// which column is focused via Thick vs Plain + accent vs dim).
+fn border<'a>(title: &'a str, focused: bool, theme: &Theme, in_pane: bool) -> Block<'a> {
     let color = if focused { theme.accent } else { theme.dim };
     // DEF-006: In ASCII font mode, use ASCII border characters (+, -, |)
     // instead of Unicode box-drawing. In Unicode mode, focused columns get
     // Thick (double-line) borders, unfocused get Plain (single-line).
-    if is_ascii() {
+    let base = if is_ascii() {
         Block::default()
             .borders(Borders::ALL)
             .border_set(ASCII_BORDER_SET)
             .border_style(Style::default().fg(color))
-            .title(Span::styled(title, Style::default().fg(color)))
     } else {
         let bt = if focused {
             BorderType::Thick
@@ -353,7 +357,20 @@ fn border<'a>(title: &'a str, focused: bool, theme: &Theme) -> Block<'a> {
             .borders(Borders::ALL)
             .border_type(bt)
             .border_style(Style::default().fg(color))
-            .title(Span::styled(title, Style::default().fg(color)))
+    };
+    // Only add the title when NOT in a pane (the pane border already
+    // shows the module name). The filter prompt is always shown (it's
+    // interactive state, not a redundant label).
+    if in_pane {
+        // In pane mode, still show the filter prompt if active (it's
+        // interactive state, not a redundant label).
+        if title.contains("filter:") {
+            base.title(Span::styled(title, Style::default().fg(color)))
+        } else {
+            base
+        }
+    } else {
+        base.title(Span::styled(title, Style::default().fg(color)))
     }
 }
 
@@ -413,8 +430,12 @@ fn filter_text_on(app: &App, col: usize) -> Option<&str> {
 /// with the accent color — the glyphs match the actual view-switch keys
 /// (the old `A`/`P`/`Q`/`Y` glyphs were mnemonic but didn't match the keys).
 fn render_rail(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let accent = Style::default().fg(theme.accent);
-    let dim = Style::default().fg(theme.dim);
+    // Phase 6 (visual spec H5 / I3): the active rail glyph uses
+    // `Theme::tab(true)` (accent + BOLD + UNDERLINE) so it's distinguishable
+    // under NO_COLOR (color-only active indication was invisible in
+    // monochrome mode).
+    let active = theme.tab(true);
+    let dim = theme.status_description();
 
     let rows = [
         ('1', View::Artists),
@@ -426,7 +447,7 @@ fn render_rail(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let lines: Vec<Line> = rows
         .iter()
         .map(|(g, v)| {
-            let style = if app.view == *v { accent } else { dim };
+            let style = if app.view == *v { active } else { dim };
             Line::from(Span::styled(g.to_string(), style))
         })
         .collect();
@@ -705,7 +726,12 @@ pub fn render_narrow(f: &mut Frame, area: Rect, app: &mut App) {
     };
 
     f.render_widget(
-        Paragraph::new(lines).block(border(&title, true, &theme)),
+        Paragraph::new(lines).block(border(
+            &title,
+            true,
+            &theme,
+            crate::tui::pane::render::is_pane_mode_active(app),
+        )),
         pane,
     );
 }
@@ -755,7 +781,12 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         filtered_title(&format!("YouTube {tag}"), app, 0),
         mixed_tag(app)
     );
-    let col1_block = border(&yt_title, app.focus_col == 0, theme);
+    let col1_block = border(
+        &yt_title,
+        app.focus_col == 0,
+        theme,
+        crate::tui::pane::render::is_pane_mode_active(app),
+    );
     // DEF-053: truncate YT list names with ellipsis.
     let yt_col_w = cols[0].width.saturating_sub(2) as usize;
     let items: Vec<ListItem> = app
@@ -839,7 +870,12 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             vec![Line::from(Span::styled(body, dim))]
         };
         f.render_widget(
-            Paragraph::new(lines).block(border("Tracks", app.focus_col == 1, theme)),
+            Paragraph::new(lines).block(border(
+                "Tracks",
+                app.focus_col == 1,
+                theme,
+                crate::tui::pane::render::is_pane_mode_active(app),
+            )),
             cols[1],
         );
     } else {
@@ -860,7 +896,12 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         f.render_widget(
             Paragraph::new(lines)
                 .scroll((scroll as u16, 0))
-                .block(border("Tracks", app.focus_col == 1, theme)),
+                .block(border(
+                    "Tracks",
+                    app.focus_col == 1,
+                    theme,
+                    crate::tui::pane::render::is_pane_mode_active(app),
+                )),
             cols[1],
         );
     }
@@ -883,7 +924,12 @@ fn render_youtube(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             })
             .collect();
         f.render_widget(
-            Paragraph::new(lines).block(border("Suggested / Up Next", false, theme)),
+            Paragraph::new(lines).block(border(
+                "Suggested / Up Next",
+                false,
+                theme,
+                crate::tui::pane::render::is_pane_mode_active(app),
+            )),
             up,
         );
     }
@@ -1109,7 +1155,12 @@ fn render_artists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     // excludes every artist shows a "no matches" hint instead of a bare empty
     // list — so the column never reads as broken.
     let title = format!("{}{}", filtered_title("Artists", app, 0), mixed_tag(app));
-    let col1_block = border(&title, app.focus_col == 0, theme);
+    let col1_block = border(
+        &title,
+        app.focus_col == 0,
+        theme,
+        crate::tui::pane::render::is_pane_mode_active(app),
+    );
     if app.artists.is_empty() {
         f.render_widget(
             dim_centered(
@@ -1209,7 +1260,12 @@ fn render_artists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     album_state.select(Some(app.cursors.album));
     f.render_stateful_widget(
         List::new(album_items)
-            .block(border("Albums", app.focus_col == 1, theme))
+            .block(border(
+                "Albums",
+                app.focus_col == 1,
+                theme,
+                crate::tui::pane::render::is_pane_mode_active(app),
+            ))
             .highlight_style(theme.selected_style()),
         album_area,
         &mut album_state,
@@ -1244,7 +1300,12 @@ fn render_artists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     f.render_widget(
         Paragraph::new(track_lines)
             .scroll((scroll as u16, 0))
-            .block(border("Tracks", app.focus_col == 2, theme)),
+            .block(border(
+                "Tracks",
+                app.focus_col == 2,
+                theme,
+                crate::tui::pane::render::is_pane_mode_active(app),
+            )),
         track_area,
     );
 }
@@ -1260,7 +1321,12 @@ fn render_playlists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     // An empty playlist set shows a dim hint to create one; a filter that
     // excludes every playlist shows a "no matches" hint.
     let title = format!("{}{}", filtered_title("Playlists", app, 0), mixed_tag(app));
-    let col1_block = border(&title, app.focus_col == 0, theme);
+    let col1_block = border(
+        &title,
+        app.focus_col == 0,
+        theme,
+        crate::tui::pane::render::is_pane_mode_active(app),
+    );
     if app.playlists.is_empty() {
         f.render_widget(
             dim_centered(
@@ -1324,7 +1390,12 @@ fn render_playlists(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     f.render_widget(
         Paragraph::new(lines)
             .scroll((scroll as u16, 0))
-            .block(border("Tracks", app.focus_col == 1, theme)),
+            .block(border(
+                "Tracks",
+                app.focus_col == 1,
+                theme,
+                crate::tui::pane::render::is_pane_mode_active(app),
+            )),
         cols[1],
     );
 }
@@ -1346,7 +1417,12 @@ fn render_queue(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         context_ids
     };
     let title = format!("Queue{}", mixed_tag(app));
-    let block = border(&title, app.focus_col == 0, theme);
+    let block = border(
+        &title,
+        app.focus_col == 0,
+        theme,
+        crate::tui::pane::render::is_pane_mode_active(app),
+    );
     if ids.is_empty() {
         // Empty-queue hint block: 3 lines — (1) dim "≡ Queue is empty"
         // headline, (2) bold "Press e on a track to enqueue" action line,

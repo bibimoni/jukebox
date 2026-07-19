@@ -8,7 +8,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::reco::generator::{GeneratedPlaylist, GeneratorConstraints};
 use crate::tui::view::icons::{Icon, IconRenderer};
-use crate::tui::view::theme::{ellipsis, sep_dot};
+use crate::tui::view::theme::{ellipsis, marker_glyph, sep_dot};
 
 /// The state of the generator overlay.
 #[derive(Clone, Debug, Default)]
@@ -167,11 +167,13 @@ pub fn render(_area: Rect, state: &GeneratorState, icons: &IconRenderer) -> Para
                     };
                     // M-1: show a selected-row indicator for `state.cursor` so
                     // j/k navigation has a visible marker (the cursor field
-                    // existed but was never rendered). `▶` on the selected row,
-                    // ` ` on other rows; bold + accent on the selected row's
+                    // existed but was never rendered). Phase 8 (visual
+                    // spec C5 / A6): use `marker_glyph()` so the selected-
+                    // row marker respects `JUKEBOX_FONT_MODE=ascii` (`>`
+                    // instead of `▶`). Bold + accent on the selected row's
                     // text so it's distinguishable without color too.
                     let selected = i == state.cursor;
-                    let marker = if selected { "▶" } else { " " };
+                    let marker = if selected { marker_glyph() } else { " " };
                     let row_style = if selected {
                         Style::default().add_modifier(Modifier::BOLD)
                     } else {
