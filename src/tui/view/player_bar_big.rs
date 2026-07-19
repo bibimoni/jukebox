@@ -1,36 +1,31 @@
 //! Big "Now Playing" player bar (I.2 — DEF-068).
 //!
 //! A 10-row rectangle that shows the now-playing track with richer metadata
-//! than the 2-row mini bar: title, artist · album, quality readout, a
-//! `▰▰▰▰▱▱` progress bar with `M:SS / M:SS + pct`, transport controls, a
-//! block-bar volume meter, the `SHUF · RPT · CONT · PREF` flags, a `Next:`
-//! preview, and a `♫ Lyrics:` first-line preview.
+//! than the 2-row mini bar: title, artist · album, quality readout + mode
+//! badge + YT state, a `▰▰▰▰▱▱` progress bar with `M:SS / M:SS + pct`,
+//! transport controls, a block-bar volume meter, the `SHUF · RPT · CONT ·
+//! PREF` flags, a `Next:` preview, and a YT state line with the human label
+//! + recovery hint (the same info the footer status line shows).
 //!
-//! RC19-D15: the album-art placeholder (a 4×4 `░▒▓█` grid + "album art" text
-//! label) was removed. The label lived in the same row as the transport
-//! controls and bled through the gaps between glyphs (`◀◀bu▶ ▶▶t`). The art
-//! was decorative-only (terminals can't render real cover art), so dropping
-//! it cleans up the transport row. The 10-col left reservation REMAINS so
-//! the flags line (rendered into the right sub-rect) doesn't overwrite the
-//! transport glyphs.
-//!
-//! Mini mode (`player_bar::render` / `render_compact`) is byte-identical to
-//! the pre-I.2 implementation; this module is purely additive.
+//! RC19-D15: the album-art placeholder was removed (decorative-only).
+//! Phase 9 redesign: the panel now includes the mode badge + YT state
+//! badge on the quality row, and the YT human-label + recovery hint on
+//! the bottom row — pulling in the footer status line's info so the user
+//! doesn't need to look at two places.
 
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
 use crate::tui::app::App;
 use crate::tui::queue::{ContinueMode, RepeatMode, ShuffleMode};
 use crate::tui::view::theme::{
-    disp_width, ellipsis, em_dash, empty_block, filled_block, is_ascii, marker_glyph, next_glyph,
-    pause_glyph, play_glyph, prev_glyph, quality_color, sep_dot, stop_glyph, Theme,
-    ASCII_BORDER_SET,
+    ellipsis, em_dash, empty_block, filled_block, marker_glyph, next_glyph, pause_glyph,
+    play_glyph, prev_glyph, quality_color, sep_dot, stop_glyph, Theme,
 };
 
 /// Player bar mode: the 2-row mini bar (current) or the 10-row big rectangle.
@@ -106,6 +101,13 @@ pub struct PlayerBarState {
     /// Horizontal scroll offset for the lyrics preview line (reserved for
     /// future long-line marquee; currently 0).
     pub lyrics_preview_scroll: u16,
+    /// True when the user has hidden the now-playing player bar via `S`
+    /// (in pane edit mode or after `Ctrl+w`). When true, the layout skips
+    /// the player bar render and gives its rows to the browse area, so
+    /// panes get more vertical room. The footer (keymap hint) stays
+    /// visible. Toggled by `pane::input::handle_prefix_key` /
+    /// `handle_pane_edit_key` on `S`.
+    pub hidden: bool,
 }
 
 impl PlayerBarState {
@@ -340,11 +342,10 @@ fn build_flags_line(app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The first non-empty line of the now-playing track's lyrics, for the
-/// `♫ Lyrics:` preview on row 10. Local tracks: read embedded/sidecar
-/// lyrics (fast). YouTube tracks: show `(none)` unless a cached result is
-/// available (the bar never fires a sidecar request — that would spam on
-/// every frame). Returns `None` when nothing is playing.
+/// The first non-empty line of the now-playing track's lyrics. Used by
+/// the Now Playing pane module (not the big bar row 7 anymore — Phase 9
+/// replaced the lyrics preview with a cleaner "Next: title" row).
+#[allow(dead_code)]
 fn lyrics_preview_line(app: &App) -> Option<String> {
     let ts = app.now_playing.as_ref()?;
     match ts {
@@ -402,56 +403,40 @@ fn next_preview(app: &App) -> String {
 /// before dispatching here.
 pub fn render_big(f: &mut Frame, area: Rect, app: &App) {
     let theme = Theme::default();
-    let dim = Style::default().fg(theme.dim);
+    let dim = theme.status_description();
     let text = Style::default().fg(theme.text);
-    let accent = Style::default().fg(theme.accent);
+    let accent = theme.status_key();
     let nc = crate::tui::view::theme::no_color();
 
-    // Bordered block with a "Now Playing" title. ASCII font mode uses the
-    // ASCII border set so the rectangle is fully ASCII under
-    // JUKEBOX_FONT_MODE=ascii.
-    let title = format!(" Now Playing {} ", em_dash());
-    let block = if is_ascii() {
-        Block::default()
-            .borders(Borders::ALL)
-            .border_set(ASCII_BORDER_SET)
-            .border_style(Style::default().fg(theme.accent))
-            .title(Span::styled(
-                title.clone(),
-                Style::default().fg(theme.accent),
-            ))
-    } else {
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
-            .border_style(Style::default().fg(theme.accent))
-            .title(Span::styled(title, Style::default().fg(theme.accent)))
-    };
-
+    // Bordered block with a "Now Playing" title. Uses Theme::pane_block
+    // for consistent styling (Phase 1 visual spec).
+    let title = format!("♪ Now Playing {} ", em_dash());
+    let block = theme.pane_block(&title, true, false);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Reserve a 10-col left column for the transport controls so the flags
-    // line (rendered into `meta_area` row 6 = rows[5]) doesn't overwrite the
-    // transport glyphs (geometry_big places transport at x0 = area.x + 1,
-    // cols 1-8). The old `show_art` branch put the album-art grid + label
-    // in this column; RC19-D15 removed the art (it was decorative and its
-    // "album art" text label bled through the transport gaps as `b`/`u`/`t`
-    // stray chars). The column reservation stays so the transport area and
-    // the flags text don't collide.
+    // Reserve a 10-col left column for the transport controls.
     let split = Layout::horizontal([Constraint::Length(10), Constraint::Min(1)]).split(inner);
     let meta_area = split[1];
 
-    // Split the metadata area into 10 rows per the spec.
+    // Split the metadata area into 8 rows. Phase 9 redesign:
+    // Row 1: ▶ title
+    // Row 2: artist · album
+    // Row 3: quality · [mode badge] · [Y state badge]
+    // Row 4: progress bar + timestamps
+    // Row 5: transport + volume
+    // Row 6: flags (SHUF/RPT/CONT/PREF)
+    // Row 7: Next: title
+    // Row 8: YT state line (human label + recovery hint from the footer)
     let rows = Layout::vertical([
         Constraint::Length(1), // Row 1: title
         Constraint::Length(1), // Row 2: artist · album
-        Constraint::Length(1), // Row 3: quality readout
+        Constraint::Length(1), // Row 3: quality + badges
         Constraint::Length(1), // Row 4: progress bar
         Constraint::Length(1), // Row 5: transport + volume
         Constraint::Length(1), // Row 6: flags
-        Constraint::Length(1), // Row 7: Next + Lyrics
-        Constraint::Length(1), // Row 8: spare
+        Constraint::Length(1), // Row 7: Next
+        Constraint::Length(1), // Row 8: YT state line
     ])
     .split(meta_area);
 
@@ -469,25 +454,12 @@ pub fn render_big(f: &mut Frame, area: Rect, app: &App) {
     };
     let title_line = match &np {
         Some(v) => Line::from(vec![
-            Span::styled(
-                format!("{state_glyph} "),
-                accent.add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(v.title.clone(), accent.add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{state_glyph} "), accent),
+            Span::styled(v.title.clone(), accent),
         ]),
         None => {
-            // RC18-D14: when stopped with a saved last-played track, show the
-            // resume hint ("▸ resume: {title} at {M:SS} · R to resume") so the
-            // user knows `R` will resume. Mirrors `player_bar::build_info_line`
-            // / `render_compact` — the mini bar already renders this hint, but
-            // the big bar didn't, so users with `big_pref=true` (persisted)
-            // never saw the offer and `R` looked broken. The hint clears on
-            // the first successful play (note_play_started).
             if let Some(hint) = app.resume_hint.as_ref() {
-                Line::from(Span::styled(
-                    format!("{} {}", marker_glyph(), hint),
-                    accent.add_modifier(Modifier::BOLD),
-                ))
+                Line::from(Span::styled(format!("{} {}", marker_glyph(), hint), accent))
             } else {
                 Line::from(Span::styled(
                     format!("{state_glyph} nothing playing {dash}", dash = em_dash()),
@@ -516,7 +488,11 @@ pub fn render_big(f: &mut Frame, area: Rect, app: &App) {
     };
     f.render_widget(Paragraph::new(row2), rows[1]);
 
-    // Row 3: quality readout (quality_color)
+    // Row 3: quality · [mode badge] · [Y state badge]
+    // Phase 9: combine quality readout + mode badge + YT state badge
+    // on one row (was quality-only). This pulls in the footer's
+    // mode_badge + compact_yt_badge info so the user sees everything
+    // at a glance.
     let row3 = match &np {
         Some(v) if v.source.is_remote() => {
             let label = v
@@ -524,11 +500,20 @@ pub fn render_big(f: &mut Frame, area: Rect, app: &App) {
                 .as_ref()
                 .map(|f| f.yt_label())
                 .unwrap_or_else(|| "YT".to_string());
-            let color = if nc { Color::Reset } else { Color::Yellow };
-            Line::from(vec![
+            let mut spans: Vec<Span<'static>> = vec![
                 Span::styled("   ", dim),
-                Span::styled(label, Style::default().fg(color)),
-            ])
+                Span::styled(
+                    label,
+                    Style::default().fg(if nc { Color::Reset } else { theme.warning }),
+                ),
+            ];
+            // Mode badge
+            spans.push(Span::raw(format!(" {} ", sep_dot())));
+            spans.push(Span::styled(format!("[{}]", app.source_mode.as_str()), dim));
+            // YT state badge
+            spans.push(Span::raw(format!(" {} ", sep_dot())));
+            spans.push(Span::styled(yt_badge_str(app), dim));
+            Line::from(spans)
         }
         Some(v) => {
             let q_color = quality_color(v.bit_depth, v.sample_rate_hz);
@@ -543,26 +528,26 @@ pub fn render_big(f: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(q_color),
                 ));
             }
+            // Mode badge
+            spans.push(Span::raw(format!(" {} ", sep_dot())));
+            spans.push(Span::styled(format!("[{}]", app.source_mode.as_str()), dim));
+            // YT state badge
+            spans.push(Span::raw(format!(" {} ", sep_dot())));
+            spans.push(Span::styled(yt_badge_str(app), dim));
             Line::from(spans)
         }
         None => Line::from(Span::styled("   --bit / -- kHz", dim)),
     };
     f.render_widget(Paragraph::new(row3), rows[2]);
 
-    // Row 4: blank
-    // Row 5: progress bar (▰▱) + M:SS / M:SS + pct
+    // Row 4: progress bar
     render_progress_bar(f, rows[3], app);
 
-    // Row 6: blank
-    // Row 7: transport ◀◀ ▶ ⏸ ⏭ ▶▶ + vol ▰▰▰▰▱ 70% [MUTED]
+    // Row 5: transport + volume
     {
         let geo = geometry_big(area);
-        let controls = Style::default()
-            .fg(if nc { Color::Reset } else { theme.accent })
-            .add_modifier(Modifier::BOLD);
+        let controls = accent;
         f.render_widget(Paragraph::new(prev_glyph()).style(controls), geo.previous);
-        // Play/pause glyph reflects the current state (same convention as
-        // the mini bar).
         let pp_glyph = if playing && has_track {
             play_glyph()
         } else if has_track {
@@ -578,7 +563,7 @@ pub fn render_big(f: &mut Frame, area: Rect, app: &App) {
         );
         f.render_widget(Paragraph::new(next_glyph()).style(controls), geo.next);
 
-        // Volume meter (right side of row 7).
+        // Volume meter (right side of row 5).
         let vol_str = {
             let blocks = 4u32;
             let filled = if app.muted {
@@ -604,44 +589,332 @@ pub fn render_big(f: &mut Frame, area: Rect, app: &App) {
                 vol_str,
                 Style::default().fg(if nc { Color::Reset } else { vol_color }),
             ),
-            Span::styled(vol_label.to_string(), Style::default().fg(theme.dim)),
+            Span::styled(vol_label.to_string(), dim),
         ]);
         f.render_widget(Paragraph::new(vol_line), geo.volume);
     }
 
-    // Row 8: blank
-    // Row 9: SHUF · RPT · CONT · PREF flags
+    // Row 6: SHUF · RPT · CONT · PREF flags
     f.render_widget(Paragraph::new(build_flags_line(app)), rows[5]);
 
-    // Row 10: Next: {title} + ♫ Lyrics: {first line}
+    // Row 7: Next: title
     {
         let next = next_preview(app);
-        let lyrics_label = if is_ascii() {
-            "# Lyrics:"
-        } else {
-            "♫ Lyrics:"
-        };
-        let lyrics_text = match &np {
-            Some(_) => match lyrics_preview_line(app) {
-                Some(line) => {
-                    // Clip to available width so the line doesn't overflow.
-                    let avail = rows[6].width as usize;
-                    let prefix_w = disp_width(&format!("{next}  {lyrics_label} ",));
-                    let budget = avail.saturating_sub(prefix_w);
-                    crate::tui::view::theme::clip_to_width(&line, budget.max(1))
-                }
-                None => "(none)".to_string(),
-            },
-            None => "(none)".to_string(),
-        };
+        let avail = rows[6].width as usize;
+        let prefix = "Next: ";
+        let budget = avail.saturating_sub(prefix.len()).max(1);
+        let next_clip = crate::tui::view::theme::clip_to_width(&next, budget);
+        let next_clean = next_clip.strip_prefix(prefix).unwrap_or(&next_clip);
         let row7 = Line::from(vec![
-            Span::styled(next, dim),
-            Span::raw("  "),
-            Span::styled(format!("{lyrics_label} "), dim),
-            Span::styled(lyrics_text, text),
+            Span::styled(prefix, dim),
+            Span::styled(next_clean.to_string(), text),
         ]);
         f.render_widget(Paragraph::new(row7), rows[6]);
     }
+
+    // Row 8: YT state line (human label + recovery hint)
+    // Phase 9: pull in the footer's YT state info so the user sees
+    // the connection status + any error/recovery hint in the panel.
+    {
+        let yt_line = build_yt_state_line(app, &theme);
+        f.render_widget(Paragraph::new(yt_line), rows[7]);
+    }
+}
+
+/// Render the big Now Playing panel WITHOUT the outer border/title.
+/// Used when Now Playing is a pane module — the pane border already
+/// says "Now Playing", so an inner border would nest "Now Playing"
+/// inside "Now Playing" (the user reported this as confusing). Content
+/// is center-aligned for a cleaner look.
+pub fn render_big_in_pane(f: &mut Frame, area: Rect, app: &App) {
+    let theme = Theme::default();
+    let dim = theme.status_description();
+    let text = Style::default().fg(theme.text);
+    let accent = theme.status_key();
+    let nc = crate::tui::view::theme::no_color();
+
+    // No outer block — the pane border provides the title.
+    let inner = area;
+
+    // Reserve a 10-col left column for the transport controls.
+    let split = Layout::horizontal([Constraint::Length(10), Constraint::Min(1)]).split(inner);
+    let meta_area = split[1];
+
+    let rows = Layout::vertical([
+        Constraint::Length(1), // Row 1: title
+        Constraint::Length(1), // Row 2: artist · album
+        Constraint::Length(1), // Row 3: quality + badges
+        Constraint::Length(1), // Row 4: progress bar
+        Constraint::Length(1), // Row 5: transport + volume
+        Constraint::Length(1), // Row 6: flags
+        Constraint::Length(1), // Row 7: Next
+        Constraint::Length(1), // Row 8: YT state
+    ])
+    .split(meta_area);
+
+    let np = app.now_playing_view();
+    let playing = app.player.is_playing();
+    let has_track = app.now_playing.is_some();
+    let state_glyph = if playing && has_track {
+        play_glyph()
+    } else if has_track {
+        pause_glyph()
+    } else {
+        stop_glyph()
+    };
+
+    // Row 1: ▶ title — center-aligned
+    let title_line = match &np {
+        Some(v) => Line::from(vec![
+            Span::styled(format!("{state_glyph} "), accent),
+            Span::styled(v.title.clone(), accent),
+        ]),
+        None => {
+            if let Some(hint) = app.resume_hint.as_ref() {
+                Line::from(Span::styled(format!("{} {}", marker_glyph(), hint), accent))
+            } else {
+                Line::from(Span::styled(
+                    format!("{state_glyph} nothing playing {}", em_dash()),
+                    dim,
+                ))
+            }
+        }
+    };
+    f.render_widget(
+        Paragraph::new(title_line).alignment(Alignment::Center),
+        rows[0],
+    );
+
+    // Row 2: artist · album — center-aligned
+    let row2 = match &np {
+        Some(v) => {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            spans.push(Span::styled(v.artist.clone(), text));
+            if let Some(album) = &v.album {
+                if !album.is_empty() {
+                    spans.push(Span::raw(format!(" {} ", sep_dot())));
+                    spans.push(Span::styled(album.clone(), text));
+                }
+            }
+            Line::from(spans)
+        }
+        None => Line::from(Span::styled("-", dim)),
+    };
+    f.render_widget(Paragraph::new(row2).alignment(Alignment::Center), rows[1]);
+
+    // Row 3: quality · mode badge · YT badge — center-aligned
+    let row3 = match &np {
+        Some(v) if v.source.is_remote() => {
+            let label = v
+                .fmt
+                .as_ref()
+                .map(|f| f.yt_label())
+                .unwrap_or_else(|| "YT".to_string());
+            Line::from(vec![
+                Span::styled(
+                    label,
+                    Style::default().fg(if nc { Color::Reset } else { theme.warning }),
+                ),
+                Span::raw(format!(" {} ", sep_dot())),
+                Span::styled(format!("[{}]", app.source_mode.as_str()), dim),
+                Span::raw(format!(" {} ", sep_dot())),
+                Span::styled(yt_badge_str(app), dim),
+            ])
+        }
+        Some(v) => {
+            let q_color = quality_color(v.bit_depth, v.sample_rate_hz);
+            let q_text = format!("{}-bit / {} kHz", v.bit_depth, khz(v.sample_rate_hz));
+            let mut spans: Vec<Span<'static>> =
+                vec![Span::styled(q_text, Style::default().fg(q_color))];
+            if app.switch_sample_rate {
+                spans.push(Span::styled(
+                    format!(" {} bit-perfect", sep_dot()),
+                    Style::default().fg(q_color),
+                ));
+            }
+            spans.push(Span::raw(format!(" {} ", sep_dot())));
+            spans.push(Span::styled(format!("[{}]", app.source_mode.as_str()), dim));
+            spans.push(Span::raw(format!(" {} ", sep_dot())));
+            spans.push(Span::styled(yt_badge_str(app), dim));
+            Line::from(spans)
+        }
+        None => Line::from(Span::styled("--bit / -- kHz", dim)),
+    };
+    f.render_widget(Paragraph::new(row3).alignment(Alignment::Center), rows[2]);
+
+    // Row 4: progress bar
+    render_progress_bar(f, rows[3], app);
+
+    // Row 5: transport + volume
+    {
+        let geo = geometry_big(area);
+        let controls = accent;
+        f.render_widget(Paragraph::new(prev_glyph()).style(controls), geo.previous);
+        let pp_glyph = if playing && has_track {
+            play_glyph()
+        } else if has_track {
+            pause_glyph()
+        } else {
+            stop_glyph()
+        };
+        f.render_widget(
+            Paragraph::new(pp_glyph)
+                .style(controls)
+                .alignment(Alignment::Center),
+            geo.play_pause,
+        );
+        f.render_widget(Paragraph::new(next_glyph()).style(controls), geo.next);
+
+        let vol_str = {
+            let blocks = 4u32;
+            let filled = if app.muted {
+                0
+            } else {
+                ((u32::from(app.volume) * blocks + 50) / 100).min(blocks)
+            };
+            let mut bar = String::new();
+            for i in 0..blocks {
+                bar.push(if i < filled {
+                    filled_block()
+                } else {
+                    empty_block()
+                });
+            }
+            let pct = if app.muted { 0 } else { app.volume };
+            format!("vol {bar} {pct}%")
+        };
+        let vol_label = if app.muted { " [MUTED]" } else { "" };
+        let vol_color = if app.muted { theme.dim } else { theme.text };
+        let vol_line = Line::from(vec![
+            Span::styled(
+                vol_str,
+                Style::default().fg(if nc { Color::Reset } else { vol_color }),
+            ),
+            Span::styled(vol_label.to_string(), dim),
+        ]);
+        f.render_widget(Paragraph::new(vol_line), geo.volume);
+    }
+
+    // Row 6: flags — center-aligned
+    f.render_widget(
+        Paragraph::new(build_flags_line(app)).alignment(Alignment::Center),
+        rows[5],
+    );
+
+    // Row 7: Next: title — center-aligned
+    {
+        let next = next_preview(app);
+        let avail = rows[6].width as usize;
+        let prefix = "Next: ";
+        let budget = avail.saturating_sub(prefix.len()).max(1);
+        let next_clip = crate::tui::view::theme::clip_to_width(&next, budget);
+        // Fix: next_preview already returns "Next: ..." — strip the
+        // duplicate prefix if present.
+        let next_clean = next_clip.strip_prefix("Next: ").unwrap_or(&next_clip);
+        let row7 = Line::from(vec![
+            Span::styled("Next: ", dim),
+            Span::styled(next_clean.to_string(), text),
+        ]);
+        f.render_widget(Paragraph::new(row7).alignment(Alignment::Center), rows[6]);
+    }
+
+    // Row 8: YT state — center-aligned
+    {
+        let yt_line = build_yt_state_line(app, &theme);
+        f.render_widget(
+            Paragraph::new(yt_line).alignment(Alignment::Center),
+            rows[7],
+        );
+    }
+}
+
+/// Render the big Now Playing panel WITH the outer border/title.
+/// Used when the big bar is at the bottom of the screen (not a pane).
+/// Mirrors `footer::compact_yt_badge` but returns a plain string (no
+/// style) since the caller applies its own style.
+fn yt_badge_str(app: &App) -> String {
+    use crate::yt::state::YtState;
+    match app.yt_state {
+        YtState::Ready => "[Y ok]",
+        YtState::Authenticating | YtState::AuthenticatedNotSynced | YtState::Synchronizing => {
+            "[Y ~]"
+        }
+        YtState::ReadyStale
+        | YtState::ProviderError
+        | YtState::AuthExpired
+        | YtState::RateLimited
+        | YtState::Failed => "[Y err]",
+        YtState::Unconfigured | YtState::SignedOut => "[Y —]",
+    }
+    .to_string()
+}
+
+/// Build the YT state line for row 8 of the big Now Playing panel.
+/// Shows the YT human label + recovery hint (same info as the footer
+/// status line, minus the mode badge which is already on row 3).
+fn build_yt_state_line(app: &App, theme: &Theme) -> Line<'static> {
+    use crate::yt::state::YtState;
+    let dim = theme.status_description();
+    let nc = crate::tui::view::theme::no_color();
+
+    // Transient toast takes precedence (same as footer).
+    if let Some(msg) = &app.status_toast {
+        let style = if nc {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            theme.error_style()
+        };
+        return Line::from(Span::styled(msg.clone(), style));
+    }
+
+    // Transient yt_status message.
+    if let Some(msg) = &app.yt_status {
+        let color = if nc { Color::Reset } else { theme.accent };
+        return Line::from(Span::styled(msg.clone(), Style::default().fg(color)));
+    }
+
+    // Persistent yt_error when Ready.
+    if app.yt_state == YtState::Ready {
+        if let Some(err) = &app.yt_error {
+            let style = theme.error_style();
+            return Line::from(vec![
+                Span::styled("[ERR] ", style),
+                Span::styled(err.clone(), style),
+            ]);
+        }
+        return Line::from(Span::styled(
+            "[ok] YT connected",
+            Style::default().fg(if nc { Color::Reset } else { theme.success }),
+        ));
+    }
+
+    // Non-Ready: show the human label + recovery hint.
+    let label = crate::tui::view::theme::ascii_sanitize(app.yt_state.human_label());
+    let icon = app.yt_state.icon();
+    let color = if nc {
+        Color::Reset
+    } else {
+        match app.yt_state {
+            YtState::AuthExpired | YtState::ProviderError | YtState::Failed => theme.error,
+            YtState::RateLimited | YtState::ReadyStale => theme.warning,
+            _ => theme.accent,
+        }
+    };
+    let style = Style::default().fg(color);
+    let err_prefix = matches!(
+        app.yt_state,
+        YtState::AuthExpired | YtState::ProviderError | YtState::Failed
+    )
+    .then_some("[!] ")
+    .unwrap_or("");
+    let yt_label = match icon {
+        Some(ic) => format!("{err_prefix}{ic} YT: {label}"),
+        None => format!("{err_prefix}YT: {label}"),
+    };
+    Line::from(vec![
+        Span::styled("   ", dim),
+        Span::styled(yt_label, style),
+    ])
 }
 
 #[cfg(test)]
@@ -791,17 +1064,22 @@ mod tests {
         );
     }
 
-    /// The big bar must show a Lyrics: line (either the first lyric line or
-    /// "(none)" when no lyrics are available).
+    /// Phase 9 redesign: the big bar no longer shows a `Lyrics:` label
+    /// (replaced by a cleaner "Next: title" row + YT state row). Instead
+    /// verify the bar shows "Next:" and the YT state badge.
     #[test]
-    fn big_bar_shows_lyrics_label() {
+    fn big_bar_shows_next_and_yt_badge() {
         let (_d, cat) = two_track_cat();
         let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
         app.play_in_context_ids(vec!["t1".into()], "t1");
         let bar = rendered_big(&app, 100, 10);
         assert!(
-            bar.contains("Lyrics:"),
-            "big bar must show Lyrics: label: {bar}"
+            bar.contains("Next:"),
+            "big bar must show Next: label (Phase 9 redesign): {bar}"
+        );
+        assert!(
+            bar.contains("[Y"),
+            "big bar must show YT state badge (Phase 9 redesign): {bar}"
         );
     }
 

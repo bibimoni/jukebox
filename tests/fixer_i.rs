@@ -11,6 +11,7 @@ use jukebox::catalog::Catalog;
 use jukebox::player::StubPlayer;
 use jukebox::tui::app::{App, Overlay, View};
 use jukebox::tui::input::handle_key;
+use jukebox::tui::keymap::{parse_key_spec, Action};
 use jukebox::tui::view::layout::draw;
 use jukebox::tui::view::overlay::help_lines;
 use ratatui::{
@@ -129,6 +130,29 @@ fn rc15_def1_help_g_key_shows_content_not_blank() {
         content_chars > 50,
         "RC15-DEF-1: after G, help popup must show content (not blank). \
          Found {content_chars} non-space chars in popup region.\n{buf}"
+    );
+}
+
+#[test]
+fn help_overlay_uses_custom_keybindings() {
+    let _xdg = isolate_xdg();
+    let (_d, cat) = one_track_cat();
+    let mut app = App::new(cat, Box::new(StubPlayer::default()), None, None);
+    app.keymap.set_primary_binding(
+        Action::PlaybackResumeOrToggle,
+        parse_key_spec("Alt+p").unwrap(),
+    );
+    app.overlay = Some(Overlay::Help);
+
+    let text = rendered(&mut app, 140, 80);
+
+    assert!(
+        text.contains("Alt+p") && text.contains("play / pause"),
+        "help overlay must show the configured playback keybinding:\n{text}"
+    );
+    assert!(
+        !text.contains("Space           play / pause"),
+        "help overlay must not keep showing the stale default binding:\n{text}"
     );
 }
 
@@ -454,21 +478,13 @@ fn rc15_def5_80x24_long_title_shows_ellipsis() {
     // Render at 80x24 (compact bar, height 1).
     let buf = rendered(&mut app, 80, 24);
 
-    // The player bar is the last row before the footer. Find the row
-    // containing "[PLAYING]" (the compact bar's state label).
+    // The redesigned deck separates playback state from metadata. Find the
+    // wrapped/truncated title line rather than the old `[PLAYING]` line.
     let bar_line = buf
         .lines()
-        .find(|l| l.contains("[PLAYING]"))
+        .find(|l| l.contains('…') || l.contains("..."))
         .map(|l| l.to_string())
-        .unwrap_or_else(|| {
-            // If not found, try [STOPPED] or [PAUSED].
-            buf.lines()
-                .find(|l| {
-                    l.contains("[STOPPED]") || l.contains("[PAUSED]") || l.contains("[BUFFERING]")
-                })
-                .map(|l| l.to_string())
-                .unwrap_or_default()
-        });
+        .unwrap_or_default();
 
     // The bar must contain the ellipsis character `…` (U+2026) or `...`
     // (ASCII mode). Under default test env, font_mode is Unicode, so `…`.
@@ -490,7 +506,7 @@ fn rc15_def5_100x30_long_title_still_truncates() {
     let buf = rendered(&mut app, 100, 30);
     let bar_line = buf
         .lines()
-        .find(|l| l.contains("[PLAYING]"))
+        .find(|l| l.contains('…') || l.contains("..."))
         .map(|l| l.to_string())
         .unwrap_or_default();
     assert!(

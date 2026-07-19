@@ -1,6 +1,6 @@
 [package]
 name = "jukebox"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Filtered-lossless jukebox: bash indexer + Rust TUI with multilingual search and mpv playback"
 license = "MIT"
@@ -25,11 +25,13 @@ signal-hook = "0.3"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 tantivy = "0.25"
 lindera = { version = "4.0", features = ["embed-ipadic"] }
 lindera-tantivy = { version = "4.0", features = ["embed-ipadic"] }
 wana_kana = "5.0"
 unicode-normalization = "0.1"
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
@@ -55,4 +57,3 @@ bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 # Each Release asset is named jukebox-<target>.tar.gz (matches release.yml's
 # `artifact:` matrix value: jukebox-aarch64-apple-darwin, etc.).
-

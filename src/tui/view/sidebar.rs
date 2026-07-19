@@ -9,7 +9,7 @@
 //!
 //! Sections: `VIEWS` (always), `DISCOVER` (always), `TOOLS` (always),
 //! `PUBLISH` (only when a playlist is focused in the Playlists view). The
-//! active view is highlighted with accent + BOLD + REVERSED (matching the tab
+//! active view is highlighted with accent + BOLD + UNDERLINE (matching the tab
 //! bar style). Inactive entries are dim. The Queue entry shows `(n)` when the
 //! manual queue is non-empty.
 //!
@@ -19,14 +19,14 @@
 
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
 use crate::tui::app::{App, Overlay, View};
-use crate::tui::view::theme::{self, h_line, is_ascii, no_color, Theme, ASCII_BORDER_SET};
+use crate::tui::view::theme::{self, h_line, is_ascii, Theme, ASCII_BORDER_SET};
 
 /// Which target a sidebar entry dispatches to. Mirrors the existing
 /// keybindings — clicking the entry (or pressing the key) triggers the same
@@ -215,25 +215,21 @@ pub fn is_visible(app: &App, term_width: u16) -> bool {
 }
 
 /// Render the sidebar into `area`. The caller (`layout::draw`) splits off the
-/// sidebar rect first; this function fills it. Active entry = accent +
-/// BOLD + REVERSED (matches the tab bar style); inactive = dim. Sections are
-/// separated by a dim `─` rule. The Queue entry appends `(n)` when the manual
-/// queue is non-empty.
+/// sidebar rect first; this function fills it. Active entry = accent + BOLD +
+/// UNDERLINE (matches the tab bar style — Phase 3 visual spec H18 / V22);
+/// inactive = dim. Sections are separated by a dim `─` rule. The Queue entry
+/// appends `(n)` when the manual queue is non-empty.
 pub fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let theme = Theme::default();
-    let nc = no_color();
-    let dim = Style::default().fg(if nc { Color::Reset } else { theme.dim });
-    let active = Style::default()
-        .fg(if nc { Color::Reset } else { theme.accent })
-        .add_modifier(Modifier::BOLD)
-        .add_modifier(Modifier::REVERSED);
-    let text = Style::default().fg(if nc { Color::Reset } else { theme.text });
-    let header = Style::default()
-        .fg(if nc { Color::Reset } else { theme.accent })
-        .add_modifier(Modifier::BOLD);
+    // Phase 3: tabs/sidebar use Theme::tab (accent + BOLD + UNDERLINE),
+    // not REVERSED, so they don't collide with row selection.
+    let dim = theme.status_description();
+    let active = theme.tab(true);
+    let text = Style::default().fg(theme.text);
+    let header = theme.status_key();
 
     let block = if is_ascii() {
         Block::default()

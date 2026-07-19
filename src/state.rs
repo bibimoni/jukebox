@@ -262,8 +262,20 @@ pub struct LayoutState {
     pub track_layout_mode: String,
     #[serde(default = "default_sidebar_visible")]
     pub sidebar_visible: bool,
+    /// Phase 9: persists `player_bar_state.hidden` so the `S` toggle
+    /// survives across sessions. Default false (bar visible).
+    #[serde(default)]
+    pub player_bar_hidden: bool,
     #[serde(default)]
     pub playlist_col: PlaylistColState,
+    /// Modular pane-editing workspace (Phase 1): the split tree + focused
+    /// pane + next-id counter. `None` on a fresh install or after a
+    /// schema migration (the workspace defaults to a single Artists
+    /// root pane). The DTO is serialized as JSON inside the SQLite state
+    /// row alongside the other UI prefs. `UiMode` is intentionally NOT
+    /// persisted — the app always starts in Normal mode.
+    #[serde(default)]
+    pub pane_workspace: Option<crate::tui::pane::persistence::PaneWorkspaceDto>,
 }
 
 fn default_sidebar_visible() -> bool {
@@ -339,7 +351,9 @@ impl Default for LayoutState {
             player_bar_mode: "mini".to_string(),
             track_layout_mode: "table".to_string(),
             sidebar_visible: true,
+            player_bar_hidden: false,
             playlist_col: PlaylistColState::default(),
+            pane_workspace: None,
         }
     }
 }
@@ -418,7 +432,12 @@ pub struct LayoutSave<'a> {
     pub player_bar_mode: &'a str,
     pub track_layout_mode: &'a str,
     pub sidebar_visible: bool,
+    /// Phase 9: persists `player_bar_state.hidden` (the `S` toggle).
+    pub player_bar_hidden: bool,
     pub playlist_col: &'a crate::tui::app::PlaylistColumnState,
+    /// Pane workspace DTO. `None` if the pane system hasn't been used
+    /// (a single Artists root pane is the default).
+    pub pane_workspace: Option<&'a crate::tui::pane::persistence::PaneWorkspaceDto>,
 }
 
 /// Save the layout (focus + widths + volume + shuffle/repeat) to `path`.
@@ -467,11 +486,13 @@ pub fn save_layout_at(path: &Path, input: &LayoutSave) -> Result<()> {
         player_bar_mode: input.player_bar_mode.to_string(),
         track_layout_mode: input.track_layout_mode.to_string(),
         sidebar_visible: input.sidebar_visible,
+        player_bar_hidden: input.player_bar_hidden,
         playlist_col: PlaylistColState {
             width: input.playlist_col.width,
             group_by_type: input.playlist_col.group_by_type,
             show_counts: input.playlist_col.show_counts,
         },
+        pane_workspace: input.pane_workspace.cloned(),
     })?;
     conn.execute(
         "INSERT INTO state (key, value) VALUES ('layout', ?1)

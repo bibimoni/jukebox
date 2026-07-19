@@ -631,9 +631,20 @@ for line in sys.stdin:
 
     // First on_tick fires get_playlist("PLFAKE").
     app.on_tick();
-    // Let the error response land.
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    app.on_tick();
+    // Poll the actual state instead of assuming the playlist response is the
+    // next message after a fixed sleep. Home/explore requests share this
+    // asynchronous queue and may be drained first under suite load.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline
+        && !app
+            .yt_session
+            .as_ref()
+            .map(|session| session.failed_playlists.contains("PLFAKE"))
+            .unwrap_or(false)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        app.on_tick();
+    }
     // After the error: PLFAKE must be in failed_playlists.
     assert!(
         app.yt_session

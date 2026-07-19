@@ -194,8 +194,8 @@ fn m1b_generator_preview_shows_cursor_marker() {
         text.push('\n');
     }
     assert!(
-        text.contains("▶"),
-        "M-1b: generator Preview should show a ▶ cursor marker:\n{text}"
+        text.contains("▸") || text.contains("▶"),
+        "M-1b: generator Preview should show a ▸/▶ cursor marker (Phase 8 visual spec C5/A6 changed ▶ → marker_glyph() = ▸):\n{text}"
     );
 }
 

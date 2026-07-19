@@ -31,6 +31,7 @@ use crate::lyrics::LyricsSource;
 use crate::reco::explanations::Explanation;
 use crate::reco::radio::RadioSession;
 use crate::tui::app::{App, Overlay};
+use crate::tui::keymap::{Action, Keymap};
 use crate::tui::view::icons::IconRenderer;
 use crate::tui::view::theme::{
     clip_to_width, disp_width, down_arrow, ellipsis, em_dash, is_ascii, marker_glyph, right_arrow,
@@ -56,7 +57,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
                 f, area, app, &input, &results, cursor, scope, &submitted, searching,
             );
         }
-        Overlay::Help => render_help(f, area, app.help_scroll),
+        Overlay::Help => render_help(f, area, app.help_scroll, &app.keymap),
         Overlay::PlaylistPicker { track_id, cursor } => {
             render_playlist_picker(f, area, app, &track_id, cursor)
         }
@@ -102,7 +103,79 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
         Overlay::Explanation { explanation } => render_explanation_overlay(f, area, &explanation),
         // Publication confirmation — centered popup.
         Overlay::Publication { state } => render_publication_overlay(f, area, &state),
+        // Pane-edit: split-direction picker. Centered popup.
+        Overlay::PaneSplitDirection { .. } => render_pane_split_direction_overlay(f, area),
+        // Pane-edit: module picker. Centered popup.
+        Overlay::PaneModulePicker {
+            target_pane,
+            pending_split,
+            cursor,
+        } => render_pane_module_picker_overlay(f, area, target_pane, pending_split, cursor),
+        Overlay::Keybindings { cursor, capturing } => {
+            render_keybindings_overlay(f, area, app, cursor, capturing)
+        }
     }
+}
+
+fn render_keybindings_overlay(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    cursor: usize,
+    capturing: bool,
+) {
+    let theme = Theme::default();
+    let popup = centered(area, 62, 70);
+    f.render_widget(Clear, area);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(if capturing {
+            " Keybindings - press a key "
+        } else {
+            " Keybindings "
+        })
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent));
+
+    let rows: Vec<ListItem> = Action::editable_actions()
+        .iter()
+        .enumerate()
+        .map(|(idx, action)| {
+            let selected = idx == cursor;
+            let marker = if selected { right_arrow() } else { " " };
+            let keys = app.keymap.bindings_for(*action).join(", ");
+            let style = if selected {
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{marker} "), style),
+                Span::styled(format!("{:<28}", action.label()), style),
+                Span::styled(keys, Style::default().fg(theme.muted)),
+            ]))
+        })
+        .collect();
+
+    let footer = if capturing {
+        "Press the replacement key. Esc cancels the overlay."
+    } else {
+        "j/k or arrows move  Enter capture  Esc close"
+    };
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let mut state = ListState::default();
+    state.select(Some(cursor));
+    f.render_stateful_widget(List::new(rows), chunks[0], &mut state);
+    f.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(theme.muted)),
+        chunks[1],
+    );
 }
 
 /// The discover overlay (`S`): a centered list of suggested albums / YT
@@ -459,10 +532,7 @@ fn render_search(
     // area, paint a dim Black backdrop, then clear + render the popup with an
     // opaque surface bg on top so it reads as a true modal.
     f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new("").style(Style::default().bg(Color::Black)),
-        area,
-    );
+    f.render_widget(Paragraph::new("").style(Theme::default().overlay()), area);
 
     let popup = centered(area, 60, 60);
     f.render_widget(Clear, popup);
@@ -485,14 +555,14 @@ fn render_search(
             .borders(Borders::ALL)
             .border_set(ASCII_BORDER_SET)
             .border_style(Style::default().fg(theme.accent))
-            .style(Style::default().bg(Color::Black))
+            .style(Theme::default().overlay())
             .title(Span::styled(title, Style::default().fg(theme.accent)))
     } else {
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Thick)
             .border_style(Style::default().fg(theme.accent))
-            .style(Style::default().bg(Color::Black))
+            .style(Theme::default().overlay())
             .title(Span::styled(title, Style::default().fg(theme.accent)))
     };
     let inner_area = inner.inner(popup);
@@ -693,7 +763,12 @@ fn render_search(
     let mut state = ListState::default();
     state.select(Some(cursor));
     f.render_stateful_widget(
-        List::new(items).highlight_style(Style::default().fg(theme.hi_fg).bg(theme.accent)),
+        // Phase 6 (visual spec C1 / I1 / V7): use Theme::selected_style
+        // (REVERSED + BOLD in color, REVERSED + BOLD under NO_COLOR) so
+        // the selected search result is visible in monochrome mode. The
+        // prior `fg(hi_fg).bg(accent)` was color-only — invisible under
+        // NO_COLOR because both collapse to Reset.
+        List::new(items).highlight_style(theme.selected_style()),
         rows[2],
         &mut state,
     );
@@ -715,6 +790,14 @@ fn render_search(
 /// `JUKEBOX_FONT_MODE=ascii`. Exposed as `pub` so the ASCII/Unicode split is
 /// unit-testable without touching process-global env vars.
 pub fn help_lines(sep_width: usize, ascii: bool) -> Vec<Line<'static>> {
+    help_lines_with_keymap(sep_width, ascii, None)
+}
+
+pub fn help_lines_with_keymap(
+    sep_width: usize,
+    ascii: bool,
+    keymap: Option<&Keymap>,
+) -> Vec<Line<'static>> {
     let theme = Theme::default();
     let accent = Style::default().fg(theme.accent);
     let bold = Style::default().add_modifier(Modifier::BOLD);
@@ -726,6 +809,13 @@ pub fn help_lines(sep_width: usize, ascii: bool) -> Vec<Line<'static>> {
             Span::styled(format!("{:<16}", key), accent),
             Span::styled(desc.to_string(), text),
         ])
+    };
+
+    let keys = |action: Action, fallback: &str| -> String {
+        keymap
+            .map(|keymap| keymap.bindings_for(action).join(" / "))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| fallback.to_string())
     };
 
     let section =
@@ -794,10 +884,23 @@ pub fn help_lines(sep_width: usize, ascii: bool) -> Vec<Line<'static>> {
         entry(nav_key, nav_desc),
         entry("gg / G", "top / bottom of column"),
         entry(
-            "1 2 3 4",
+            &format!(
+                "{} {} {} {}",
+                keys(Action::NavigationViewArtists, "1"),
+                keys(Action::NavigationViewPlaylists, "2"),
+                keys(Action::NavigationViewQueue, "3"),
+                keys(Action::NavigationViewYoutube, "4")
+            ),
             "switch view: Artists / Playlists / Queue / YouTube",
         ),
-        entry("Tab / Shift+Tab", "cycle view"),
+        entry(
+            &format!(
+                "{} / {}",
+                keys(Action::NavigationViewCycleNext, "Tab"),
+                keys(Action::NavigationViewCyclePrev, "Shift+Tab")
+            ),
+            "cycle view",
+        ),
         entry("B", "toggle sidebar (feature entry points)"),
         sep(),
         section("YouTube view tabs (I.4)"),
@@ -810,21 +913,64 @@ pub fn help_lines(sep_width: usize, ascii: bool) -> Vec<Line<'static>> {
             "h / l (Home tab)",
             "switch Home section (h at left exits YT)",
         ),
-        entry("/", "jump to Search tab with input focused"),
+        entry(
+            &keys(Action::SearchOpen, "/"),
+            "jump to Search tab with input focused",
+        ),
         entry("H", "open Home tab (switches to YT view)"),
         entry("S (YT/Mixed)", "open Discover tab"),
         sep(),
         section("Playback"),
-        entry("Enter", "play selected in context"),
-        entry("Space", "play / pause"),
-        entry("> / <", "next / previous track"),
-        entry(", / .", seek_desc),
-        entry("+ / -", "volume up / down"),
-        entry("m", "mute"),
-        entry("z / Z", "cycle shuffle / reshuffle"),
-        entry("r", repeat_desc),
-        entry("c", "cycle continue (mode-dependent)"),
-        entry("M", "cycle source pref (Local / YouTube / Mixed)"),
+        entry(
+            &keys(Action::PlaybackPlaySelected, "Enter"),
+            "play selected in context",
+        ),
+        entry(
+            &keys(Action::PlaybackResumeOrToggle, "Space"),
+            "play / pause / resume",
+        ),
+        entry(
+            &format!(
+                "{} / {}",
+                keys(Action::PlaybackNext, ">"),
+                keys(Action::PlaybackPrevious, "<")
+            ),
+            "next / previous track",
+        ),
+        entry(
+            &format!(
+                "{} / {}",
+                keys(Action::PlaybackSeekBack, ","),
+                keys(Action::PlaybackSeekForward, ".")
+            ),
+            seek_desc,
+        ),
+        entry(
+            &format!(
+                "{} / {}",
+                keys(Action::VolumeUp, "+"),
+                keys(Action::VolumeDown, "-")
+            ),
+            "volume up / down",
+        ),
+        entry(&keys(Action::VolumeMuteToggle, "m"), "mute"),
+        entry(
+            &format!(
+                "{} / {}",
+                keys(Action::ShuffleCycle, "z"),
+                keys(Action::ShuffleReshuffle, "Z")
+            ),
+            "cycle shuffle / reshuffle",
+        ),
+        entry(&keys(Action::RepeatCycle, "r"), repeat_desc),
+        entry(
+            &keys(Action::ContinueCycle, "c"),
+            "cycle continue (mode-dependent)",
+        ),
+        entry(
+            &keys(Action::SourceModeCycle, "M"),
+            "cycle source pref (Local / YouTube / Mixed)",
+        ),
         entry("P", "toggle big player bar (needs 100x30+)"),
         entry("T", "toggle track-list cards (needs 140 cols+)"),
         sep(),
@@ -834,16 +980,21 @@ pub fn help_lines(sep_width: usize, ascii: bool) -> Vec<Line<'static>> {
         entry("f", filter_desc),
         sep(),
         section("Modes"),
-        entry("/", "search (scoped to view)"),
-        entry("?", "help"),
-        entry(":", "command"),
+        entry(&keys(Action::SearchOpen, "/"), "search (scoped to view)"),
+        entry(&keys(Action::HelpOpen, "?"), "help"),
+        entry(&keys(Action::CommandOpen, ":"), "command"),
         entry("a", "add to playlist"),
         entry("L", "lyrics for the playing track (synced/plain)"),
         entry("D", "diagnostics overlay (recent provider errors)"),
         entry("e", "enqueue (play next)"),
         entry("x", "remove from queue"),
         entry("d", "delete playlist"),
-        entry("R", "resume last track (when stopped) / retry YT"),
+        entry(
+            &keys(Action::YoutubeRefreshSurface, "R"),
+            "refresh focused YT surface / retry YT",
+        ),
+        entry(&keys(Action::KeybindingsOpen, "Ctrl+k"), "edit keybindings"),
+        entry(":keys", "edit keybindings (terminal-safe fallback)"),
         entry(":yt auth", "paste cookies"),
         entry(":yt auth browser", "<chrome|firefox|safari|edge|brave>"),
         entry(":yt setup", "install deps"),
@@ -888,6 +1039,52 @@ pub fn help_lines(sep_width: usize, ascii: bool) -> Vec<Line<'static>> {
         entry("Esc", "close overlay / exit YouTube view"),
         entry("q", "quit"),
         sep(),
+        section("Pane editing (modular split tree)"),
+        entry(
+            &keys(Action::PaneEditToggle, "E"),
+            "enter / exit pane edit mode",
+        ),
+        entry(
+            &format!(
+                "{} / {} / {} / {}",
+                keys(Action::PaneFocusLeft, "Alt+h"),
+                keys(Action::PaneFocusDown, "Alt+j"),
+                keys(Action::PaneFocusUp, "Alt+k"),
+                keys(Action::PaneFocusRight, "Alt+l")
+            ),
+            "move pane focus (Normal mode)",
+        ),
+        entry(
+            &format!(
+                "{} / {}",
+                keys(Action::PaneCycleNext, "Tab"),
+                keys(Action::PaneCyclePrev, "Shift+Tab")
+            ),
+            "cycle pane focus (Normal mode)",
+        ),
+        entry("h/j/k/l or arrows", "move pane focus (PaneEdit mode)"),
+        entry("H/J/K/L", "grow focused pane left/down/up/right"),
+        entry("v / x", "split right / bottom (Placeholder module)"),
+        entry("s", "split-direction picker (Left/Right/Top/Bottom)"),
+        entry("d", "close focused pane (refuses if only root)"),
+        entry("m", "module picker (change focused pane's module)"),
+        entry("1-4", "set focused pane module: Artists/Playlists/Queue/YT"),
+        entry("5", "set focused pane module: Now Playing (big player bar)"),
+        entry("Tab / Shift+Tab", "cycle pane focus forward / backward"),
+        entry("r", "rectangle selection (pick a sub-region)"),
+        entry(
+            "  arrows / hjkl",
+            "  move active corner (Shift = 4x faster)",
+        ),
+        entry("  Enter", "  confirm anchor, then extent, then module"),
+        entry("  Tab", "  switch active corner"),
+        entry("  Esc", "  cancel rectangle selection"),
+        entry(
+            "S",
+            "hide/show now-playing player bar (more room for panes)",
+        ),
+        entry("Esc", "exit pane edit mode"),
+        sep(),
         section("Accessibility"),
         entry(
             "NO_COLOR=1",
@@ -905,7 +1102,7 @@ pub fn help_lines(sep_width: usize, ascii: bool) -> Vec<Line<'static>> {
     ]
 }
 
-fn render_help(f: &mut Frame, area: Rect, scroll: u16) {
+fn render_help(f: &mut Frame, area: Rect, scroll: u16, keymap: &Keymap) {
     let theme = Theme::default();
     // True modal: clear the FULL screen so the browse chrome (columns, player
     // bar, footer) is erased completely — not visible behind the popup. The
@@ -944,7 +1141,7 @@ fn render_help(f: &mut Frame, area: Rect, scroll: u16) {
     // Compute the inner width (popup width minus 2 for borders) and pass it
     // to help_lines so the `─` separators reach the right border.
     let sep_width = popup.width.saturating_sub(2) as usize;
-    let lines = help_lines(sep_width, ascii);
+    let lines = help_lines_with_keymap(sep_width, ascii, Some(keymap));
     // RC15-DEF-1: clamp scroll so the popup never shows blank lines past the
     // last content row. The inner height (popup height minus 2 borders) is the
     // max visible rows; `max_scroll` = content_height - visible_rows. Without
@@ -1015,7 +1212,16 @@ fn render_playlist_picker(f: &mut Frame, area: Rect, app: &App, track_id: &str, 
     let mut state = ListState::default();
     state.select(Some(cursor.min(items.len().saturating_sub(1))));
     f.render_stateful_widget(
-        List::new(items).highlight_style(Style::default().fg(theme.hi_fg).bg(theme.accent)),
+        // Phase 6 (visual spec C2 / I2 / V7 / V17): use Theme::selected_style
+        // (REVERSED + BOLD) so the selected playlist is visible under
+        // NO_COLOR. The prior `fg(hi_fg).bg(accent)` was color-only.
+        // V17 also wanted a `›` marker glyph prefix on the selected row
+        // for a third non-color cue; the Ratatui List widget's highlight
+        // mechanism applies the style to the whole row, so the REVERSED
+        // inversion already provides a strong non-color cue here. The
+        // `›` marker is added by the module picker (which builds items
+        // manually) — for the playlist picker we rely on REVERSED+BOLD.
+        List::new(items).highlight_style(theme.selected_style()),
         inner,
         &mut state,
     );
@@ -1129,7 +1335,7 @@ fn render_lyrics_overlay(
     // Dim backdrop on the content area only — the player bar below is left
     // untouched (it has its own opaque styling).
     f.render_widget(
-        Paragraph::new("").style(Style::default().bg(Color::Black)),
+        Paragraph::new("").style(Theme::default().overlay()),
         content_rect,
     );
     // Centered popup — 80% width so the lyrics pane is readable but leaves a
@@ -1163,14 +1369,14 @@ fn render_lyrics_overlay(
             .borders(Borders::ALL)
             .border_set(ASCII_BORDER_SET)
             .border_style(Style::default().fg(theme.accent))
-            .style(Style::default().bg(Color::Black))
+            .style(Theme::default().overlay())
             .title(Span::styled(title, Style::default().fg(theme.accent)))
             .padding(Padding::horizontal(1))
     } else {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.accent))
-            .style(Style::default().bg(Color::Black))
+            .style(Theme::default().overlay())
             .title(Span::styled(title, Style::default().fg(theme.accent)))
             .padding(Padding::horizontal(1))
     };
@@ -1566,10 +1772,7 @@ fn render_radio_overlay(f: &mut Frame, area: Rect, app: &mut App, session: Optio
     // the opaque backdrop makes the cleared cells non-default so the diff
     // always emits them. Mirrors `render_search`.
     f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new("").style(Style::default().bg(Color::Black)),
-        area,
-    );
+    f.render_widget(Paragraph::new("").style(Theme::default().overlay()), area);
     // DEF-062: a wider popup (70% instead of 60%) reduces the surrounding
     // bleed region so less of the main view shows on the sides. Clear is
     // still called on the popup rect below.
@@ -1614,10 +1817,7 @@ fn render_generator_overlay(f: &mut Frame, area: Rect, state: &generator::Genera
     let theme = Theme::default();
     let icons = IconRenderer::auto();
     f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new("").style(Style::default().bg(Color::Black)),
-        area,
-    );
+    f.render_widget(Paragraph::new("").style(Theme::default().overlay()), area);
     let popup = centered(area, 60, 70);
     f.render_widget(Clear, popup);
     let block = titled_block(" generator ", &theme);
@@ -1634,10 +1834,7 @@ fn render_explanation_overlay(f: &mut Frame, area: Rect, explanation: &Explanati
     let theme = Theme::default();
     let icons = IconRenderer::auto();
     f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new("").style(Style::default().bg(Color::Black)),
-        area,
-    );
+    f.render_widget(Paragraph::new("").style(Theme::default().overlay()), area);
     let popup = centered(area, 60, 50);
     f.render_widget(Clear, popup);
     let block = titled_block(" explanation ", &theme);
@@ -1654,10 +1851,7 @@ fn render_publication_overlay(f: &mut Frame, area: Rect, state: &publication::Pu
     let theme = Theme::default();
     let icons = IconRenderer::auto();
     f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new("").style(Style::default().bg(Color::Black)),
-        area,
-    );
+    f.render_widget(Paragraph::new("").style(Theme::default().overlay()), area);
     // M-1: at 80x24 a 70%-height popup is only ~16 rows, and the publication
     // content (>16 lines) overflows so the account + publish/cancel controls
     // are clipped off-screen. Use a fixed height that fills most of the
@@ -1670,6 +1864,137 @@ fn render_publication_overlay(f: &mut Frame, area: Rect, state: &publication::Pu
     f.render_widget(block, popup);
     let para = publication::render(popup, state, &icons).scroll((state.scroll, 0));
     f.render_widget(para, inner);
+}
+
+// ---------------------------------------------------------------------------
+// Pane-edit overlays: split-direction picker + module picker
+// ---------------------------------------------------------------------------
+
+/// `PaneSplitDirection` overlay: a centered popup asking the user which
+/// side to split the focused pane on. Mirrors the styling of the
+/// existing `PlaylistPicker` (centered, accent border, dim hint text).
+/// Key dispatch lives in `pane::input::handle_split_direction_key`.
+fn render_pane_split_direction_overlay(f: &mut Frame, area: Rect) {
+    let theme = Theme::default();
+    // Use centered_fixed (absolute height) instead of centered (percentage)
+    // so the overlay is tall enough to show all content rows regardless of
+    // terminal height. The content is 6 rows + 2 border = 8 rows.
+    let popup = centered_fixed(area, 60, 8);
+    f.render_widget(Clear, popup);
+    let block = block_with_title("Split direction", &theme);
+    let inner = block.inner(popup);
+
+    let accent = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme.dim);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("h", accent),
+            Span::styled(" / ", dim),
+            Span::styled("←", accent),
+            Span::styled("  split left    ", dim),
+            Span::styled("l", accent),
+            Span::styled(" / ", dim),
+            Span::styled("→", accent),
+            Span::styled("  split right", dim),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("k", accent),
+            Span::styled(" / ", dim),
+            Span::styled("↑", accent),
+            Span::styled("  split top     ", dim),
+            Span::styled("j", accent),
+            Span::styled(" / ", dim),
+            Span::styled("↓", accent),
+            Span::styled("  split bottom", dim),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Esc cancel", dim)),
+    ];
+
+    f.render_widget(block, popup);
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+}
+
+/// `PaneModulePicker` overlay: a centered popup listing the registered
+/// modules. `j/k` or arrows navigate; Enter confirms (splits if
+/// `pending_split` is set, else changes the existing pane's module).
+fn render_pane_module_picker_overlay(
+    f: &mut Frame,
+    area: Rect,
+    _target_pane: crate::tui::pane::PaneId,
+    pending_split: Option<crate::tui::pane::model::Side>,
+    cursor: usize,
+) {
+    let theme = Theme::default();
+    // Keep a stable popup height and scroll the module viewport. The registry
+    // can contain more modules than fit here, so rendering every item would
+    // push the selected row and key hint outside the popup.
+    let popup = centered_fixed(area, 60, 12);
+    f.render_widget(Clear, popup);
+    let title = if pending_split.is_some() {
+        "Choose module for new pane"
+    } else {
+        "Choose module for pane"
+    };
+    let block = block_with_title(title, &theme);
+    let inner = block.inner(popup);
+
+    let accent = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let text = Style::default().fg(theme.text);
+    let dim = Style::default().fg(theme.dim);
+
+    let modules = crate::tui::pane::model::ModuleId::all();
+    let selected = cursor.min(modules.len().saturating_sub(1));
+    let visible_rows = (inner.height as usize).saturating_sub(2).max(1);
+    let max_offset = modules.len().saturating_sub(visible_rows);
+    let offset = selected
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(max_offset);
+    let mut lines = Vec::new();
+    for (i, m) in modules.iter().enumerate().skip(offset).take(visible_rows) {
+        let style = if i == selected { accent } else { text };
+        let marker = if i == selected { "› " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(marker, if i == selected { accent } else { dim }),
+            Span::styled(m.label(), style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "j/k move · Enter confirm · Esc cancel",
+        dim,
+    )));
+
+    f.render_widget(block, popup);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A titled block with the accent border, mirroring the existing
+/// `PlaylistPicker` styling.
+fn block_with_title(title: &str, theme: &Theme) -> Block<'static> {
+    let accent = Style::default().fg(theme.accent);
+    let title_owned = title.to_string();
+    if crate::tui::view::theme::is_ascii() {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(ASCII_BORDER_SET)
+            .border_style(accent)
+            .title(Span::styled(title_owned, accent))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Thick)
+            .border_style(accent)
+            .title(Span::styled(title_owned, accent))
+    }
 }
 
 #[cfg(test)]
@@ -2206,5 +2531,34 @@ mod tests {
             found_ellipsis,
             "RC16-DEF-3: search results must show ellipsis for long titles"
         );
+    }
+
+    #[test]
+    fn module_picker_scrolls_to_keep_last_choice_visible() {
+        let modules = crate::tui::pane::model::ModuleId::all();
+        let cursor = modules.len() - 1;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_pane_module_picker_overlay(
+                    frame,
+                    frame.area(),
+                    crate::tui::pane::PaneId(0),
+                    None,
+                    cursor,
+                );
+            })
+            .unwrap();
+
+        let mut output = String::new();
+        for y in 0..24 {
+            for x in 0..80 {
+                output.push_str(terminal.backend().buffer()[(x, y)].symbol());
+            }
+            output.push('\n');
+        }
+        assert!(output.contains("› Placeholder"), "{output}");
+        assert!(output.contains("Enter confirm"), "{output}");
     }
 }

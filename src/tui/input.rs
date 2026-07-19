@@ -16,6 +16,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 
 use crate::reco::feedback::FeedbackAction;
 use crate::tui::app::{App, Overlay, View, YtTab};
+use crate::tui::keymap::Action;
+use crate::tui::pane::model::Direction;
 
 // ---------------------------------------------------------------------------
 // Key dispatch
@@ -38,6 +40,42 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
     }
 
+    // Pane prefix: `Ctrl+w` arms a one-shot prefix. The next key is
+    // interpreted by `pane::input::handle_prefix_key` (pane navigation
+    // in any mode, toggle edit mode, etc.). If the next key isn't a
+    // pane command, it falls through to normal dispatch. This keeps
+    // pane keybindings out of the existing keymap (no conflicts) while
+    // letting the user enter pane-edit mode from anywhere.
+    //
+    // Phase 6 (visual spec H6 / I4): emit a transient status toast when
+    // the prefix is armed so the user has feedback that `Ctrl+w` is
+    // waiting for the next key. Without this, the user has no indication
+    // that the prefix is armed — they may hesitate, forget, or be
+    // surprised when a non-pane key falls through to normal dispatch.
+    if app.keymap.action_for(key) == Some(Action::PanePrefix) {
+        app.pending_pane_prefix = true;
+        app.set_status_toast("Ctrl+w — hjkl move · e/E edit · Tab cycle · S status".into());
+        return;
+    }
+    if app.pending_pane_prefix {
+        app.pending_pane_prefix = false;
+        if crate::tui::pane::input::handle_prefix_key(app, key) {
+            return;
+        }
+        // Not a pane command — fall through to normal dispatch.
+    }
+    // Pane-edit mode: route to the pane-edit handler instead of the
+    // global match. The pane handler manages its own key set (split /
+    // close / resize / change-module / exit) and passes through global
+    // playback + quit keys. Overlay routing still happens first so
+    // pane-edit sub-modes (PaneSplitDirection, PaneModulePicker) work.
+    if app.pane_workspace.mode == crate::tui::pane::model::UiMode::PaneEdit
+        && app.overlay.is_none()
+        && crate::tui::pane::input::handle_pane_edit_key(app, key)
+    {
+        return;
+    }
+
     // Overlay-open routing: typing, n/N, Enter pick, Esc close.
     if app.overlay.is_some() {
         handle_overlay_key(app, key);
@@ -48,6 +86,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // clear. Navigation keys (arrows) fall through to normal dispatch and
     // operate on the filtered list.
     if app.filter.is_some() && handle_filter_key(app, key) {
+        return;
+    }
+
+    if dispatch_keymap_action(app, key) {
         return;
     }
 
@@ -82,7 +124,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             app.yt_tab_fetch_on_visit();
             return;
         }
-        if matches!(key.code, KeyCode::Char('/')) {
+        if app.keymap.action_for(key) == Some(Action::SearchOpen) {
             app.yt_view.tab = YtTab::Search;
         }
         if matches!(key.code, KeyCode::Char('H')) {
@@ -337,61 +379,48 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
 
         // View switching: 1/2/3/4 = Artists/Playlists/Queue/YouTube.
-        (KeyCode::Char('1'), m) if m == KeyModifiers::NONE => switch_view(app, View::Artists),
-        (KeyCode::Char('2'), m) if m == KeyModifiers::NONE => switch_view(app, View::Playlists),
-        (KeyCode::Char('3'), m) if m == KeyModifiers::NONE => switch_view(app, View::Queue),
-        (KeyCode::Char('4'), m) if m == KeyModifiers::NONE => switch_view(app, View::Youtube),
+        // When the pane workspace is active (multiple panes OR pane edit
+        // mode), 1-4 change the FOCUSED pane's module instead of switching
+        // the global view — the pane renderer overrides app.view during
+        // render, so a global view switch would be invisible. Changing
+        // the focused pane's module matches the user's expectation: 1-4
+        // always controls what's in the focused pane.
+        (KeyCode::Char('1' | '2' | '3' | '4'), m) if m == KeyModifiers::NONE => {}
+        // `5` is only bound when the pane workspace is active — it
+        // changes the focused pane's module to Now Playing. There's no
+        // global `5` view to switch to (only 1-4 map to top-level
+        // views), so in the legacy single-view mode `5` is unbound.
+        (KeyCode::Char('5'), m) if m == KeyModifiers::NONE && app.pane_workspace.is_active() => {
+            app.pane_workspace.set_module(
+                app.pane_workspace.focused_pane,
+                crate::tui::pane::ModuleId::NowPlaying,
+            );
+            // No else: in legacy mode `5` falls through to `_ => {}`.
+        }
 
         // Tab / Shift+Tab cycle view forward / backward.
-        (KeyCode::Tab, m) if m.contains(KeyModifiers::SHIFT) => cycle_view(app, false),
-        (KeyCode::Tab, _) => cycle_view(app, true),
+        (KeyCode::Tab, _) => {}
 
         // --- Playback -------------------------------------------------------
-        (KeyCode::Enter, _) => app.play_selected(),
-        (KeyCode::Char(' '), _) => {
-            // RC14-DEF-4: route through `toggle_pause` so wall-clock pause
-            // tracking stays in sync (used by the hi-res progress fallback).
-            app.toggle_pause();
-        }
-        (KeyCode::Char('>'), _) => {
-            if app.playlist_col_focused() {
-                app.adjust_playlist_col_width(1);
-            } else {
-                app.next();
-            }
-        }
-        (KeyCode::Char('<'), _) => {
-            if app.playlist_col_focused() {
-                app.adjust_playlist_col_width(-1);
-            } else {
-                app.prev();
-            }
-        }
-        (KeyCode::Char(','), _) => {
-            let _ = app.player.seek(-5.0);
-        }
-        (KeyCode::Char('.'), _) => {
-            let _ = app.player.seek(5.0);
-        }
-        (KeyCode::Char('+'), _) => app.volume_up(),
-        (KeyCode::Char('-'), _) => app.volume_down(),
-        (KeyCode::Char('m'), _) => app.toggle_mute(),
+        (KeyCode::Enter, _) => {}
+        (KeyCode::Char(' '), _) => {}
+        (KeyCode::Char('>'), _) => {}
+        (KeyCode::Char('<'), _) => {}
+        (KeyCode::Char(','), _) => {}
+        (KeyCode::Char('.'), _) => {}
+        (KeyCode::Char('+'), _) => {}
+        (KeyCode::Char('-'), _) => {}
+        (KeyCode::Char('m'), _) => {}
 
         // --- Modes ----------------------------------------------------------
-        (KeyCode::Char('z'), _) => app.cycle_shuffle(),
-        (KeyCode::Char('Z'), _) => app.reshuffle(),
-        (KeyCode::Char('r'), _) => app.cycle_repeat(),
+        (KeyCode::Char('z'), _) => {}
+        (KeyCode::Char('Z'), _) => {}
+        (KeyCode::Char('r'), _) => {}
         // `c` cycles continue mode (mode-dependent: see App::cycle_continue).
-        (KeyCode::Char('c'), _) => {
-            if app.playlist_col_focused() {
-                app.toggle_playlist_counts();
-            } else {
-                app.cycle_continue();
-            }
-        }
+        (KeyCode::Char('c'), _) => {}
         // `M` cycles the source mode Local → YouTube → Mixed → Local (never
         // stops playback).
-        (KeyCode::Char('M'), _) => app.cycle_mode(),
+        (KeyCode::Char('M'), _) => {}
         // I.2: `P` toggles the big player bar preference.
         (KeyCode::Char('P'), _) => {
             app.player_bar_state.big_pref = !app.player_bar_state.big_pref;
@@ -450,30 +479,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
 
         // --- Overlays -------------------------------------------------------
-        (KeyCode::Char('/'), _) => {
-            // Default the search scope to the active view: YouTube search in
-            // the Y view (explicit-submit — ytmusicapi is slow), local BM25
-            // elsewhere (instant, live). `Tab` inside the overlay toggles.
-            let scope = if app.view == crate::tui::app::View::Youtube {
-                crate::tui::app::SearchScope::Youtube
-            } else {
-                crate::tui::app::SearchScope::Local
-            };
-            app.overlay = Some(Overlay::Search {
-                input: String::new(),
-                results: Vec::new(),
-                cursor: 0,
-                scope,
-                submitted: None,
-                searching: false,
-            });
-        }
+        (KeyCode::Char('/'), _) => {}
         // `f` inline filter on the focused column (spec §5.4).
         (KeyCode::Char('f'), _) => app.toggle_filter(),
-        (KeyCode::Char('?'), _) => {
-            app.help_scroll = 0;
-            app.overlay = Some(Overlay::Help);
-        }
+        (KeyCode::Char('?'), _) => {}
         (KeyCode::Char('a'), _) => {
             if let Some(track_id) = app.selected_track_id() {
                 app.overlay = Some(Overlay::PlaylistPicker {
@@ -482,12 +491,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 });
             }
         }
-        (KeyCode::Char(':'), _) => {
-            app.overlay = Some(Overlay::Command {
-                input: String::new(),
-                cursor: 0,
-            });
-        }
+        (KeyCode::Char(':'), _) => {}
         // `L` toggles the lyrics overlay for the currently-playing track.
         // Shows loading → available (synced/plain) / not found / error, with
         // synced-line highlighting by player.position(). `L` again (or Esc) closes.
@@ -501,11 +505,224 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // reachable via `:home`.
         (KeyCode::Char('H'), _) => app.open_home(),
         (KeyCode::Char('B'), _) => app.toggle_sidebar(),
+        // `E` toggles pane edit mode directly (no `Ctrl+w` prefix
+        // needed). Added because many terminals intercept `Ctrl+W` as
+        // "close tab" so the prefix never reaches the app. The
+        // `Ctrl+w, e` sequence still works in terminals that pass it
+        // through. In edit mode, `E` (or `Esc`) exits.
+        (KeyCode::Char('E'), _) => {
+            use crate::tui::pane::model::UiMode;
+            if app.pane_workspace.mode == UiMode::PaneEdit
+                && app.overlay.is_none()
+                && app.rectangle_selection.is_none()
+            {
+                app.pane_workspace.exit_edit_mode();
+                app.set_status_toast("exited pane edit mode".into());
+            } else {
+                app.pane_workspace.enter_edit_mode();
+                app.set_status_toast(
+                    "EDIT MODE — hjkl move · v/x split · d close · m module · Esc exit".into(),
+                );
+            }
+        }
 
         // --- Quit -----------------------------------------------------------
         (KeyCode::Char('q'), _) => app.quit(),
 
         _ => {}
+    }
+}
+
+fn dispatch_keymap_action(app: &mut App, key: KeyEvent) -> bool {
+    let Some(action) = app.keymap.action_for(key) else {
+        return false;
+    };
+    match action {
+        Action::PanePrefix => {
+            app.pending_pane_prefix = true;
+            app.set_status_toast("Ctrl+w — hjkl move · e/E edit · Tab cycle · S status".into());
+            true
+        }
+        Action::PaneEditToggle => {
+            use crate::tui::pane::model::UiMode;
+            if app.pane_workspace.mode == UiMode::PaneEdit
+                && app.overlay.is_none()
+                && app.rectangle_selection.is_none()
+            {
+                app.pane_workspace.exit_edit_mode();
+                app.set_status_toast("exited pane edit mode".into());
+            } else {
+                app.pane_workspace.enter_edit_mode();
+                app.set_status_toast(
+                    "EDIT MODE — hjkl move · v/x split · d close · m module · Esc exit".into(),
+                );
+            }
+            true
+        }
+        Action::PaneFocusLeft => crate::tui::pane::input::move_focus(app, Direction::Left),
+        Action::PaneFocusDown => crate::tui::pane::input::move_focus(app, Direction::Down),
+        Action::PaneFocusUp => crate::tui::pane::input::move_focus(app, Direction::Up),
+        Action::PaneFocusRight => crate::tui::pane::input::move_focus(app, Direction::Right),
+        Action::PaneCycleNext => crate::tui::pane::input::cycle_focus(app, true),
+        Action::PaneCyclePrev => crate::tui::pane::input::cycle_focus(app, false),
+        Action::NavigationViewArtists => {
+            switch_or_set_focused_pane(app, View::Artists, crate::tui::pane::ModuleId::Artists);
+            true
+        }
+        Action::NavigationViewPlaylists => {
+            switch_or_set_focused_pane(app, View::Playlists, crate::tui::pane::ModuleId::Playlists);
+            true
+        }
+        Action::NavigationViewQueue => {
+            switch_or_set_focused_pane(app, View::Queue, crate::tui::pane::ModuleId::Queue);
+            true
+        }
+        Action::NavigationViewYoutube => {
+            switch_or_set_focused_pane(app, View::Youtube, crate::tui::pane::ModuleId::Youtube);
+            true
+        }
+        Action::NavigationViewCycleNext => {
+            cycle_view(app, true);
+            true
+        }
+        Action::NavigationViewCyclePrev => {
+            cycle_view(app, false);
+            true
+        }
+        Action::PlaybackResumeOrToggle => {
+            app.toggle_or_resume();
+            true
+        }
+        Action::PlaybackPlaySelected => {
+            app.play_selected();
+            true
+        }
+        Action::PlaybackNext => {
+            if app.playlist_col_focused() {
+                app.adjust_playlist_col_width(1);
+            } else {
+                app.next();
+            }
+            true
+        }
+        Action::PlaybackPrevious => {
+            if app.playlist_col_focused() {
+                app.adjust_playlist_col_width(-1);
+            } else {
+                app.prev();
+            }
+            true
+        }
+        Action::PlaybackSeekBack => {
+            let _ = app.player.seek(-5.0);
+            true
+        }
+        Action::PlaybackSeekForward => {
+            let _ = app.player.seek(5.0);
+            true
+        }
+        Action::VolumeUp => {
+            app.volume_up();
+            true
+        }
+        Action::VolumeDown => {
+            app.volume_down();
+            true
+        }
+        Action::VolumeMuteToggle => {
+            app.toggle_mute();
+            true
+        }
+        Action::ShuffleCycle => {
+            app.cycle_shuffle();
+            true
+        }
+        Action::ShuffleReshuffle => {
+            app.reshuffle();
+            true
+        }
+        Action::RepeatCycle => {
+            app.cycle_repeat();
+            true
+        }
+        Action::ContinueCycle => {
+            if app.playlist_col_focused() {
+                app.toggle_playlist_counts();
+            } else {
+                app.cycle_continue();
+            }
+            true
+        }
+        Action::SourceModeCycle => {
+            app.cycle_mode();
+            true
+        }
+        Action::YoutubeRefreshSurface => refresh_focused_youtube_surface(app),
+        Action::KeybindingsOpen => {
+            app.overlay = Some(Overlay::Keybindings {
+                cursor: 0,
+                capturing: false,
+            });
+            true
+        }
+        Action::HelpOpen => {
+            app.help_scroll = 0;
+            app.overlay = Some(Overlay::Help);
+            true
+        }
+        Action::SearchOpen => {
+            open_search_overlay(app);
+            true
+        }
+        Action::CommandOpen => {
+            app.overlay = Some(Overlay::Command {
+                input: String::new(),
+                cursor: 0,
+            });
+            true
+        }
+    }
+}
+
+fn open_search_overlay(app: &mut App) {
+    let scope = if app.view == crate::tui::app::View::Youtube {
+        crate::tui::app::SearchScope::Youtube
+    } else {
+        crate::tui::app::SearchScope::Local
+    };
+    app.overlay = Some(Overlay::Search {
+        input: String::new(),
+        results: Vec::new(),
+        cursor: 0,
+        scope,
+        submitted: None,
+        searching: false,
+    });
+}
+
+fn refresh_focused_youtube_surface(app: &mut App) -> bool {
+    let focused_module = crate::tui::pane::input::focused_module(&app.pane_workspace);
+    let focused_yt_tab = match focused_module {
+        crate::tui::pane::ModuleId::YtHome => Some(YtTab::Home),
+        crate::tui::pane::ModuleId::YtExplore => Some(YtTab::Explore),
+        crate::tui::pane::ModuleId::YtCharts => Some(YtTab::Charts),
+        _ => None,
+    };
+    if let Some(tab) = focused_yt_tab.or_else(|| {
+        (app.view == View::Youtube
+            && matches!(
+                app.yt_view.tab,
+                YtTab::Home | YtTab::Explore | YtTab::Charts
+            ))
+        .then_some(app.yt_view.tab)
+    }) {
+        let saved = app.yt_view.tab;
+        app.yt_view.tab = tab;
+        app.refresh_yt_home_explore_charts();
+        app.yt_view.tab = saved;
+        true
+    } else {
+        false
     }
 }
 
@@ -519,6 +736,22 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         // state so no busy/Authenticating/AuthenticatedNotSynced lingers.
         if matches!(app.overlay, Some(Overlay::YtAuth { .. })) {
             app.cancel_yt_auth();
+        }
+        // Pane-edit sub-mode overlays (PaneSplitDirection /
+        // PaneModulePicker) return to PaneEdit mode on Esc, not Normal.
+        if matches!(
+            app.overlay,
+            Some(Overlay::PaneSplitDirection { .. } | Overlay::PaneModulePicker { .. })
+        ) {
+            app.pane_workspace
+                .set_mode(crate::tui::pane::model::UiMode::PaneEdit);
+            // Cancelling the PaneModulePicker also drops a pending
+            // rectangle selection (Phase 2): the user picked a
+            // rectangle but backed out of choosing a module, so the
+            // selection is abandoned. The pane tree is unchanged.
+            if matches!(app.overlay, Some(Overlay::PaneModulePicker { .. })) {
+                app.rectangle_selection = None;
+            }
         }
         app.overlay = None;
         // Drop any stashed play-saved index so a later confirm doesn't
@@ -773,8 +1006,19 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
                     // `render_command` (overlay.rs) prepends `:` for display.
                     // Storing `:` here would double it (`::yt`) on screen (DEF-010).
                     let known = [
-                        "queue", "yt", "lyrics", "diag", "help", "quit", "q", "home", "gen",
-                        "radio", "publish",
+                        "queue",
+                        "yt",
+                        "lyrics",
+                        "diag",
+                        "help",
+                        "quit",
+                        "q",
+                        "home",
+                        "gen",
+                        "radio",
+                        "publish",
+                        "keys",
+                        "keybindings",
                     ];
                     let prefix = input.trim_start_matches(':');
                     let matches: Vec<&str> = known
@@ -1687,6 +1931,59 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             }
             app.overlay = Some(Overlay::Publication { state });
         }
+        // Pane-edit: split-direction picker. h/l/k/j or arrows choose
+        // the side; Esc cancels (handled at the top of this fn). On
+        // confirm, the PaneModulePicker overlay opens to pick the new
+        // pane's module. The overlay is put back before dispatch so the
+        // handler can take it itself (mirroring the existing pattern
+        // where each overlay handler receives the destructured fields).
+        Some(overlay @ Overlay::PaneSplitDirection { .. }) => {
+            app.overlay = Some(overlay);
+            let _ = crate::tui::pane::input::handle_split_direction_key(app, key);
+        }
+        // Pane-edit: module picker. j/k or arrows navigate the module
+        // list; Enter confirms (splits if `pending_split` is set, else
+        // changes the existing pane's module); Esc cancels (handled at
+        // the top of this fn).
+        Some(overlay @ Overlay::PaneModulePicker { .. }) => {
+            app.overlay = Some(overlay);
+            let _ = crate::tui::pane::input::handle_module_picker_key(app, key);
+        }
+        Some(Overlay::Keybindings {
+            mut cursor,
+            mut capturing,
+        }) => {
+            let actions = Action::editable_actions();
+            if capturing {
+                if let Some(action) = actions.get(cursor).copied() {
+                    app.keymap
+                        .set_primary_binding(action, crate::tui::keymap::KeySpec::from(key));
+                    match app.keymap.save() {
+                        Ok(()) => app.set_status_toast(format!(
+                            "saved {} = {}",
+                            action.label(),
+                            app.keymap.bindings_for(action).join(", ")
+                        )),
+                        Err(err) => {
+                            app.set_status_toast(format!("could not save keybindings: {err}"))
+                        }
+                    }
+                }
+                capturing = false;
+            } else {
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        cursor = (cursor + 1).min(actions.len().saturating_sub(1));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        cursor = cursor.saturating_sub(1);
+                    }
+                    KeyCode::Enter => capturing = true,
+                    _ => {}
+                }
+            }
+            app.overlay = Some(Overlay::Keybindings { cursor, capturing });
+        }
         None => {}
     }
 }
@@ -1856,6 +2153,15 @@ fn execute_command(app: &mut App, cmd: &str) {
         // `:home` — open the YouTube Home view (same as the `H` keybinding).
         "home" => {
             app.open_home();
+        }
+        // `:keys` / `:keybindings` — open the editable keybinding registry.
+        // This is the reliable fallback for terminals/window managers that
+        // reserve or transform Ctrl+k before crossterm can report it.
+        "keys" | "keybindings" => {
+            app.overlay = Some(Overlay::Keybindings {
+                cursor: 0,
+                capturing: false,
+            });
         }
         // `:gen` — open the playlist generator (same as `G` in the Y view).
         "gen" => {
@@ -2178,6 +2484,15 @@ fn switch_view(app: &mut App, view: View) {
     }
 }
 
+fn switch_or_set_focused_pane(app: &mut App, view: View, module: crate::tui::pane::ModuleId) {
+    if app.pane_workspace.is_active() {
+        app.pane_workspace
+            .set_module(app.pane_workspace.focused_pane, module);
+    } else {
+        switch_view(app, view);
+    }
+}
+
 /// Cycle the browse view forward (`fwd=true`, Tab) or backward (Shift+Tab).
 fn cycle_view(app: &mut App, fwd: bool) {
     let next = match (app.view, fwd) {
@@ -2219,6 +2534,19 @@ pub fn handle_mouse(app: &mut App, m: MouseEvent) {
 
 /// Deterministic mouse dispatcher for a known frame area.
 pub fn handle_mouse_in_area(app: &mut App, m: MouseEvent, area: ratatui::layout::Rect) {
+    // Rectangle selection (Phase 2): when a selection is active and the
+    // mouse event lands inside the focused pane's inner rect, route to
+    // the selection handler. This intercepts left-click-drag (to draw
+    // the rectangle), mouse-up (to confirm), and right-click (to
+    // cancel) before the normal browse-click routing runs.
+    if app.rectangle_selection.is_some() {
+        if let Some(pane_inner) = crate::tui::pane::input::focused_pane_inner_rect(app) {
+            if rect_contains(pane_inner, m.column, m.row) {
+                crate::tui::pane::input::handle_rectangle_selection_mouse(app, m, pane_inner);
+                return;
+            }
+        }
+    }
     match m.kind {
         MouseEventKind::ScrollUp => move_up(app),
         MouseEventKind::ScrollDown => move_down(app),
@@ -2227,7 +2555,11 @@ pub fn handle_mouse_in_area(app: &mut App, m: MouseEvent, area: ratatui::layout:
             // browse columns. Drag is deliberately NOT routed: a held-drag used
             // to scrub volume on every mouse-move, which jumped the level
             // erratically. Volume is keyboard-only (+/-/m) now.
-            let bar = crate::tui::view::layout::player_bar_area(area);
+            let bar = if app.player_bar_state.hidden {
+                None
+            } else {
+                crate::tui::view::layout::player_bar_area(area)
+            };
             if let Some(bar) = bar.filter(|bar| rect_contains(*bar, m.column, m.row)) {
                 handle_player_bar_click(app, m.column, m.row, bar);
             } else if bar.is_none_or(|bar| m.row < bar.y) {
@@ -2250,7 +2582,7 @@ fn rect_contains(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
 }
 
 fn handle_player_bar_click(app: &mut App, col: u16, row: u16, area: ratatui::layout::Rect) {
-    let geo = crate::tui::view::player_bar::geometry(area);
+    let geo = crate::tui::view::now_playing_deck::geometry(area, app);
     if rect_contains(geo.progress, col, row) {
         let pct = (col.saturating_sub(geo.progress.x) as f64 / geo.progress.width.max(1) as f64)
             .clamp(0.0, 1.0);
@@ -2266,8 +2598,7 @@ fn handle_player_bar_click(app: &mut App, col: u16, row: u16, area: ratatui::lay
     if rect_contains(geo.previous, col, row) {
         app.prev();
     } else if rect_contains(geo.play_pause, col, row) {
-        // RC14-DEF-4: route through `toggle_pause` for pause-time tracking.
-        app.toggle_pause();
+        app.toggle_or_resume();
     } else if rect_contains(geo.next, col, row) {
         app.next();
     }

@@ -1,0 +1,6 @@
+version: 1
+source_dir: ""
+filtered_dir: "filtered_lossless"
+player: mpv
+mpv_socket: "/tmp/jukebox-mpv.sock"
+switch_sample_rate: true

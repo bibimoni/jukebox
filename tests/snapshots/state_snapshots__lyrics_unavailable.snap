@@ -1,9 +1,7 @@
 ---
 source: tests/state_snapshots.rs
-assertion_line: 88
 expression: s
 ---
-
 
             ┌ Lyrics — not found ──────────────────────────────────────────────────────────────────────────┐
             │ Lyrics are searched on YouTube; local tracks without a YouTube match have no lyrics.         │
@@ -11,19 +9,20 @@ expression: s
             │ R retry lyrics for this track  ·  L or Esc close                                             │
             │                                                                                              │
             │                                                                                              │
-            │                                                                                              │
-            │                                                                                              │
-            │                                                                                              │
-            │                                                                                              │
-            │                                                                                              │
-            │                                                                                              │
-            │                                                                                              │
-            │                                                                                              │
-            │                                                                                              │
             │                                    Esc close · j/k scroll                                    │
             └──────────────────────────────────────────────────────────────────────────────────────────────┘
 
-
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-[STOPPED] ■ — nothing playing —  --:-- / --:--  ▸ Enter to play  --  PREF local · CONT off · SHUF off · RPT off
+╭─ NOW PLAYING ────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│— nothing playing —                                                                                                   │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│■ STOPPED                                                                                                             │
+│--:--  ────────────────────────────────────────────────────────────  --:--                                            │
+│[←] Previous   [Space] Play   [→] Next   Vol 70% ▰▰▰▰▰▰▰▱▱▱                                                           │
+│LOCAL                                                                                                                 │
+│Shuffle: Off   Repeat: Off   Continue: Off                                                                            │
+│Up next: Nothing queued                                                                                               │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 VIEW: local · SOURCE: local [Y —]

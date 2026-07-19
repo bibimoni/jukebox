@@ -11,18 +11,18 @@ VIEWS                      │Home │ Library │ Search │ Discover │ Radio
 DISCOVER                   │▸ ♫ Song1 — 40mP
 ♫   H Home                 │♫ Ghost Rule — DECO*27
 ✦   S Discover             │
-◎ :radio Radio             │── Made for You ──
-◆ :gen Generator           │Generated mixes tailored to your taste
-────────────────────────   │✨  Daily Mix — Tracks clustered by your recent listening, refreshed daily
-TOOLS                      │✨  Discover Mix — Taste-adjacent music you haven't heard
-/   / Search               │✨  Local + YouTube Blend — A blend of your local library and YouTube
-!   D Diagnostics          │
-?   ? Help                 │── Start Radio ──
-                           │Start a radio session from any seed
-                           │◎ Track Radio — start a radio session
-                           │◎ Artist Radio — start a radio session
-                           │
-                           │                j/k navigate · Tab sections · Enter play · ? help · Esc close
+◎ :radio Radio             │                j/k navigate · Tab sections · Enter play · ? help · Esc close
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-[STOPPED] ■ — nothing playing —  --:-- / --:--  ▸ Enter to play  --  PREF local · YT! · CONT off · SHUF off · RPT off
+╭─ NOW PLAYING ────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│— nothing playing —                                                                                                   │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│■ STOPPED                                                                                                             │
+│--:--  ────────────────────────────────────────────────────────────  --:--                                            │
+│[←] Previous   [Space] Play   [→] Next   Vol 70% ▰▰▰▰▰▰▰▱▱▱                                                           │
+│LOCAL                                                                                                                 │
+│Shuffle: Off   Repeat: Off   Continue: Off                                                                            │
+│Up next: Nothing queued                                                                                               │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 VIEW: youtube · SOURCE: local [Y err] · [!] [err] YT: provider error — press R to retry

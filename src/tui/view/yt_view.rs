@@ -40,8 +40,8 @@ pub fn render_yt_view(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
     // Split: sub-tab bar (1 row) + content (rest). The tab bar mirrors the
-    // style of `layout::render_tab_bar` (accent + BOLD + REVERSED on active,
-    // dim on inactive, │ separators).
+    // style of `layout::render_tab_bar` (accent + BOLD + UNDERLINE on active,
+    // dim on inactive, │ separators — Phase 3 visual spec H18/V22).
     let split = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
     render_yt_tab_bar(f, split[0], app);
     match app.yt_view.tab {
@@ -97,11 +97,22 @@ fn render_playlist_browse(
     theme: &Theme,
     dim: &Style,
 ) {
-    let dash = em_dash();
-    let dot = sep_dot();
     let block = border("Playlist tracks", true, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    render_playlist_browse_content(f, inner, app, tab_name, theme, dim);
+}
+
+fn render_playlist_browse_content(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    tab_name: &str,
+    theme: &Theme,
+    dim: &Style,
+) {
+    let dash = em_dash();
+    let dot = sep_dot();
 
     let tracks = &app.yt_view.browse_playlist_tracks;
     let loading = tracks.is_empty();
@@ -173,17 +184,17 @@ fn render_playlist_browse(
             *dim,
         )));
         // Scroll the focused row into view.
-        let visible_h = inner.height as usize;
+        let visible_h = area.height as usize;
         let scroll = if cursor >= visible_h {
             (cursor - visible_h + 1) as u16
         } else {
             0
         };
-        f.render_widget(Paragraph::new(out).scroll((scroll, 0)), inner);
+        f.render_widget(Paragraph::new(out).scroll((scroll, 0)), area);
         return;
     };
 
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Explore tab (Task 5): renders the cached YouTube Music explore-feed
@@ -208,6 +219,14 @@ fn render_playlist_browse(
 /// task only renders the list (no selection styling). Task 6 may add an
 /// `explore_cursor` field on `YtViewState` if needed.
 pub fn render_yt_explore(f: &mut Frame, area: Rect, app: &App) {
+    render_yt_explore_impl(f, area, app, true);
+}
+
+pub fn render_yt_explore_pane(f: &mut Frame, area: Rect, app: &App) {
+    render_yt_explore_impl(f, area, app, false);
+}
+
+fn render_yt_explore_impl(f: &mut Frame, area: Rect, app: &App, framed: bool) {
     let theme = Theme::default();
     let nc = no_color();
     let dim = Style::default().fg(if nc { Color::Reset } else { theme.dim });
@@ -216,7 +235,11 @@ pub fn render_yt_explore(f: &mut Frame, area: Rect, app: &App) {
 
     // Browse mode: show the playlist's tracks instead of the playlist list.
     if app.yt_view.browse_playlist_id.is_some() {
-        render_playlist_browse(f, area, app, "Explore", &theme, &dim);
+        if framed {
+            render_playlist_browse(f, area, app, "Explore", &theme, &dim);
+        } else {
+            render_playlist_browse_content(f, area, app, "Explore", &theme, &dim);
+        }
         return;
     }
 
@@ -235,9 +258,14 @@ pub fn render_yt_explore(f: &mut Frame, area: Rect, app: &App) {
     let filter_active = app.yt_filter_active();
     let filter_text = app.yt_view.yt_filter.clone().unwrap_or_default();
 
-    let block = border("Explore", true, &theme);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = if framed {
+        let block = border("Explore", true, &theme);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        inner
+    } else {
+        area
+    };
 
     // Filter input line at the top (when active).
     let content_area = if filter_active {
@@ -375,6 +403,14 @@ pub fn render_yt_explore(f: &mut Frame, area: Rect, app: &App) {
 ///
 /// Cursor tracking / j/k/Enter navigation belongs to Task 6 (input.rs).
 pub fn render_yt_charts(f: &mut Frame, area: Rect, app: &App) {
+    render_yt_charts_impl(f, area, app, true);
+}
+
+pub fn render_yt_charts_pane(f: &mut Frame, area: Rect, app: &App) {
+    render_yt_charts_impl(f, area, app, false);
+}
+
+fn render_yt_charts_impl(f: &mut Frame, area: Rect, app: &App, framed: bool) {
     let theme = Theme::default();
     let nc = no_color();
     let dim = Style::default().fg(if nc { Color::Reset } else { theme.dim });
@@ -386,7 +422,11 @@ pub fn render_yt_charts(f: &mut Frame, area: Rect, app: &App) {
 
     // Browse mode: show the playlist's tracks instead of the chart list.
     if app.yt_view.browse_playlist_id.is_some() {
-        render_playlist_browse(f, area, app, "Charts", &theme, &dim);
+        if framed {
+            render_playlist_browse(f, area, app, "Charts", &theme, &dim);
+        } else {
+            render_playlist_browse_content(f, area, app, "Charts", &theme, &dim);
+        }
         return;
     }
 
@@ -398,9 +438,14 @@ pub fn render_yt_charts(f: &mut Frame, area: Rect, app: &App) {
     let cached = app.yt_view.charts_cached.as_ref();
     let is_empty = cached.map(|v| v.is_empty()).unwrap_or(true);
 
-    let block = border("Charts", true, &theme);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = if framed {
+        let block = border("Charts", true, &theme);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        inner
+    } else {
+        area
+    };
 
     let lines: Vec<Line> = if loading && cached.is_none() {
         // Loading state — animated spinner (see render_yt_explore).
@@ -522,8 +567,8 @@ pub fn render_yt_charts(f: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Render the 5-tab sub-tab bar: `1:Home | 2:Library | 3:Search | 4:Discover
-/// | 5:Radio`. Active = accent + BOLD + REVERSED (mirrors
-/// `layout::render_tab_bar`). The `1`-`5` prefixes match the YT tab-switch
+/// | 5:Radio`. Active = accent + BOLD + UNDERLINE (mirrors
+/// `layout::render_tab_bar` — Phase 3 visual spec H18/V22). The `1`-`5` prefixes match the YT tab-switch
 /// keys. Inactive tabs are dim. `│` separators (or `|` in ASCII). The
 /// breadcrumb on the right shows the YT provider state tag (`YouTube [ok]`,
 /// `YouTube [err]`, ...).
@@ -532,13 +577,12 @@ pub fn render_yt_tab_bar(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let theme = Theme::default();
-    let nc = no_color();
-    let dim = Style::default().fg(if nc { Color::Reset } else { theme.dim });
-    let active = Style::default()
-        .fg(if nc { Color::Reset } else { theme.accent })
-        .add_modifier(Modifier::BOLD)
-        .add_modifier(Modifier::REVERSED);
-    let text = Style::default().fg(if nc { Color::Reset } else { theme.text });
+    // Phase 3 (visual spec H18 / V22): YT sub-tabs use Theme::tab
+    // (accent + BOLD + UNDERLINE), not REVERSED, to match the top tab
+    // bar and avoid colliding with row selection.
+    let dim = theme.status_description();
+    let active = theme.tab(true);
+    let text = Style::default().fg(theme.text);
 
     let tabs = YtTab::all();
     let sep: &'static str = if v_sep() == "|" { " | " } else { " │ " };
@@ -613,6 +657,14 @@ fn kind_glyph_label(kind: YtListKind) -> (&'static str, &'static str) {
 /// <100). When a list is focused (Enter / `l`), splits: left = grouped
 /// list, right = track rows.
 pub fn render_yt_library(f: &mut Frame, area: Rect, app: &mut App) {
+    render_yt_library_impl(f, area, app, true);
+}
+
+pub fn render_yt_library_pane(f: &mut Frame, area: Rect, app: &mut App) {
+    render_yt_library_impl(f, area, app, false);
+}
+
+fn render_yt_library_impl(f: &mut Frame, area: Rect, app: &mut App, framed: bool) {
     let theme = Theme::default();
     let nc = no_color();
     let dim = Style::default().fg(if nc { Color::Reset } else { theme.dim });
@@ -650,7 +702,8 @@ pub fn render_yt_library(f: &mut Frame, area: Rect, app: &mut App) {
     // the right (right-aligned via pad_between, when show_counts). The
     // selected row uses `theme.selected_style()` + `▸` marker (3 non-color
     // cues under NO_COLOR: REVERSED + BOLD + glyph).
-    let col_w = list_area.width.saturating_sub(2) as usize;
+    let frame_padding = if framed { 2 } else { 0 };
+    let col_w = list_area.width.saturating_sub(frame_padding) as usize;
     let mut lines: Vec<Line> = Vec::new();
     let mut prev_kind: Option<YtListKind> = None;
     for (idx, l) in app.yt_lists.iter().enumerate() {
@@ -737,7 +790,7 @@ pub fn render_yt_library(f: &mut Frame, area: Rect, app: &mut App) {
 
     // Scroll-to-cursor: keep the selected row visible when the list is
     // longer than the pane (Paragraph doesn't auto-scroll like List).
-    let visible_h = list_area.height.saturating_sub(2) as usize;
+    let visible_h = list_area.height.saturating_sub(frame_padding) as usize;
     let cursor = app.cursors.playlist;
     let scroll = if cursor >= visible_h {
         (cursor - visible_h + 1) as u16
@@ -745,11 +798,15 @@ pub fn render_yt_library(f: &mut Frame, area: Rect, app: &mut App) {
         0
     };
 
-    let block = border("Library", app.focus_col == 0, &theme);
-    f.render_widget(
-        Paragraph::new(lines).scroll((scroll, 0)).block(block),
-        list_area,
-    );
+    let list = Paragraph::new(lines).scroll((scroll, 0));
+    if framed {
+        f.render_widget(
+            list.block(border("Library", app.focus_col == 0, &theme)),
+            list_area,
+        );
+    } else {
+        f.render_widget(list, list_area);
+    }
 
     // Right pane: tracks of the focused list (when focus_col >= 1).
     if let Some(tracks_area) = tracks_area {
@@ -888,6 +945,10 @@ pub fn render_yt_home(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+pub fn render_yt_home_pane(f: &mut Frame, area: Rect, app: &mut App) {
+    render_yt_home(f, area, app);
+}
+
 /// Search tab (I.1): in-pane search — input line at top, results list
 /// below. Reuses the `Overlay::Search` data when present (the overlay is set
 /// by `/` and key dispatch routes typing there). `overlay::render` skips the
@@ -895,6 +956,14 @@ pub fn render_yt_home(f: &mut Frame, area: Rect, app: &mut App) {
 /// one. If no overlay is active, show a "press / to search" placeholder so
 /// the tab isn't a dead end.
 pub fn render_yt_search(f: &mut Frame, area: Rect, app: &App) {
+    render_yt_search_impl(f, area, app, true);
+}
+
+pub fn render_yt_search_pane(f: &mut Frame, area: Rect, app: &App) {
+    render_yt_search_impl(f, area, app, false);
+}
+
+fn render_yt_search_impl(f: &mut Frame, area: Rect, app: &App, framed: bool) {
     let theme = Theme::default();
     let dim = Style::default().fg(if no_color() { Color::Reset } else { theme.dim });
 
@@ -928,19 +997,25 @@ pub fn render_yt_search(f: &mut Frame, area: Rect, app: &App) {
                     dim,
                 )),
             ];
-            f.render_widget(
-                Paragraph::new(lines)
-                    .alignment(Alignment::Center)
-                    .block(border("Search", true, &theme)),
-                area,
-            );
+            let para = Paragraph::new(lines).alignment(Alignment::Center);
+            if framed {
+                f.render_widget(para.block(border("Search", true, &theme)), area);
+            } else {
+                f.render_widget(para, area);
+            }
             return;
         }
     };
 
     // Split: input line (1) + status/hint (1) + results (rest).
-    let inner = border("Search", true, &theme).inner(area);
-    f.render_widget(border("Search", true, &theme), area);
+    let inner = if framed {
+        let block = border("Search", true, &theme);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        inner
+    } else {
+        area
+    };
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -1088,6 +1163,14 @@ fn yt_search_label(app: &App, id: &str) -> String {
 /// paint when this tab is active. If no overlay is active, show a "press S
 /// to discover" placeholder.
 pub fn render_yt_discover(f: &mut Frame, area: Rect, app: &App) {
+    render_yt_discover_impl(f, area, app, true);
+}
+
+pub fn render_yt_discover_pane(f: &mut Frame, area: Rect, app: &App) {
+    render_yt_discover_impl(f, area, app, false);
+}
+
+fn render_yt_discover_impl(f: &mut Frame, area: Rect, app: &App, framed: bool) {
     let theme = Theme::default();
     let dim = Style::default().fg(if no_color() { Color::Reset } else { theme.dim });
     let dash = em_dash();
@@ -1113,19 +1196,24 @@ pub fn render_yt_discover(f: &mut Frame, area: Rect, app: &App) {
                     dim,
                 )),
             ];
-            f.render_widget(
-                Paragraph::new(lines)
-                    .alignment(Alignment::Center)
-                    .block(border("Discover", true, &theme)),
-                area,
-            );
+            let para = Paragraph::new(lines).alignment(Alignment::Center);
+            if framed {
+                f.render_widget(para.block(border("Discover", true, &theme)), area);
+            } else {
+                f.render_widget(para, area);
+            }
             return;
         }
     };
 
-    let block = border("Discover", true, &theme);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = if framed {
+        let block = border("Discover", true, &theme);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        inner
+    } else {
+        area
+    };
 
     let mut lines: Vec<Line> = items
         .iter()
@@ -1209,12 +1297,25 @@ pub fn render_yt_discover(f: &mut Frame, area: Rect, app: &App) {
 /// set by `:radio`; `overlay::render` skips the popup paint when this tab is
 /// active. If no overlay is active, show a "no active session" placeholder.
 pub fn render_yt_radio(f: &mut Frame, area: Rect, app: &mut App) {
+    render_yt_radio_impl(f, area, app, true);
+}
+
+pub fn render_yt_radio_pane(f: &mut Frame, area: Rect, app: &mut App) {
+    render_yt_radio_impl(f, area, app, false);
+}
+
+fn render_yt_radio_impl(f: &mut Frame, area: Rect, app: &mut App, framed: bool) {
     let theme = Theme::default();
     let dim = Style::default().fg(if no_color() { Color::Reset } else { theme.dim });
 
-    let block = border("Radio", true, &theme);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = if framed {
+        let block = border("Radio", true, &theme);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        inner
+    } else {
+        area
+    };
 
     let session = match &app.overlay {
         Some(Overlay::Radio { session }) => session.clone(),
@@ -1323,9 +1424,13 @@ mod tests {
         }
     }
 
-    /// I.4: the active tab is distinguishable (REVERSED + BOLD modifier on
-    /// its label cells). Task 4 removed the `1:`-`5:` number prefixes, so the
-    /// probe strings look for "Library" (active) and "Home" (inactive).
+    /// I.4: the active tab is distinguishable from inactive tabs via
+    /// modifiers on its label cells. Phase 3 (visual spec H18 / V22)
+    /// changed the active tab style from `accent + BOLD + REVERSED` to
+    /// `accent + BOLD + UNDERLINE` so tabs don't collide visually with
+    /// row selection (which keeps `REVERSED + BOLD`). The probe now
+    /// checks for BOLD + UNDERLINED on "Library" (active) and the
+    /// absence of UNDERLINED on "Home" (inactive).
     #[test]
     fn yt_view_active_tab_has_selection_style() {
         use ratatui::style::Modifier;
@@ -1341,13 +1446,13 @@ mod tests {
             .unwrap();
         let buf = terminal.backend().buffer();
         // Find the row containing the tab labels, then check the "Library"
-        // cells carry REVERSED + BOLD (active). Other tabs should not. We
-        // probe by scanning for the "L" of "Library" and the "H" of "Home",
-        // then reading a window to confirm the full label is present (the
-        // bare letters alone could collide with other words; the window
-        // check disambiguates).
-        let mut found_active_reversed = false;
-        let mut found_inactive_not_reversed = false;
+        // cells carry BOLD + UNDERLINED (active). Other tabs should not
+        // have UNDERLINED. We probe by scanning for the "L" of "Library"
+        // and the "H" of "Home", then reading a window to confirm the
+        // full label is present (the bare letters alone could collide
+        // with other words; the window check disambiguates).
+        let mut found_active_bold_underlined = false;
+        let mut found_inactive_not_underlined = false;
         for y in 0..3u16 {
             for x in 0..100u16 {
                 let cell = &buf[(x, y)];
@@ -1360,10 +1465,10 @@ mod tests {
                         }
                     }
                     if probe.contains("Library")
-                        && cell.modifier.contains(Modifier::REVERSED)
                         && cell.modifier.contains(Modifier::BOLD)
+                        && cell.modifier.contains(Modifier::UNDERLINED)
                     {
-                        found_active_reversed = true;
+                        found_active_bold_underlined = true;
                     }
                 }
                 if sym.contains('H') {
@@ -1373,19 +1478,19 @@ mod tests {
                             probe.push(c.symbol().chars().next().unwrap_or(' '));
                         }
                     }
-                    if probe.contains("Home") && !cell.modifier.contains(Modifier::REVERSED) {
-                        found_inactive_not_reversed = true;
+                    if probe.contains("Home") && !cell.modifier.contains(Modifier::UNDERLINED) {
+                        found_inactive_not_underlined = true;
                     }
                 }
             }
         }
         assert!(
-            found_active_reversed,
-            "I.4: active tab 'Library' must have REVERSED+BOLD"
+            found_active_bold_underlined,
+            "I.4: active tab 'Library' must have BOLD+UNDERLINED (Phase 3 visual spec H18/V22)"
         );
         assert!(
-            found_inactive_not_reversed,
-            "I.4: inactive tab 'Home' must NOT have REVERSED"
+            found_inactive_not_underlined,
+            "I.4: inactive tab 'Home' must NOT have UNDERLINED"
         );
     }
 

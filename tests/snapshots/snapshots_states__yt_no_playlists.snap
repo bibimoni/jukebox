@@ -11,18 +11,18 @@ VIEWS                      │Home │ Library │ Search │ Discover │ Radio
 DISCOVER                   │▸ ♫ Song1 — 40mP
 ♫   H Home                 │♫ Ghost Rule — DECO*27
 ✦   S Discover             │
-◎ :radio Radio             │── Made for You ──
-◆ :gen Generator           │Generated mixes tailored to your taste
-────────────────────────   │✨  Daily Mix — Tracks clustered by your recent listening, refreshed daily
-TOOLS                      │✨  Discover Mix — Taste-adjacent music you haven't heard
-/   / Search               │✨  Local + YouTube Blend — A blend of your local library and YouTube
-!   D Diagnostics          │
-?   ? Help                 │── Start Radio ──
-                           │Start a radio session from any seed
-                           │◎ Track Radio — start a radio session
-                           │◎ Artist Radio — start a radio session
-                           │
-                           │                j/k navigate · Tab sections · Enter play · ? help · Esc close
+◎ :radio Radio             │                j/k navigate · Tab sections · Enter play · ? help · Esc close
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-[PLAYING] ▶ Song1 — 40mP  0:00 / 3:00  ▸ Next: (end)  24bit/96  PREF local · YT · CONT off · SHUF off · RPT off
+╭─ NOW PLAYING ────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│Song1                                                                                                                 │
+│40mP                                                                                                                  │
+│Cosmic                                                                                                                │
+│LOCAL · 24-bit · 96 kHz                                                                                               │
+│▶ PLAYING  [Space] Pause                                                                                              │
+│0:00  ────────────────────────────────────────────────────────────  3:00                                              │
+│[←] Previous   [Space] Pause   [→] Next   Vol 70% ▰▰▰▰▰▰▰▱▱▱                                                          │
+│LOCAL                                                                                                                 │
+│Shuffle: Off   Repeat: Off   Continue: Off                                                                            │
+│Up next: Nothing queued                                                                                               │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 VIEW: youtube · SOURCE: local [Y ok]  Space pause · q quit · ? help · 1-4 view · > < next prev · M pref · S discover

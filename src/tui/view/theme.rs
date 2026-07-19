@@ -47,10 +47,20 @@ use std::cell::RefCell;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
+use ratatui::text::Span;
+use ratatui::widgets::{Block, BorderType, Borders};
 
 use crate::tui::view::icons::{FontMode, Icon};
 
 /// True when NO_COLOR is set (no-color.org). Colors must not be the only signal.
+///
+/// Reads the env var directly on every call. Hot-path callers should
+/// snapshot the value once via `Theme::default()` (which stores the
+/// `no_color` decision on the struct) and use the snapshot instead of
+/// re-calling this function. Direct env reads are cheap (one syscall
+/// amortized over many calls), but the per-row render path calls this
+/// ~50×/frame via `Theme::*_style` methods — those should use the
+/// Theme snapshot, not this free function.
 pub fn no_color() -> bool {
     std::env::var_os("NO_COLOR").is_some()
 }
@@ -71,6 +81,33 @@ pub fn no_color() -> bool {
 // the next read on their thread re-reads the env.
 thread_local! {
     static FONT_MODE: RefCell<Option<FontMode>> = const { RefCell::new(None) };
+    // Phase 9 reduced-motion: JUKEBOX_NO_MOTION is read once per thread
+    // and frozen for the thread's lifetime (the TUI event loop is
+    // single-threaded so thread-local == process-stable in production).
+    // Tests that mutate JUKEBOX_NO_MOTION call [`reset_no_motion_cache`].
+    static NO_MOTION_CACHED: RefCell<Option<bool>> = const { RefCell::new(None) };
+}
+
+/// True when `JUKEBOX_NO_MOTION=1` is set (Phase 9 reduced-motion). When
+/// set, the cursor style skips `SLOW_BLINK` and the braille spinner is
+/// frozen at frame 0. Honors the reduced-motion convention for users
+/// with vestibular/photosensitivity concerns. Cached per-thread like
+/// `cached_font_mode` so the read happens once.
+pub fn no_motion() -> bool {
+    NO_MOTION_CACHED.with(|cell| {
+        if let Some(b) = *cell.borrow() {
+            return b;
+        }
+        let b = std::env::var_os("JUKEBOX_NO_MOTION").is_some();
+        *cell.borrow_mut() = Some(b);
+        b
+    })
+}
+
+/// Reset the cached `JUKEBOX_NO_MOTION` flag for the calling thread.
+/// Intended for tests that toggle `JUKEBOX_NO_MOTION` between assertions.
+pub fn reset_no_motion_cache() {
+    NO_MOTION_CACHED.with(|cell| *cell.borrow_mut() = None);
 }
 
 /// Read the cached startup font mode, initializing it from
@@ -103,8 +140,9 @@ pub fn reset_font_mode_cache() {
 /// since it is an explicit opt-in — the high-contrast palette is already
 /// hue-free so it satisfies the `NO_COLOR` convention.
 ///
-/// **Accessibility:** user-facing toggle for high-contrast mode, documented
-/// in the Help overlay. Set via `JUKEBOX_HIGH_CONTRAST=1 jukebox`.
+/// Reads the env var directly on every call (cheap). Callers that want
+/// a snapshot should use `Theme::default()` which stores the
+/// `high_contrast` decision on the struct.
 pub fn high_contrast() -> bool {
     std::env::var_os("JUKEBOX_HIGH_CONTRAST").is_some()
 }
@@ -131,6 +169,41 @@ pub struct Theme {
     /// Auto-detected at startup; can be changed at runtime via
     /// `set_font_mode`. Used by `icon()` to render glyphs.
     pub font_mode: FontMode,
+    // --- Pane-polish semantic tokens (visual spec Phase 0) ---
+    /// Overlay / dialog background. `Black` in color mode, `Reset` under
+    /// `NO_COLOR` (so overlay backdrops don't emit `\e[40m` and don't
+    /// invert on light-theme terminals). Replaces the 10 hardcoded
+    /// `bg(Color::Black)` sites in `overlay.rs`.
+    pub background: Color,
+    /// Active-pane background accent — slightly lighter than `surface`,
+    /// used to suggest depth on the focused pane. `Indexed(238)` in color
+    /// mode, `Reset` under `NO_COLOR`, `Black` in high-contrast.
+    pub surface_active: Color,
+    /// Unfocused pane border color (semantically `dim`). Kept as a
+    /// dedicated slot so callers document intent (`theme.border` reads as
+    /// "border color" rather than "chrome / dim text").
+    pub border: Color,
+    /// Focused pane border color (semantically `accent`).
+    pub border_focused: Color,
+    /// Pane-edit-mode border color. Distinct from `border_focused` so
+    /// edit mode can be emphasized without re-coloring focused panes.
+    pub border_editing: Color,
+    /// Secondary text — semantic alias of `dim` for callers that want to
+    /// document "muted text" intent. Same value as `dim` in every palette.
+    pub text_muted: Color,
+    /// Disabled / greyed controls. `DarkGray` in color mode (paired with
+    /// `DIM` modifier under `NO_COLOR` for a non-color cue).
+    pub text_disabled: Color,
+    /// De-emphasized interactive accent — used for hover/secondary actions.
+    /// `DarkCyan` in color mode, `Reset` under `NO_COLOR`, `Gray` in
+    /// high-contrast.
+    pub accent_soft: Color,
+    /// Selection background — semantic alias of `accent` for clarity. The
+    /// selected row's background color.
+    pub selection_bg: Color,
+    /// Selection foreground — semantic alias of `hi_fg` for clarity. The
+    /// selected row's text color (high-contrast on `selection_bg`).
+    pub selection_fg: Color,
 }
 
 impl Default for Theme {
@@ -165,7 +238,22 @@ impl Default for Theme {
                 source_local: Color::Reset,
                 source_yt: Color::Reset,
                 surface: Color::Black, // subtle zebra background
-                font_mode: FontMode::auto_detect(),
+                font_mode: cached_font_mode(),
+                // Phase 0: pane-polish semantic tokens, NO_COLOR path.
+                // All collapse to grayscale (no hue) so the TUI stays
+                // usable without color. `background` is `Reset` (not
+                // `Black`) so overlay backdrops don't paint a hard black
+                // box on light-theme terminals under NO_COLOR.
+                background: Color::Reset,
+                surface_active: Color::Reset,
+                border: Color::Reset,
+                border_focused: Color::White,
+                border_editing: Color::White,
+                text_muted: Color::Reset,
+                text_disabled: Color::Reset,
+                accent_soft: Color::Reset,
+                selection_bg: Color::White,
+                selection_fg: Color::Black,
             }
         } else {
             Theme {
@@ -189,7 +277,23 @@ impl Default for Theme {
                 // was only ~2.1:1 vs Gray text — below WCAG. See columns.rs
                 // zebra_bg usage.
                 surface: Color::Indexed(236),
-                font_mode: FontMode::auto_detect(),
+                font_mode: cached_font_mode(),
+                // Phase 0: pane-polish semantic tokens, color path. Single
+                // cyan accent + one warning hue (Yellow, reserved for
+                // `warning`) + one error hue (Red, reserved for `error`).
+                // Magenta is kept only for `hires` (a quality tag) and
+                // `playing` (the now-playing row) for backward compat;
+                // Phase 5 demotes `playing` to `accent`.
+                background: Color::Black,
+                surface_active: Color::Indexed(238),
+                border: Color::Gray,
+                border_focused: Color::Cyan,
+                border_editing: Color::Cyan,
+                text_muted: Color::Gray,
+                text_disabled: Color::DarkGray,
+                accent_soft: Color::Indexed(30), // 256-color dark cyan (0x008787)
+                selection_bg: Color::Cyan,
+                selection_fg: Color::Black,
             }
         }
     }
@@ -221,7 +325,21 @@ impl Theme {
             source_local: Color::White,
             source_yt: Color::White,
             surface: Color::Black,
-            font_mode: FontMode::auto_detect(),
+            font_mode: cached_font_mode(),
+            // Phase 0: pane-polish semantic tokens, high-contrast path.
+            // Pure white/black/gray — no hue. `background` is `Black` so
+            // overlay backdrops remain visible on a dark terminal (the
+            // documented assumption for JUKEBOX_HIGH_CONTRAST).
+            background: Color::Black,
+            surface_active: Color::Black,
+            border: Color::Gray,
+            border_focused: Color::White,
+            border_editing: Color::White,
+            text_muted: Color::Gray,
+            text_disabled: Color::Gray,
+            accent_soft: Color::Gray,
+            selection_bg: Color::White,
+            selection_fg: Color::Black,
         }
     }
 
@@ -326,13 +444,27 @@ impl Theme {
     ///
     /// **Accessibility:** the glyph shape is a non-color cue. Color is never
     /// the only signal (AC-M6.4.2).
+    ///
+    /// Phase 8 (visual spec C5 / A3): the glyphs now route through
+    /// `play_glyph()` / `pause_glyph()` / `stop_glyph()` so they respect
+    /// `JUKEBOX_FONT_MODE=ascii` (`>` / `||` / `#` instead of `▶` / `⏸` /
+    /// `■`). Returns a `&'static str` matching the helper's return type.
     pub fn state_label(&self, playing: bool, paused: bool) -> &'static str {
         if playing {
-            "[▶]"
+            match play_glyph() {
+                ">" => "[>]",
+                _ => "[▶]",
+            }
         } else if paused {
-            "[⏸]"
+            match pause_glyph() {
+                "||" => "[||]",
+                _ => "[⏸]",
+            }
         } else {
-            "[■]"
+            match stop_glyph() {
+                "#" => "[#]",
+                _ => "[■]",
+            }
         }
     }
 
@@ -388,6 +520,244 @@ impl Theme {
                 .bg(self.accent)
                 .add_modifier(Modifier::BOLD)
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 0: pane-polish semantic methods. These are additive —
+    // existing callers continue to use `selected_style` / `error_style`
+    // / `header_style` / `playing_style` unchanged. New callers should
+    // prefer the methods below so styling is centralized and the view
+    // layer stops constructing `Style::default().fg(...)` inline.
+    // -----------------------------------------------------------------
+
+    /// Pane border `Style`. `focused` switches the border color from
+    /// `border` (unfocused) to `border_focused` (focused); `editing`
+    /// further switches to `border_editing` (PaneEdit mode). Returns
+    /// only the `Style` — the caller still applies `border_set` (ASCII
+    /// vs Unicode) and `border_type` (Thick vs Plain) on the `Block`.
+    ///
+    /// **Accessibility:** under `NO_COLOR` all three colors collapse to
+    /// grayscale; the caller's `BorderType::Thick` (focused) vs `Plain`
+    /// (unfocused) provides the non-color cue. Under `high_contrast` the
+    /// border is `White` (focused/editing) or `Gray` (unfocused).
+    pub fn pane_border(&self, focused: bool, editing: bool) -> Style {
+        let color = if editing {
+            self.border_editing
+        } else if focused {
+            self.border_focused
+        } else {
+            self.border
+        };
+        Style::default().fg(color)
+    }
+
+    /// Convenience: a full pane `Block` with title, borders, ASCII/Unicode
+    /// branch, and `Thick` (focused/editing) vs `Plain` (unfocused) border
+    /// type. Collapses the ~14 duplicated `pane_block` constructions across
+    /// `pane/render.rs`, `columns.rs`, `yt_view.rs`, `sidebar.rs`,
+    /// `now_playing_panel.rs`, `player_bar_big.rs`. The caller passes the
+    /// already-formatted title (e.g. `"Artists [EDIT]"`); this method
+    /// applies the title color via [`pane_border`].
+    pub fn pane_block(&self, title: &str, focused: bool, editing: bool) -> Block<'static> {
+        let style = self.pane_border(focused, editing);
+        let mut block = if is_ascii() {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_set(ASCII_BORDER_SET)
+                .border_style(style)
+        } else {
+            let bt = if focused || editing {
+                BorderType::Thick
+            } else {
+                BorderType::Plain
+            };
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(bt)
+                .border_style(style)
+        };
+        block = block.title(Span::styled(title.to_string(), style));
+        block
+    }
+
+    /// Build a `Block` whose title sits in a **notch** on the top border
+    /// (e.g. `╭─ ▶ NOW PLAYING ────╮`) rather than colliding with the
+    /// `─` line. The caller passes the already-formatted title **without**
+    /// leading/trailing spaces — this method adds them so Ratatui
+    /// renders `─` on both sides of the title span.
+    ///
+    /// Per spec:
+    /// - **Single-line** borders by default. `BorderType::Rounded` for
+    ///   a polished look (corners `╭╮╰╯`).
+    /// - **Focused** state adds the `▶` marker and `· FOCUSED` suffix in
+    ///   the title text — **not** a heavy double border (the spec:
+    ///   "avoid heavy double borders unless needed for accessibility").
+    /// - ASCII fallback via [`ASCII_BORDER_SET`] (`+`-`-`|`).
+    ///
+    /// The title is rendered with `pane_border(focused, editing)` so the
+    /// border color and the title color match (no visual collision).
+    /// Body cells are left terminal-default (no `bg`) so transparency is
+    /// preserved.
+    ///
+    /// Pass `title = "NOW PLAYING"` and `marker = "▶"` for the focused
+    /// state, or `marker = ""` for the unfocused state. The resulting
+    /// title string is `" {marker} {title} "` (with leading/trailing
+    /// spaces) so Ratatui's border renderer draws `─` on both sides.
+    pub fn pane_block_notched(
+        &self,
+        title: &str,
+        marker: &str,
+        focused: bool,
+        editing: bool,
+    ) -> Block<'static> {
+        let style = self.pane_border(focused, editing);
+        let notch = if is_ascii() { "-" } else { "─" };
+        let title_str = if marker.is_empty() {
+            format!("{notch} {title} ")
+        } else {
+            format!("{notch} {marker} {title} ")
+        };
+        let mut block = if is_ascii() {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_set(ASCII_BORDER_SET)
+                .border_style(style)
+        } else {
+            // Single-line rounded border for both focused and unfocused.
+            // The focus cue is the title marker + text, not a heavy
+            // double border (spec: avoid heavy double borders).
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(style)
+        };
+        block = block.title(Span::styled(title_str, style));
+        block
+    }
+
+    /// Selected-row style. `focused=true` matches the current
+    /// [`selected_style`] (REVERSED + BOLD in color, REVERSED + BOLD only
+    /// under NO_COLOR). `focused=false` produces a dimmer selection for
+    /// unfocused panes — `text_muted` + BOLD, no REVERSED, no glyph
+    /// prefix — so the live selection in the focused pane is unmistakable
+    /// at a glance. The view layer still adds the `▸`/`›` glyph marker
+    /// on the focused pane's selected row.
+    ///
+    /// **Accessibility:** under `NO_COLOR` the focused branch keeps
+    /// REVERSED + BOLD (color-agnostic inversion). The unfocused branch
+    /// uses BOLD only (weight without color or inversion) so it remains
+    /// distinguishable from the focused selection.
+    pub fn selected_row(&self, focused: bool) -> Style {
+        if focused {
+            self.selected_style()
+        } else {
+            Style::default()
+                .fg(self.text_muted)
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+
+    /// Tab / breadcrumb active style. `active=true` → `accent + BOLD +
+    /// UNDERLINE`; `active=false` → `dim`. Replaces the ~14 inline
+    /// `Style::default().fg(theme.accent).add_modifier(BOLD)` sites and
+    /// the 11 `if nc { Reset } else { theme.accent }` accent-drift sites.
+    ///
+    /// **Why UNDERLINE not REVERSED:** reverse-video on a 1-row tab
+    /// inverts the whole row, making the active tab look like a selected
+    /// list row (visual spec §3 conflict resolution). Underline survives
+    /// `NO_COLOR` and doesn't collide with row selection. The visual
+    /// hierarchy becomes: tabs (accent + bold + underline) < selected
+    /// row (accent + bold + reverse) < focused pane (accent + thick).
+    pub fn tab(&self, active: bool) -> Style {
+        if active {
+            Style::default()
+                .fg(self.accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(self.dim)
+        }
+    }
+
+    /// Status-line key-cap style (e.g. `"Enter"`, `"Esc"`, `"hjkl"`):
+    /// `accent + BOLD`. Replaces the inline `accent + BOLD` constructions
+    /// in the footer, edit-mode status line, and overlay keymap hints.
+    /// Distinct from [`tab`] — key caps don't get UNDERLINE (they're
+    /// short tokens, not full-row tabs).
+    pub fn status_key(&self) -> Style {
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Status-line description style (e.g. `"to play"`, `"move"`):
+    /// `dim`. Replaces the 33 redundant `if no_color() { Reset } else
+    /// { theme.dim }` branches across the view layer — `theme.dim` is
+    /// already `Reset` under `NO_COLOR`, so the branch re-implements
+    /// the theme's own collapse.
+    pub fn status_description(&self) -> Style {
+        Style::default().fg(self.dim)
+    }
+
+    /// Overlay / dialog background `Style`. Returns `bg(background)` so
+    /// overlay backdrops adapt to `NO_COLOR` (`Reset` instead of `Black`)
+    /// and `high_contrast` (`Black`). Replaces the 10 hardcoded
+    /// `Style::default().bg(Color::Black)` sites in `overlay.rs` which
+    /// violate no-color.org and invert on light-theme terminals.
+    pub fn overlay(&self) -> Style {
+        Style::default().bg(self.background)
+    }
+
+    /// Edit-prompt cursor style: `accent + SLOW_BLINK`. Replaces the 7
+    /// inline `Style::default().add_modifier(Modifier::SLOW_BLINK)`
+    /// sites in `overlay.rs` and `yt_view.rs`. Honors `JUKEBOX_NO_MOTION`
+    /// (Phase 9) by dropping the blink modifier when reduced-motion is
+    /// requested — the cursor stays visible as a static `_` via the
+    /// caller-supplied glyph.
+    pub fn cursor(&self) -> Style {
+        let mut style = Style::default().fg(self.accent);
+        if !no_motion() {
+            style = style.add_modifier(Modifier::SLOW_BLINK);
+        }
+        style
+    }
+
+    /// Form-field focus style (e.g. publication.rs Name/Privacy/Account
+    /// fields): `accent + BOLD` when active, `dim` when not. Semantically
+    /// identical to [`tab`] but named for its UI context. Replaces the
+    /// inline `Style::default().add_modifier(BOLD)` toggled by active
+    /// field in `publication.rs:232,237,242` and `generator.rs:176`.
+    pub fn form_field(&self, active: bool) -> Style {
+        if active {
+            Style::default()
+                .fg(self.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(self.dim)
+        }
+    }
+
+    /// Quality-tag `Style`: wraps the existing [`quality_color`] free
+    /// fn into a `Style`. `hires` (Magenta) for ≥24-bit or ≥48kHz,
+    /// `cd` (Green) otherwise. `Reset` under `NO_COLOR` (the text label
+    /// `"24bit-96kHz"` carries the information — color is decorative).
+    /// Replaces the 5 inline `Span::styled(label, Style::default().fg(
+    /// quality_color(...)))` sites in `player_bar.rs` and
+    /// `player_bar_big.rs`.
+    pub fn quality_style(&self, bit_depth: u32, sample_rate_hz: u32) -> Style {
+        Style::default().fg(quality_color(bit_depth, sample_rate_hz))
+    }
+
+    /// Source-badge `Style` for the `[L]`/`[Y]` row badge in Mixed mode.
+    /// Replaces the 2 inline constructions in `columns.rs:1519,1521,1679`
+    /// which use `theme.source_local` / `theme.source_yt` on `zebra_bg`.
+    /// The caller supplies the zebra background via the row's existing
+    /// `bg(zebra_bg)` style; this method only returns the fg.
+    pub fn source_badge(&self, yt: bool) -> Style {
+        Style::default().fg(if yt {
+            self.source_yt
+        } else {
+            self.source_local
+        })
     }
 }
 
@@ -476,40 +846,14 @@ pub fn progress_color(theme: &Theme) -> Color {
     }
 }
 
-/// Display width of a single character: ASCII = 1, CJK + kana + fullwidth =
-/// 2, zero-width/combining = 0. Extracted from [`disp_width`] so callers that
-/// iterate char-by-char (e.g. truncation) can get per-char width without
-/// allocating a string per character.
+/// Terminal display width of a single character. Uses the same Unicode width
+/// tables as Ratatui, including CJK, emoji, combining marks, and zero-width
+/// characters.
 pub fn char_disp_width(c: char) -> usize {
-    let cp = c as u32;
-    // Zero-width / combining: display width 0
-    if (0x0300..=0x036F).contains(&cp) // combining diacritical marks
-    || (0x200B..=0x200F).contains(&cp) // zero-width space, non-joiner, etc.
-    || cp == 0xFEFF
-    // zero-width no-break space (BOM)
-    {
-        0
-    } else if (0x1100..=0x115F).contains(&cp)                    // Hangul Jamo
-    || (0x2E80..=0xA4CF).contains(&cp) && cp != 0x303F // CJK radicals / Yi
-    || (0xAC00..=0xD7A3).contains(&cp)                // Hangul syllables
-    || (0xF900..=0xFAFF).contains(&cp)                // CJK compat ideographs
-    || (0xFE30..=0xFE4F).contains(&cp)                // CJK compat forms
-    || (0xFF00..=0xFF60).contains(&cp)                 // fullwidth forms
-    || (0xFFE0..=0xFFE6).contains(&cp)                 // fullwidth signs
-    || (0x3000..=0x303F).contains(&cp)                 // CJK symbols (incl. ・)
-    || (0x3040..=0x30FF).contains(&cp)                 // Hiragana + Katakana
-    || (0x4E00..=0x9FFF).contains(&cp)
-    // CJK Unified Ideographs
-    {
-        2
-    } else {
-        1
-    }
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
-/// Approximate display width: ASCII = 1, CJK + kana + fullwidth = 2,
-/// zero-width/combining = 0. Good enough for terminal alignment of mixed
-/// JP/EN titles without pulling in the unicode-width crate.
+/// Unicode terminal display width used for clipping and alignment.
 ///
 /// Zero-width chars (U+200B–200F, U+FEFF) and combining diacritical marks
 /// (U+0300–036F) count as 0 so they don't inflate alignment calculations
@@ -640,6 +984,33 @@ pub fn empty_block() -> char {
         '-'
     } else {
         '▱'
+    }
+}
+/// Heavy horizontal line for the progress bar's filled portion: `━` or `=`.
+/// Per spec, the deck's progress uses `━` (heavy) for filled + `─` (light)
+/// for empty so the playhead stands out against the track, rather than the
+/// block characters `▰` / `▱` used by the legacy bars.
+pub fn progress_fill() -> char {
+    if is_ascii() {
+        '='
+    } else {
+        '━'
+    }
+}
+/// Light horizontal line for the progress bar's empty portion: `─` or `-`.
+pub fn progress_track() -> char {
+    if is_ascii() {
+        '-'
+    } else {
+        '─'
+    }
+}
+/// Playhead thumb for the progress bar: `●` or `#`.
+pub fn progress_thumb() -> char {
+    if is_ascii() {
+        '#'
+    } else {
+        '●'
     }
 }
 /// Previous-track glyph: `◀◀` or `<<`.

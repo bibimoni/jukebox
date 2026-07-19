@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context as _, Result};
-use crossterm::event::{self, Event, KeyEvent};
+use crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -414,7 +414,15 @@ pub fn run(app: &mut App, captured: Option<CapturedFormat>) -> Result<()> {
 
         if event::poll(std::time::Duration::from_millis(POLL_TIMEOUT_MS))? {
             match event::read()? {
-                Event::Key(k) => handle_key_event(app, k),
+                // macOS crossterm emits both Press and Release events for
+                // each keypress. Without this filter, every key fires
+                // twice — e.g. `Ctrl+W, e` would: (1) enter edit mode on
+                // the Press, then (2) fall through to `enqueue_selected()`
+                // on the Release, making it look like `e` didn't work.
+                // Only process Press events.
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    handle_key_event(app, k);
+                }
                 Event::Mouse(m) => input::handle_mouse(app, m),
                 Event::Resize(_, _) => {
                     // ratatui auto-handles via Terminal::draw on the next loop

@@ -489,6 +489,31 @@ pub enum Overlay {
     Publication {
         state: crate::tui::view::publication::PublicationState,
     },
+    /// Pane-edit: choose which side to split the focused pane on. `s` in
+    /// PaneEdit mode opens this overlay; the user picks L/R/T/B with
+    /// `h/l/k/j` or arrow keys; on confirm the `PaneModulePicker` overlay
+    /// opens to pick the new pane's module.
+    PaneSplitDirection {
+        target_pane: crate::tui::pane::PaneId,
+    },
+    /// Pane-edit: pick a module to install in a pane. `m` in PaneEdit
+    /// mode opens this for the focused pane (no split); the split-
+    /// direction picker opens this with `pending_split = Some(side)` so
+    /// Enter both splits and assigns the module in one go. `j/k` or
+    /// arrows navigate; Enter confirms; Esc cancels.
+    PaneModulePicker {
+        target_pane: crate::tui::pane::PaneId,
+        /// `Some(side)` = the user picked this side in the
+        /// `PaneSplitDirection` overlay; Enter splits AND assigns the
+        /// module. `None` = change the existing pane's module (no split).
+        pending_split: Option<crate::tui::pane::model::Side>,
+        /// Cursor into `ModuleId::all()`.
+        cursor: usize,
+    },
+    Keybindings {
+        cursor: usize,
+        capturing: bool,
+    },
 }
 
 /// Actions that can be confirmed via [`Overlay::Confirm`].
@@ -909,6 +934,32 @@ pub struct App {
     pub player_bar_state: crate::tui::view::player_bar_big::PlayerBarState,
     pub sidebar_visible: bool,
     pub playlist_col: PlaylistColumnState,
+
+    // --- Modular pane-editing system (Phase 1) ---------------------------
+    /// The pane workspace: split tree + focused pane + interaction mode.
+    /// Owned by `App` as a single field; all layout logic lives in
+    /// [`crate::tui::pane`]. Inactive by default (single root leaf +
+    /// Normal mode) so a fresh app renders identically to today. The
+    /// pane system activates when the user splits or enters edit mode.
+    /// The module registry is process-global (see
+    /// [`crate::tui::pane::registry`]) — keeping it out of `App` avoids
+    /// a split-borrow conflict between `&app.pane_registry` (for module
+    /// lookup) and `&mut app` (which `PaneModule::render` needs).
+    pub pane_workspace: crate::tui::pane::PaneWorkspace,
+    /// Pending `Ctrl+w` prefix: the next key is a pane command. Set by
+    /// `input::handle_key` when `Ctrl+w` is pressed; consumed by
+    /// [`crate::tui::pane::input::handle_prefix_key`] on the next key.
+    pub pending_pane_prefix: bool,
+    /// Active rectangle selection (Phase 2). `Some` when the user is in
+    /// the middle of picking a sub-region of the focused pane via `r`
+    /// in PaneEdit mode. Stored in normalized coords so it survives
+    /// terminal resize. The render layer draws the preview on top of
+    /// the focused pane; the input layer routes keys + mouse events to
+    /// the selection while it's active. Set to `None` on cancel (Esc)
+    /// or after the module picker confirms (the rectangle is converted
+    /// to split-tree ops and the selection is consumed).
+    pub rectangle_selection: Option<crate::tui::pane::RectangleSelection>,
+    pub keymap: crate::tui::keymap::Keymap,
 }
 
 /// Inline filter state for the `f` filter-on-focused-column (spec §5.4).
@@ -1003,6 +1054,42 @@ impl ContextResolver for ClonedResolver<'_> {
 }
 
 impl App {
+    /// Best-effort estimate of the main content area's `Rect` — where the
+    /// pane workspace lives. Used by the pane input layer for directional
+    /// focus movement (which needs pane rects; the actual rects are
+    /// recomputed on render). Returns a 1×1 rect if the terminal size is
+    /// unknown (the focus logic gracefully no-ops on degenerate input).
+    ///
+    /// This mirrors [`crate::tui::view::layout::overlay_content_area`]'s
+    /// top-level computation but uses the live terminal size from
+    /// `crossterm::terminal::size`. The render layer recomputes the
+    /// actual rects from the tree on every frame, so an imprecise
+    /// estimate here only affects focus movement (and only when the
+    /// terminal has been resized between frames — a rare race that
+    /// self-corrects on the next render).
+    pub fn pane_content_area(&self) -> ratatui::layout::Rect {
+        let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+        let area = ratatui::layout::Rect::new(0, 0, w, h);
+        // Subtract the sidebar when render does, so pane focus uses the same
+        // coordinate frame as the rendered panes.
+        let main = if crate::tui::view::sidebar::is_visible(self, area.width) {
+            let sw = crate::tui::view::sidebar::sidebar_width(area.width);
+            if sw > 0 && area.width > sw {
+                let split = ratatui::layout::Layout::horizontal([
+                    ratatui::layout::Constraint::Length(sw),
+                    ratatui::layout::Constraint::Min(1),
+                ])
+                .split(area);
+                split[1]
+            } else {
+                area
+            }
+        } else {
+            area
+        };
+        crate::tui::view::layout::overlay_content_area(main)
+    }
+
     pub fn new(
         catalog: Catalog,
         player: Box<dyn Player>,
@@ -1148,6 +1235,10 @@ impl App {
             player_bar_state: crate::tui::view::player_bar_big::PlayerBarState::default(),
             sidebar_visible: true,
             playlist_col: PlaylistColumnState::default(),
+            pane_workspace: crate::tui::pane::PaneWorkspace::new(),
+            pending_pane_prefix: false,
+            rectangle_selection: None,
+            keymap: crate::tui::keymap::Keymap::load_or_default(),
         }
     }
 
@@ -6104,6 +6195,15 @@ impl App {
     /// `note_play_started`).
     fn set_play_start_offset(&mut self, offset: f64) {
         self.play_start_offset = offset.max(0.0);
+    }
+
+    /// Execute the action advertised by the deck's `[Space]` control.
+    pub fn toggle_or_resume(&mut self) {
+        if self.now_playing.is_none() && self.resume_hint.is_some() && self.pending_play.is_none() {
+            self.resume_last();
+        } else {
+            self.toggle_pause();
+        }
     }
 
     /// RC14-DEF-4: toggle pause/resume on the player backend AND track the

@@ -12,17 +12,17 @@ expression: s
 4  │┃                                                                          ┃
    │┃Albums — 40mP:                                                            ┃
    │┃  Cosmic                                                                  ┃
-   │┃                                                                          ┃
-   │┃                                                                          ┃
-   │┃                                                                          ┃
-   │┃                                                                          ┃
-   │┃                                                                          ┃
-   │┃                                                                          ┃
-   │┃                                                                          ┃
-   │┃                                                                          ┃
-   │┃                                                                          ┃
-   │┃                                                                          ┃
-   │┃                                                                          ┃
    │┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-[PLAYING] ▶ Song1 — 40mP  0:00 / 3:00  ▸ Next: (end)  24bit/96  PREF local
+╭─ NOW PLAYING ────────────────────────────────────────────────────────────────╮
+│Song1                                                                         │
+│40mP                                                                          │
+│Cosmic                                                                        │
+│LOCAL · 24-bit · 96 kHz                                                       │
+│▶ PLAYING  [Space] Pause                                                      │
+│0:00  ────────────────────────────────────────────────────────────  3:00      │
+│[←] Previous   [Space] Pause   [→] Next   Vol 70% ▰▰▰▰▰▰▰▱▱▱                  │
+│LOCAL                                                                         │
+│Shuffle: Off   Repeat: Off   Continue: Off                                    │
+│Up next: Nothing queued                                                       │
+╰──────────────────────────────────────────────────────────────────────────────╯
 VIEW: local · SOURCE: local [Y —]
